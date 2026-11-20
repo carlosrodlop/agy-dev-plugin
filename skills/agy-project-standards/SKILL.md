@@ -15,6 +15,7 @@ Provides a deterministic, reusable quality and security gate for any Python/Shel
 | **Antigravity Plugin Layout** | Valid `plugin.json` (`suggestedPrompts <= 3`), flat/named `hooks.json` schema, and valid YAML frontmatter (`tools:` on `agents/*.md`) strictly `< 24,000` bytes across `rules/*.md`, `skills/*/SKILL.md`, and `agents/*.md` |
 | **Santa & Declarative Tooling** | Zero `curl\|sh`, `wget\|sh`, or `mise` pipes; checks `.tool-versions`, `pyproject.toml`, `.pre-commit-config.yaml`, `Makefile` |
 | **POSIX Shell & CI Hygiene** | `bash -n` syntax validation across `*.sh` + BATS suites (`tests/bats/*.bats`); GitHub Actions pin `ubuntu-24.04` (no unpinned `ubuntu-latest`) |
+| **Copilot Review Hygiene (Optional)** | Non-blocking warning `agy:copilot-instructions-bloat` when optional `.github/copilot-instructions.md` exists and exceeds `4,000` bytes (never required when absent) |
 
 ## 2. Usage
 ```bash

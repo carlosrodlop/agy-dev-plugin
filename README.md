@@ -20,7 +20,7 @@ By decoupling generic SDLC automation from domain-specific plugins (such as [`ag
 ### 2. Skills (`skills/`)
 | Skill | Purpose |
 | :--- | :--- |
-| **`agy-project-standards`** | Audits any repo or plugin for Python AST safety, Zero-PII, Santa compliance, `.tool-versions`, `hooks.json` / `agents/*.md` schemas, pinned CI workflows, shell/BATS hygiene, and `<24 KB` rule/skill limits (`project_audit.py`). |
+| **`agy-project-standards`** | Audits any repo or plugin for Python AST safety, Zero-PII, Santa compliance, `.tool-versions`, `hooks.json` / `agents/*.md` schemas, pinned CI workflows, shell/BATS hygiene, `<24 KB` rule/skill limits, and optional `<=4 KB` Copilot instructions hygiene (`project_audit.py`). |
 | **`git-commit-configuration`** | Enforces Conventional Commits, `pre-commit` verification, Zero-PII scans, version stamping, and `$HOME` plugin deployment (`git_client.py deploy-home`). |
 | **`agy-code-remediation-pr`** | Creates isolated worktree branches (`fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>`) behind per-repository `dev_pr_locks` (`--workdir`, `--repo`, `--all`), runs `test-local`, pushes to `origin/<branch>`, invokes `agy-code-pr-reviewer` (`Model="pro"`), and spawns `watch-pr-merge`. |
 | **`agy-dev-queue-orchestrator`** | Coordinates multi-repo engineering tasks in `dev_queue.json`, picks unblocked repos (`queue-next --unlocked`), tracks progressive `merged_repos`, provides the zero-hardcode `agy-queue` TUI & live `dev_queue_board.md` HITL artifact, supports in-app `/hitl-review`, and safely cleans up merged conversations. |
@@ -68,3 +68,11 @@ Because `carlosrodlop/agy-dev-plugin` is a public repository (unlimited GitHub A
 - `.github/workflows/offline-unit-tests.yml`: Runs `unittest` discovery, `bats tests/bats/*.bats`, and `selective_test_runner.py --plan-only`.
 - `.github/workflows/pre-commit.yml`: Installs `bats` and executes the full `.pre-commit-config.yaml` hook suite.
 - `.github/workflows/coverage-report.yml`: Runs `pytest --cov=clients --cov=skills` coverage reporting.
+
+### 7. Optional GitHub Copilot Code Review (Credit-Safe Ruleset)
+To enable optional GitHub Copilot Code Review on Pull Requests targeting `main` without burning AI Credits on intermediate commits or drafts, configure the repository **GitHub Ruleset** for `main` as follows:
+- **Automatically request Copilot code review**: **ON**
+- **Review new pushes**: **OFF** (prevents redundant re-reviews on incremental fixup pushes)
+- **Review draft pull requests**: **OFF** (reviews only ready-for-review PRs)
+
+Repository review rules live in [`.github/copilot-instructions.md`](.github/copilot-instructions.md) and are kept strictly `<= 4,000` bytes (checked via the optional non-blocking `agy:copilot-instructions-bloat` warning in `project_audit.py`) to keep prompts concise and control AI Credit consumption without relaxing native `/usr/bin/git` + `/usr/bin/ssh` (`PROPRIETARY_VCS_CLI_RE`) guardrails.

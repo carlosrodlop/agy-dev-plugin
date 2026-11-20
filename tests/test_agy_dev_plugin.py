@@ -1101,6 +1101,104 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
         self.assertIn("## 🧪 Automated Verification Checks", wf_text)
         self.assertIn("## 🤖 Independent PR Review", wf_text)
 
+    def test_project_audit_copilot_instructions_optional_and_size_cap(self) -> None:
+        self.assertEqual(project_audit.MAX_COPILOT_INSTRUCTIONS_BYTES, 4000)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. Repo WITHOUT .github/copilot-instructions.md -> 0 errors, 0 warnings
+            repo_absent = pathlib.Path(tmp) / "repo-absent"
+            repo_absent.mkdir()
+            (repo_absent / "app.py").write_text("def ok() -> int:\n    return 1\n", encoding="utf-8")
+            rep_absent = project_audit.audit_repository(repo_absent, strict=True)
+            self.assertTrue(rep_absent.passed)
+            self.assertEqual(rep_absent.errors, [])
+            self.assertEqual(rep_absent.warnings, [])
+
+            # 2. Repo WITH .github/copilot-instructions.md <= 4,000 bytes (exact boundary) -> 0 warnings
+            repo_ok = pathlib.Path(tmp) / "repo-ok"
+            (repo_ok / ".github").mkdir(parents=True)
+            (repo_ok / ".github" / "copilot-instructions.md").write_bytes(b"a" * 4000)
+            rep_ok = project_audit.audit_repository(repo_ok, strict=True)
+            self.assertTrue(rep_ok.passed)
+            self.assertEqual(rep_ok.errors, [])
+            self.assertEqual(rep_ok.warnings, [])
+
+            # 3. Repo WITH .github/copilot-instructions.md > 4,000 bytes -> non-blocking warning
+            repo_bloat = pathlib.Path(tmp) / "repo-bloat"
+            (repo_bloat / ".github").mkdir(parents=True)
+            (repo_bloat / ".github" / "copilot-instructions.md").write_bytes(b"a" * 4001)
+
+            rep_non_strict = project_audit.audit_repository(repo_bloat, strict=False)
+            self.assertTrue(rep_non_strict.passed)
+            self.assertEqual(rep_non_strict.errors, [])
+            bloat_warnings = [w for w in rep_non_strict.warnings if w.rule_id == "agy:copilot-instructions-bloat"]
+            self.assertEqual(len(bloat_warnings), 1)
+            self.assertEqual(bloat_warnings[0].severity, "warning")
+            self.assertEqual(bloat_warnings[0].file, ".github/copilot-instructions.md")
+
+            rep_strict = project_audit.audit_repository(repo_bloat, strict=True)
+            self.assertFalse(rep_strict.passed)
+            self.assertEqual(rep_strict.errors, [])
+            self.assertEqual([w.rule_id for w in rep_strict.warnings], ["agy:copilot-instructions-bloat"])
+
+            # 4. Multi-byte UTF-8 exceeding 4,000 bytes (fewer than 4,000 chars) also triggers warning
+            repo_utf8 = pathlib.Path(tmp) / "repo-utf8"
+            (repo_utf8 / ".github").mkdir(parents=True)
+            (repo_utf8 / ".github" / "copilot-instructions.md").write_text("é" * 2001, encoding="utf-8")
+            rep_utf8 = project_audit.audit_repository(repo_utf8, strict=False)
+            self.assertTrue(rep_utf8.passed)
+            self.assertEqual([w.rule_id for w in rep_utf8.warnings], ["agy:copilot-instructions-bloat"])
+
+            # 5. Even if the walker skips hidden .github files, audit_repository explicitly inspects it once
+            with mock.patch.object(project_audit, "_iter_repo_files", return_value=[]):
+                rep_fallback = project_audit.audit_repository(repo_bloat, strict=False)
+                self.assertEqual([w.rule_id for w in rep_fallback.warnings], ["agy:copilot-instructions-bloat"])
+                rep_fallback_absent = project_audit.audit_repository(repo_absent, strict=True)
+                self.assertTrue(rep_fallback_absent.passed)
+                self.assertEqual(rep_fallback_absent.warnings, [])
+
+    def test_repo_copilot_instructions_and_ruleset_docs_contract(self) -> None:
+        copilot_file = REPO_ROOT / ".github" / "copilot-instructions.md"
+        self.assertTrue(copilot_file.is_file(), msg=".github/copilot-instructions.md must exist")
+        size_bytes = copilot_file.stat().st_size
+        self.assertLess(size_bytes, 2500, msg=f".github/copilot-instructions.md must be < 2,500 bytes (got {size_bytes})")
+        self.assertLessEqual(size_bytes, project_audit.MAX_COPILOT_INSTRUCTIONS_BYTES)
+
+        copilot_text = copilot_file.read_text(encoding="utf-8")
+        for required_term in (
+            "Zero-PII",
+            "/Users/<user>/",
+            "AcmeCorp",
+            "PROPRIETARY_VCS_CLI_RE",
+            "/usr/bin/git",
+            "Santa Lockdown",
+            ".tool-versions",
+            "pyproject.toml",
+            "ubuntu-24.04",
+            'platform.system() == "Darwin"',
+            "24,000",
+            "4,000",
+            "unittest",
+            "bats",
+        ):
+            self.assertIn(required_term, copilot_text, msg=f"Missing guardrail in .github/copilot-instructions.md: {required_term}")
+
+        skill_md = REPO_ROOT / "skills" / "agy-project-standards" / "SKILL.md"
+        self.assertLess(skill_md.stat().st_size, 24000)
+        skill_text = skill_md.read_text(encoding="utf-8")
+        self.assertIn("agy:copilot-instructions-bloat", skill_text)
+        self.assertIn("4,000", skill_text)
+
+        readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        for ruleset_term in (
+            "Automatically request Copilot code review",
+            "Review new pushes",
+            "Review draft pull requests",
+            "agy:copilot-instructions-bloat",
+            "4,000",
+        ):
+            self.assertIn(ruleset_term, readme_text, msg=f"Missing Copilot Ruleset guidance in README.md: {ruleset_term}")
+
 
 if __name__ == "__main__":
     unittest.main()
