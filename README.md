@@ -27,13 +27,14 @@ By decoupling generic SDLC automation from domain-specific plugins (such as [`ag
 
 ### 3. Dedicated Agents (`agents/`)
 - **`agy-dev-orchestrator`** (`mainAgent` / `subagent`): General SDLC coordinator routing multi-repo work across `agy-dev-planner`, `agy-dev-executor`, `agy-code-developer`, and `agy-code-pr-reviewer`.
-- **`agy-dev-planner`** (`mainAgent` / `subagent`, read-only): Scopes tasks, anchors target files/tests, identifies cross-repo dependencies, and produces prioritized implementation plans.
+- **`agy-dev-planner`** (`mainAgent` / `subagent`, read-only): Leads Phase 0 interactive co-design (`co-design-and-discovery.md`), scopes tasks, anchors target files/tests, identifies cross-repo dependencies, and produces prioritized Design Contracts + plans in `dev_queue.json`.
 - **`agy-dev-executor`** (`mainAgent` / `subagent`): Drives per-repo `dev_pr_locks` worktrees, runs `pre-commit` / `test-local` / `bats`, pushes feature branches, and enforces Maker-Checker review.
 - **`agy-code-developer`** (`subagent`): Isolated branch implementer consuming pre-anchored context and running targeted tests before pushing.
 - **`agy-code-pr-reviewer`** (`subagent`, `Model="pro"`): Independent Maker-Checker evaluator scoring diff accuracy, test coverage, Zero-PII compliance, and style.
 
 ### 4. Rules (`rules/`)
-- `engineering-pillars.md` (`always_on`)
+- `engineering-pillars.md` (`always_on`) — Foundational SDLC pillars (`Phase 0 Co-Design -> Planning -> Queue -> Execution -> Maker-Checker Review -> Manual PR`)
+- `co-design-and-discovery.md` (`model_decision`) — Default Phase 0 adaptive Grill-Me protocol, silent codebase-first discovery, demanding partner pushback, hybrid cadence, and Design Contract exit gate
 - `python-and-testing.md` (`glob`)
 - `git-and-pr-workflow.md` (`glob`)
 

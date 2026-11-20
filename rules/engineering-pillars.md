@@ -14,14 +14,16 @@ All software development, scripting, automation, and repository configuration ch
 4. **Antigravity-Native Customizations First**: Reuse official Antigravity plugins, MCP servers, skills, rules, hooks (`agy-dev-sdlc-guardrail` flat schema), and dedicated agents (`agy-dev-orchestrator`, `agy-dev-planner`, `agy-dev-executor`, `agy-code-developer`, `agy-code-pr-reviewer`) before adding custom client wrappers. Keep plugin definitions, agent personas, rule files, and `SKILL.md` files strictly under `24,000` bytes.
 5. **Modular Functional & Data-Driven Python**: Favor small, single-purpose functions and typed dataclasses / Pydantic schemas over ceremonial wrapper hierarchies. Never duplicate logic; extract shared helpers cleanly.
 
-## 2. Security, Privacy & Manual Gates
-6. **Zero PII & Zero Secrets in Tracked Code**: Never commit customer names, domains, personal emails, tokens, credentials, or local `/Users/<user>/` paths into any tracked repository file. Store sensitive runtime configuration exclusively in `0600` `~/.env` (with mock placeholders mirrored in `.env.example`) and untracked state under `~/.local/share/`.
-7. **Deterministic Verification Before Reasoning**: Codify repeatable checks into fast CLI validators, pre-commit hooks, static AST audits (`project_audit.py` / `qa_static_audit.py`), and `PreToolUse`/`SessionStart` hooks.
-8. **Protected `main` Branch Workflow**: Never push directly to `main`. Route every tracked code/config change through `git-commit-configuration` and `agy-code-remediation-pr` (`fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>` under per-repository `dev_pr_locks`) with independent `agy-code-pr-reviewer` (`Model="pro"`) evaluation and human PR approval.
+## 2. Co-Design, Security, Privacy & Manual Gates
+6. **Phase 0 Interactive Co-Design (`Grill-Me` by Default)**: `agy-dev-plugin` governs the full SDLC from problem framing to PR merge (`Co-Design -> Planning -> Queue -> Execution -> Maker-Checker Review -> Manual PR`). For any interactive new feature, UX/design change, refactor, or open-ended engineering problem (skipping trivial deterministic fixes, explicit user bypasses, and autonomous subagents/crons), read and follow [`co-design-and-discovery.md`]($HOME/.gemini/config/plugins/agy-dev-plugin/rules/co-design-and-discovery.md): inspect the codebase silently first, challenge premises (Antigravity-native alternatives, MVP/YAGNI, debt), co-design via adaptive iterative/compact `ask_question` rounds, and converge on a concise **Design Contract** before planning, queueing, or coding.
+7. **Zero PII & Zero Secrets in Tracked Code**: Never commit customer names, domains, personal emails, tokens, credentials, or local `/Users/<user>/` paths into any tracked repository file. Store sensitive runtime configuration exclusively in `0600` `~/.env` (with mock placeholders mirrored in `.env.example`) and untracked state under `~/.local/share/`.
+8. **Deterministic Verification Before Reasoning**: Codify repeatable checks into fast CLI validators, pre-commit hooks, static AST audits (`project_audit.py` / `qa_static_audit.py`), and `PreToolUse`/`SessionStart` hooks.
+9. **Protected `main` Branch Workflow**: Never push directly to `main`. Route every tracked code/config change through `git-commit-configuration` and `agy-code-remediation-pr` (`fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>` under per-repository `dev_pr_locks`) with independent `agy-code-pr-reviewer` (`Model="pro"`) evaluation and human PR approval.
 
-## 3. Domain Skill Map
-| Need / Workflow | Skill in `agy-dev-plugin` |
+## 3. Domain Rule & Skill Map
+| Need / Lifecycle Stage | Rule or Skill in `agy-dev-plugin` |
 | :--- | :--- |
+| Phase 0 Problem Discovery, Grill-Me Co-Design & Design Contract exit gate | [`co-design-and-discovery.md`]($HOME/.gemini/config/plugins/agy-dev-plugin/rules/co-design-and-discovery.md) |
 | Audit or scaffold project quality gates (`pyproject.toml`, pre-commit, CI, Zero-PII) | [`agy-project-standards`]($HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-project-standards/SKILL.md) |
 | Semantic commits, secret scanning, `$HOME` plugin sync (`deploy-home`) | [`git-commit-configuration`]($HOME/.gemini/config/plugins/agy-dev-plugin/skills/git-commit-configuration/SKILL.md) |
 | Timestamped branches, per-repo `dev_pr_locks`, Maker-Checker review (`pr_remediator.py`) | [`agy-code-remediation-pr`]($HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/SKILL.md) |
