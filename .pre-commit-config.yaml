@@ -4,12 +4,28 @@ repos:
     hooks:
       - id: check-ast
       - id: check-json
+      - id: pretty-format-json
+        args: ["--autofix", "--no-ensure-ascii", "--indent=2"]
       - id: check-yaml
+      - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files
         args: ["--maxkb=512"]
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: check-docstring-first
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
       - id: end-of-file-fixer
       - id: trailing-whitespace
+      - id: detect-private-key
+      - id: detect-aws-credentials
+        args: ["--allow-missing-credentials"]
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ["--exclude-lines", "(?i)(placeholder|example|mock|fake|0000000|AcmeCorp)"]
   - repo: local
     hooks:
       - id: qa-static-audit
@@ -27,3 +43,8 @@ repos:
         entry: python3 ./tests/scripts/selective_test_runner.py
         language: system
         pass_filenames: false
+      - id: bats-suite
+        name: BATS CLI & Installer Tests
+        entry: bash -c 'if command -v bats >/dev/null 2>&1; then env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR -u GIT_PREFIX bats tests/bats/*.bats; else echo "bats not installed; skipping"; fi'
+        language: system
+        files: '(\.sh|\.bats|hooks\.json|agents/.*\.md)$'

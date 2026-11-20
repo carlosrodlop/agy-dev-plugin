@@ -22,7 +22,12 @@
 .Spotlight-V100
 .Trashes
 
-# Python bytecode, build artifacts & test caches
+# Python bytecode, virtualenvs, build artifacts & test caches
+.venv/
+venv/
+.asdf/
+.ruff_cache/
+.mypy_cache/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -35,6 +40,9 @@ dist/
 coverage.xml
 htmlcov/
 
-# Backup artifacts
+# Worktrees, logs & backup artifacts
+pr-worktree-*
+logs/
+tmp/
 **/*.old
 **/*.bak.*

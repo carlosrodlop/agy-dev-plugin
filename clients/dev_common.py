@@ -82,10 +82,10 @@ DETERMINISTIC_DEV_SESSION_CHECKS: tuple[dict[str, str], ...] = (
     {
         "check_id": "session:dev-pr-lock-context",
         "event": "SessionStart",
-        "title": "Cross-Conversation dev_pr_lock Context Injector",
-        "target": "SessionStart (dev_pr_lock.json / actions_state.json)",
+        "title": "Per-Repository Cross-Conversation dev_pr_locks Context Injector",
+        "target": "SessionStart (dev_pr_locks / dev_pr_lock.json / actions_state.json)",
         "decision": "inject_context",
-        "description": "Inspects active dev_pr_lock state at session start and injects a systemMessage enforcing single-branch concurrency.",
+        "description": "Inspects active per-repository dev_pr_locks state at session start and injects a systemMessage scoping concurrency to the active repository.",
     },
 )
 
@@ -554,6 +554,87 @@ def try_send_branch_review_notification(
         return {"sent": False, "transport": "gmail_draft_client", "error": str(exc)}
 
 
+def normalize_repo_slug(raw_value: str) -> str:
+    """Normalize a Git remote URL, SSH path, or `owner/repo` identifier into lowercase `owner/repo`."""
+    raw = str(raw_value or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    if raw.endswith(".git"):
+        raw = raw[:-4]
+    raw = raw.rstrip("/")
+    m_scp = re.match(r"^(?:ssh://)?[^@:/]+@[^:/]+[:/](.+)$", raw)
+    if m_scp:
+        raw = m_scp.group(1)
+    elif "://" in raw:
+        raw = raw.split("://", 1)[1]
+        if "/" in raw:
+            raw = raw.split("/", 1)[1]
+    parts = [p for p in raw.split("/") if p]
+    if len(parts) >= 2:
+        return f"{parts[-2]}/{parts[-1]}".lower()
+    return raw.lower()
+
+
+def _resolve_git_config_from_root(repo_root: Path) -> Path | None:
+    """Resolve `.git/config` for a normal Git checkout or `.git` gitdir worktree pointer."""
+    dot_git = repo_root / ".git"
+    if dot_git.is_dir():
+        cfg = dot_git / "config"
+        return cfg if cfg.is_file() else None
+    if dot_git.is_file():
+        with contextlib.suppress(OSError):
+            first_line = dot_git.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
+            if first_line.lower().startswith("gitdir:"):
+                raw_gitdir = first_line.split(":", 1)[1].strip()
+                gitdir = Path(raw_gitdir)
+                if not gitdir.is_absolute():
+                    gitdir = (repo_root / gitdir).resolve()
+                commondir_file = gitdir / "commondir"
+                if commondir_file.is_file():
+                    rel_common = commondir_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    common_dir = Path(rel_common)
+                    if not common_dir.is_absolute():
+                        common_dir = (gitdir / common_dir).resolve()
+                    cfg = common_dir / "config"
+                    if cfg.is_file():
+                        return cfg
+                cfg_local = gitdir / "config"
+                if cfg_local.is_file():
+                    return cfg_local
+    return None
+
+
+def resolve_repo_slug_from_path(candidate: Path | str) -> str:
+    """Resolve `owner/repo` (or directory fallback name) by walking up from `candidate` to its `.git` root."""
+    raw_str = str(candidate or "").strip()
+    if not raw_str:
+        return ""
+    try:
+        cur = Path(raw_str).expanduser().resolve()
+    except OSError:
+        cur = Path(raw_str).expanduser()
+    if cur.is_file() or not cur.exists():
+        cur = cur.parent
+    for cand in (cur, *cur.parents):
+        if (cand / ".git").exists():
+            cfg = _resolve_git_config_from_root(cand)
+            if cfg is not None:
+                with contextlib.suppress(OSError):
+                    cfg_text = cfg.read_text(encoding="utf-8", errors="ignore")
+                    m_sec = re.search(
+                        r'\[remote "origin"\]\s*\n((?:[ \t]+[^\n]*\n?)*)',
+                        cfg_text,
+                    )
+                    if m_sec:
+                        m_url = re.search(r"^\s*url\s*=\s*(.+)$", m_sec.group(1), re.MULTILINE)
+                        if m_url and m_url.group(1).strip():
+                            slug = normalize_repo_slug(m_url.group(1).strip())
+                            if slug:
+                                return slug
+            return cand.name.lower()
+    return ""
+
+
 class DevLifecycleGuardrailEvaluator:
     """Deterministic evaluator for SDLC `PreToolUse` and `SessionStart` lifecycle guardrails."""
 
@@ -584,8 +665,8 @@ class DevLifecycleGuardrailEvaluator:
         """Evaluate a `PreToolUse` hook payload and return `{\"decision\": \"allow\"|\"deny\", ...}`."""
         tool_call = payload.get("toolCall")
         if isinstance(tool_call, dict):
-            tool_name = str(tool_call.get("toolName") or "").strip()
-            raw_args = tool_call.get("arguments")
+            tool_name = str(tool_call.get("name") or tool_call.get("toolName") or "").strip()
+            raw_args = tool_call.get("args") if "args" in tool_call else tool_call.get("arguments")
             if isinstance(raw_args, str):
                 try:
                     args = json.loads(raw_args) if raw_args.strip() else {}
@@ -597,7 +678,7 @@ class DevLifecycleGuardrailEvaluator:
                 args = {}
         else:
             tool_name = str(payload.get("tool_name") or payload.get("toolName") or "").strip()
-            raw_input = payload.get("tool_input") or payload.get("arguments") or {}
+            raw_input = payload.get("tool_input") or payload.get("args") or payload.get("arguments") or {}
             args = raw_input if isinstance(raw_input, dict) else {}
 
         if tool_name == "run_command":
@@ -650,47 +731,143 @@ class DevLifecycleGuardrailEvaluator:
 
         return {"decision": "allow"}
 
-    def _read_active_lock_data(self) -> dict[str, Any]:
-        """Inspect `dev_pr_lock.json` and `actions_state.json` across active & compat state dirs."""
+    @staticmethod
+    def _extract_repo_slug_from_lock(lock_data: dict[str, Any], default_key: str = "") -> str:
+        """Infer normalized `owner/repo` slug from a lock dictionary or fallback key."""
+        for key in ("repo_slug", "repo"):
+            val = normalize_repo_slug(str(lock_data.get(key) or ""))
+            if val:
+                return val
+        for path_key in ("target_repo_dir", "worktree_dir"):
+            raw_p = str(lock_data.get(path_key) or "").strip()
+            if raw_p:
+                resolved = resolve_repo_slug_from_path(raw_p.replace("$HOME", str(Path.home())))
+                if resolved:
+                    return resolved
+        clean_def = normalize_repo_slug(default_key)
+        return clean_def or "default"
+
+    def _read_active_locks_map(self) -> dict[str, dict[str, Any]]:
+        """Inspect `dev_pr_locks`, `dev_pr_lock.json`, and `actions_state.json` across state dirs, keyed by `repo_slug`."""
         search_dirs = [self.state_dir]
         compat_dir = self.home_dir / ".local" / "share" / COMPAT_PORTFOLIO_STATE_DIRNAME
         if compat_dir.resolve() != self.state_dir.resolve():
             search_dirs.append(compat_dir)
 
+        active_map: dict[str, dict[str, Any]] = {}
         for candidate_dir in search_dirs:
-            lock_data = atomic_read_json(candidate_dir / "dev_pr_lock.json", default={})
-            if isinstance(lock_data, dict) and lock_data.get("active"):
-                return lock_data
+            lock_file_data = atomic_read_json(candidate_dir / "dev_pr_lock.json", default={})
+            if isinstance(lock_file_data, dict):
+                raw_nested = lock_file_data.get("dev_pr_locks") or lock_file_data.get("locks")
+                if isinstance(raw_nested, dict):
+                    for k, v in raw_nested.items():
+                        if isinstance(v, dict) and v.get("active"):
+                            slug = self._extract_repo_slug_from_lock(v, k)
+                            active_map.setdefault(slug, v)
+                elif lock_file_data.get("active"):
+                    slug = self._extract_repo_slug_from_lock(lock_file_data)
+                    active_map.setdefault(slug, lock_file_data)
+
             st_raw = atomic_read_json(candidate_dir / "actions_state.json", default={})
             if isinstance(st_raw, dict):
-                cand_lock = (st_raw.get("actions_log_audit_state") or {}).get("dev_pr_lock")
-                if isinstance(cand_lock, dict) and cand_lock.get("active"):
-                    return cand_lock
-        return {}
+                audit_st = st_raw.get("actions_log_audit_state") or {}
+                if isinstance(audit_st, dict):
+                    raw_locks = audit_st.get("dev_pr_locks")
+                    if isinstance(raw_locks, dict):
+                        for k, v in raw_locks.items():
+                            if isinstance(v, dict) and v.get("active"):
+                                slug = self._extract_repo_slug_from_lock(v, k)
+                                active_map.setdefault(slug, v)
+                    cand_lock = audit_st.get("dev_pr_lock")
+                    if isinstance(cand_lock, dict) and cand_lock.get("active"):
+                        slug = self._extract_repo_slug_from_lock(cand_lock)
+                        active_map.setdefault(slug, cand_lock)
+        return active_map
+
+    def _read_active_lock_data(self, repo_slug: str = "") -> dict[str, Any]:
+        """Inspect active locks and return either the lock matching `repo_slug` or the first active lock."""
+        active_map = self._read_active_locks_map()
+        if not active_map:
+            return {}
+        clean_slug = normalize_repo_slug(repo_slug)
+        if clean_slug:
+            return active_map.get(clean_slug, {})
+        first_key = next(iter(active_map))
+        return active_map[first_key]
 
     def evaluate_session_start(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Evaluate a `SessionStart` hook payload and inject a lock status notice if `dev_pr_lock` is active."""
-        lock_data = self._read_active_lock_data()
-        if not lock_data.get("active"):
+        """Evaluate a `SessionStart` hook payload and inject a per-repository lock status notice."""
+        active_map = self._read_active_locks_map()
+        if not active_map:
             return {"decision": "allow"}
 
-        branch_name = str(lock_data.get("branch_name") or "").strip()
-        owner_cid = str(lock_data.get("conversation_id") or "").strip()
         current_cid = str(payload.get("conversationId") or payload.get("conversation_id") or "").strip()
-        if not branch_name:
-            return {"decision": "allow"}
+        workspace_repos: list[str] = []
+        raw_paths = payload.get("workspacePaths")
+        candidates: list[str] = list(raw_paths) if isinstance(raw_paths, list) else []
+        cwd_val = str(payload.get("cwd") or "").strip()
+        if cwd_val:
+            candidates.append(cwd_val)
+        for item in candidates:
+            slug = resolve_repo_slug_from_path(str(item))
+            if slug and slug not in workspace_repos:
+                workspace_repos.append(slug)
 
-        if current_cid and current_cid == owner_cid:
-            msg = (
-                f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) owned by this conversation ({owner_cid[:8]}) "
-                f"on branch '{branch_name}'. Reuse this branch (--reuse-active) for follow-up commits."
-            )
+        messages: list[str] = []
+        other_locked: list[str] = []
+        if workspace_repos:
+            matched_repos = [r for r in workspace_repos if r in active_map]
+            free_repos = [r for r in workspace_repos if r not in active_map]
+            for r in matched_repos:
+                lock_data = active_map[r]
+                branch_name = str(lock_data.get("branch_name") or "").strip()
+                owner_cid = str(lock_data.get("conversation_id") or "").strip()
+                if not branch_name:
+                    continue
+                if current_cid and current_cid == owner_cid:
+                    messages.append(
+                        f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) for repo '{r}' "
+                        f"owned by this conversation ({owner_cid[:8]}) on branch '{branch_name}'. "
+                        f"Reuse this branch (--reuse-active --workdir ...) for follow-up commits."
+                    )
+                else:
+                    messages.append(
+                        f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) for repo '{r}' "
+                        f"held by conversation '{owner_cid[:8]}' on branch '{branch_name}'. Do not start a new branch "
+                        f"or modify tracked repository files in '{r}' from another conversation until that branch is merged into main or evaluated."
+                    )
+            for slug, lock_data in active_map.items():
+                if slug not in workspace_repos and lock_data.get("branch_name"):
+                    other_locked.append(
+                        f"{slug}: '{lock_data.get('branch_name')}' (cid {str(lock_data.get('conversation_id') or '')[:8]})"
+                    )
+            if free_repos and other_locked:
+                messages.append(
+                    f"[Antigravity Dev Guardrail] Active workspace repository {', '.join(free_repos)} is UNLOCKED "
+                    f"(safe to branch cleanly). Concurrent locks exist on sibling repositories: {'; '.join(other_locked)}."
+                )
         else:
-            msg = (
-                f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) held by conversation '{owner_cid[:8]}' on branch "
-                f"'{branch_name}'. Do not start a new branch or modify tracked repository files from another "
-                f"conversation until that branch is merged into main or evaluated."
-            )
+            for slug, lock_data in active_map.items():
+                branch_name = str(lock_data.get("branch_name") or "").strip()
+                owner_cid = str(lock_data.get("conversation_id") or "").strip()
+                if not branch_name:
+                    continue
+                if current_cid and current_cid == owner_cid:
+                    messages.append(
+                        f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) for '{slug}' "
+                        f"owned by this conversation ({owner_cid[:8]}) on branch '{branch_name}'. "
+                        f"Reuse this branch (--reuse-active) for follow-up commits."
+                    )
+                else:
+                    messages.append(
+                        f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) for '{slug}' "
+                        f"held by conversation '{owner_cid[:8]}' on branch '{branch_name}'. Do not start a new branch "
+                        f"or modify tracked repository files in '{slug}' from another conversation until that branch is merged into main or evaluated."
+                    )
+
+        if not messages:
+            return {"decision": "allow"}
+        msg = "\n".join(messages)
         return {
             "decision": "allow",
             "additionalContext": msg,
