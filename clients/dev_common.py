@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Iterator
+import urllib.parse
 
 PLUGIN_NAME = "agy-dev-plugin"
 DEFAULT_DEV_STATE_DIRNAME = "agy-dev-plugin"
@@ -537,6 +538,17 @@ def get_active_dev_pr_lock_protections(
     return active_branches, active_worktrees
 
 
+def _sanitize_http_target_url(target_url: str) -> str:
+    """Validate and strip an optional HTTP(S) target URL for notification dispatch."""
+    cleaned = str(target_url or "").strip()
+    if not cleaned or any(ch in cleaned for ch in ("\r", "\n")):
+        return ""
+    parsed = urllib.parse.urlsplit(cleaned)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        return ""
+    return cleaned
+
+
 def try_send_branch_review_notification(
     *,
     status: str,
@@ -545,27 +557,32 @@ def try_send_branch_review_notification(
     conversation_id: str,
     validator: str,
     branch_name: str,
+    target_url: str = "",
     errors_only_override: bool | None = None,
     home_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Optionally dispatch a branch-review notification using `AGY_DEV_NOTIFY_CMD` or companion `gmail_draft_client.py`."""
+    clean_target_url = _sanitize_http_target_url(target_url)
     notify_cmd = str(os.environ.get("AGY_DEV_NOTIFY_CMD") or "").strip()
     if notify_cmd:
         try:
+            notify_args = [
+                *notify_cmd.split(),
+                "--status",
+                status,
+                "--subject",
+                subject,
+                "--body",
+                body,
+                "--conversation-id",
+                conversation_id,
+                "--branch-name",
+                branch_name,
+            ]
+            if clean_target_url:
+                notify_args.extend(["--target-url", clean_target_url])
             proc = subprocess.run(
-                [
-                    *notify_cmd.split(),
-                    "--status",
-                    status,
-                    "--subject",
-                    subject,
-                    "--body",
-                    body,
-                    "--conversation-id",
-                    conversation_id,
-                    "--branch-name",
-                    branch_name,
-                ],
+                notify_args,
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -600,7 +617,7 @@ def try_send_branch_review_notification(
     if status == "OK" and errors_only:
         return {"sent": False, "transport": "gmail_draft_client", "skipped_reason": "errors_only_policy"}
 
-    cmd = [
+    base_cmd = [
         sys.executable,
         str(gmail_client),
         "--send-notification",
@@ -620,7 +637,11 @@ def try_send_branch_review_notification(
         branch_name,
     ]
     if errors_only_override is False:
-        cmd.append("--force-notify-ok")
+        base_cmd.append("--force-notify-ok")
+
+    cmd = [*base_cmd]
+    if clean_target_url:
+        cmd.extend(["--target-url", clean_target_url])
 
     try:
         res_em = subprocess.run(
@@ -630,7 +651,24 @@ def try_send_branch_review_notification(
             timeout=30,
             check=False,
         )
-        return {"sent": res_em.returncode == 0, "transport": "gmail_draft_client"}
+        fallback_without_target_url = False
+        if (
+            res_em.returncode != 0
+            and clean_target_url
+            and "unrecognized arguments: --target-url" in (res_em.stderr or "")
+        ):
+            fallback_without_target_url = True
+            res_em = subprocess.run(
+                base_cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        result: dict[str, Any] = {"sent": res_em.returncode == 0, "transport": "gmail_draft_client"}
+        if fallback_without_target_url:
+            result["fallback_without_target_url"] = True
+        return result
     except Exception as exc:
         return {"sent": False, "transport": "gmail_draft_client", "error": str(exc)}
 

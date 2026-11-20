@@ -393,6 +393,168 @@ class TestGitClientAndRemediation(unittest.TestCase):
             ),
         )
 
+    def test_vcs_pr_notification_url_and_remote_sanitization(self) -> None:
+        # 1. Remote detection strips HTTPS userinfo and custom SSH ports cleanly
+        self.assertEqual(
+            git_client.detect_vcs_provider_from_remote("https://user@host.example.com/org/repo.git"),
+            ("generic-git", "https://host.example.com/org/repo", "org/repo"),
+        )
+        self.assertEqual(
+            git_client.detect_vcs_provider_from_remote("https://mock-user:mock-tok@github.com/acme-org/acme-repo.git"),
+            ("github", "https://github.com/acme-org/acme-repo", "acme-org/acme-repo"),
+        )
+        self.assertEqual(
+            git_client.detect_vcs_provider_from_remote("ssh://git@gitlab.example.com:2222/org/repo.git"),
+            ("gitlab", "https://gitlab.example.com/org/repo", "org/repo"),
+        )
+        self.assertEqual(
+            git_client.detect_vcs_provider_from_remote("ssh://git@gitlab.example.com:2222/group/subgroup/repo.git"),
+            ("gitlab", "https://gitlab.example.com/group/subgroup/repo", "group/subgroup/repo"),
+        )
+
+        # 2. Direct PR/MR links strip bloated query params across providers
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="fix/demo",
+                remote_url="git@github.com:acme-org/acme-repo.git",
+                pr_url="https://github.com/acme-org/acme-repo/pull/42?title=huge&body=bloated",
+            ),
+            "https://github.com/acme-org/acme-repo/pull/42",
+        )
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="fix/demo",
+                remote_url="ssh://git@gitlab.example.com:2222/group/subgroup/repo.git",
+                pr_url="https://gitlab.example.com/group/subgroup/repo/-/merge_requests/18?view=inline",
+            ),
+            "https://gitlab.example.com/group/subgroup/repo/-/merge_requests/18",
+        )
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="fix/demo",
+                remote_url="git@bitbucket.org:acme/repo.git",
+                pr_url="https://bitbucket.org/acme/repo/pull-requests/9?title=x",
+            ),
+            "https://bitbucket.org/acme/repo/pull-requests/9",
+        )
+
+        # 3. Clean Compare/Create PR URLs without title/body/description params
+        gh_clean = git_client.build_vcs_pr_notification_url(
+            branch_name="fix/20261120-demo",
+            base_branch="main",
+            remote_url="git@github.com:acme-org/acme-repo.git",
+            pr_url="https://github.com/acme-org/acme-repo/compare/main...fix/20261120-demo?expand=1&title=LongTitle&body=HugeBody",
+        )
+        self.assertEqual(gh_clean, "https://github.com/acme-org/acme-repo/compare/main...fix/20261120-demo?expand=1")
+
+        gl_clean = git_client.build_vcs_pr_notification_url(
+            branch_name="fix/20261120-demo",
+            base_branch="main",
+            remote_url="https://user@gitlab.example.com/group/subgroup/repo.git",
+        )
+        self.assertEqual(
+            gl_clean,
+            "https://gitlab.example.com/group/subgroup/repo/-/merge_requests/new?"
+            "merge_request%5Bsource_branch%5D=fix/20261120-demo&merge_request%5Btarget_branch%5D=main",
+        )
+
+        gl_ssh_clean = git_client.build_vcs_pr_notification_url(
+            branch_name="fix/20261120-demo",
+            base_branch="main",
+            remote_url="ssh://git@gitlab.example.com:2222/org/repo.git",
+        )
+        self.assertEqual(
+            gl_ssh_clean,
+            "https://gitlab.example.com/org/repo/-/merge_requests/new?"
+            "merge_request%5Bsource_branch%5D=fix/20261120-demo&merge_request%5Btarget_branch%5D=main",
+        )
+
+        bb_clean = git_client.build_vcs_pr_notification_url(
+            branch_name="fix/20261120-demo",
+            base_branch="main",
+            remote_url="git@bitbucket.org:acme/repo.git",
+        )
+        self.assertEqual(bb_clean, "https://bitbucket.org/acme/repo/pull-requests/new?source=fix/20261120-demo&dest=main")
+
+        generic_clean = git_client.build_vcs_pr_notification_url(
+            branch_name="fix/20261120-demo",
+            base_branch="main",
+            remote_url="https://git.acme.internal/acme/repo.git",
+        )
+        self.assertEqual(generic_clean, "https://git.acme.internal/acme/repo/tree/fix/20261120-demo")
+
+        # 4. Fallback chain: Compare -> branch URL -> repo URL -> repo_slug fallback -> ""
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="fix/demo",
+                base_branch="",
+                remote_url="git@github.com:acme/repo.git",
+            ),
+            "https://github.com/acme/repo/tree/fix/demo",
+        )
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="fix/demo",
+                base_branch="",
+                remote_url="git@gitlab.com:acme/repo.git",
+            ),
+            "https://gitlab.com/acme/repo/-/tree/fix/demo",
+        )
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="fix/demo",
+                base_branch="",
+                remote_url="git@bitbucket.org:acme/repo.git",
+            ),
+            "https://bitbucket.org/acme/repo/src/fix/demo",
+        )
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="",
+                remote_url="git@github.com:acme/repo.git",
+            ),
+            "https://github.com/acme/repo",
+        )
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="fix/demo",
+                remote_url="/tmp/acme/bare.git",
+                repo_slug="acme/widget",
+            ),
+            "https://github.com/acme/widget/compare/main...fix/demo?expand=1",
+        )
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="fix/demo",
+                remote_url="/tmp/acme/bare.git",
+                repo_slug="default",
+            ),
+            "",
+        )
+        self.assertEqual(
+            git_client.build_vcs_pr_notification_url(
+                branch_name="",
+                remote_url="",
+                repo_slug="",
+                pr_url="https://github.com/acme/repo/compare/main...fix/demo?expand=1&title=x&body=y",
+            ),
+            "https://github.com/acme/repo/compare/main...fix/demo?expand=1",
+        )
+
+        # 5. GitVcsIntegrationClient.build_pr_notification_url wrapper
+        with tempfile.TemporaryDirectory() as tmp:
+            _, clone = _create_bare_and_clone(pathlib.Path(tmp), name="notify-url-repo")
+            subprocess.run(
+                ["git", "-C", str(clone), "remote", "set-url", "origin", "git@github.com:acme-org/notify-url-repo.git"],
+                check=True,
+                capture_output=True,
+            )
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(clone)})
+            self.assertEqual(
+                vcs.build_pr_notification_url(branch_name="fix/demo", repo_dir=clone),
+                "https://github.com/acme-org/notify-url-repo/compare/main...fix/demo?expand=1",
+            )
+
     def test_record_branch_review_and_custom_notify_transport(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             troot = pathlib.Path(tmp)
@@ -451,7 +613,14 @@ class TestGitClientAndRemediation(unittest.TestCase):
             self.assertTrue(rev["branch_pushed"])
             self.assertTrue(rev["notification_email_sent"])
             self.assertTrue(notify_log.is_file())
-            self.assertIn(branch_name, notify_log.read_text(encoding="utf-8"))
+            logged_args = notify_log.read_text(encoding="utf-8")
+            self.assertIn(branch_name, logged_args)
+            self.assertIn("--target-url", logged_args)
+            self.assertIn(rev["notification_target_url"], logged_args)
+            self.assertNotIn("title=", rev["notification_target_url"])
+            self.assertNotIn("body=", rev["notification_target_url"])
+            self.assertTrue(rev["email_subject"].startswith("PR Ready for Validation ["))
+            self.assertTrue(rev["email_subject"].endswith("(PASS 96/100)"))
             self.assertNotIn("agy-qa-validator", rev["review_markdown"])
 
     def test_branch_review_notification_forwards_force_notify_ok_when_errors_only_false(self) -> None:
@@ -493,7 +662,8 @@ class TestGitClientAndRemediation(unittest.TestCase):
                 self.assertEqual(suppressed["skipped_reason"], "errors_only_policy")
                 self.assertFalse(args_log.exists())
 
-                # 2. errors_only_override=False dispatches with --force-notify-ok
+                # 2. errors_only_override=False dispatches with --force-notify-ok and forwards valid --target-url
+                sample_target_url = "https://github.com/acme-org/demo-repo/compare/main...fix/20261120-110000-demo-44444444?expand=1"
                 dispatched = dev_common.try_send_branch_review_notification(
                     status="OK",
                     subject="PR Review OK",
@@ -501,15 +671,92 @@ class TestGitClientAndRemediation(unittest.TestCase):
                     conversation_id="44444444-4444-4444-8444-444444444444",
                     validator="agy-code-pr-reviewer",
                     branch_name="fix/20261120-110000-demo-44444444",
+                    target_url=sample_target_url,
                     errors_only_override=False,
                     home_dir=fake_home,
                 )
                 self.assertTrue(dispatched["sent"])
                 self.assertEqual(dispatched["transport"], "gmail_draft_client")
+                self.assertNotIn("fallback_without_target_url", dispatched)
                 self.assertTrue(args_log.is_file())
                 argv_logged = json.loads(args_log.read_text(encoding="utf-8"))
                 self.assertIn("--send-notification", argv_logged)
                 self.assertIn("--force-notify-ok", argv_logged)
+                self.assertIn("--target-url", argv_logged)
+                self.assertEqual(argv_logged[argv_logged.index("--target-url") + 1], sample_target_url)
+
+                # 2b. Non-HTTP(S) target_url is sanitized out and never forwarded
+                args_log.unlink()
+                sanitized = dev_common.try_send_branch_review_notification(
+                    status="OK",
+                    subject="PR Review OK",
+                    body="All checks passed",
+                    conversation_id="44444444-4444-4444-8444-444444444444",
+                    validator="agy-code-pr-reviewer",
+                    branch_name="fix/20261120-110000-demo-44444444",
+                    target_url="file:///etc/passwd",
+                    errors_only_override=False,
+                    home_dir=fake_home,
+                )
+                self.assertTrue(sanitized["sent"])
+                argv_sanitized = json.loads(args_log.read_text(encoding="utf-8"))
+                self.assertNotIn("--target-url", argv_sanitized)
+
+                # 2c. Graceful fallback retry when an older $HOME gmail_draft_client rejects --target-url
+                args_log.unlink()
+                fake_gmail.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, pathlib, sys\n"
+                    "if '--target-url' in sys.argv[1:]:\n"
+                    "    sys.stderr.write('usage: gmail_draft_client.py\\ngmail_draft_client.py: error: unrecognized arguments: --target-url ' + sys.argv[sys.argv.index('--target-url') + 1] + '\\n')\n"
+                    "    sys.exit(2)\n"
+                    f"pathlib.Path({str(args_log)!r}).write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n",
+                    encoding="utf-8",
+                )
+                fallback_res = dev_common.try_send_branch_review_notification(
+                    status="OK",
+                    subject="PR Review OK",
+                    body="All checks passed",
+                    conversation_id="44444444-4444-4444-8444-444444444444",
+                    validator="agy-code-pr-reviewer",
+                    branch_name="fix/20261120-110000-demo-44444444",
+                    target_url=sample_target_url,
+                    errors_only_override=False,
+                    home_dir=fake_home,
+                )
+                self.assertTrue(fallback_res["sent"])
+                self.assertTrue(fallback_res.get("fallback_without_target_url"))
+                argv_fallback = json.loads(args_log.read_text(encoding="utf-8"))
+                self.assertNotIn("--target-url", argv_fallback)
+                self.assertIn("--force-notify-ok", argv_fallback)
+
+                # 2d. AGY_DEV_NOTIFY_CMD forwards --target-url cleanly
+                custom_args_log = troot / "custom_notify_args.json"
+                custom_notify = troot / "custom_notify.py"
+                custom_notify.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, pathlib, sys\n"
+                    f"pathlib.Path({str(custom_args_log)!r}).write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n",
+                    encoding="utf-8",
+                )
+                custom_notify.chmod(0o755)
+                with mock.patch.dict(os.environ, {"AGY_DEV_NOTIFY_CMD": str(custom_notify)}):
+                    custom_res = dev_common.try_send_branch_review_notification(
+                        status="OK",
+                        subject="PR Review OK",
+                        body="All checks passed",
+                        conversation_id="44444444-4444-4444-8444-444444444444",
+                        validator="agy-code-pr-reviewer",
+                        branch_name="fix/20261120-110000-demo-44444444",
+                        target_url=sample_target_url,
+                        errors_only_override=False,
+                        home_dir=fake_home,
+                    )
+                self.assertTrue(custom_res["sent"])
+                self.assertEqual(custom_res["transport"], "AGY_DEV_NOTIFY_CMD")
+                custom_argv = json.loads(custom_args_log.read_text(encoding="utf-8"))
+                self.assertIn("--target-url", custom_argv)
+                self.assertEqual(custom_argv[custom_argv.index("--target-url") + 1], sample_target_url)
 
             # 3. record_pr_review_evaluation(send_email=True) explicitly passes errors_only_override=False
             pdir = troot / "state"
@@ -554,6 +801,75 @@ class TestGitClientAndRemediation(unittest.TestCase):
             self.assertTrue(rev["notification_email_sent"])
             mock_notify.assert_called_once()
             self.assertIs(mock_notify.call_args.kwargs.get("errors_only_override"), False)
+            self.assertEqual(
+                mock_notify.call_args.kwargs.get("subject"),
+                "PR Ready for Validation [agy-dev-plugin]: fix(notify-check): pass errors_only_override=False (PASS 98/100)",
+            )
+            self.assertEqual(
+                mock_notify.call_args.kwargs.get("target_url"),
+                f"https://github.com/carlosrodlop/agy-dev-plugin/compare/main...{start['branch_name']}?expand=1",
+            )
+            self.assertEqual(rev["notification_target_url"], mock_notify.call_args.kwargs.get("target_url"))
+
+    def test_record_pr_review_evaluation_standardizes_subject_and_clean_target_url_for_github_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "state"
+            pdir.mkdir(parents=True, exist_ok=True)
+            _, clone = _create_bare_and_clone(troot, name="widget-core")
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(clone)})
+            start = pr_remediator.start_remediation_branch_and_lock(
+                conversation_id="66666666-6666-4666-8666-666666666666",
+                action_id="widget-notify",
+                rca_summary="Long summary normalization",
+                proposed_fix="Truncate subject cleanly to 80 chars and emit clean VCS URL",
+                checkout_branch=True,
+                branch_timestamp="20261120-120000",
+                portfolio_dir=pdir,
+                git_client=vcs,
+            )
+            self.assertEqual(start["status"], "ok")
+            (clone / "widget.py").write_text("WIDGET = 1\n", encoding="utf-8")
+            long_title = "feat(notify):   implement   clean  VCS  target-url  forwarding  with  extra  description  beyond  eighty  characters"
+            staged = pr_remediator.push_remediation_branch_and_build_reviewer_plan(
+                title=long_title,
+                executive_summary="Clean VCS URL forwarding",
+                workdir=clone,
+                portfolio_dir=pdir,
+                git_client=vcs,
+            )
+            self.assertEqual(staged["status"], "ok")
+            with (
+                mock.patch.object(vcs, "resolve_remote_url", return_value="git@github.com:acme-org/widget-core.git"),
+                mock.patch.object(
+                    dev_common,
+                    "try_send_branch_review_notification",
+                    return_value={"sent": True, "transport": "gmail_draft_client"},
+                ) as mock_notify,
+            ):
+                rev = pr_remediator.record_pr_review_evaluation(
+                    branch_name=start["branch_name"],
+                    verdict="PASS",
+                    score=95,
+                    summary="Clean subject & target_url.",
+                    send_email=True,
+                    workdir=clone,
+                    portfolio_dir=pdir,
+                    git_client=vcs,
+                    repo_slug="acme-org/widget-core",
+                )
+            self.assertTrue(rev["ready_for_human_pr"])
+            subj = rev["email_subject"]
+            self.assertTrue(subj.startswith("PR Ready for Validation [widget-core]: "))
+            self.assertTrue(subj.endswith(" (PASS 95/100)"))
+            inner_summary = subj[len("PR Ready for Validation [widget-core]: ") : -len(" (PASS 95/100)")]
+            self.assertLessEqual(len(inner_summary), 80)
+            self.assertTrue(inner_summary.endswith("..."))
+            self.assertNotIn("  ", inner_summary)
+            expected_url = f"https://github.com/acme-org/widget-core/compare/main...{start['branch_name']}?expand=1"
+            self.assertEqual(rev["notification_target_url"], expected_url)
+            self.assertEqual(mock_notify.call_args.kwargs.get("target_url"), expected_url)
+            self.assertEqual(mock_notify.call_args.kwargs.get("subject"), subj)
 
 
 class TestProjectAuditAndPluginContracts(unittest.TestCase):
