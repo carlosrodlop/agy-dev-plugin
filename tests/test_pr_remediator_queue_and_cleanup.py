@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import urllib.parse
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLIENTS_DIR = REPO_ROOT / "clients"
@@ -848,6 +849,212 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertEqual(clean_res["status"], "ok")
             self.assertIn(active_branch, clean_res["deleted_local_branches"])
             self.assertFalse(active_wt.exists())
+
+    def test_sync_dev_pr_lock_with_git_missing_or_cleaned_workdir_never_syncs_default_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme-org"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+            scratch = troot / "scratch"
+            scratch.mkdir(parents=True, exist_ok=True)
+
+            bare_default, repo_default = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-default")
+            initial_default_sha = _git_rev_parse(repo_default)
+            _push_upstream_commit(bare_default, scratch, "default-upstream.txt", "ahead commit\n")
+
+            missing_wt = troot / "tmp" / "pr-worktree-acme-other-fix-20261120-100000-demo-12345678"
+            plain_non_git = troot / "plain-non-git-dir"
+            plain_non_git.mkdir(parents=True, exist_ok=True)
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_default)}),
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+            ):
+                # 1. Empty active_map: missing cleaned worktree must skip sync and never touch repo_default
+                res_missing_empty = prs.sync_dev_pr_lock_with_git(
+                    portfolio_dir=pdir,
+                    workdir=missing_wt,
+                )
+                self.assertEqual(res_missing_empty["status"], "ok")
+                self.assertFalse(res_missing_empty["active"])
+                self.assertEqual(res_missing_empty["repo_sync"]["status"], "skipped")
+                self.assertFalse(res_missing_empty["repo_sync"]["synced"])
+                self.assertEqual(res_missing_empty["repo_sync"]["reason"], "workdir_not_a_git_repo")
+                self.assertEqual(_git_rev_parse(repo_default), initial_default_sha)
+
+                # 2. Empty active_map: existing non-git directory must also skip sync and never touch repo_default
+                res_nongit_empty = prs.sync_dev_pr_lock_with_git(
+                    portfolio_dir=pdir,
+                    workdir=plain_non_git,
+                )
+                self.assertEqual(res_nongit_empty["repo_sync"]["status"], "skipped")
+                self.assertFalse(res_nongit_empty["repo_sync"]["synced"])
+                self.assertEqual(res_nongit_empty["repo_sync"]["reason"], "workdir_not_a_git_repo")
+                self.assertEqual(_git_rev_parse(repo_default), initial_default_sha)
+
+                # 3. Non-empty active_map holding a lock on repo_default: missing/cleaned workdir skips without touching repo_default
+                prs.acquire_dev_pr_lock(
+                    conversation_id="66666666-1111-4111-8111-666666666666",
+                    action_id="hold-default",
+                    branch_name="fix/20261120-100000-hold-default-66666666",
+                    summary="Active lock on default repo",
+                    proposed_fix="Stay locked",
+                    target_repo_dir=str(repo_default),
+                    repo_slug="acme-org/acme-default",
+                    portfolio_dir=pdir,
+                )
+                res_missing_locked = prs.sync_dev_pr_lock_with_git(
+                    portfolio_dir=pdir,
+                    workdir=missing_wt,
+                )
+                self.assertEqual(res_missing_locked["status"], "ok")
+                self.assertTrue(res_missing_locked["active"])
+                self.assertFalse(res_missing_locked["repo_active"])
+                self.assertEqual(res_missing_locked["repo_sync"]["status"], "skipped")
+                self.assertFalse(res_missing_locked["repo_sync"]["synced"])
+                self.assertEqual(res_missing_locked["repo_sync"]["reason"], "workdir_not_a_git_repo")
+                self.assertEqual(_git_rev_parse(repo_default), initial_default_sha)
+
+    def test_record_review_on_merged_repo_with_deleted_worktree_never_corrupts_sibling_active_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme-org"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-a")
+            _, repo_b = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-b")
+
+            cid_a = "aaaaaaaa-9999-4999-8999-aaaaaaaaaaaa"
+            cid_b = "bbbbbbbb-9999-4999-8999-bbbbbbbbbbbb"
+            branch_a = "fix/20261120-110121-repo-a-aaaaaaaa"
+            branch_b = "fix/20261120-110127-repo-b-bbbbbbbb"
+            wt_a = troot / "tmp" / f"pr-worktree-acme-a-{branch_a.replace('/', '-')}"
+            wt_b = troot / "tmp" / f"pr-worktree-acme-b-{branch_b.replace('/', '-')}"
+            wt_a.parent.mkdir(parents=True, exist_ok=True)
+
+            # Create branch_a + worktree on repo_a, commit with real title, push, merge into main, then release lock (deleting wt_a)
+            subprocess.run(
+                ["git", "-C", str(repo_a), "worktree", "add", "-b", branch_a, str(wt_a), "main"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            (wt_a / "feature_a.txt").write_text("feature a\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(wt_a), "add", "feature_a.txt"], check=True, capture_output=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(wt_a),
+                    "commit",
+                    "-m",
+                    "feat(a): real repo-a feature\n\n## 📋 Executive Summary\n\n- **Summary of Changes**: Real repo-a summary.\n",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "-C", str(wt_a), "push", "-u", "origin", branch_a], check=True, capture_output=True)
+            branch_a_sha = _git_rev_parse(wt_a, "HEAD")
+
+            prs.acquire_dev_pr_lock(
+                conversation_id=cid_a,
+                action_id="repo-a",
+                branch_name=branch_a,
+                worktree_path=str(wt_a),
+                summary="Repo A change",
+                proposed_fix="Ship repo A",
+                target_repo_dir=str(repo_a),
+                repo_slug="acme-org/acme-a",
+                portfolio_dir=pdir,
+            )
+            subprocess.run(["git", "-C", str(repo_a), "merge", "--no-ff", branch_a, "-m", f"Merge {branch_a}"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "origin", "main"], check=True, capture_output=True)
+            with (
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+                mock.patch.object(prs, "restart_pro_api_server", return_value=False),
+            ):
+                prs.release_dev_pr_lock(
+                    reason="BRANCH_MERGED_INTO_MAIN",
+                    portfolio_dir=pdir,
+                    repo_slug="acme-org/acme-a",
+                    branch_name=branch_a,
+                )
+            self.assertFalse(wt_a.exists())
+
+            # Create active DEVELOPING unpushed branch_b + worktree wt_b on repo_b (also set as default AGY_CONF_REPO_DIR)
+            subprocess.run(
+                ["git", "-C", str(repo_b), "worktree", "add", "-b", branch_b, str(wt_b), "main"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            prs.acquire_dev_pr_lock(
+                conversation_id=cid_b,
+                action_id="repo-b",
+                branch_name=branch_b,
+                worktree_path=str(wt_b),
+                summary="Active repo B work",
+                proposed_fix="Must stay isolated",
+                target_repo_dir=str(repo_b),
+                repo_slug="acme-org/acme-b",
+                portfolio_dir=pdir,
+            )
+            self.assertTrue(wt_b.is_dir())
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_b)}),
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+                mock.patch.object(prs, "spawn_pr_merge_watcher_daemon", return_value={"status": "skipped", "spawned": False}),
+            ):
+                # Late record_pr_review_evaluation on merged repo_a with deleted wt_a must NOT touch repo_b's lock or overwrite branch_a commit
+                rev_late = prs.record_pr_review_evaluation(
+                    branch_name=branch_a,
+                    workdir=wt_a,
+                    verdict="PASS",
+                    score=96,
+                    summary="Late review after merge",
+                    send_email=False,
+                    portfolio_dir=pdir,
+                )
+                self.assertEqual(rev_late["status"], "ok")
+                # Existing commit subject/SHA/summary on repo_a preserved (never amended or routed to repo_b)
+                self.assertEqual(_git_rev_parse(repo_a, branch_a), branch_a_sha)
+                unquoted_url = urllib.parse.unquote(rev_late["manual_pr_url"])
+                self.assertIn("acme-org/acme-a", unquoted_url)
+                self.assertIn("feat(a): real repo-a feature", unquoted_url)
+                self.assertIn("Real repo-a summary.", rev_late["review_markdown"])
+
+                # repo_b's active lock MUST remain completely uncorrupted
+                active_locks = prs.get_all_dev_pr_locks(portfolio_dir=pdir)
+                self.assertEqual(set(active_locks.keys()), {"acme-org/acme-b"})
+                lock_b = active_locks["acme-org/acme-b"]
+                self.assertTrue(lock_b["active"])
+                self.assertEqual(lock_b["branch_name"], branch_b)
+                self.assertEqual(lock_b["conversation_id"], cid_b)
+
+                # Direct cross-branch update_dev_pr_lock on repo_b with branch_a must also be refused
+                bad_upd = prs.update_dev_pr_lock(
+                    {"branch_name": branch_a, "status": "PENDING_HUMAN_PR_VALIDATION"},
+                    portfolio_dir=pdir,
+                    repo_slug="acme-org/acme-b",
+                )
+                self.assertEqual(bad_upd["status"], "error")
+                self.assertEqual(prs.get_all_dev_pr_locks(portfolio_dir=pdir)["acme-org/acme-b"]["branch_name"], branch_b)
+
+                # Subsequent sync_dev_pr_lock_with_git must preserve repo_b's active worktree and branch intact
+                sync_after = prs.sync_dev_pr_lock_with_git(portfolio_dir=pdir)
+                self.assertEqual(sync_after["status"], "ok")
+                self.assertTrue(sync_after["active"])
+                self.assertTrue(wt_b.is_dir())
+                self.assertIn("acme-org/acme-b", prs.get_all_dev_pr_locks(portfolio_dir=pdir))
 
 
 if __name__ == "__main__":
