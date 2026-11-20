@@ -122,7 +122,11 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             troot = pathlib.Path(tmp)
             pdir = troot / "portfolio"
             pdir.mkdir(parents=True, exist_ok=True)
-            _, clone = _init_bare_and_clone_repo(troot)
+            remotes_org = troot / "remotes" / "acme-org"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+            _, clone = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-plugin")
             vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(clone)})
 
             orch_cid = "11111111-1111-4111-8111-111111111111"
@@ -1509,6 +1513,115 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
                 by_cid_2 = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
                 self.assertEqual(by_cid_2[cid_b]["status"], "pr_open")
                 self.assertEqual(by_cid_2[cid_def]["status"], "pr_open")
+
+    def test_reconcile_fetch_false_zero_network_calls_offline_git_guard_and_single_repo_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-a")
+            _, repo_ssh = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-ssh")
+            subprocess.run(
+                ["git", "-C", str(repo_ssh), "remote", "set-url", "origin", "git@github.com:acme/repo-ssh.git"],
+                check=True,
+                capture_output=True,
+            )
+
+            # 1. Verify _is_local_git_remote distinguishes local/file:// remotes from network remotes
+            vcs_a = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+            vcs_ssh = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_ssh)})
+            self.assertTrue(vcs_a._is_local_git_remote(repo_a))
+            self.assertFalse(vcs_ssh._is_local_git_remote(repo_ssh))
+
+            # 2. Prepare a merged branch whose local refs/heads/<br> is deleted while refs/remotes/origin/<br> remains
+            cid_remote_ref = "dddddddd-1111-4ddd-8ddd-dddddddddddd"
+            cid_mismatch = "eeeeeeee-1111-4eee-8eee-eeeeeeeeeeee"
+            br_remote_ref = "fix/20261120-140000-remote-ref-dddddddd"
+            url_remote_ref = f"https://github.com/acme/repo-a/compare/main...{br_remote_ref}?expand=1"
+            url_mismatch = "https://github.com/acme/repo-b/compare/main...fix/20261120-140000-b-eeeeeeee?expand=1"
+
+            subprocess.run(["git", "-C", str(repo_a), "checkout", "-b", br_remote_ref], check=True, capture_output=True)
+            (repo_a / "remref.txt").write_text("remote tracking ref merged\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo_a), "add", "remref.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "commit", "-m", "fix: remote tracking ref"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "-u", "origin", br_remote_ref], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "checkout", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "merge", "--no-ff", br_remote_ref, "-m", f"Merge {br_remote_ref}"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "origin", "main"], check=True, capture_output=True)
+            # Delete local branch only; refs/remotes/origin/<br_remote_ref> still exists locally
+            subprocess.run(["git", "-C", str(repo_a), "branch", "-D", br_remote_ref], check=True, capture_output=True)
+
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_remote_ref,
+                title="Merged branch tracked via origin/<branch>",
+                repo_slugs=["acme/repo-a"],
+                branch_names=[br_remote_ref],
+                pr_urls=[url_remote_ref],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_mismatch,
+                title="Single-repo item for acme/repo-b",
+                repo_slugs=["acme/repo-b"],
+                branch_names=["fix/20261120-140000-b-eeeeeeee"],
+                pr_urls=[url_mismatch],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+
+            # 3. Spy on subprocess.run and prove fetch=False runs ZERO `git ls-remote` or `git fetch` commands
+            real_run = subprocess.run
+            recorded_cmds: list[list[str]] = []
+
+            def _spy_run(cmd: list[str] | str, *args: object, **kwargs: object) -> subprocess.CompletedProcess:
+                if isinstance(cmd, (list, tuple)):
+                    recorded_cmds.append([str(c) for c in cmd])
+                return real_run(cmd, *args, **kwargs)
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_a), "AGY_OFFLINE_ONLY": "1"}),
+                mock.patch.object(prs.subprocess, "run", side_effect=_spy_run),
+                mock.patch.object(git_client.subprocess, "run", side_effect=_spy_run),
+            ):
+                recon_res = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir, workdir=repo_a, fetch=False)
+                self.assertEqual(recon_res["status"], "ok")
+                self.assertEqual(recon_res["reconciled_count"], 1)
+
+                # Also verify AGY_OFFLINE_ONLY=1 skips network fetch/ls-remote on SSH remote without hanging
+                ssh_sync = vcs_ssh.sync_and_clean_local_repo(base_branch="main", state_dir=pdir)
+                self.assertEqual(ssh_sync["status"], "ok")
+                ssh_state = vcs_ssh.inspect_remote_branch_state(branch_name="fix/nonexistent", fetch=True)
+                self.assertEqual(ssh_state["status"], "ok")
+                self.assertFalse(ssh_state["remote_exists"])
+
+            network_git_cmds = [
+                cmd for cmd in recorded_cmds if "ls-remote" in cmd or "fetch" in cmd
+            ]
+            self.assertEqual(network_git_cmds, [], f"Expected zero network git commands, saw: {network_git_cmds}")
+
+            by_cid = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+            self.assertEqual(by_cid[cid_remote_ref]["status"], "merged")
+            self.assertEqual(by_cid[cid_remote_ref]["merged_repos"], ["acme/repo-a"])
+            self.assertEqual(by_cid[cid_remote_ref]["pr_urls"], [])
+
+            # 4. Single-repo mismatch guard: releasing acme/repo-a must NEVER mark acme/repo-b merged or prune its URLs
+            mismatch_res = prs._mark_queue_item_repo_merged(
+                conversation_id=cid_mismatch,
+                released_repo_slug="acme/repo-a",
+                portfolio_dir=pdir,
+            )
+            self.assertFalse(mismatch_res["updated"])
+            self.assertEqual(mismatch_res["status"], "skipped")
+            by_cid_after = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+            self.assertEqual(by_cid_after[cid_mismatch]["status"], "pr_open")
+            self.assertEqual(by_cid_after[cid_mismatch]["pr_urls"], [url_mismatch])
+            self.assertEqual(by_cid_after[cid_mismatch].get("merged_repos") or [], [])
 
 
 if __name__ == "__main__":

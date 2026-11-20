@@ -4048,6 +4048,13 @@ def _mark_queue_item_repo_merged(
             for norm in [dev_common.normalize_repo_slug(str(r))]
             if norm
         ]
+        if target_repos and clean_slug and clean_slug != "default" and clean_slug not in target_repos:
+            return {
+                "status": "skipped",
+                "updated": False,
+                "reason": "released_repo_not_in_item_target_repos",
+                "item": item,
+            }
         merged_repos = _normalize_str_list(
             [
                 *[dev_common.normalize_repo_slug(str(r)) for r in (item.get("merged_repos") or [])],
@@ -4063,7 +4070,7 @@ def _mark_queue_item_repo_merged(
                 break
         all_target_repos_merged = (
             (not target_repos and not still_locked_for_item)
-            or (len(target_repos) <= 1 and not still_locked_for_item)
+            or (clean_slug in ("", "default") and len(target_repos) <= 1 and not still_locked_for_item)
             or (set(target_repos).issubset(set(merged_repos)) and not still_locked_for_item)
         )
 
@@ -4112,6 +4119,82 @@ def _branch_found_in_base_git_log(
         if proc.returncode == 0:
             return bool(pattern.search(proc.stdout or ""))
     return False
+
+
+def _inspect_local_branch_merged_readonly(
+    repo_dir: Path,
+    branch_name: str,
+    base_branch: str = "main",
+    remote: str = "origin",
+) -> tuple[bool, str]:
+    """Verify whether `branch_name` is merged into `origin/<base>` / `<base>` strictly via local refs & log (zero network calls)."""
+    clean_branch = str(branch_name or "").strip().removeprefix("refs/heads/")
+    clean_base = (base_branch or "main").strip()
+    if not clean_branch or not (repo_dir / ".git").exists():
+        return False, "repo_or_branch_missing"
+
+    base_ref = ""
+    base_sha = ""
+    for cand_base in (f"refs/remotes/{remote}/{clean_base}", f"refs/heads/{clean_base}"):
+        p_base = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--verify", cand_base],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if p_base.returncode == 0 and (p_base.stdout or "").strip():
+            base_ref = cand_base
+            base_sha = (p_base.stdout or "").strip()
+            break
+    if not base_ref or not base_sha:
+        return False, "base_ref_missing"
+
+    target_sha = ""
+    for cand_ref in (f"refs/remotes/{remote}/{clean_branch}", f"refs/heads/{clean_branch}"):
+        p_ref = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--verify", cand_ref],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if p_ref.returncode == 0 and (p_ref.stdout or "").strip():
+            target_sha = (p_ref.stdout or "").strip()
+            break
+
+    if target_sha:
+        if target_sha == base_sha:
+            return True, f"git_merged_into_base:{clean_branch}"
+        p_anc = subprocess.run(
+            ["git", "-C", str(repo_dir), "merge-base", "--is-ancestor", target_sha, base_ref],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if p_anc.returncode == 0:
+            return True, f"git_merged_into_base:{clean_branch}"
+        p_cherry = subprocess.run(
+            ["git", "-C", str(repo_dir), "cherry", base_ref, target_sha],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if p_cherry.returncode == 0:
+            cherry_lines = [
+                ln.strip()
+                for ln in (p_cherry.stdout or "").splitlines()
+                if ln.strip()
+            ]
+            if cherry_lines and not any(ln.startswith("+") for ln in cherry_lines):
+                return True, f"git_merged_into_base:{clean_branch}"
+        return False, "unmerged_local_ref_exists"
+
+    if _branch_found_in_base_git_log(repo_dir, clean_branch, base_branch=clean_base):
+        return True, f"git_log_merge_commit:{clean_branch}"
+    return False, "not_merged"
 
 
 def _collect_queue_item_repo_branches(
@@ -4264,6 +4347,18 @@ def _verify_queue_repo_merged_readonly(
                 eff_fetch = False
             else:
                 fetched_dirs.add(dir_key)
+
+        if (
+            not eff_fetch
+            and isinstance(vcs, GitVcsIntegrationClient)
+            and repo_dir is not None
+            and (repo_dir / ".git").exists()
+        ):
+            loc_merged, loc_reason = _inspect_local_branch_merged_readonly(repo_dir, br_name, base_branch="main")
+            if loc_merged:
+                return True, loc_reason, [br_name], []
+            continue
+
         try:
             st = vcs.inspect_remote_branch_state(
                 branch_name=br_name,
@@ -4293,39 +4388,9 @@ def _verify_queue_repo_merged_readonly(
             if repo_dir is not None and _branch_found_in_base_git_log(repo_dir, br_name, base_branch="main"):
                 return True, f"git_log_merge_commit:{br_name}", [br_name], []
         elif repo_dir is not None and (repo_dir / ".git").exists():
-            # Offline fallback when remote ls-remote fails: verify strictly against existing local refs/remotes/origin/main
-            loc_proc = subprocess.run(
-                ["git", "-C", str(repo_dir), "rev-parse", "--verify", f"refs/heads/{br_name}"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            base_proc = subprocess.run(
-                ["git", "-C", str(repo_dir), "rev-parse", "--verify", "refs/remotes/origin/main"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if loc_proc.returncode == 0 and base_proc.returncode == 0:
-                anc_proc = subprocess.run(
-                    [
-                        "git",
-                        "-C",
-                        str(repo_dir),
-                        "merge-base",
-                        "--is-ancestor",
-                        f"refs/heads/{br_name}",
-                        "refs/remotes/origin/main",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                    check=False,
-                )
-                if anc_proc.returncode == 0:
-                    return True, f"git_local_ancestor_origin_main:{br_name}", [br_name], []
+            loc_merged, loc_reason = _inspect_local_branch_merged_readonly(repo_dir, br_name, base_branch="main")
+            if loc_merged:
+                return True, loc_reason, [br_name], []
 
     return False, "not_merged", [], []
 
