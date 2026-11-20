@@ -1774,7 +1774,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         clean_name = (plugin_name or "wiz-tam-plugin").strip().strip("/")
         if (
             rel_str in ("plugin.json", "hooks.json", "mcp_config.json")
-            or rel_str.startswith(("skills/", "clients/", "agents/", "rules/", "assets/"))
+            or rel_str.startswith(("skills/", "clients/", "agents/", "rules/", "assets/", "shell/"))
         ):
             return f".gemini/config/plugins/{clean_name}/{rel_str}"
         if clean_name == "wiz-tam-plugin" and rel_str in (".env.example", ".tool-versions", ".tool-plugins"):
@@ -1856,6 +1856,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     "rules",
                     "clients",
                     "assets",
+                    "shell",
                 ],
                 capture_output=True,
                 timeout=10,
@@ -1949,6 +1950,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     and rel_str.endswith(".py")
                 )
                 or (rel_str.startswith(".gemini/config/actions/") and "/scripts/" in rel_str and rel_str.endswith(".py"))
+                or (plugin_prefix and rel_str.startswith(f"{plugin_prefix}/shell/") and rel_str.endswith(".sh"))
             ):
                 mode = 0o755
             elif rel_str.startswith(".ssh/"):

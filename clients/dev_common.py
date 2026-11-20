@@ -1288,6 +1288,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_dev_queue_tui_cli(argv: list[str] | None = None) -> int:
+    """Console entrypoint (`agy-queue`) delegating to `dev_queue_tui.py`."""
+    candidates = (
+        resolve_plugin_root() / "skills" / "agy-dev-queue-orchestrator" / "scripts" / "dev_queue_tui.py",
+        Path.home()
+        / ".gemini"
+        / "config"
+        / "plugins"
+        / PLUGIN_NAME
+        / "skills"
+        / "agy-dev-queue-orchestrator"
+        / "scripts"
+        / "dev_queue_tui.py",
+    )
+    for script_path in candidates:
+        mod = _load_optional_module(script_path, "_agy_dev_queue_tui_cli")
+        if mod is not None and hasattr(mod, "main"):
+            return int(mod.main(argv))
+    sys.stderr.write("[agy-queue] Error: dev_queue_tui.py not found. Run ./install.sh to deploy agy-dev-plugin.\n")
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for `dev_common.py`."""
     args = build_parser().parse_args(argv)
