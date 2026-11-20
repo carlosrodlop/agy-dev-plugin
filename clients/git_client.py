@@ -1038,6 +1038,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         checkout_base_if_current_gone: bool = True,
         deploy_to_home: bool | None = None,
         home_dir: Path | None = None,
+        state_dir: Path | str | None = None,
     ) -> dict[str, Any]:
         """Synchronize local `base_branch` (`main`) with `<remote>/<base_branch>`, prune local branches/worktrees cleaned on `<remote>`, and atomically deploy `src/home/` (`main`) to `$HOME`."""
         clean_base = (base_branch or "main").strip()
@@ -1214,6 +1215,15 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
             if str(fb or "").strip()
         } - {"main", "master", clean_base}
 
+        # Never delete local branches or worktrees held by active `dev_pr_locks` (especially DEVELOPING / unpushed),
+        # unless explicitly requested via `force_clean_branches` after verified merge/deletion.
+        active_lock_state_dir = state_dir or self._env_overrides.get("AGY_DEV_STATE_DIR") or None
+        active_lock_branches, active_lock_worktrees = _dev_common.get_active_dev_pr_lock_protections(
+            state_dir=active_lock_state_dir,
+            home_dir=home_dir,
+        )
+        protected_set.update(active_lock_branches - force_clean_set)
+
         needs_merged_check = any(
             (ln.split("|", 1)[0].strip() not in protected_set)
             and (ln.split("|", 1)[0].strip() not in force_clean_set)
@@ -1324,6 +1334,9 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                         elif ln.startswith("branch "):
                             wt_branch = ln[len("branch ") :].strip().removeprefix("refs/heads/")
                     if not wt_path_str or str(Path(wt_path_str).resolve()) == main_repo_resolved:
+                        continue
+                    wt_resolved_str = str(Path(wt_path_str).resolve())
+                    if wt_resolved_str in active_lock_worktrees and wt_branch not in force_clean_set:
                         continue
                     if wt_branch in stale_branches or (
                         wt_branch not in protected_set and wt_branch not in remote_branches

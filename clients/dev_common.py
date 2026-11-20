@@ -470,6 +470,56 @@ def try_sync_actions_ledger_verdicts(
         return dict(verdict_updates or {})
 
 
+def get_active_dev_pr_lock_protections(
+    *,
+    state_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> tuple[set[str], set[str]]:
+    """Return `(active_branches, active_worktree_paths)` held by any active `dev_pr_locks` or legacy `dev_pr_lock` entry."""
+    p_dir = resolve_state_dir(state_dir, home_dir=home_dir)
+    state_obj = atomic_read_json(p_dir / "actions_state.json", default={})
+    if not isinstance(state_obj, dict):
+        return set(), set()
+    audit_state = state_obj.get("actions_log_audit_state")
+    if not isinstance(audit_state, dict):
+        return set(), set()
+
+    entries: list[dict[str, Any]] = []
+    raw_locks = audit_state.get("dev_pr_locks")
+    if isinstance(raw_locks, dict):
+        entries.extend(v for v in raw_locks.values() if isinstance(v, dict))
+    legacy = audit_state.get("dev_pr_lock")
+    if isinstance(legacy, dict):
+        entries.append(legacy)
+
+    base_home = str((Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()))
+    active_branches: set[str] = set()
+    active_worktrees: set[str] = set()
+    for entry in entries:
+        if not bool(entry.get("active")):
+            continue
+        main_br = str(entry.get("branch_name") or "").strip().removeprefix("refs/heads/")
+        if main_br:
+            active_branches.add(main_br)
+        raw_wt = str(entry.get("worktree_path") or "").strip()
+        if raw_wt:
+            with contextlib.suppress(OSError):
+                active_worktrees.add(str(Path(raw_wt.replace("$HOME", base_home)).expanduser().resolve()))
+        rb_map = entry.get("repo_branches")
+        if isinstance(rb_map, dict):
+            for rb_item in rb_map.values():
+                if not isinstance(rb_item, dict):
+                    continue
+                rb_br = str(rb_item.get("branch_name") or "").strip().removeprefix("refs/heads/")
+                if rb_br:
+                    active_branches.add(rb_br)
+                rb_wt = str(rb_item.get("worktree_path") or "").strip()
+                if rb_wt:
+                    with contextlib.suppress(OSError):
+                        active_worktrees.add(str(Path(rb_wt.replace("$HOME", base_home)).expanduser().resolve()))
+    return active_branches, active_worktrees
+
+
 def try_send_branch_review_notification(
     *,
     status: str,
@@ -509,8 +559,18 @@ def try_send_branch_review_notification(
             return {"sent": False, "transport": "AGY_DEV_NOTIFY_CMD", "error": str(exc)}
 
     base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
-    gmail_client = base_home / ".gemini" / "config" / "clients" / "gmail_draft_client.py"
-    if not gmail_client.is_file():
+    gmail_client = next(
+        (
+            cand
+            for cand in (
+                base_home / ".gemini" / "config" / "clients" / "gmail_draft_client.py",
+                base_home / ".gemini" / "config" / "plugins" / "wiz-tam-plugin" / "clients" / "gmail_draft_client.py",
+            )
+            if cand.is_file()
+        ),
+        None,
+    )
+    if gmail_client is None:
         return {"sent": False, "transport": "none", "skipped_reason": "no_notification_transport"}
 
     errors_only = True if errors_only_override is None else errors_only_override
@@ -523,27 +583,31 @@ def try_send_branch_review_notification(
     if status == "OK" and errors_only:
         return {"sent": False, "transport": "gmail_draft_client", "skipped_reason": "errors_only_policy"}
 
+    cmd = [
+        sys.executable,
+        str(gmail_client),
+        "--send-notification",
+        "--status",
+        status,
+        "--source",
+        "Ad-Hoc",
+        "--subject",
+        subject,
+        "--body",
+        body,
+        "--conversation-id",
+        conversation_id,
+        "--validator",
+        validator,
+        "--branch-name",
+        branch_name,
+    ]
+    if errors_only_override is False:
+        cmd.append("--force-notify-ok")
+
     try:
         res_em = subprocess.run(
-            [
-                sys.executable,
-                str(gmail_client),
-                "--send-notification",
-                "--status",
-                status,
-                "--source",
-                "Ad-Hoc",
-                "--subject",
-                subject,
-                "--body",
-                body,
-                "--conversation-id",
-                conversation_id,
-                "--validator",
-                validator,
-                "--branch-name",
-                branch_name,
-            ],
+            cmd,
             capture_output=True,
             text=True,
             timeout=30,
