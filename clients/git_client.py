@@ -897,6 +897,33 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
             "output": f"{proc_push.stdout}\n{proc_push.stderr}".strip(),
         }
 
+    def _is_local_git_remote(self, target_dir: Path, remote: str = "origin") -> bool:
+        """Return True iff `<remote>` in `target_dir` points to a local filesystem or `file://` repository."""
+        if not (target_dir / ".git").exists():
+            return False
+        raw_url = ""
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc = subprocess.run(
+                ["git", "-C", str(target_dir), "remote", "get-url", remote],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if proc.returncode == 0:
+                raw_url = (proc.stdout or "").strip()
+        if not raw_url:
+            return False
+        lowered = raw_url.lower()
+        if lowered.startswith("file://"):
+            return True
+        if lowered.startswith(("ssh://", "http://", "https://", "git://", "git@")):
+            return False
+        if "://" in raw_url or re.match(r"^[A-Za-z0-9_.-]+@[^/:]+:", raw_url):
+            return False
+        cand = Path(raw_url).expanduser()
+        return cand.is_absolute() or cand.exists() or (target_dir / raw_url).exists()
+
     def inspect_remote_branch_state(
         self,
         branch_name: str,
@@ -912,7 +939,13 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         if not (target_dir / ".git").exists():
             return {"status": "error", "error": f"Git repository not found at {target_dir}"}
 
-        if fetch:
+        is_offline_mode = (
+            os.environ.get("AGY_OFFLINE_ONLY") == "1"
+            or os.environ.get("PRE_COMMIT_HOOK") == "1"
+        )
+        allow_remote_network = (not is_offline_mode) or self._is_local_git_remote(target_dir, remote)
+
+        if fetch and allow_remote_network:
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 subprocess.run(
                     ["git", "-C", str(target_dir), "fetch", remote, "--prune", "--quiet"],
@@ -922,38 +955,53 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     check=False,
                 )
 
-        ls_out = ""
-        try:
-            proc_ls = subprocess.run(
-                ["git", "-C", str(target_dir), "ls-remote", "--heads", remote, clean_branch],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            if proc_ls.returncode != 0:
+        exists_on_remote = False
+        remote_sha = ""
+        if allow_remote_network:
+            ls_out = ""
+            try:
+                proc_ls = subprocess.run(
+                    ["git", "-C", str(target_dir), "ls-remote", "--heads", remote, clean_branch],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                if proc_ls.returncode != 0:
+                    return {
+                        "status": "error",
+                        "branch_name": clean_branch,
+                        "base_branch": clean_base,
+                        "remote": remote,
+                        "error": (
+                            proc_ls.stderr
+                            or proc_ls.stdout
+                            or f"git ls-remote exited with {proc_ls.returncode}"
+                        ).strip(),
+                    }
+                ls_out = (proc_ls.stdout or "").strip()
+            except (subprocess.TimeoutExpired, OSError) as exc:
                 return {
                     "status": "error",
                     "branch_name": clean_branch,
                     "base_branch": clean_base,
                     "remote": remote,
-                    "error": (
-                        proc_ls.stderr
-                        or proc_ls.stdout
-                        or f"git ls-remote exited with {proc_ls.returncode}"
-                    ).strip(),
+                    "error": f"git ls-remote failed: {exc}",
                 }
-            ls_out = (proc_ls.stdout or "").strip()
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            return {
-                "status": "error",
-                "branch_name": clean_branch,
-                "base_branch": clean_base,
-                "remote": remote,
-                "error": f"git ls-remote failed: {exc}",
-            }
-        exists_on_remote = bool(ls_out)
-        remote_sha = ls_out.split()[0] if ls_out else ""
+            exists_on_remote = bool(ls_out)
+            remote_sha = ls_out.split()[0] if ls_out else ""
+        else:
+            remote_sha = self._read_local_ref_sha(target_dir, f"refs/remotes/{remote}/{clean_branch}")
+            if not remote_sha:
+                proc_rref = subprocess.run(
+                    ["git", "-C", str(target_dir), "rev-parse", "--verify", f"refs/remotes/{remote}/{clean_branch}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                remote_sha = (proc_rref.stdout or "").strip() if proc_rref.returncode == 0 else ""
+            exists_on_remote = bool(remote_sha)
 
         base_remote_sha = self._read_local_ref_sha(target_dir, f"refs/remotes/{remote}/{clean_base}")
         if not base_remote_sha:
@@ -1133,14 +1181,16 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                 except OSError:
                     post_merge_hook_installed = False
 
-        if fetch:
-            subprocess.run(
-                ["git", "-C", str(target_dir), "fetch", remote, "--prune", "--quiet"],
-                capture_output=True,
-                text=True,
-                timeout=25,
-                check=False,
-            )
+        allow_remote_network = (not is_hermetic_offline) or self._is_local_git_remote(target_dir, remote)
+        if fetch and allow_remote_network:
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                subprocess.run(
+                    ["git", "-C", str(target_dir), "fetch", remote, "--prune", "--quiet"],
+                    capture_output=True,
+                    text=True,
+                    timeout=25,
+                    check=False,
+                )
 
         proc_all_refs = subprocess.run(
             [

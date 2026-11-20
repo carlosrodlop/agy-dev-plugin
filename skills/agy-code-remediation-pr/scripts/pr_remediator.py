@@ -52,6 +52,7 @@ import subprocess
 import sys
 import time
 from typing import Any
+import urllib.parse
 
 import dev_common  # noqa: E402
 from git_client import GitVcsIntegrationClient, stamp_repo_version_manifests  # noqa: E402
@@ -1337,6 +1338,13 @@ def sync_dev_pr_lock_with_git(
             portfolio_dir=portfolio_dir,
             git_client=git_client,
         )
+        queue_recon = reconcile_dev_queue_with_git(
+            portfolio_dir=portfolio_dir,
+            git_client=git_client,
+            repo_slug=repo_slug,
+            workdir=workdir,
+            fetch=False,
+        )
         res: dict[str, Any] = {
             "status": "ok",
             "active": False,
@@ -1344,6 +1352,7 @@ def sync_dev_pr_lock_with_git(
             "lock": get_dev_pr_lock(portfolio_dir=portfolio_dir, repo_slug=repo_slug, workdir=workdir),
             "locks": {},
             "repo_sync": repo_sync,
+            "queue_reconciliation": queue_recon,
         }
         if scoped_slug:
             res["repo_slug"] = scoped_slug
@@ -1370,6 +1379,13 @@ def sync_dev_pr_lock_with_git(
                 portfolio_dir=portfolio_dir,
                 git_client=git_client,
             )
+            queue_recon = reconcile_dev_queue_with_git(
+                portfolio_dir=portfolio_dir,
+                git_client=git_client,
+                repo_slug=repo_slug,
+                workdir=workdir,
+                fetch=False,
+            )
             return {
                 "status": "ok",
                 "active": bool(active_map),
@@ -1379,6 +1395,7 @@ def sync_dev_pr_lock_with_git(
                 "lock": get_dev_pr_lock(portfolio_dir=portfolio_dir, repo_slug=repo_slug, workdir=workdir),
                 "locks": active_map,
                 "repo_sync": repo_sync,
+                "queue_reconciliation": queue_recon,
             }
     elif git_client is not None and len(active_map) > 1:
         first_slug = next(iter(active_map))
@@ -1404,12 +1421,20 @@ def sync_dev_pr_lock_with_git(
                 first_release_reason = str(res_item.get("reason") or "")
                 first_release_result = dict(res_item.get("release_result") or {})
 
+    queue_recon = reconcile_dev_queue_with_git(
+        portfolio_dir=portfolio_dir,
+        git_client=git_client if len(target_entries) == 1 else None,
+        repo_slug=repo_slug,
+        workdir=workdir,
+        fetch=False,
+    )
     remaining = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
     if len(target_entries) == 1:
         single_res = next(iter(per_repo_results.values()))
         single_res.setdefault("locks", remaining)
         if repo_slug.strip() or workdir:
             single_res["any_active"] = bool(remaining)
+        single_res["queue_reconciliation"] = queue_recon
         return single_res
 
     return {
@@ -1420,6 +1445,7 @@ def sync_dev_pr_lock_with_git(
         "release_result": first_release_result,
         "results_by_repo": per_repo_results,
         "locks": remaining,
+        "queue_reconciliation": queue_recon,
     }
 
 
@@ -3830,6 +3856,10 @@ def enqueue_dev_queue_item(
             "added_at": str(existing.get("added_at") or now_iso),
             "updated_at": now_iso,
         }
+        if existing.get("merged_repos"):
+            item["merged_repos"] = _normalize_str_list(
+                [dev_common.normalize_repo_slug(str(r)) for r in existing.get("merged_repos") or [] if str(r).strip()]
+            )
         if idx >= 0:
             items[idx] = item
         else:
@@ -3903,6 +3933,94 @@ def update_dev_queue_item_status(
     }
 
 
+_STALE_PR_COMPARE_MARKERS = (
+    "/compare/",
+    "/-/merge_requests/new",
+    "/pull-requests/new",
+)
+_MERGED_LOCK_RELEASE_REASONS = ("BRANCH_MERGED_INTO_MAIN", "HUMAN_VALIDATED_MANUAL_PR")
+
+
+def _extract_repo_slug_and_branch_from_pr_url(raw_url: str) -> tuple[str, str]:
+    """Extract `(normalized_repo_slug, branch_name)` from a VCS compare/new-PR URL when recognizable."""
+    url_str = str(raw_url or "").strip()
+    if not url_str:
+        return "", ""
+    parsed = urllib.parse.urlsplit(url_str)
+    path = parsed.path or ""
+    path_lower = path.lower()
+
+    def _slug_from_prefix(prefix_path: str) -> str:
+        parts = [p for p in prefix_path.strip("/").split("/") if p]
+        if len(parts) >= 2:
+            return dev_common.normalize_repo_slug(f"{parts[-2]}/{parts[-1]}")
+        return ""
+
+    compare_idx = path_lower.find("/compare/")
+    if compare_idx >= 0:
+        slug = _slug_from_prefix(path[:compare_idx])
+        tail = path[compare_idx + len("/compare/") :].strip("/")
+        if "..." in tail:
+            branch_raw = tail.split("...", 1)[1]
+        elif ".." in tail:
+            branch_raw = tail.split("..", 1)[1]
+        else:
+            branch_raw = tail
+        branch = urllib.parse.unquote(branch_raw).strip().removeprefix("refs/heads/")
+        return slug, branch
+
+    gl_idx = path_lower.find("/-/merge_requests/new")
+    if gl_idx >= 0:
+        slug = _slug_from_prefix(path[:gl_idx])
+        qs = urllib.parse.parse_qs(parsed.query)
+        br_list = qs.get("merge_request[source_branch]") or []
+        branch = str(br_list[0]).strip().removeprefix("refs/heads/") if br_list else ""
+        return slug, branch
+
+    bb_idx = path_lower.find("/pull-requests/new")
+    if bb_idx >= 0:
+        slug = _slug_from_prefix(path[:bb_idx])
+        qs = urllib.parse.parse_qs(parsed.query)
+        br_list = qs.get("source") or []
+        branch = str(br_list[0]).strip().removeprefix("refs/heads/") if br_list else ""
+        return slug, branch
+
+    return "", ""
+
+
+def _prune_merged_repo_pr_urls(
+    pr_urls: list[str] | None,
+    released_repo_slug: str = "",
+    *,
+    all_merged: bool = False,
+    merged_repos: list[str] | None = None,
+) -> list[str]:
+    """Remove stale VCS compare/new-PR URLs for merged repos while preserving open-repo and archival URLs."""
+    pruned_slugs: set[str] = set()
+    for raw_slug in [released_repo_slug, *(merged_repos or [])]:
+        norm = dev_common.normalize_repo_slug(str(raw_slug or ""))
+        if norm and norm != "default":
+            pruned_slugs.add(norm.lower())
+
+    kept: list[str] = []
+    for raw_url in _normalize_str_list(pr_urls):
+        path_lower = urllib.parse.urlsplit(raw_url).path.lower()
+        is_compare_url = any(marker in path_lower for marker in _STALE_PR_COMPARE_MARKERS)
+        if not is_compare_url:
+            kept.append(raw_url)
+            continue
+        if all_merged:
+            continue
+        if any(
+            f"/{slug}{marker}" in path_lower
+            for slug in pruned_slugs
+            for marker in _STALE_PR_COMPARE_MARKERS
+        ):
+            continue
+        kept.append(raw_url)
+    return kept
+
+
 def _mark_queue_item_repo_merged(
     *,
     conversation_id: str,
@@ -3912,7 +4030,7 @@ def _mark_queue_item_repo_merged(
     remaining_active_locks: dict[str, dict[str, Any]] | None = None,
     portfolio_dir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Record a merged repository on a queue item and promote status to `merged` once all target repos finish."""
+    """Record a merged repository on a queue item, prune stale compare `pr_urls`, and promote to `merged` once all target repos finish."""
     cid_clean = str(conversation_id or "").strip()
     clean_slug = dev_common.normalize_repo_slug(released_repo_slug)
     q_path = get_dev_queue_path(portfolio_dir=portfolio_dir)
@@ -3930,6 +4048,13 @@ def _mark_queue_item_repo_merged(
             for norm in [dev_common.normalize_repo_slug(str(r))]
             if norm
         ]
+        if target_repos and clean_slug and clean_slug != "default" and clean_slug not in target_repos:
+            return {
+                "status": "skipped",
+                "updated": False,
+                "reason": "released_repo_not_in_item_target_repos",
+                "item": item,
+            }
         merged_repos = _normalize_str_list(
             [
                 *[dev_common.normalize_repo_slug(str(r)) for r in (item.get("merged_repos") or [])],
@@ -3943,12 +4068,20 @@ def _mark_queue_item_repo_merged(
             if _matches_cid(act_cid, cid_clean) or any(_matches_cid(s, cid_clean) for s in act_sibs):
                 still_locked_for_item = True
                 break
-        all_target_repos_merged = (not target_repos) or (
-            len(target_repos) <= 1 and not still_locked_for_item
-        ) or (set(target_repos).issubset(set(merged_repos)) and not still_locked_for_item)
+        all_target_repos_merged = (
+            (not target_repos and not still_locked_for_item)
+            or (clean_slug in ("", "default") and len(target_repos) <= 1 and not still_locked_for_item)
+            or (set(target_repos).issubset(set(merged_repos)) and not still_locked_for_item)
+        )
 
         item["merged_repos"] = merged_repos
         item["branch_names"] = _normalize_str_list([*(item.get("branch_names") or []), *(branch_names or [])])
+        item["pr_urls"] = _prune_merged_repo_pr_urls(
+            item.get("pr_urls"),
+            released_repo_slug=clean_slug,
+            all_merged=all_target_repos_merged,
+            merged_repos=merged_repos,
+        )
         item["subagent_conversation_ids"] = _normalize_str_list(
             [*(item.get("subagent_conversation_ids") or []), *(subagent_conversation_ids or [])]
         )
@@ -3963,6 +4096,479 @@ def _mark_queue_item_repo_merged(
         data["updated_at"] = now_iso
         _atomic_write_json_0600(q_path, data)
     return {"status": "ok", "updated": True, "item": item}
+
+
+def _branch_found_in_base_git_log(
+    repo_dir: Path,
+    branch_name: str,
+    base_branch: str = "main",
+) -> bool:
+    """Strictly read-only check for an exact branch reference inside recent `origin/<base>` / `<base>` commit history."""
+    clean_branch = str(branch_name or "").strip().removeprefix("refs/heads/")
+    if len(clean_branch) < 4 or not (repo_dir / ".git").exists():
+        return False
+    pattern = re.compile(rf"(?<![A-Za-z0-9_.-]){re.escape(clean_branch)}(?![A-Za-z0-9_./-])")
+    for base_ref in (f"origin/{base_branch}", base_branch):
+        proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "log", "-n", "100", "--format=%s%n%b", base_ref],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return bool(pattern.search(proc.stdout or ""))
+    return False
+
+
+def _inspect_local_branch_merged_readonly(
+    repo_dir: Path,
+    branch_name: str,
+    base_branch: str = "main",
+    remote: str = "origin",
+) -> tuple[bool, str]:
+    """Verify whether `branch_name` is merged into `origin/<base>` / `<base>` strictly via local refs & log (zero network calls)."""
+    clean_branch = str(branch_name or "").strip().removeprefix("refs/heads/")
+    clean_base = (base_branch or "main").strip()
+    if not clean_branch or not (repo_dir / ".git").exists():
+        return False, "repo_or_branch_missing"
+
+    base_ref = ""
+    base_sha = ""
+    for cand_base in (f"refs/remotes/{remote}/{clean_base}", f"refs/heads/{clean_base}"):
+        p_base = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--verify", cand_base],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if p_base.returncode == 0 and (p_base.stdout or "").strip():
+            base_ref = cand_base
+            base_sha = (p_base.stdout or "").strip()
+            break
+    if not base_ref or not base_sha:
+        return False, "base_ref_missing"
+
+    target_sha = ""
+    for cand_ref in (f"refs/remotes/{remote}/{clean_branch}", f"refs/heads/{clean_branch}"):
+        p_ref = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--verify", cand_ref],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if p_ref.returncode == 0 and (p_ref.stdout or "").strip():
+            target_sha = (p_ref.stdout or "").strip()
+            break
+
+    if target_sha:
+        if target_sha == base_sha:
+            return True, f"git_merged_into_base:{clean_branch}"
+        p_anc = subprocess.run(
+            ["git", "-C", str(repo_dir), "merge-base", "--is-ancestor", target_sha, base_ref],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if p_anc.returncode == 0:
+            return True, f"git_merged_into_base:{clean_branch}"
+        p_cherry = subprocess.run(
+            ["git", "-C", str(repo_dir), "cherry", base_ref, target_sha],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if p_cherry.returncode == 0:
+            cherry_lines = [
+                ln.strip()
+                for ln in (p_cherry.stdout or "").splitlines()
+                if ln.strip()
+            ]
+            if cherry_lines and not any(ln.startswith("+") for ln in cherry_lines):
+                return True, f"git_merged_into_base:{clean_branch}"
+        return False, "unmerged_local_ref_exists"
+
+    if _branch_found_in_base_git_log(repo_dir, clean_branch, base_branch=clean_base):
+        return True, f"git_log_merge_commit:{clean_branch}"
+    return False, "not_merged"
+
+
+def _collect_queue_item_repo_branches(
+    item: dict[str, Any],
+    target_slug: str,
+) -> tuple[list[str], list[str]]:
+    """Return `(candidate_branches, repo_specific_branches)` for `(item, target_slug)`."""
+    clean_target = dev_common.normalize_repo_slug(target_slug)
+    target_name = clean_target.rsplit("/", 1)[-1] if clean_target else ""
+    url_owners: dict[str, set[str]] = {}
+    repo_specific: list[str] = []
+
+    for raw_url in item.get("pr_urls") or []:
+        u_slug, u_br = _extract_repo_slug_and_branch_from_pr_url(str(raw_url))
+        if u_slug and u_br:
+            url_owners.setdefault(u_br, set()).add(u_slug)
+            if u_slug == clean_target and u_br not in repo_specific:
+                repo_specific.append(u_br)
+
+    candidates: list[str] = list(repo_specific)
+    for raw_br in item.get("branch_names") or []:
+        br_str = str(raw_br or "").strip()
+        if not br_str:
+            continue
+        if "::" in br_str:
+            hint_raw, br_only = br_str.split("::", 1)
+            clean_br = br_only.strip().removeprefix("refs/heads/")
+            if not clean_br:
+                continue
+            hint_norm = dev_common.normalize_repo_slug(hint_raw)
+            hint_name = hint_raw.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git").lower()
+            if hint_norm == clean_target or (target_name and hint_name == target_name.lower()):
+                if clean_br not in repo_specific:
+                    repo_specific.append(clean_br)
+                if clean_br not in candidates:
+                    candidates.append(clean_br)
+            continue
+        clean_br = br_str.removeprefix("refs/heads/")
+        if not clean_br:
+            continue
+        owners = url_owners.get(clean_br)
+        if owners and clean_target not in owners:
+            continue
+        if clean_br not in candidates:
+            candidates.append(clean_br)
+    return candidates, repo_specific
+
+
+def _verify_queue_repo_merged_readonly(
+    *,
+    item: dict[str, Any],
+    target_slug: str,
+    all_locks: dict[str, dict[str, Any]],
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+    is_scoped: bool = False,
+    scoped_slug: str = "",
+    scoped_repo_dir: Path | None = None,
+    fetch: bool = False,
+    fetched_dirs: set[str] | None = None,
+) -> tuple[bool, str, list[str], list[str]]:
+    """Verify via read-only lock history or Git history whether `(item, target_slug)` is genuinely merged."""
+    item_cid = str(item.get("conversation_id") or "").strip()
+    candidate_branches, repo_specific_branches = _collect_queue_item_repo_branches(item, target_slug)
+
+    # Evidence (a): Inactive released lock history for `target_slug`
+    inactive_lock = all_locks.get(target_slug)
+    if isinstance(inactive_lock, dict) and not bool(inactive_lock.get("active")):
+        rel_reason = str(inactive_lock.get("last_release_reason") or "").strip()
+        if rel_reason in _MERGED_LOCK_RELEASE_REASONS:
+            last_cid = str(inactive_lock.get("last_conversation_id") or "").strip()
+            last_br = str(inactive_lock.get("last_branch_name") or "").strip()
+            branch_matched = any(
+                _entry_matches_branch(inactive_lock, br, include_inactive=True)
+                for br in candidate_branches
+            )
+            cid_matched = _matches_cid(last_cid, item_cid)
+            conflicting_specific_branch = bool(
+                repo_specific_branches
+                and last_br
+                and not any(
+                    _entry_matches_branch(inactive_lock, br, include_inactive=True)
+                    for br in repo_specific_branches
+                )
+            )
+            if branch_matched or (cid_matched and not conflicting_specific_branch):
+                ev_branches: list[str] = []
+                if last_br:
+                    ev_branches.append(last_br)
+                last_rb = inactive_lock.get("last_repo_branches")
+                if isinstance(last_rb, dict):
+                    rb_entry = last_rb.get(target_slug)
+                    if isinstance(rb_entry, dict) and rb_entry.get("branch_name"):
+                        rb_br = str(rb_entry["branch_name"]).strip()
+                        if rb_br and rb_br not in ev_branches:
+                            ev_branches.append(rb_br)
+                ev_subagents = [
+                    str(s).strip()
+                    for s in (inactive_lock.get("last_subagent_conversation_ids") or [])
+                    if str(s).strip()
+                ]
+                match_kind = "branch" if branch_matched else "conversation_id"
+                return True, f"inactive_lock:{rel_reason}:{match_kind}", ev_branches, ev_subagents
+
+    # Evidence (b): Strictly read-only native Git verification
+    if not candidate_branches:
+        return False, "no_candidate_branches", [], []
+
+    vcs: Any = None
+    repo_dir: Path | None = None
+    use_injected_client = False
+    if git_client is not None:
+        if is_scoped and target_slug == scoped_slug:
+            use_injected_client = True
+        elif not is_scoped and hasattr(git_client, "resolve_repo"):
+            with contextlib.suppress(Exception):
+                injected_slug = dev_common.normalize_repo_slug(str(git_client.resolve_repo() or ""))
+                use_injected_client = injected_slug == target_slug
+
+    if use_injected_client and git_client is not None:
+        vcs = git_client
+        if is_scoped and target_slug == scoped_slug and scoped_repo_dir is not None:
+            repo_dir = scoped_repo_dir
+        elif hasattr(git_client, "resolve_repo_dir"):
+            with contextlib.suppress(Exception):
+                cand_d = git_client.resolve_repo_dir()
+                if isinstance(cand_d, Path) and (cand_d / ".git").exists():
+                    repo_dir = _resolve_main_git_repo_root(cand_d)
+    else:
+        if is_scoped and target_slug == scoped_slug and scoped_repo_dir is not None:
+            repo_dir = scoped_repo_dir
+        else:
+            repo_dir = _resolve_repo_dir_for_slug(
+                target_slug,
+                portfolio_dir=portfolio_dir,
+                git_client=git_client if (git_client is not None and hasattr(git_client, "resolve_repo_dir")) else None,
+            )
+        if repo_dir is None or not (repo_dir / ".git").exists():
+            return False, "repo_dir_not_found", [], []
+        vcs = GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_dir)})
+
+    if not hasattr(vcs, "inspect_remote_branch_state"):
+        return False, "vcs_missing_inspect_remote_branch_state", [], []
+
+    for br_name in candidate_branches:
+        eff_fetch = fetch
+        dir_key = str(repo_dir) if repo_dir is not None else ""
+        if eff_fetch and fetched_dirs is not None and dir_key and not use_injected_client:
+            if dir_key in fetched_dirs:
+                eff_fetch = False
+            else:
+                fetched_dirs.add(dir_key)
+
+        if (
+            not eff_fetch
+            and isinstance(vcs, GitVcsIntegrationClient)
+            and repo_dir is not None
+            and (repo_dir / ".git").exists()
+        ):
+            loc_merged, loc_reason = _inspect_local_branch_merged_readonly(repo_dir, br_name, base_branch="main")
+            if loc_merged:
+                return True, loc_reason, [br_name], []
+            continue
+
+        try:
+            st = vcs.inspect_remote_branch_state(
+                branch_name=br_name,
+                base_branch="main",
+                repo_dir=repo_dir,
+                fetch=eff_fetch,
+            )
+        except TypeError:
+            st = vcs.inspect_remote_branch_state(branch_name=br_name)
+
+        if isinstance(st, dict) and st.get("status") == "ok":
+            if bool(st.get("merged_into_base")):
+                return True, f"git_merged_into_base:{br_name}", [br_name], []
+            remote_exists = bool(st.get("remote_exists") or st.get("exists_on_remote"))
+            local_exists = False
+            if repo_dir is not None and (repo_dir / ".git").exists():
+                loc_proc = subprocess.run(
+                    ["git", "-C", str(repo_dir), "rev-parse", "--verify", f"refs/heads/{br_name}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                local_exists = loc_proc.returncode == 0
+            if remote_exists or local_exists:
+                continue
+            if repo_dir is not None and _branch_found_in_base_git_log(repo_dir, br_name, base_branch="main"):
+                return True, f"git_log_merge_commit:{br_name}", [br_name], []
+        elif repo_dir is not None and (repo_dir / ".git").exists():
+            loc_merged, loc_reason = _inspect_local_branch_merged_readonly(repo_dir, br_name, base_branch="main")
+            if loc_merged:
+                return True, loc_reason, [br_name], []
+
+    return False, "not_merged", [], []
+
+
+def reconcile_dev_queue_with_git(
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    fetch: bool = False,
+) -> dict[str, Any]:
+    """Reconcile stale `pr_open` / branched `in_progress` items in `dev_queue.json` using read-only lock & Git evidence."""
+    all_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir, include_inactive=True)
+    active_locks = {k: v for k, v in all_locks.items() if isinstance(v, dict) and bool(v.get("active"))}
+
+    is_scoped = bool(str(repo_slug or "").strip() or workdir)
+    scoped_slug = ""
+    scoped_repo_dir: Path | None = None
+    if is_scoped:
+        scoped_slug, scoped_repo_dir = _resolve_repo_slug_and_dir(
+            repo_slug=repo_slug,
+            workdir=workdir,
+            git_client=git_client if (git_client is not None and hasattr(git_client, "resolve_repo")) else None,
+            prefer_cwd=False,
+            portfolio_dir=portfolio_dir,
+            locks_map=all_locks,
+        )
+        if scoped_repo_dir is not None and (scoped_repo_dir / ".git").exists():
+            scoped_repo_dir = _resolve_main_git_repo_root(scoped_repo_dir)
+        if not scoped_slug:
+            return {
+                "status": "skipped",
+                "reason": "workdir_not_a_git_repo",
+                "repo_slug": "",
+                "checked_count": 0,
+                "reconciled_count": 0,
+                "reconciled_items": [],
+            }
+
+    q_data = load_dev_queue(portfolio_dir=portfolio_dir)
+    items = list(q_data.get("items") or [])
+    checked_count = 0
+    reconciled_items: list[dict[str, Any]] = []
+    fetched_dirs: set[str] = set()
+
+    for raw_item in items:
+        item = dict(raw_item)
+        item_cid = str(item.get("conversation_id") or "").strip()
+        item_status = str(item.get("status") or "").strip().lower()
+        if not item_cid:
+            continue
+        has_branch_or_pr = bool(item.get("branch_names")) or bool(item.get("pr_urls"))
+        if item_status != "pr_open" and not (item_status == "in_progress" and has_branch_or_pr):
+            continue
+
+        target_repos = _normalize_str_list(
+            [dev_common.normalize_repo_slug(str(r)) for r in (item.get("repo_slugs") or []) if str(r).strip()]
+        )
+        if not target_repos:
+            inferred_repos: list[str] = []
+            for raw_url in item.get("pr_urls") or []:
+                u_slug, _ = _extract_repo_slug_and_branch_from_pr_url(str(raw_url))
+                if u_slug and u_slug not in inferred_repos:
+                    inferred_repos.append(u_slug)
+            if not inferred_repos:
+                for l_slug, l_entry in all_locks.items():
+                    if not isinstance(l_entry, dict):
+                        continue
+                    l_cid = str(l_entry.get("conversation_id") or l_entry.get("last_conversation_id") or "").strip()
+                    if _matches_cid(l_cid, item_cid) or any(
+                        _entry_matches_branch(l_entry, str(br).strip(), include_inactive=True)
+                        for br in (item.get("branch_names") or [])
+                    ):
+                        norm_l = dev_common.normalize_repo_slug(l_slug)
+                        if norm_l and norm_l not in inferred_repos:
+                            inferred_repos.append(norm_l)
+            target_repos = inferred_repos
+
+        if not target_repos:
+            continue
+
+        already_merged = {
+            dev_common.normalize_repo_slug(str(r))
+            for r in (item.get("merged_repos") or [])
+            if str(r).strip()
+        }
+
+        for cand_slug in target_repos:
+            if is_scoped and cand_slug != scoped_slug:
+                continue
+            checked_count += 1
+            if cand_slug in active_locks:
+                continue
+
+            if cand_slug in already_merged:
+                item_still_locked = any(
+                    _matches_cid(str(al.get("conversation_id") or ""), item_cid)
+                    or any(_matches_cid(str(s), item_cid) for s in (al.get("sibling_conversation_ids") or []))
+                    for al in active_locks.values()
+                )
+                all_done = set(target_repos).issubset(already_merged) and not item_still_locked
+                pruned_urls = _prune_merged_repo_pr_urls(
+                    item.get("pr_urls"),
+                    released_repo_slug=cand_slug,
+                    all_merged=all_done,
+                    merged_repos=list(already_merged),
+                )
+                needs_cleanup = (
+                    all_done and str(item.get("status") or "").lower() != "merged"
+                ) or (pruned_urls != _normalize_str_list(item.get("pr_urls")))
+                if needs_cleanup:
+                    upd = _mark_queue_item_repo_merged(
+                        conversation_id=item_cid,
+                        released_repo_slug=cand_slug,
+                        remaining_active_locks=active_locks,
+                        portfolio_dir=portfolio_dir,
+                    )
+                    if upd.get("updated"):
+                        item = dict(upd.get("item") or item)
+                        reconciled_items.append(
+                            {
+                                "conversation_id": item_cid,
+                                "repo_slug": cand_slug,
+                                "evidence": "already_merged_repo_cleanup",
+                                "status": str(item.get("status") or ""),
+                                "merged_repos": list(item.get("merged_repos") or []),
+                                "pr_urls_remaining": list(item.get("pr_urls") or []),
+                            }
+                        )
+                continue
+
+            is_merged, evidence, ev_branches, ev_subagents = _verify_queue_repo_merged_readonly(
+                item=item,
+                target_slug=cand_slug,
+                all_locks=all_locks,
+                portfolio_dir=portfolio_dir,
+                git_client=git_client,
+                is_scoped=is_scoped,
+                scoped_slug=scoped_slug,
+                scoped_repo_dir=scoped_repo_dir,
+                fetch=fetch,
+                fetched_dirs=fetched_dirs,
+            )
+            if not is_merged:
+                continue
+
+            upd = _mark_queue_item_repo_merged(
+                conversation_id=item_cid,
+                released_repo_slug=cand_slug,
+                branch_names=ev_branches or None,
+                subagent_conversation_ids=ev_subagents or None,
+                remaining_active_locks=active_locks,
+                portfolio_dir=portfolio_dir,
+            )
+            if upd.get("updated"):
+                item = dict(upd.get("item") or item)
+                already_merged.add(cand_slug)
+                reconciled_items.append(
+                    {
+                        "conversation_id": item_cid,
+                        "repo_slug": cand_slug,
+                        "evidence": evidence,
+                        "status": str(item.get("status") or ""),
+                        "merged_repos": list(item.get("merged_repos") or []),
+                        "pr_urls_remaining": list(item.get("pr_urls") or []),
+                    }
+                )
+
+    result: dict[str, Any] = {
+        "status": "ok",
+        "checked_count": checked_count,
+        "reconciled_count": len(reconciled_items),
+        "reconciled_items": reconciled_items,
+    }
+    if scoped_slug:
+        result["repo_slug"] = scoped_slug
+    return result
 
 
 def _auto_enqueue_blocked_task(
@@ -4885,6 +5491,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_qnext.add_argument("--orchestrator-id", default="", help="Optional active orchestrator conversation ID to record.")
     p_qnext.add_argument("--unlocked", action="store_true", help="Skip queue items whose target repo currently holds an active lock.")
 
+    p_qsync = sub.add_parser(
+        "queue-sync",
+        help="Reconcile stale `pr_open` / branched `in_progress` items in `dev_queue.json` against lock history & native Git merge state, pruning stale compare `pr_urls`.",
+    )
+    p_qsync.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug to scope reconciliation.")
+    p_qsync.add_argument("--workdir", default="", help="Optional target repository directory or worktree path to scope reconciliation.")
+    p_qsync.add_argument("--fetch", action="store_true", help="Fetch origin refs before checking Git merge state.")
+
     p_clean = sub.add_parser(
         "cleanup-merged-conversations",
         help="Safely delete merged conversation directories/protobufs and spawned subagents after verifying git merge and protections.",
@@ -5129,6 +5743,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(q_res, indent=2, ensure_ascii=False))
         return 0 if q_res.get("status") == "ok" else 1
+
+    if args.subcommand == "queue-sync":
+        q_res = reconcile_dev_queue_with_git(
+            repo_slug=getattr(args, "repo_slug", ""),
+            workdir=getattr(args, "workdir", "") or None,
+            fetch=bool(getattr(args, "fetch", False)),
+        )
+        print(json.dumps(q_res, indent=2, ensure_ascii=False))
+        return 0 if q_res.get("status") in ("ok", "skipped") else 1
 
     if args.subcommand == "cleanup-merged-conversations":
         c_res = cleanup_merged_conversations(

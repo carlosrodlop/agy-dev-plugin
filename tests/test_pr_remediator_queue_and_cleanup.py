@@ -122,7 +122,11 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             troot = pathlib.Path(tmp)
             pdir = troot / "portfolio"
             pdir.mkdir(parents=True, exist_ok=True)
-            _, clone = _init_bare_and_clone_repo(troot)
+            remotes_org = troot / "remotes" / "acme-org"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+            _, clone = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-plugin")
             vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(clone)})
 
             orch_cid = "11111111-1111-4111-8111-111111111111"
@@ -1055,6 +1059,569 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
                 self.assertTrue(sync_after["active"])
                 self.assertTrue(wt_b.is_dir())
                 self.assertIn("acme-org/acme-b", prs.get_all_dev_pr_locks(portfolio_dir=pdir))
+
+    def test_single_repo_stale_pr_open_reconciled_via_sync_and_queue_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            bare_a, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-a")
+
+            cid_git = "11111111-1234-4123-8123-111111111111"
+            cid_inprog_branched = "22222222-1234-4123-8123-222222222222"
+            cid_inprog_plain = "33333333-1234-4123-8123-333333333333"
+            cid_inactive_lock = "44444444-1234-4123-8123-444444444444"
+            br_git = "fix/20261120-120000-single-a-11111111"
+            br_inprog = "fix/20261120-120500-inprog-a-22222222"
+            br_lock = "fix/20261120-121000-lock-a-44444444"
+
+            # Create and merge br_git into origin/main on repo-a
+            subprocess.run(["git", "-C", str(repo_a), "checkout", "-b", br_git], check=True, capture_output=True)
+            (repo_a / "single_a.txt").write_text("single a fix\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo_a), "add", "single_a.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "commit", "-m", "fix: single a"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "-u", "origin", br_git], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "checkout", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "merge", "--no-ff", br_git, "-m", f"Merge {br_git}"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "origin", "main"], check=True, capture_output=True)
+
+            compare_url_a = f"https://github.com/acme/repo-a/compare/main...{br_git}?expand=1"
+            archival_pr_url = "https://github.com/acme/repo-a/pull/42"
+
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_git,
+                title="Stale single-repo pr_open item",
+                repo_slugs=["acme/repo-a"],
+                branch_names=[br_git],
+                pr_urls=[compare_url_a, archival_pr_url],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_inprog_plain,
+                title="In-progress item with no branch or PR yet",
+                repo_slugs=["acme/repo-a"],
+                status="in_progress",
+                portfolio_dir=pdir,
+            )
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_a), "AGY_DEV_STATE_DIR": str(pdir)}),
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+            ):
+                # 1. sync_dev_pr_lock_with_git automatically reconciles stale pr_open item & prunes compare URL
+                sync_res = prs.sync_dev_pr_lock_with_git(portfolio_dir=pdir, workdir=repo_a)
+                self.assertEqual(sync_res["status"], "ok")
+                self.assertFalse(sync_res["active"])
+                self.assertIn("queue_reconciliation", sync_res)
+                self.assertEqual(sync_res["queue_reconciliation"]["status"], "ok")
+                self.assertEqual(sync_res["queue_reconciliation"]["reconciled_count"], 1)
+
+                q_by_cid = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+                self.assertEqual(q_by_cid[cid_git]["status"], "merged")
+                self.assertEqual(q_by_cid[cid_git]["merged_repos"], ["acme/repo-a"])
+                self.assertEqual(q_by_cid[cid_git]["pr_urls"], [archival_pr_url])
+                self.assertEqual(q_by_cid[cid_inprog_plain]["status"], "in_progress")
+
+                # Re-running sync is idempotent
+                sync_again = prs.sync_dev_pr_lock_with_git(portfolio_dir=pdir, workdir=repo_a)
+                self.assertEqual(sync_again["queue_reconciliation"]["reconciled_count"], 0)
+
+                # 2. Merge br_inprog on bare_a via a separate clone so local repo_a needs --fetch via queue-sync CLI
+                pusher = troot / "pusher-inprog"
+                subprocess.run(["git", "clone", f"file://{bare_a}", str(pusher)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(pusher), "config", "user.name", "Acme Bot"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(pusher), "config", "user.email", "acme-bot@example.com"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(pusher), "checkout", "-b", br_inprog], check=True, capture_output=True)
+                (pusher / "inprog.txt").write_text("inprog fix\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(pusher), "add", "inprog.txt"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(pusher), "commit", "-m", "fix: inprog"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(pusher), "push", "-u", "origin", br_inprog], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(pusher), "checkout", "main"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(pusher), "merge", "--no-ff", br_inprog, "-m", f"Merge {br_inprog}"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(pusher), "push", "origin", "main"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(pusher), "push", "origin", "--delete", br_inprog], check=True, capture_output=True)
+
+                prs.enqueue_dev_queue_item(
+                    conversation_id=cid_inprog_branched,
+                    title="Branched in_progress item merged upstream",
+                    repo_slugs=["acme/repo-a"],
+                    branch_names=[br_inprog],
+                    pr_urls=[f"https://github.com/acme/repo-a/compare/main...{br_inprog}?expand=1"],
+                    status="in_progress",
+                    portfolio_dir=pdir,
+                )
+
+                # Without --fetch, local repo_a origin/main does not yet contain the remote-only merge
+                no_fetch_res = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir, workdir=repo_a, fetch=False)
+                self.assertEqual(no_fetch_res["reconciled_count"], 0)
+
+                # CLI queue-sync --workdir <repo_a> --fetch discovers the merged & pruned branch via git log
+                parsed = prs.parse_args(["queue-sync", "--workdir", str(repo_a), "--fetch"])
+                self.assertEqual(parsed.subcommand, "queue-sync")
+                self.assertTrue(parsed.fetch)
+                with mock.patch("builtins.print"):
+                    exit_code = prs.main(["queue-sync", "--workdir", str(repo_a), "--fetch"])
+                self.assertEqual(exit_code, 0)
+
+                q_after_cli = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+                self.assertEqual(q_after_cli[cid_inprog_branched]["status"], "merged")
+                self.assertEqual(q_after_cli[cid_inprog_branched]["merged_repos"], ["acme/repo-a"])
+                self.assertEqual(q_after_cli[cid_inprog_branched]["pr_urls"], [])
+
+                # 3. Evidence (a): Inactive lock history with BRANCH_MERGED_INTO_MAIN reconciles even if CID differed and branch matched
+                (pdir / "actions_state.json").write_text(
+                    json.dumps(
+                        {
+                            "actions_log_audit_state": {
+                                "dev_pr_locks": {
+                                    "acme/repo-a": {
+                                        "active": False,
+                                        "repo_slug": "acme/repo-a",
+                                        "last_release_reason": "BRANCH_MERGED_INTO_MAIN",
+                                        "last_conversation_id": "99999999-aaaa-4aaa-8aaa-999999999999",
+                                        "last_branch_name": br_lock,
+                                    }
+                                }
+                            }
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                prs.enqueue_dev_queue_item(
+                    conversation_id=cid_inactive_lock,
+                    title="Reconciled via inactive lock branch history",
+                    repo_slugs=["acme/repo-a"],
+                    branch_names=[br_lock],
+                    pr_urls=[f"https://github.com/acme/repo-a/compare/main...{br_lock}?expand=1"],
+                    status="pr_open",
+                    portfolio_dir=pdir,
+                )
+                lock_hist_res = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir, repo_slug="acme/repo-a")
+                self.assertEqual(lock_hist_res["reconciled_count"], 1)
+                self.assertIn("inactive_lock:BRANCH_MERGED_INTO_MAIN", lock_hist_res["reconciled_items"][0]["evidence"])
+                q_final = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+                self.assertEqual(q_final[cid_inactive_lock]["status"], "merged")
+                self.assertEqual(q_final[cid_inactive_lock]["pr_urls"], [])
+
+    def test_multi_repo_progressive_reconciliation_and_pr_url_pruning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-a")
+            _, repo_b = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-b")
+
+            multi_cid = "55555555-aaaa-4555-8555-555555555555"
+            br_a = "fix/20261120-130000-multi-a-55555555"
+            br_b = "fix/20261120-130000-multi-b-55555555"
+            url_a = f"https://github.com/acme/repo-a/compare/main...{br_a}?expand=1"
+            url_b = f"https://github.com/acme/repo-b/compare/main...{br_b}?expand=1"
+
+            # Direct unit check of _prune_merged_repo_pr_urls across VCS providers & substring safety
+            url_ab = "https://github.com/acme/repo-ab/compare/main...fix/other?expand=1"
+            url_gl_a = "https://gitlab.com/acme/repo-a/-/merge_requests/new?merge_request%5Bsource_branch%5D=fix%2Fa"
+            url_bb_a = "https://bitbucket.org/acme/repo-a/pull-requests/new?source=fix%2Fa&dest=main"
+            url_archival = "https://github.com/acme/repo-a/pull/99"
+            pruned_partial = prs._prune_merged_repo_pr_urls(
+                [url_a, url_b, url_ab, url_gl_a, url_bb_a, url_archival],
+                "acme/repo-a",
+                all_merged=False,
+            )
+            self.assertEqual(pruned_partial, [url_b, url_ab, url_archival])
+            pruned_all = prs._prune_merged_repo_pr_urls(
+                [url_a, url_b, url_archival],
+                "acme/repo-b",
+                all_merged=True,
+            )
+            self.assertEqual(pruned_all, [url_archival])
+
+            # Repo A: create, push, and merge br_a into origin/main
+            subprocess.run(["git", "-C", str(repo_a), "checkout", "-b", br_a], check=True, capture_output=True)
+            (repo_a / "a.py").write_text("A = 1\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo_a), "add", "a.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "commit", "-m", "feat: repo a"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "-u", "origin", br_a], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "checkout", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "merge", "--no-ff", br_a, "-m", f"Merge {br_a}"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "origin", "main"], check=True, capture_output=True)
+
+            # Repo B: create and push br_b, keep UNMERGED
+            subprocess.run(["git", "-C", str(repo_b), "checkout", "-b", br_b], check=True, capture_output=True)
+            (repo_b / "b.py").write_text("B = 2\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo_b), "add", "b.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_b), "commit", "-m", "feat: repo b"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_b), "push", "-u", "origin", br_b], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_b), "checkout", "main"], check=True, capture_output=True)
+
+            prs.enqueue_dev_queue_item(
+                conversation_id=multi_cid,
+                title="Multi-repo progressive merge",
+                repo_slugs=["acme/repo-a", "acme/repo-b"],
+                branch_names=[br_a, br_b],
+                pr_urls=[url_a, url_b],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+
+            with mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_a)}):
+                # Step 1: Repo A merged -> merged_repos=["acme/repo-a"], url_a pruned, url_b kept, status stays pr_open
+                step1 = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir)
+                self.assertEqual(step1["status"], "ok")
+                self.assertEqual(step1["reconciled_count"], 1)
+                item1 = prs.load_dev_queue(portfolio_dir=pdir)["items"][0]
+                self.assertEqual(item1["status"], "pr_open")
+                self.assertEqual(item1["merged_repos"], ["acme/repo-a"])
+                self.assertEqual(item1["pr_urls"], [url_b])
+
+                # Idempotent re-run before Repo B merges
+                step1_repeat = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir)
+                self.assertEqual(step1_repeat["reconciled_count"], 0)
+
+                # Step 2: Merge Repo B into origin/main and delete branch refs -> item promotes to merged & prunes url_b
+                subprocess.run(["git", "-C", str(repo_b), "merge", "--no-ff", br_b, "-m", f"Merge {br_b}"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(repo_b), "push", "origin", "main"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(repo_b), "push", "origin", "--delete", br_b], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(repo_b), "branch", "-D", br_b], check=True, capture_output=True)
+
+                step2 = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir)
+                self.assertEqual(step2["status"], "ok")
+                self.assertEqual(step2["reconciled_count"], 1)
+                item2 = prs.load_dev_queue(portfolio_dir=pdir)["items"][0]
+                self.assertEqual(item2["status"], "merged")
+                self.assertEqual(item2["merged_repos"], ["acme/repo-a", "acme/repo-b"])
+                self.assertEqual(item2["pr_urls"], [])
+
+    def test_reconcile_safety_guard_active_locked_and_unmerged_pr_open_never_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            _, repo_locked = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-locked")
+            _, repo_unmerged = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-unmerged")
+            _, repo_deleted = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-deleted")
+
+            cid_locked = "66666666-bbbb-4666-8666-666666666666"
+            cid_unmerged = "77777777-bbbb-4777-8777-777777777777"
+            cid_deleted = "88888888-bbbb-4888-8888-888888888888"
+            br_locked = "fix/20261120-131000-locked-66666666"
+            br_unmerged = "fix/20261120-131000-unmerged-77777777"
+            br_deleted = "fix/20261120-131000-deleted-88888888"
+
+            # repo_locked: merged in git, BUT STILL holds an active dev_pr_lock!
+            subprocess.run(["git", "-C", str(repo_locked), "checkout", "-b", br_locked], check=True, capture_output=True)
+            (repo_locked / "l.txt").write_text("locked\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo_locked), "add", "l.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_locked), "commit", "-m", "fix: locked"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_locked), "push", "-u", "origin", br_locked], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_locked), "checkout", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_locked), "merge", "--no-ff", br_locked, "-m", f"Merge {br_locked}"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_locked), "push", "origin", "main"], check=True, capture_output=True)
+            prs.acquire_dev_pr_lock(
+                conversation_id=cid_locked,
+                action_id="locked",
+                branch_name=br_locked,
+                summary="Still active",
+                proposed_fix="Hold lock",
+                target_repo_dir=str(repo_locked),
+                repo_slug="acme/repo-locked",
+                portfolio_dir=pdir,
+            )
+
+            # repo_unmerged: unlocked, pushed commit NOT merged into main
+            subprocess.run(["git", "-C", str(repo_unmerged), "checkout", "-b", br_unmerged], check=True, capture_output=True)
+            (repo_unmerged / "u.txt").write_text("unmerged\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo_unmerged), "add", "u.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_unmerged), "commit", "-m", "fix: unmerged"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_unmerged), "push", "-u", "origin", br_unmerged], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_unmerged), "checkout", "main"], check=True, capture_output=True)
+
+            # repo_deleted: unlocked, branch deleted without merging + non-merge release reason
+            subprocess.run(["git", "-C", str(repo_deleted), "checkout", "-b", br_deleted], check=True, capture_output=True)
+            (repo_deleted / "d.txt").write_text("rejected\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo_deleted), "add", "d.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_deleted), "commit", "-m", "fix: rejected"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_deleted), "checkout", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_deleted), "branch", "-D", br_deleted], check=True, capture_output=True)
+            prs.acquire_dev_pr_lock(
+                conversation_id=cid_deleted,
+                action_id="deleted",
+                branch_name=br_deleted,
+                summary="Rejected",
+                proposed_fix="Deleted",
+                target_repo_dir=str(repo_deleted),
+                repo_slug="acme/repo-deleted",
+                portfolio_dir=pdir,
+            )
+            with (
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+                mock.patch.object(prs, "restart_pro_api_server", return_value=False),
+            ):
+                prs.release_dev_pr_lock(
+                    reason="REMOTE_BRANCH_DELETED_AFTER_EVALUATION",
+                    portfolio_dir=pdir,
+                    repo_slug="acme/repo-deleted",
+                )
+
+            url_locked = f"https://github.com/acme/repo-locked/compare/main...{br_locked}?expand=1"
+            url_unmerged = f"https://github.com/acme/repo-unmerged/compare/main...{br_unmerged}?expand=1"
+            url_deleted = f"https://github.com/acme/repo-deleted/compare/main...{br_deleted}?expand=1"
+
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_locked,
+                title="Active locked pr_open",
+                repo_slugs=["acme/repo-locked"],
+                branch_names=[br_locked],
+                pr_urls=[url_locked],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_unmerged,
+                title="Unlocked unmerged pr_open",
+                repo_slugs=["acme/repo-unmerged"],
+                branch_names=[br_unmerged],
+                pr_urls=[url_unmerged],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_deleted,
+                title="Rejected deleted branch pr_open",
+                repo_slugs=["acme/repo-deleted"],
+                branch_names=[br_deleted],
+                pr_urls=[url_deleted],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+
+            with mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_unmerged)}):
+                res = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir, fetch=True)
+                self.assertEqual(res["status"], "ok")
+                self.assertEqual(res["reconciled_count"], 0)
+                self.assertEqual(res["reconciled_items"], [])
+
+                by_cid = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+                for cid, expected_url in (
+                    (cid_locked, url_locked),
+                    (cid_unmerged, url_unmerged),
+                    (cid_deleted, url_deleted),
+                ):
+                    self.assertEqual(by_cid[cid]["status"], "pr_open")
+                    self.assertEqual(by_cid[cid]["pr_urls"], [expected_url])
+                    self.assertEqual(by_cid[cid].get("merged_repos") or [], [])
+
+    def test_queue_sync_strict_cross_repo_isolation_and_missing_workdir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            _, repo_default = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-default")
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-a")
+            _, repo_b = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-b")
+
+            missing_dir = troot / "tmp" / "pr-worktree-acme-missing-fix-20261120-132000-none-12345678"
+            plain_non_git = troot / "plain-non-git"
+            plain_non_git.mkdir(parents=True, exist_ok=True)
+
+            items_spec = [
+                ("aaaaaaaa-cccc-4aaa-8aaa-aaaaaaaaaaaa", "acme/repo-default", repo_default, "fix/20261120-132000-def-aaaaaaaa"),
+                ("bbbbbbbb-cccc-4bbb-8bbb-bbbbbbbbbbbb", "acme/repo-a", repo_a, "fix/20261120-132000-a-bbbbbbbb"),
+                ("cccccccc-cccc-4ccc-8ccc-cccccccccccc", "acme/repo-b", repo_b, "fix/20261120-132000-b-cccccccc"),
+            ]
+            urls_by_cid: dict[str, str] = {}
+            for cid, slug, rpath, br in items_spec:
+                subprocess.run(["git", "-C", str(rpath), "checkout", "-b", br], check=True, capture_output=True)
+                (rpath / f"{rpath.name}.txt").write_text("merged\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(rpath), "add", f"{rpath.name}.txt"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(rpath), "commit", "-m", f"feat: {rpath.name}"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(rpath), "push", "-u", "origin", br], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(rpath), "checkout", "main"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(rpath), "merge", "--no-ff", br, "-m", f"Merge {br}"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(rpath), "push", "origin", "main"], check=True, capture_output=True)
+                cmp_url = f"https://github.com/{slug}/compare/main...{br}?expand=1"
+                urls_by_cid[cid] = cmp_url
+                prs.enqueue_dev_queue_item(
+                    conversation_id=cid,
+                    title=f"Merged {slug}",
+                    repo_slugs=[slug],
+                    branch_names=[br],
+                    pr_urls=[cmp_url],
+                    status="pr_open",
+                    portfolio_dir=pdir,
+                )
+
+            cid_def, cid_a, cid_b = items_spec[0][0], items_spec[1][0], items_spec[2][0]
+
+            with mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_default), "AGY_DEV_STATE_DIR": str(pdir)}):
+                # 1. Missing or non-git --workdir MUST skip and NEVER fall back to repo-default or touch repo-a/repo-b
+                res_missing = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir, workdir=missing_dir)
+                self.assertEqual(res_missing["status"], "skipped")
+                self.assertEqual(res_missing["reason"], "workdir_not_a_git_repo")
+                self.assertEqual(res_missing["reconciled_count"], 0)
+
+                res_nongit = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir, workdir=plain_non_git)
+                self.assertEqual(res_nongit["status"], "skipped")
+                self.assertEqual(res_nongit["reason"], "workdir_not_a_git_repo")
+                self.assertEqual(res_nongit["reconciled_count"], 0)
+
+                by_cid_0 = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+                for cid in (cid_def, cid_a, cid_b):
+                    self.assertEqual(by_cid_0[cid]["status"], "pr_open")
+                    self.assertEqual(by_cid_0[cid]["pr_urls"], [urls_by_cid[cid]])
+
+                # 2. Scoped `queue-sync --repo acme/repo-a` MUST reconcile ONLY acme/repo-a, leaving repo-b & repo-default untouched
+                with mock.patch("builtins.print"):
+                    rc = prs.main(["queue-sync", "--repo", "acme/repo-a"])
+                self.assertEqual(rc, 0)
+
+                by_cid_1 = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+                self.assertEqual(by_cid_1[cid_a]["status"], "merged")
+                self.assertEqual(by_cid_1[cid_a]["merged_repos"], ["acme/repo-a"])
+                self.assertEqual(by_cid_1[cid_a]["pr_urls"], [])
+
+                self.assertEqual(by_cid_1[cid_b]["status"], "pr_open")
+                self.assertEqual(by_cid_1[cid_b]["pr_urls"], [urls_by_cid[cid_b]])
+                self.assertEqual(by_cid_1[cid_def]["status"], "pr_open")
+                self.assertEqual(by_cid_1[cid_def]["pr_urls"], [urls_by_cid[cid_def]])
+
+                # 3. Unknown --repo slug never touches default or repo-b
+                res_unknown = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir, repo_slug="acme/nonexistent-repo")
+                self.assertEqual(res_unknown["status"], "ok")
+                self.assertEqual(res_unknown["reconciled_count"], 0)
+                by_cid_2 = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+                self.assertEqual(by_cid_2[cid_b]["status"], "pr_open")
+                self.assertEqual(by_cid_2[cid_def]["status"], "pr_open")
+
+    def test_reconcile_fetch_false_zero_network_calls_offline_git_guard_and_single_repo_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-a")
+            _, repo_ssh = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-ssh")
+            subprocess.run(
+                ["git", "-C", str(repo_ssh), "remote", "set-url", "origin", "git@github.com:acme/repo-ssh.git"],
+                check=True,
+                capture_output=True,
+            )
+
+            # 1. Verify _is_local_git_remote distinguishes local/file:// remotes from network remotes
+            vcs_a = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+            vcs_ssh = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_ssh)})
+            self.assertTrue(vcs_a._is_local_git_remote(repo_a))
+            self.assertFalse(vcs_ssh._is_local_git_remote(repo_ssh))
+
+            # 2. Prepare a merged branch whose local refs/heads/<br> is deleted while refs/remotes/origin/<br> remains
+            cid_remote_ref = "dddddddd-1111-4ddd-8ddd-dddddddddddd"
+            cid_mismatch = "eeeeeeee-1111-4eee-8eee-eeeeeeeeeeee"
+            br_remote_ref = "fix/20261120-140000-remote-ref-dddddddd"
+            url_remote_ref = f"https://github.com/acme/repo-a/compare/main...{br_remote_ref}?expand=1"
+            url_mismatch = "https://github.com/acme/repo-b/compare/main...fix/20261120-140000-b-eeeeeeee?expand=1"
+
+            subprocess.run(["git", "-C", str(repo_a), "checkout", "-b", br_remote_ref], check=True, capture_output=True)
+            (repo_a / "remref.txt").write_text("remote tracking ref merged\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo_a), "add", "remref.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "commit", "-m", "fix: remote tracking ref"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "-u", "origin", br_remote_ref], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "checkout", "main"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "merge", "--no-ff", br_remote_ref, "-m", f"Merge {br_remote_ref}"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "origin", "main"], check=True, capture_output=True)
+            # Delete local branch only; refs/remotes/origin/<br_remote_ref> still exists locally
+            subprocess.run(["git", "-C", str(repo_a), "branch", "-D", br_remote_ref], check=True, capture_output=True)
+
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_remote_ref,
+                title="Merged branch tracked via origin/<branch>",
+                repo_slugs=["acme/repo-a"],
+                branch_names=[br_remote_ref],
+                pr_urls=[url_remote_ref],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_mismatch,
+                title="Single-repo item for acme/repo-b",
+                repo_slugs=["acme/repo-b"],
+                branch_names=["fix/20261120-140000-b-eeeeeeee"],
+                pr_urls=[url_mismatch],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+
+            # 3. Spy on subprocess.run and prove fetch=False runs ZERO `git ls-remote` or `git fetch` commands
+            real_run = subprocess.run
+            recorded_cmds: list[list[str]] = []
+
+            def _spy_run(cmd: list[str] | str, *args: object, **kwargs: object) -> subprocess.CompletedProcess:
+                if isinstance(cmd, (list, tuple)):
+                    recorded_cmds.append([str(c) for c in cmd])
+                return real_run(cmd, *args, **kwargs)
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_a), "AGY_OFFLINE_ONLY": "1"}),
+                mock.patch.object(prs.subprocess, "run", side_effect=_spy_run),
+                mock.patch.object(git_client.subprocess, "run", side_effect=_spy_run),
+            ):
+                recon_res = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir, workdir=repo_a, fetch=False)
+                self.assertEqual(recon_res["status"], "ok")
+                self.assertEqual(recon_res["reconciled_count"], 1)
+
+                # Also verify AGY_OFFLINE_ONLY=1 skips network fetch/ls-remote on SSH remote without hanging
+                ssh_sync = vcs_ssh.sync_and_clean_local_repo(base_branch="main", state_dir=pdir)
+                self.assertEqual(ssh_sync["status"], "ok")
+                ssh_state = vcs_ssh.inspect_remote_branch_state(branch_name="fix/nonexistent", fetch=True)
+                self.assertEqual(ssh_state["status"], "ok")
+                self.assertFalse(ssh_state["remote_exists"])
+
+            network_git_cmds = [
+                cmd for cmd in recorded_cmds if "ls-remote" in cmd or "fetch" in cmd
+            ]
+            self.assertEqual(network_git_cmds, [], f"Expected zero network git commands, saw: {network_git_cmds}")
+
+            by_cid = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+            self.assertEqual(by_cid[cid_remote_ref]["status"], "merged")
+            self.assertEqual(by_cid[cid_remote_ref]["merged_repos"], ["acme/repo-a"])
+            self.assertEqual(by_cid[cid_remote_ref]["pr_urls"], [])
+
+            # 4. Single-repo mismatch guard: releasing acme/repo-a must NEVER mark acme/repo-b merged or prune its URLs
+            mismatch_res = prs._mark_queue_item_repo_merged(
+                conversation_id=cid_mismatch,
+                released_repo_slug="acme/repo-a",
+                portfolio_dir=pdir,
+            )
+            self.assertFalse(mismatch_res["updated"])
+            self.assertEqual(mismatch_res["status"], "skipped")
+            by_cid_after = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+            self.assertEqual(by_cid_after[cid_mismatch]["status"], "pr_open")
+            self.assertEqual(by_cid_after[cid_mismatch]["pr_urls"], [url_mismatch])
+            self.assertEqual(by_cid_after[cid_mismatch].get("merged_repos") or [], [])
 
 
 if __name__ == "__main__":
