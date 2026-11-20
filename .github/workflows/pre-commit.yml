@@ -1,0 +1,17 @@
+name: Pre-Commit Hygiene
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: pre-commit/action@v3.0.1

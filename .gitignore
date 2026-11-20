@@ -1,0 +1,40 @@
+# Security & Credentials - NEVER commit secrets
+*password*
+*secret*
+*.key
+*.pem
+*_session.json
+*token*.json
+*credentials*.json
+
+# Environment files - block all .env files except .env.example
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# macOS system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Python bytecode, build artifacts & test caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Backup artifacts
+**/*.old
+**/*.bak.*

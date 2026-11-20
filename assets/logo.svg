@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 280" width="280" height="280" fill="none">
+  <defs>
+    <linearGradient id="devPillGrad" x1="76" y1="183" x2="204" y2="225" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1E40AF"/>
+      <stop offset="100%" stop-color="#0F766E"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Clean Circular White Medallion -->
+  <circle cx="140" cy="140" r="128" fill="#FFFFFF"/>
+
+  <!-- 4-Color Google Segmented Perimeter Ring -->
+  <path d="M49.5 49.5A128 128 0 0 1 230.5 49.5" stroke="#EA4335" stroke-width="6" stroke-linecap="round"/>
+  <path d="M230.5 49.5A128 128 0 0 1 230.5 230.5" stroke="#4285F4" stroke-width="6" stroke-linecap="round"/>
+  <path d="M230.5 230.5A128 128 0 0 1 49.5 230.5" stroke="#34A853" stroke-width="6" stroke-linecap="round"/>
+  <path d="M49.5 230.5A128 128 0 0 1 49.5 49.5" stroke="#FBBC05" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Geometric "</>" Developer Emblem -->
+  <g stroke="#1E3A8A" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" transform="translate(0, -14)">
+    <polyline points="92,108 54,142 92,176"/>
+    <line x1="154" y1="96" x2="126" y2="188"/>
+    <polyline points="188,108 226,142 188,176"/>
+  </g>
+
+  <!-- Bottom AGY Pill -->
+  <rect x="76" y="183" width="128" height="42" rx="21" fill="url(#devPillGrad)"/>
+  <text x="140" y="211" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-weight="700" font-size="22" letter-spacing="3" fill="#FFFFFF">DEV</text>
+</svg>

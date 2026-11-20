@@ -1,0 +1,20 @@
+{
+  "author": {
+    "name": "carlosrodlop",
+    "url": "https://github.com/carlosrodlop"
+  },
+  "description": "Standalone Antigravity plugin for software engineering best practices, VCS-interoperable native Git/SSH PR workflows (git_client & pr_remediator), multi-repo dev queue orchestration, lifecycle guardrails, pre-commit hygiene, and hermetic static QA & security auditing.",
+  "displayName": "Antigravity Dev & SDLC Plugin",
+  "homepage": "https://github.com/carlosrodlop/agy-dev-plugin",
+  "logo": "assets/logo.svg",
+  "name": "agy-dev-plugin",
+  "repository": "https://github.com/carlosrodlop/agy-dev-plugin",
+  "suggestedPrompts": [
+    "Audit this repository with engineering static QA & Zero-PII gates",
+    "Create a timestamped branch and run the full manual PR workflow",
+    "Commit my staged changes cleanly with semantic commits and pre-commit checks",
+    "Inspect dev_pr_lock and advance the persistent multi-repo development queue",
+    "Scaffold hermetic Python/Shell best practices (pyproject.toml, .pre-commit-config.yaml, GHA)"
+  ],
+  "version": "0000000-20261120"
+}

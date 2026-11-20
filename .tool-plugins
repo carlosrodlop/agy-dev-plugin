@@ -1,0 +1,5 @@
+pre-commit          https://github.com/jonathanmorley/asdf-pre-commit.git
+python              https://github.com/danhper/asdf-python.git
+jq                  https://github.com/lsanwick/asdf-jq.git
+bats                https://github.com/timgluz/asdf-bats.git
+asdf-plugin-manager https://github.com/asdf-community/asdf-plugin-manager.git

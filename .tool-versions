@@ -1,0 +1,7 @@
+# Tooling-as-Code Declarative Versions
+# Santa Lockdown Compliant: Pure-Script & Python/Source Runtimes Only
+pre-commit 3.5.0
+python 3.11.15
+jq system
+bats 1.14.0
+asdf-plugin-manager 1.5.0

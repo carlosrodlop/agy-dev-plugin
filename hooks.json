@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|write_file|edit_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.gemini/config/plugins/agy-dev-plugin/clients/dev_common.py guardrail-hook --event PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 $HOME/.gemini/config/plugins/agy-dev-plugin/clients/dev_common.py guardrail-hook --event SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,29 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-ast
+      - id: check-json
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=512"]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+  - repo: local
+    hooks:
+      - id: qa-static-audit
+        name: AGY Dev Static QA & Zero-PII Audit
+        entry: python3 ./tests/scripts/qa_static_audit.py --strict
+        language: system
+        pass_filenames: false
+      - id: install-sh-syntax
+        name: POSIX Shell Syntax Check (install.sh)
+        entry: bash -n install.sh
+        language: system
+        files: '\.sh$'
+      - id: unit-tests-fast
+        name: Offline Unit Tests
+        entry: python3 ./tests/scripts/selective_test_runner.py
+        language: system
+        pass_filenames: false
