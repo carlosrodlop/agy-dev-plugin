@@ -1,0 +1,89 @@
+name: Sync PR Verification Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: ["main"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-pr-verification:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Sync Automated Verification Checks & Independent PR Review to PR Body
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1 pragma: allowlist secret
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.info('No pull_request payload present; skipping.');
+              return;
+            }
+            const { owner, repo } = context.repo;
+            const commitResp = await github.rest.repos.getCommit({
+              owner,
+              repo,
+              ref: pr.head.sha,
+            });
+            const message = (commitResp.data.commit && commitResp.data.commit.message) || '';
+
+            const extractSection = (text, headingPrefix) => {
+              const escaped = headingPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              const re = new RegExp(`(^${escaped}[^\\n]*\\n[\\s\\S]*?)(?=\\n## |$)`, 'm');
+              const match = text.match(re);
+              return match ? match[1].trim() : '';
+            };
+
+            const verificationSection = extractSection(message, '## 🧪 Automated Verification Checks');
+            const reviewSection = extractSection(message, '## 🤖 Independent PR Review');
+            const sections = [verificationSection, reviewSection].filter(Boolean);
+
+            if (sections.length === 0) {
+              core.info('HEAD commit message contains no Automated Verification Checks or Independent PR Review sections; skipping.');
+              return;
+            }
+
+            const startMarker = '<!-- agy-verifications:start -->';
+            const endMarker = '<!-- agy-verifications:end -->';
+            const boundedBlock = `${startMarker}\n${sections.join('\n\n')}\n${endMarker}`;
+
+            const currentBody = pr.body || '';
+            const markerRe = /<!-- agy-verifications:start -->[\s\S]*?<!-- agy-verifications:end -->/;
+
+            let nextBody;
+            if (markerRe.test(currentBody)) {
+              nextBody = currentBody.replace(markerRe, boundedBlock);
+            } else {
+              const stripSection = (text, headingPrefix) => {
+                const escaped = headingPrefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const re = new RegExp(`\\n*${escaped}[^\\n]*\\n[\\s\\S]*?(?=\\n## |$)`, 'm');
+                return text.replace(re, '').trimEnd();
+              };
+              let cleaned = currentBody;
+              cleaned = stripSection(cleaned, '## 🧪 Automated Verification Checks');
+              cleaned = stripSection(cleaned, '## 🤖 Independent PR Review');
+              cleaned = cleaned.trimEnd();
+              nextBody = cleaned ? `${cleaned}\n\n${boundedBlock}\n` : `${boundedBlock}\n`;
+            }
+
+            if (nextBody.trim() === currentBody.trim()) {
+              core.info('PR verification block is already up to date.');
+              return;
+            }
+
+            await github.rest.pulls.update({
+              owner,
+              repo,
+              pull_number: pr.number,
+              body: nextBody,
+            });
+            core.info(`Updated PR #${pr.number} verification block from HEAD commit ${pr.head.sha.slice(0, 12)}.`);

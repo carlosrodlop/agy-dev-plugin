@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -1622,6 +1624,664 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertEqual(by_cid_after[cid_mismatch]["status"], "pr_open")
             self.assertEqual(by_cid_after[cid_mismatch]["pr_urls"], [url_mismatch])
             self.assertEqual(by_cid_after[cid_mismatch].get("merged_repos") or [], [])
+
+    def test_local_first_review_hard_gate_iteration_loop_verification_and_worktree_publish(self) -> None:
+        """Verify Local-First Review staging, deterministic verification persistence, PASS>90 hard gate, iteration loop, worktree-aware publish, and subsequent commit invalidation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            bare_a, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-a")
+            # Seed tiny deterministic tests + mock qa_static_audit inside repo-a so test-local runs hermetically
+            (repo_a / "tests" / "scripts").mkdir(parents=True, exist_ok=True)
+            (repo_a / "tests" / "scripts" / "qa_static_audit.py").write_text(
+                "#!/usr/bin/env python3\nprint('[qa_static_audit] PASS: 3 files scanned (0 errors, 0 warnings)')\n",
+                encoding="utf-8",
+            )
+            (repo_a / "tests" / "test_acme_unit.py").write_text(
+                "import unittest\n"
+                "class T(unittest.TestCase):\n"
+                "    def test_ok_one(self): self.assertEqual(1 + 1, 2)\n"
+                "    def test_ok_two(self): self.assertTrue(True)\n"
+                "if __name__ == '__main__': unittest.main()\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo_a), "add", "tests"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "commit", "-m", "test: seed hermetic suite"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "origin", "main"], check=True, capture_output=True)
+
+            vcs_a = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+            cid = "10101010-2020-4030-8040-101010101010"
+
+            # Verify CLI `prepare-review` alias parses cleanly and `--allow-pre-review-push` does NOT exist
+            parsed_prep = prs.parse_args(["prepare-review", "--title", "feat(gate): sample", "--workdir", str(repo_a)])
+            self.assertEqual(parsed_prep.subcommand, "prepare-review")
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                prs.parse_args(["push-branch", "--title", "x", "--allow-pre-review-push"])
+
+            # Step 1: Start remediation in isolated worktree & enqueue item with a stale bare compare URL
+            start_res = prs.start_remediation_branch_and_lock(
+                conversation_id=cid,
+                action_id="pr-gate",
+                rca_summary="Unreviewed branches leaked compare URLs",
+                proposed_fix="Enforce PASS>90 local-first PR readiness gate",
+                create_worktree=True,
+                branch_timestamp="20261120-151000",
+                workdir=repo_a,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(start_res["status"], "ok")
+            self.assertEqual(start_res["manual_pr_url"], "")
+            self.assertFalse(start_res["pr_gate_ready"])
+            wt_path = pathlib.Path(start_res["worktree_path"])
+            branch_name = start_res["branch_name"]
+
+            stale_compare_url = f"https://github.com/acme/repo-a/compare/main...{branch_name}?expand=1"
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid,
+                title="Enforce hard PR readiness gate",
+                repo_slugs=["acme/repo-a"],
+                branch_names=[branch_name],
+                pr_urls=[stale_compare_url],
+                status="in_progress",
+                portfolio_dir=pdir,
+            )
+
+            # Step 2: Edit file in worktree, commit, and run deterministic `test-local`
+            (wt_path / "gate_impl.py").write_text("GATE_VERSION = 1\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(wt_path), "add", "gate_impl.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(wt_path), "commit", "-m", "feat: gate v1"], check=True, capture_output=True)
+            sha_v1 = _git_rev_parse(wt_path, "HEAD")
+
+            val_res = prs.run_local_validation_suite(
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                pre_commit_status="pass",
+                run_bats=False,
+            )
+            self.assertTrue(val_res["passed"])
+            self.assertEqual(val_res["head_sha"], sha_v1)
+            vr = val_res["verification_results"]
+            self.assertEqual(vr["head_sha"], sha_v1)
+            self.assertEqual(vr["qa_static_audit"]["status"], "pass")
+            self.assertEqual(vr["qa_static_audit"]["errors"], 0)
+            self.assertEqual(vr["unittest"]["passed_count"], 2)
+            self.assertEqual(vr["unittest"]["total_count"], 2)
+            self.assertEqual(vr["pre_commit"]["status"], "pass")
+
+            # Verify verification_results persisted inside dev_pr_lock
+            lock_after_test = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt_path)
+            self.assertEqual(lock_after_test["verification_results"]["head_sha"], sha_v1)
+
+            # Step 3: Local-First Review (`push-branch` / `prepare-review`) MUST commit locally WITHOUT pushing to bare origin
+            staged = prs.push_remediation_branch_and_build_reviewer_plan(
+                title="feat(pr-gate): enforce local-first review",
+                executive_summary="Enforce local-first review and hard PASS>90 PR gate.",
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(staged["status"], "ok")
+            self.assertFalse(staged["branch_pushed"])
+            self.assertFalse(staged["pr_gate_ready"])
+            self.assertTrue(staged["awaiting_agent_review"])
+            self.assertEqual(staged["manual_pr_url"], "")
+            self.assertEqual(staged["pr_url"], "")
+            self.assertTrue(staged["staged_head_sha"])
+            self.assertEqual(staged["lock"]["status"], "AWAITING_AGENT_REVIEW")
+
+            # Confirm bare remote has ZERO refs for feature branch before review PASS!
+            remote_heads_pre = subprocess.run(
+                ["git", "--git-dir", str(bare_a), "for-each-ref", "--format=%(refname:short)", "refs/heads"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertEqual(remote_heads_pre, ["main"])
+
+            # Confirm local commit body deterministically includes Automated Verification Checks above Independent PR Review
+            local_msg = subprocess.run(
+                ["git", "-C", str(wt_path), "log", "-1", "--format=%B"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertIn("## 📋 Executive Summary", local_msg)
+            self.assertIn("## 🧪 Automated Verification Checks", local_msg)
+            self.assertIn("## 🤖 Independent PR Review", local_msg)
+            self.assertLess(local_msg.index("## 🧪 Automated Verification Checks"), local_msg.index("## 🤖 Independent PR Review"))
+            self.assertIn("2/2 tests passed", local_msg)
+
+            # Re-seed a stale compare URL on queue item to prove NEEDS_REVISION strips it cleanly
+            prs.update_dev_queue_item_status(cid, "in_progress", pr_urls=[stale_compare_url], portfolio_dir=pdir)
+
+            # Step 4: Round 1 NEEDS_REVISION (82) -> NOT pushed, suppresses URL & email, preserves real Executive Summary
+            with mock.patch.object(prs.dev_common, "try_send_branch_review_notification") as mock_notify:
+                rev1 = prs.record_pr_review_evaluation(
+                    branch_name=branch_name,
+                    verdict="NEEDS_REVISION",
+                    score=82,
+                    summary="Reviewer critique: handle edge case when score equals 90.",
+                    send_email=True,
+                    workdir=wt_path,
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                )
+            self.assertEqual(rev1["status"], "ok")
+            self.assertFalse(rev1["ready_for_human_pr"])
+            self.assertTrue(rev1["needs_reiteration"])
+            self.assertFalse(rev1["circuit_breaker_tripped"])
+            self.assertFalse(rev1["branch_pushed"])
+            self.assertFalse(rev1["pr_gate_ready"])
+            self.assertEqual(rev1["manual_pr_url"], "")
+            self.assertEqual(rev1["pr_url"], "")
+            self.assertEqual(rev1["review_iteration"], 1)
+            self.assertFalse(rev1["notification_email_sent"])
+            mock_notify.assert_not_called()
+            self.assertIn("developer_remediation_plan", rev1)
+            self.assertIn("handle edge case", rev1["developer_remediation_plan"]["reviewer_feedback"])
+
+            lock_r1 = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt_path)
+            self.assertEqual(lock_r1["status"], "NEEDS_REVISION_ITERATING")
+            self.assertEqual(lock_r1["review_iteration"], 1)
+            self.assertEqual(lock_r1["summary"], "Unreviewed branches leaked compare URLs")
+            self.assertEqual(lock_r1["proposed_fix"], "Enforce PASS>90 local-first PR readiness gate")
+            self.assertEqual(lock_r1["executive_summary"], "Enforce local-first review and hard PASS>90 PR gate.")
+            q_r1 = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}[cid]
+            self.assertEqual(q_r1["status"], "in_progress")
+            self.assertEqual(q_r1["pr_urls"], [])
+
+            # Step 5: Boundary check Round 2 PASS with score == 90 STILL fails hard gate (requires > 90, i.e. >= 91)
+            with mock.patch.object(prs.dev_common, "try_send_branch_review_notification") as mock_notify_90:
+                rev2_boundary = prs.record_pr_review_evaluation(
+                    branch_name=branch_name,
+                    verdict="PASS",
+                    score=90,
+                    summary="Borderline score 90 must still iterate.",
+                    send_email=True,
+                    workdir=wt_path,
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                )
+            self.assertFalse(rev2_boundary["ready_for_human_pr"])
+            self.assertTrue(rev2_boundary["needs_reiteration"])
+            self.assertEqual(rev2_boundary["review_iteration"], 2)
+            self.assertEqual(rev2_boundary["manual_pr_url"], "")
+            mock_notify_90.assert_not_called()
+
+            # Remote bare repo STILL does not have the branch!
+            remote_heads_mid = subprocess.run(
+                ["git", "--git-dir", str(bare_a), "for-each-ref", "--format=%(refname:short)", "refs/heads"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertEqual(remote_heads_mid, ["main"])
+
+            # Step 6: Developer fixes in worktree, re-runs test-local & prepare-review, then Round 3 PASS (96)
+            # Deliberately pass PRIMARY repo dir `repo_a` (checked out on main!) to prove `git worktree list --porcelain` resolution works!
+            (wt_path / "gate_impl.py").write_text("GATE_VERSION = 2\nMIN_SCORE = 91\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(wt_path), "add", "gate_impl.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(wt_path), "commit", "-m", "fix: address round 1-2 findings"], check=True, capture_output=True)
+            val_res2 = prs.run_local_validation_suite(
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                pre_commit_status="pass",
+                run_bats=False,
+            )
+            self.assertTrue(val_res2["passed"])
+            staged2 = prs.push_remediation_branch_and_build_reviewer_plan(
+                title="feat(pr-gate): enforce local-first review",
+                executive_summary="Enforce local-first review and hard PASS>90 PR gate.",
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(staged2["status"], "ok")
+            self.assertFalse(staged2["branch_pushed"])
+
+            with mock.patch.object(
+                prs.dev_common,
+                "try_send_branch_review_notification",
+                return_value={"sent": True, "transport": "mock"},
+            ) as mock_notify_pass:
+                rev_pass = prs.record_pr_review_evaluation(
+                    branch_name=branch_name,
+                    verdict="PASS",
+                    score=96,
+                    summary="All findings resolved with deterministic tests.",
+                    send_email=True,
+                    workdir=repo_a,  # Primary repo dir, NOT wt_path -> tests worktree resolution!
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                )
+            self.assertEqual(rev_pass["status"], "ok")
+            self.assertTrue(rev_pass["ready_for_human_pr"])
+            self.assertFalse(rev_pass["needs_reiteration"])
+            self.assertTrue(rev_pass["pr_gate_ready"])
+            self.assertTrue(rev_pass["branch_pushed"])
+            self.assertEqual(rev_pass["review_iteration"], 3)
+            self.assertTrue(rev_pass["notification_email_sent"])
+            mock_notify_pass.assert_called_once()
+            self.assertEqual(mock_notify_pass.call_args.kwargs.get("status"), "OK")
+
+            # Confirm bare remote NOW HAS the branch and its commit carries real Executive Summary + Verification Checks + Round 3/3 Review
+            remote_heads_post = subprocess.run(
+                ["git", "--git-dir", str(bare_a), "for-each-ref", "--format=%(refname:short)", "refs/heads"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertIn(branch_name, remote_heads_post)
+            remote_sha = subprocess.run(
+                ["git", "--git-dir", str(bare_a), "rev-parse", f"refs/heads/{branch_name}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(rev_pass["reviewed_head_sha"], remote_sha)
+            remote_msg = subprocess.run(
+                ["git", "--git-dir", str(bare_a), "log", "-1", "--format=%B", f"refs/heads/{branch_name}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertIn("Enforce local-first review and hard PASS>90 PR gate.", remote_msg)
+            self.assertNotIn("Reviewer critique: handle edge case", remote_msg)
+            self.assertIn("## 🧪 Automated Verification Checks", remote_msg)
+            self.assertIn("2/2 tests passed", remote_msg)
+            self.assertIn("## 🤖 Independent PR Review", remote_msg)
+            self.assertIn("`3/3`", remote_msg)
+
+            # Confirm lock & queue transitioned to PENDING_HUMAN_PR_VALIDATION / pr_open with rich manual_pr_url
+            lock_pass = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt_path)
+            self.assertEqual(lock_pass["status"], "PENDING_HUMAN_PR_VALIDATION")
+            self.assertTrue(lock_pass["pr_gate_ready"])
+            self.assertEqual(lock_pass["reviewed_head_sha"], remote_sha)
+            self.assertIn("title=", rev_pass["manual_pr_url"])
+            self.assertIn("body=", rev_pass["manual_pr_url"])
+            q_pass = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}[cid]
+            self.assertEqual(q_pass["status"], "pr_open")
+            self.assertEqual(q_pass["pr_urls"], [rev_pass["manual_pr_url"]])
+
+            # Step 7: Subsequent commit + prepare-review invalidates reviewed_head_sha, pr_gate_ready, and manual_pr_url
+            (wt_path / "gate_impl.py").write_text("GATE_VERSION = 3\n", encoding="utf-8")
+            staged3 = prs.push_remediation_branch_and_build_reviewer_plan(
+                title="feat(pr-gate): follow-up tweak",
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(staged3["status"], "ok")
+            self.assertFalse(staged3["pr_gate_ready"])
+            self.assertEqual(staged3["manual_pr_url"], "")
+            lock_invalidated = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt_path)
+            self.assertFalse(lock_invalidated["pr_gate_ready"])
+            self.assertEqual(lock_invalidated["reviewed_head_sha"], "")
+            self.assertEqual(lock_invalidated["manual_pr_url"], "")
+
+            prs.cleanup_worktree(wt_path, repo_dir=repo_a)
+
+    def test_review_circuit_breaker_round_3_escalates_to_hitl_blocked(self) -> None:
+        """Verify 3 consecutive failing review rounds trip the circuit breaker to ESCALATED_MAX_REVIEW_ITERATIONS + hitl_blocked + [🟥] escalation alert without pushing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            bare_a, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-cb")
+            vcs_a = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+            cid = "20202020-3030-4040-8050-202020202020"
+
+            start_res = prs.start_remediation_branch_and_lock(
+                conversation_id=cid,
+                action_id="circuit-breaker",
+                rca_summary="Flaky parser",
+                proposed_fix="Stabilize parser",
+                create_worktree=True,
+                branch_timestamp="20261120-152000",
+                workdir=repo_a,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            wt_path = pathlib.Path(start_res["worktree_path"])
+            branch_name = start_res["branch_name"]
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid,
+                title="Circuit breaker test",
+                repo_slugs=["acme/repo-cb"],
+                branch_names=[branch_name],
+                status="in_progress",
+                portfolio_dir=pdir,
+            )
+            (wt_path / "parser.py").write_text("X = 1\n", encoding="utf-8")
+            prs.push_remediation_branch_and_build_reviewer_plan(
+                title="fix(cb): stabilize parser",
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+
+            with mock.patch.object(
+                prs.dev_common,
+                "try_send_branch_review_notification",
+                return_value={"sent": True, "transport": "mock"},
+            ) as mock_notify:
+                r1 = prs.record_pr_review_evaluation(
+                    branch_name=branch_name, verdict="NEEDS_REVISION", score=75, summary="Round 1 fail",
+                    send_email=True, workdir=wt_path, portfolio_dir=pdir, git_client=vcs_a,
+                )
+                r2 = prs.record_pr_review_evaluation(
+                    branch_name=branch_name, verdict="WARN", score=88, summary="Round 2 warn",
+                    send_email=True, workdir=wt_path, portfolio_dir=pdir, git_client=vcs_a,
+                )
+                self.assertEqual(mock_notify.call_count, 0)
+                self.assertTrue(r1["needs_reiteration"])
+                self.assertTrue(r2["needs_reiteration"])
+
+                r3 = prs.record_pr_review_evaluation(
+                    branch_name=branch_name, verdict="PASS", score=90, summary="Round 3 still <= 90",
+                    send_email=True, workdir=wt_path, portfolio_dir=pdir, git_client=vcs_a,
+                )
+
+            self.assertEqual(r3["status"], "ok")
+            self.assertFalse(r3["ready_for_human_pr"])
+            self.assertFalse(r3["needs_reiteration"])
+            self.assertTrue(r3["circuit_breaker_tripped"])
+            self.assertFalse(r3["pr_gate_ready"])
+            self.assertFalse(r3["branch_pushed"])
+            self.assertEqual(r3["manual_pr_url"], "")
+            self.assertEqual(r3["review_iteration"], 3)
+            self.assertEqual(len(r3["review_history"]), 3)
+            self.assertTrue(r3["notification_email_sent"])
+            mock_notify.assert_called_once()
+            self.assertEqual(mock_notify.call_args.kwargs.get("status"), "KO")
+
+            lock_cb = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt_path)
+            self.assertEqual(lock_cb["status"], "ESCALATED_MAX_REVIEW_ITERATIONS")
+            self.assertFalse(lock_cb["pr_gate_ready"])
+            self.assertFalse(lock_cb["branch_pushed"])
+            self.assertEqual(lock_cb["manual_pr_url"], "")
+            q_cb = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}[cid]
+            self.assertEqual(q_cb["status"], "hitl_blocked")
+            self.assertEqual(q_cb["pr_urls"], [])
+
+            remote_heads = subprocess.run(
+                ["git", "--git-dir", str(bare_a), "for-each-ref", "--format=%(refname:short)", "refs/heads"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertEqual(remote_heads, ["main"])
+            prs.cleanup_worktree(wt_path, repo_dir=repo_a)
+
+    def test_record_review_non_silent_amend_and_push_failure(self) -> None:
+        """Verify PASS review fails loudly with status='error' when amend or push fails instead of silently exposing PR URLs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-fail")
+            vcs_a = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+            cid = "30303030-4040-4050-8060-303030303030"
+
+            start_res = prs.start_remediation_branch_and_lock(
+                conversation_id=cid,
+                action_id="fail-loud",
+                rca_summary="Silent amend/push failure",
+                proposed_fix="Fail loudly on amend or push error",
+                create_worktree=True,
+                branch_timestamp="20261120-153000",
+                workdir=repo_a,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            wt_path = pathlib.Path(start_res["worktree_path"])
+            branch_name = start_res["branch_name"]
+
+            # 1. With 0 commits ahead of main, amend MUST fail loudly
+            with mock.patch.object(prs.dev_common, "try_send_branch_review_notification") as mock_notify_fail:
+                amend_fail = prs.record_pr_review_evaluation(
+                    branch_name=branch_name,
+                    verdict="PASS",
+                    score=97,
+                    summary="Should fail because nothing to amend",
+                    send_email=True,
+                    workdir=wt_path,
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                )
+            self.assertEqual(amend_fail["status"], "error")
+            self.assertEqual(amend_fail["step"], "amend_commit_message")
+            self.assertFalse(amend_fail["ready_for_human_pr"])
+            self.assertFalse(amend_fail["pr_gate_ready"])
+            self.assertEqual(amend_fail["manual_pr_url"], "")
+            mock_notify_fail.assert_not_called()
+
+            # 2. With a real commit, if vcs.push_branch fails, record-review MUST fail loudly without unlocking or sending email
+            (wt_path / "change.py").write_text("OK = True\n", encoding="utf-8")
+            prs.push_remediation_branch_and_build_reviewer_plan(
+                title="fix(fail-loud): commit before push failure",
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            with (
+                mock.patch.object(
+                    vcs_a,
+                    "push_branch",
+                    return_value={"status": "error", "error": "remote rejected non-fast-forward"},
+                ),
+                mock.patch.object(prs.dev_common, "try_send_branch_review_notification") as mock_notify_push_fail,
+            ):
+                push_fail = prs.record_pr_review_evaluation(
+                    branch_name=branch_name,
+                    verdict="PASS",
+                    score=97,
+                    summary="Push failure must be surfaced loudly",
+                    send_email=True,
+                    workdir=wt_path,
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                )
+            self.assertEqual(push_fail["status"], "error")
+            self.assertEqual(push_fail["step"], "push_branch")
+            self.assertFalse(push_fail["ready_for_human_pr"])
+            self.assertFalse(push_fail["pr_gate_ready"])
+            self.assertFalse(push_fail["branch_pushed"])
+            self.assertEqual(push_fail["manual_pr_url"], "")
+            mock_notify_push_fail.assert_not_called()
+            lock_after = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt_path)
+            self.assertEqual(lock_after["status"], "AWAITING_AGENT_REVIEW")
+            self.assertFalse(lock_after["pr_gate_ready"])
+            prs.cleanup_worktree(wt_path, repo_dir=repo_a)
+
+    def test_rich_pr_urls_deduplication_and_evaluate_branch_approve_guard(self) -> None:
+        """Verify rich pr_urls deduplication priority (/pull/ > verified PASS compare > bare ?expand=1) and evaluate-branch approve guard + --force."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-dedup")
+            vcs_a = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+
+            cid_q = "40404040-5050-4060-8070-404040404040"
+            br_a = "fix/20261120-154000-dedup-40404040"
+            br_b = "fix/20261120-154000-dedup-b-40404040"
+            bare_a = f"https://github.com/acme/repo-dedup/compare/main...{br_a}?expand=1"
+            plain_tb_a = f"https://github.com/acme/repo-dedup/compare/main...{br_a}?expand=1&title=fix&body=Summary"
+            rich_pass_a = (
+                f"https://github.com/acme/repo-dedup/compare/main...{br_a}"
+                "?expand=1&title=fix%28dedup%29&body=%23%23+Independent+PR+Review+PASS+96%2F100"
+            )
+            pull_a = "https://github.com/acme/repo-dedup/pull/77"
+            rich_b = (
+                f"https://github.com/acme/repo-other/compare/main...{br_b}"
+                "?expand=1&title=fix%28b%29&body=Verdict+PASS"
+            )
+
+            # 1. Enqueue with bare + plain + rich PASS compare URL -> keeps ONLY richest verified PASS URL
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_q,
+                title="Rich PR URL dedup test",
+                repo_slugs=["acme/repo-dedup", "acme/repo-other"],
+                branch_names=[br_a, br_b],
+                pr_urls=[bare_a, plain_tb_a, rich_pass_a, rich_b],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+            it1 = prs.load_dev_queue(portfolio_dir=pdir)["items"][0]
+            self.assertEqual(it1["pr_urls"], [rich_pass_a, rich_b])
+
+            # 2. Trailing queue-set-status with bare ?expand=1 MUST NOT bury or duplicate the rich PASS compare URL
+            upd_bare = prs.update_dev_queue_item_status(
+                conversation_id=cid_q,
+                status="pr_open",
+                pr_urls=[bare_a],
+                portfolio_dir=pdir,
+            )["item"]
+            self.assertEqual(upd_bare["pr_urls"], [rich_pass_a, rich_b])
+
+            # 3. Adding created /pull/77 supersedes compare URL for acme/repo-dedup while preserving acme/repo-other
+            upd_pull = prs.update_dev_queue_item_status(
+                conversation_id=cid_q,
+                status="pr_open",
+                pr_urls=[pull_a],
+                portfolio_dir=pdir,
+            )["item"]
+            self.assertEqual(upd_pull["pr_urls"], [rich_b, pull_a])
+
+            # 4. evaluate-branch --decision approve guard & --force escape hatch
+            start_res = prs.start_remediation_branch_and_lock(
+                conversation_id=cid_q,
+                action_id="approve-guard",
+                rca_summary="Unreviewed approve bypass",
+                proposed_fix="Enforce pr_gate_ready and reviewed_head_sha",
+                create_worktree=True,
+                branch_timestamp="20261120-154500",
+                workdir=repo_a,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            wt_path = pathlib.Path(start_res["worktree_path"])
+            guard_br = start_res["branch_name"]
+            (wt_path / "guard.py").write_text("SAFE = 1\n", encoding="utf-8")
+            prs.push_remediation_branch_and_build_reviewer_plan(
+                title="fix(guard): enforce approve gate",
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+
+            # 4a. Approve blocked while pr_gate_ready == False
+            blocked_unready = prs.evaluate_branch_and_release_lock(
+                decision="approve",
+                comment="Attempt premature approve",
+                branch_name=guard_br,
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(blocked_unready["status"], "error")
+            self.assertEqual(blocked_unready["decision"], "blocked_pr_gate_not_ready")
+            self.assertFalse(blocked_unready["lock_released"])
+            self.assertTrue(prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt_path)["active"])
+
+            # 4b. Pass review -> pr_gate_ready == True, then add an unreviewed commit -> approve blocked by SHA mismatch!
+            rev_ok = prs.record_pr_review_evaluation(
+                branch_name=guard_br,
+                verdict="PASS",
+                score=96,
+                summary="Looks great",
+                send_email=False,
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertTrue(rev_ok["ready_for_human_pr"])
+            (wt_path / "guard.py").write_text("SAFE = 2\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(wt_path), "add", "guard.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(wt_path), "commit", "-m", "chore: unreviewed follow-up"], check=True, capture_output=True)
+
+            blocked_sha = prs.evaluate_branch_and_release_lock(
+                decision="approve",
+                comment="Approve after unreviewed commit",
+                branch_name=guard_br,
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(blocked_sha["status"], "error")
+            self.assertEqual(blocked_sha["decision"], "blocked_unreviewed_commits")
+            self.assertFalse(blocked_sha["lock_released"])
+
+            # 4c. CLI `--force` flag parses and overrides approve guard when explicitly requested
+            parsed_force = prs.parse_args(
+                ["evaluate-branch", "--branch", guard_br, "--decision", "approve", "--comment", "override", "--force"]
+            )
+            self.assertTrue(parsed_force.force)
+            with (
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+                mock.patch.object(prs, "restart_pro_api_server", return_value=False),
+            ):
+                forced_ok = prs.evaluate_branch_and_release_lock(
+                    decision="approve",
+                    comment="Emergency HITL override",
+                    branch_name=guard_br,
+                    workdir=wt_path,
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                    force=True,
+                )
+            self.assertEqual(forced_ok["status"], "ok")
+            self.assertTrue(forced_ok["lock_released"])
+
+            # 4d. Reject ALWAYS works even when pr_gate_ready == False
+            start_rej = prs.start_remediation_branch_and_lock(
+                conversation_id="50505050-6060-4070-8080-505050505050",
+                action_id="reject-unready",
+                rca_summary="Discard",
+                proposed_fix="Discard",
+                create_worktree=True,
+                branch_timestamp="20261120-155000",
+                workdir=repo_a,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            with (
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+                mock.patch.object(prs, "restart_pro_api_server", return_value=False),
+            ):
+                rej_ok = prs.evaluate_branch_and_release_lock(
+                    decision="reject",
+                    comment="Reject unreviewed branch",
+                    branch_name=start_rej["branch_name"],
+                    workdir=start_rej["worktree_path"],
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                )
+            self.assertEqual(rej_ok["status"], "ok")
+            self.assertTrue(rej_ok["lock_released"])
 
 
 if __name__ == "__main__":

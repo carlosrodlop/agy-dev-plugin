@@ -43,6 +43,7 @@ import argparse
 import contextlib
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -69,6 +70,8 @@ if str(CLIENTS_DIR) not in sys.path:
 PR_DEVELOPER_SUBAGENT_NAME = "agy-code-developer"
 PR_REVIEWER_SUBAGENT_NAME = "agy-code-pr-reviewer"
 PR_SUBAGENT_MODEL = "pro"
+PR_REVIEW_PASS_MIN_SCORE = 91
+MAX_PR_REVIEW_ITERATIONS = 3
 
 FRONTEND_PATH_MARKERS = (
     "api/ui.py",
@@ -682,18 +685,20 @@ def acquire_dev_pr_lock(
                 }
 
         prev_entry = repo_branches.get(resolved_slug, {})
+        prev_pushed = bool(prev_entry.get("branch_pushed", False))
         repo_branches[resolved_slug] = {
             "repo_slug": resolved_slug,
             "branch_name": default_branch,
             "branch_timestamp": resolved_ts,
             "target_repo_dir": clean_repo_dir or str(prev_entry.get("target_repo_dir") or ""),
-            "manual_pr_url": str(prev_entry.get("manual_pr_url") or issue_url or ""),
-            "branch_pushed": bool(prev_entry.get("branch_pushed", False)),
+            "manual_pr_url": str(prev_entry.get("manual_pr_url") or "") if prev_pushed else "",
+            "branch_pushed": prev_pushed,
             "head_sha": str(prev_entry.get("head_sha") or ""),
             "updated_at": now_iso,
         }
 
         same_prev = isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
+        prev_gate_ready = bool(existing_lock.get("pr_gate_ready")) if (same_prev and not reuse_active_branch) else False
         new_lock: dict[str, Any] = {
             "active": True,
             "vcs_mode": "native_git",
@@ -706,20 +711,36 @@ def acquire_dev_pr_lock(
             "notification_source": "Ad-Hoc",
             "branch_timestamp": resolved_ts,
             "branch_name": default_branch,
-            "branch_pushed": bool(existing_lock.get("branch_pushed")) if same_prev else False,
+            "branch_pushed": bool(existing_lock.get("branch_pushed")) if (same_prev and prev_gate_ready) else False,
+            "pr_gate_ready": prev_gate_ready,
+            "reviewed_head_sha": str(existing_lock.get("reviewed_head_sha") or "") if (same_prev and prev_gate_ready) else "",
+            "staged_head_sha": str(existing_lock.get("staged_head_sha") or "") if same_prev else "",
             "head_sha": str(existing_lock.get("head_sha") or "") if same_prev else "",
-            "manual_pr_url": str(existing_lock.get("manual_pr_url") or "") if same_prev else "",
+            "manual_pr_url": str(existing_lock.get("manual_pr_url") or "") if (same_prev and prev_gate_ready) else "",
             "target_repo_dir": clean_repo_dir or (str(existing_lock.get("target_repo_dir") or "") if same_prev else ""),
             "repo_branches": repo_branches,
-            "worktree_path": _sanitize_home_paths(str(worktree_path or "").strip()),
+            "worktree_path": _sanitize_home_paths(str(worktree_path or "").strip())
+            or (str(existing_lock.get("worktree_path") or "") if same_prev else ""),
             "issue_number": int(issue_number) if issue_number is not None else None,
             "issue_url": str(issue_url or "").strip(),
             "pr_number": existing_lock.get("pr_number") if same_prev else None,
-            "pr_url": str(existing_lock.get("pr_url") or "") if same_prev else "",
+            "pr_url": str(existing_lock.get("pr_url") or "") if (same_prev and prev_gate_ready) else "",
             "status": "DEVELOPING",
             "summary": _sanitize_home_paths(str(summary or "").strip()),
             "proposed_fix": _sanitize_home_paths(str(proposed_fix or "").strip()),
+            "executive_summary": (
+                str(existing_lock.get("executive_summary") or "")
+                if same_prev and existing_lock.get("executive_summary")
+                else _sanitize_home_paths(str(proposed_fix or summary or "").strip())
+            ),
             "target_files": [str(f).strip() for f in (target_files or []) if str(f).strip()],
+            "review_iteration": int(existing_lock.get("review_iteration") or 0) if same_prev else 0,
+            "review_history": list(existing_lock.get("review_history") or []) if same_prev else [],
+            "verification_results": (
+                dict(existing_lock.get("verification_results") or {})
+                if same_prev and isinstance(existing_lock.get("verification_results"), dict)
+                else {}
+            ),
             "acquired_at": (
                 str(existing_lock.get("acquired_at"))
                 if same_prev and existing_lock.get("acquired_at")
@@ -803,7 +824,7 @@ def update_dev_pr_lock(
         current_lock = dict(cand_lock)
         for k, v in updates.items():
             if v is not None:
-                if k in ("summary", "proposed_fix", "proposal_title", "proposal_body", "target_repo_dir", "worktree_path") and isinstance(v, str):
+                if k in ("summary", "proposed_fix", "executive_summary", "proposal_title", "proposal_body", "target_repo_dir", "worktree_path") and isinstance(v, str):
                     current_lock[k] = _sanitize_home_paths(v)
                 else:
                     current_lock[k] = v
@@ -2044,25 +2065,11 @@ def start_remediation_branch_and_lock(
                 )
             stamp_repo_version_manifests(repo_dir, branch_timestamp=resolved_ts)
 
-    try:
-        manual_pr_url = vcs.build_manual_pr_url(
-            head_branch=branch_name,
-            base_branch="main",
-            title=proposal_title,
-            repo_dir=target_repo_dir if isinstance(target_repo_dir, Path) else None,
-        )
-    except TypeError:
-        manual_pr_url = vcs.build_manual_pr_url(
-            head_branch=branch_name,
-            base_branch="main",
-            title=proposal_title,
-        )
-
     lock_res = acquire_dev_pr_lock(
         conversation_id=cid_clean,
         action_id=action_id,
         issue_number=None,
-        issue_url=manual_pr_url,
+        issue_url="",
         branch_name=branch_name,
         branch_timestamp=resolved_ts,
         worktree_path=wt_path,
@@ -2089,35 +2096,312 @@ def start_remediation_branch_and_lock(
         "branch_name": branch_name,
         "proposal_title": proposal_title,
         "proposal_markdown": proposal_body,
-        "manual_pr_url": manual_pr_url,
+        "manual_pr_url": "",
+        "pr_gate_ready": False,
         "worktree_path": wt_path,
         "lock": lock_res.get("lock", {}),
     }
 
 
 # ==============================================================================
-# Step 6: Local Unit Test & Static QA Gate
+# Step 6: Local Unit Test & Static QA Gate (Deterministic Verification Persistence)
 # ==============================================================================
+
+_GIT_HOOK_ENV_VARS: tuple[str, ...] = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+)
+
+
+def _clean_git_subprocess_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a subprocess environment stripped of outer git hook `GIT_*` overrides."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_HOOK_ENV_VARS}
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _snapshot_worktree_state(target_dir: Path, branch_name: str = "") -> dict[str, Any]:
+    """Capture deterministic git `head_sha`, `tree_sha`, `dirty`, and `content_fingerprint` for `target_dir`."""
+    if not (target_dir / ".git").exists():
+        return {"head_sha": "", "tree_sha": "", "dirty": False, "content_fingerprint": ""}
+
+    ref = branch_name.strip() or "HEAD"
+    head_proc = subprocess.run(
+        ["git", "-C", str(target_dir), "rev-parse", "--verify", ref],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    head_sha = (head_proc.stdout or "").strip() if head_proc.returncode == 0 else ""
+
+    tree_proc = subprocess.run(
+        ["git", "-C", str(target_dir), "rev-parse", "--verify", f"{ref}^{{tree}}"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    tree_sha = (tree_proc.stdout or "").strip() if tree_proc.returncode == 0 else ""
+
+    status_proc = subprocess.run(
+        ["git", "-C", str(target_dir), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    porcelain = (status_proc.stdout or "").strip() if status_proc.returncode == 0 else ""
+    is_dirty = bool(porcelain)
+
+    hasher = hashlib.sha256()
+    hasher.update(tree_sha.encode("utf-8"))
+    if is_dirty:
+        diff_proc = subprocess.run(
+            ["git", "-C", str(target_dir), "diff", "HEAD"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        hasher.update(b"\x00diff\x00")
+        hasher.update(diff_proc.stdout or b"")
+        untracked_proc = subprocess.run(
+            ["git", "-C", str(target_dir), "ls-files", "--others", "--exclude-standard"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        for rel_u in sorted((untracked_proc.stdout or "").splitlines()):
+            rel_clean = rel_u.strip()
+            if not rel_clean:
+                continue
+            u_path = target_dir / rel_clean
+            if u_path.is_file():
+                hasher.update(b"\x00untracked\x00" + rel_clean.encode("utf-8") + b"\x00")
+                with contextlib.suppress(OSError):
+                    hasher.update(u_path.read_bytes())
+
+    return {
+        "head_sha": head_sha,
+        "tree_sha": tree_sha,
+        "dirty": is_dirty,
+        "content_fingerprint": hasher.hexdigest()[:32],
+    }
+
+
+def _parse_qa_static_audit_summary(output: str, passed: bool, ran: bool) -> dict[str, Any]:
+    """Extract deterministic error/warning counts from `qa_static_audit.py` output."""
+    if not ran:
+        return {"status": "skipped", "passed": True, "errors": 0, "warnings": 0}
+    errors_cnt = 0 if passed else 1
+    warnings_cnt = 0
+    m_counts = re.search(r"\((\d+)\s+errors?,\s*(\d+)\s+warnings?\)", output or "", re.IGNORECASE)
+    if m_counts:
+        errors_cnt = int(m_counts.group(1))
+        warnings_cnt = int(m_counts.group(2))
+    return {
+        "status": "pass" if passed else "fail",
+        "passed": bool(passed),
+        "errors": errors_cnt,
+        "warnings": warnings_cnt,
+    }
+
+
+def _parse_unittest_summary(output: str, passed: bool, ran: bool) -> dict[str, Any]:
+    """Extract deterministic passed/total/failed counts from `unittest` stderr/stdout."""
+    if not ran:
+        return {"status": "skipped", "passed": True, "passed_count": 0, "total_count": 0, "failed_count": 0}
+    total = sum(int(m) for m in re.findall(r"Ran\s+(\d+)\s+tests?\s+in\b", output or ""))
+    failures = sum(int(m) for m in re.findall(r"failures=(\d+)", output or ""))
+    errors = sum(int(m) for m in re.findall(r"errors=(\d+)", output or ""))
+    failed = failures + errors
+    if not passed and failed == 0:
+        failed = max(1, total)
+    passed_cnt = max(0, total - failed) if total else (0 if not passed else 0)
+    return {
+        "status": "pass" if passed else "fail",
+        "passed": bool(passed),
+        "passed_count": passed_cnt,
+        "total_count": total,
+        "failed_count": failed,
+    }
+
+
+def _parse_bats_summary(output: str, passed: bool, ran: bool) -> dict[str, Any]:
+    """Extract deterministic TAP passed/total counts from BATS output."""
+    if not ran:
+        return {"status": "skipped", "passed": True, "passed_count": 0, "total_count": 0}
+    ok_cnt = len(re.findall(r"(?m)^ok\s+\d+\b", output or ""))
+    not_ok_cnt = len(re.findall(r"(?m)^not ok\s+\d+\b", output or ""))
+    plan_total = sum(int(m) for m in re.findall(r"(?m)^1\.\.(\d+)\s*$", output or ""))
+    total = max(plan_total, ok_cnt + not_ok_cnt)
+    return {
+        "status": "pass" if passed else "fail",
+        "passed": bool(passed),
+        "passed_count": ok_cnt,
+        "total_count": total,
+    }
+
+
+def _resolve_valid_verification_results(
+    lock_info: dict[str, Any] | None,
+    target_dir: Path | None,
+    branch_name: str = "",
+    *,
+    pre_commit_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return `verification_results` bound to current commit/tree SHA, or empty dict if stale/absent."""
+    if not isinstance(lock_info, dict):
+        return {}
+    vr = lock_info.get("verification_results")
+    if not isinstance(vr, dict) or not vr:
+        return {}
+
+    if target_dir is None or not (target_dir / ".git").exists():
+        return dict(vr)
+
+    cur_state = _snapshot_worktree_state(target_dir, branch_name=branch_name)
+    vr_head = str(vr.get("head_sha") or "").strip()
+    vr_tree = str(vr.get("tree_sha") or "").strip()
+    vr_fp = str(vr.get("content_fingerprint") or "").strip()
+    vr_dirty = bool(vr.get("dirty"))
+
+    matches = False
+    if cur_state["head_sha"] and vr_head and vr_head == cur_state["head_sha"] and not vr_dirty and not cur_state["dirty"]:
+        matches = True
+    elif cur_state["tree_sha"] and vr_tree and vr_tree == cur_state["tree_sha"] and not vr_dirty and not cur_state["dirty"]:
+        matches = True
+    elif cur_state["content_fingerprint"] and vr_fp and vr_fp == cur_state["content_fingerprint"]:
+        matches = True
+    elif pre_commit_state and vr_fp and vr_fp == str(pre_commit_state.get("content_fingerprint") or ""):
+        matches = True
+
+    if not matches:
+        return {}
+
+    bound = dict(vr)
+    if cur_state["head_sha"]:
+        bound["head_sha"] = cur_state["head_sha"]
+    if cur_state["tree_sha"]:
+        bound["tree_sha"] = cur_state["tree_sha"]
+    bound["dirty"] = bool(cur_state["dirty"])
+    if cur_state["content_fingerprint"]:
+        bound["content_fingerprint"] = cur_state["content_fingerprint"]
+    return bound
+
+
+def _format_verification_checks_markdown(verification_results: dict[str, Any] | None) -> list[str]:
+    """Render deterministic `## 🧪 Automated Verification Checks` Markdown lines from `verification_results`."""
+    lines: list[str] = [
+        "",
+        "## 🧪 Automated Verification Checks",
+        "",
+    ]
+    if not isinstance(verification_results, dict) or not verification_results:
+        lines.append("- **Status**: ⚠️ No verified `test-local` snapshot bound to current commit SHA yet.")
+        return lines
+
+    head_sha = str(verification_results.get("head_sha") or "").strip()
+    tree_sha = str(verification_results.get("tree_sha") or "").strip()
+    verified_at = str(verification_results.get("verified_at_utc") or "").strip()
+    meta_parts: list[str] = []
+    if head_sha:
+        meta_parts.append(f"**Verified Commit SHA**: `{head_sha[:12]}`")
+    if tree_sha:
+        meta_parts.append(f"**Tree SHA**: `{tree_sha[:12]}`")
+    if verified_at:
+        meta_parts.append(f"**Verified At (UTC)**: `{verified_at}`")
+    if meta_parts:
+        lines.append("- " + " · ".join(meta_parts))
+        lines.append("")
+
+    def _status_badge(status_str: str) -> str:
+        norm = status_str.strip().lower()
+        if norm == "pass":
+            return "✅ PASS"
+        if norm == "fail":
+            return "❌ FAIL"
+        if norm == "not_run":
+            return "⏭️ NOT RUN"
+        return "⏭️ SKIPPED"
+
+    qa_info = verification_results.get("qa_static_audit") if isinstance(verification_results.get("qa_static_audit"), dict) else {}
+    ut_info = verification_results.get("unittest") if isinstance(verification_results.get("unittest"), dict) else {}
+    bats_info = verification_results.get("bats") if isinstance(verification_results.get("bats"), dict) else {}
+    pc_info = verification_results.get("pre_commit") if isinstance(verification_results.get("pre_commit"), dict) else {}
+
+    qa_st = str(qa_info.get("status") or "skipped")
+    qa_det = (
+        f"`{int(qa_info.get('errors') or 0)} errors, {int(qa_info.get('warnings') or 0)} warnings`"
+        if qa_st != "skipped"
+        else "`qa_static_audit.py` not present"
+    )
+    ut_st = str(ut_info.get("status") or "skipped")
+    ut_total = int(ut_info.get("total_count") or 0)
+    ut_passed = int(ut_info.get("passed_count") or 0)
+    ut_det = (
+        f"`{ut_passed}/{ut_total} tests passed`"
+        if ut_total > 0
+        else ("`all targeted checks passed`" if ut_st == "pass" else "`tests failed`" if ut_st == "fail" else "`no tests/` directory")
+    )
+    bats_st = str(bats_info.get("status") or "skipped")
+    bats_total = int(bats_info.get("total_count") or 0)
+    bats_passed = int(bats_info.get("passed_count") or 0)
+    bats_det = (
+        f"`{bats_passed}/{bats_total} specs passed`"
+        if bats_total > 0
+        else ("`BATS suite passed`" if bats_st == "pass" else "`BATS suite failed`" if bats_st == "fail" else "`no BATS suite`")
+    )
+    pc_st = str(pc_info.get("status") or "not_run")
+    pc_det = "`pre-commit run --all-files`" if pc_st in ("pass", "fail") else "`not recorded in test-local`"
+
+    lines.extend(
+        [
+            "| Check | Status | Details |",
+            "| :--- | :--- | :--- |",
+            f"| `qa_static_audit` | {_status_badge(qa_st)} | {qa_det} |",
+            f"| `unittest` | {_status_badge(ut_st)} | {ut_det} |",
+            f"| `bats` | {_status_badge(bats_st)} | {bats_det} |",
+            f"| `pre_commit` | {_status_badge(pc_st)} | {pc_det} |",
+        ]
+    )
+    return lines
 
 
 def run_local_validation_suite(
     workdir: Path | str | None = None,
     test_targets: list[str] | None = None,
     timeout: float = 180.0,
+    *,
+    portfolio_dir: Path | str | None = None,
+    run_pre_commit: bool = False,
+    pre_commit_status: str = "",
+    run_bats: bool = True,
 ) -> dict[str, Any]:
-    """Execute Step 6: Run local offline unit tests (`unittest`) and `qa_static_audit.py` to guarantee zero broken tests."""
+    """Execute Step 6: Run local offline unit tests (`unittest`), `qa_static_audit.py`, optional BATS/pre-commit, and persist `verification_results` bound to `head_sha` into `dev_pr_lock`."""
     vcs = GitVcsIntegrationClient()
     target_dir = Path(workdir).expanduser().resolve() if workdir else vcs.resolve_repo_dir()
     if not target_dir.is_dir():
         return {"status": "error", "passed": False, "error": f"Workdir not found: {target_dir}"}
 
+    clean_env = _clean_git_subprocess_env({"AGY_OFFLINE_ONLY": "1", "PRE_COMMIT_HOOK": "1"})
+
     qa_script = target_dir / "tests" / "scripts" / "qa_static_audit.py"
+    qa_ran = qa_script.is_file()
     qa_passed = True
     qa_output = ""
-    if qa_script.is_file():
+    if qa_ran:
         proc_qa = subprocess.run(
             [sys.executable, str(qa_script), "--incremental"],
             cwd=str(target_dir),
+            env=clean_env,
             capture_output=True,
             text=True,
             timeout=60,
@@ -2127,36 +2411,137 @@ def run_local_validation_suite(
         qa_output = f"{proc_qa.stdout}\n{proc_qa.stderr}".strip()
 
     targets = list(test_targets or [])
-    env = {**os.environ, "AGY_OFFLINE_ONLY": "1", "PRE_COMMIT_HOOK": "1"}
     selective_runner = target_dir / "tests" / "scripts" / "selective_test_runner.py"
+    tests_dir = target_dir / "tests"
+    unittest_ran = True
+    tests_passed = True
+    test_output = ""
     if targets:
         cmd = [sys.executable, "-m", "unittest", *targets]
     elif selective_runner.is_file():
         cmd = [sys.executable, str(selective_runner)]
-    else:
+    elif tests_dir.is_dir():
         cmd = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
-    proc_test = subprocess.run(
-        cmd,
-        cwd=str(target_dir),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    tests_passed = proc_test.returncode == 0
-    test_output = f"{proc_test.stdout}\n{proc_test.stderr}".strip()
-    overall_passed = bool(qa_passed and tests_passed)
+    else:
+        cmd = []
+        unittest_ran = False
+
+    if cmd:
+        proc_test = subprocess.run(
+            cmd,
+            cwd=str(target_dir),
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        tests_passed = proc_test.returncode == 0
+        test_output = f"{proc_test.stdout}\n{proc_test.stderr}".strip()
+
+    # Capture BATS status either from selective_test_runner TAP output or direct execution
+    bats_files = sorted((target_dir / "tests" / "bats").glob("*.bats")) if (target_dir / "tests" / "bats").is_dir() else []
+    bats_ran = False
+    bats_passed = True
+    bats_output = ""
+    if re.search(r"(?m)^1\.\.\d+\s*$", test_output):
+        bats_ran = True
+        bats_passed = tests_passed and not bool(re.search(r"(?m)^not ok\s+\d+\b", test_output))
+        bats_output = test_output
+    elif run_bats and not targets and bats_files:
+        bats_bin = shutil.which("bats")
+        if bats_bin:
+            bats_ran = True
+            proc_bats = subprocess.run(
+                [bats_bin, *(str(p) for p in bats_files)],
+                cwd=str(target_dir),
+                env=clean_env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            bats_passed = proc_bats.returncode == 0
+            bats_output = f"{proc_bats.stdout}\n{proc_bats.stderr}".strip()
+
+    # Optional pre-commit validation recording
+    pre_commit_entry: dict[str, Any] = {"status": "not_run", "passed": None}
+    pre_commit_output = ""
+    if run_pre_commit and (target_dir / ".pre-commit-config.yaml").is_file():
+        pc_bin = shutil.which("pre-commit")
+        if pc_bin:
+            proc_pc = subprocess.run(
+                [pc_bin, "run", "--all-files"],
+                cwd=str(target_dir),
+                env=clean_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            pc_ok = proc_pc.returncode == 0
+            pre_commit_output = f"{proc_pc.stdout}\n{proc_pc.stderr}".strip()
+            pre_commit_entry = {"status": "pass" if pc_ok else "fail", "passed": pc_ok}
+        else:
+            pre_commit_entry = {"status": "skipped", "passed": None}
+    elif pre_commit_status.strip().lower() in ("pass", "fail", "skipped"):
+        norm_pc = pre_commit_status.strip().lower()
+        pre_commit_entry = {
+            "status": norm_pc,
+            "passed": True if norm_pc == "pass" else (False if norm_pc == "fail" else None),
+        }
+
+    wt_state = _snapshot_worktree_state(target_dir)
+    # Preserve previously recorded pre_commit pass/fail if same code fingerprint
+    existing_lock = get_dev_pr_lock(portfolio_dir=portfolio_dir, workdir=target_dir)
+    if pre_commit_entry["status"] == "not_run" and existing_lock.get("active"):
+        prev_vr = existing_lock.get("verification_results")
+        if (
+            isinstance(prev_vr, dict)
+            and prev_vr.get("content_fingerprint") == wt_state["content_fingerprint"]
+            and isinstance(prev_vr.get("pre_commit"), dict)
+            and prev_vr["pre_commit"].get("status") in ("pass", "fail")
+        ):
+            pre_commit_entry = dict(prev_vr["pre_commit"])
+
+    pre_commit_passed = pre_commit_entry.get("passed")
+    overall_passed = bool(qa_passed and tests_passed and bats_passed and (pre_commit_passed is not False))
+
+    verification_results: dict[str, Any] = {
+        "head_sha": wt_state["head_sha"],
+        "tree_sha": wt_state["tree_sha"],
+        "dirty": wt_state["dirty"],
+        "content_fingerprint": wt_state["content_fingerprint"],
+        "verified_at_utc": _utc_now_iso(),
+        "overall_passed": overall_passed,
+        "qa_static_audit": _parse_qa_static_audit_summary(qa_output, qa_passed, qa_ran),
+        "unittest": _parse_unittest_summary(test_output, tests_passed, unittest_ran),
+        "bats": _parse_bats_summary(bats_output, bats_passed, bats_ran),
+        "pre_commit": pre_commit_entry,
+    }
+
+    if existing_lock.get("active"):
+        with contextlib.suppress(Exception):
+            update_dev_pr_lock(
+                {"verification_results": verification_results},
+                portfolio_dir=portfolio_dir,
+                workdir=target_dir,
+            )
 
     return {
         "status": "ok" if overall_passed else "error",
         "passed": overall_passed,
         "qa_static_passed": qa_passed,
         "unit_tests_passed": tests_passed,
+        "bats_passed": bats_passed,
+        "pre_commit_passed": pre_commit_passed,
+        "head_sha": wt_state["head_sha"],
         "workdir": str(target_dir),
         "test_targets": targets,
+        "verification_results": verification_results,
         "qa_output": qa_output[-1500:],
         "test_output": test_output[-2500:],
+        "pre_commit_output": pre_commit_output[-1500:] if pre_commit_output else "",
     }
 
 
@@ -2182,8 +2567,8 @@ def build_code_developer_subagent_plan(
 
     Supports optional model tiering (`flash` for bounded/pre-anchored tasks or `pro` [default]
     for complex multi-module/security work) while keeping `agy-code-pr-reviewer` on `pro`.
-    Executes Steps 1–4 using pure native `git` (RCA -> Create Timestamped Branch & Acquire per-repo `dev_pr_locks` entry ->
-    Propose Changes on Branch & Run Local Unit Tests -> Push Branch to Remote `origin/<branch_name>`)
+    Executes Local-First Review staging using pure native `git` (RCA -> Create Timestamped Branch & Acquire per-repo `dev_pr_locks` entry ->
+    Propose Changes on Branch & Run Local Unit Tests -> Stage Locally via `push-branch`/`prepare-review` WITHOUT pushing to `origin`)
     and returns the branch details + `agy-code-pr-reviewer` invocation plan.
     """
     cid_clean = str(conversation_id or "").strip()
@@ -2204,17 +2589,17 @@ def build_code_developer_subagent_plan(
         f"for `agy-dev-plugin` and companion repositories (`agy-tam-plugin`, `g-control-tower`, etc.).\n"
         f"You are invoked whenever a user prompt or incident audit requires a code, script, configuration, or `SKILL.md` change.\n"
         f"You MUST use pure native `git` only (zero proprietary GitHub/GitLab REST API calls; the human validates the branch and creates the Pull Request manually).\n"
-        f"NEVER commit, merge, or push directly to `main`.\n"
+        f"NEVER commit, merge, or push directly to `main`, and NEVER run direct `git push` on an unvalidated feature branch before `{PR_REVIEWER_SUBAGENT_NAME}` passes (>90/100).\n"
         f"Your mandatory responsibilities:\n"
         f"1. Consume coordinator-provided file anchors, exact line ranges, and contracts cleanly without redundant full-repo discovery; inspect `rca` only if additional root-cause detail is missing.\n"
-        f"2. Create a timestamped branch (`fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>`) and acquire the per-repository lock (`dev_pr_locks[repo_slug]`) via:\n"
+        f"2. Create or reuse a timestamped branch (`fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>`) and acquire the per-repository lock (`dev_pr_locks[repo_slug]`) via:\n"
         f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation --id <CONVERSATION_ID> --action-id <ACTION_ID> --workdir <REPO_DIR> --rca-summary \"...\" --proposed-fix \"...\" --worktree`\n"
         f"   - If `status == \"locked\"` on this repository, `dev_queue.json` records the blocked item automatically; stop immediately and return the active lock status.\n"
         f"3. Implement modular Zero-PII code/skill fixes and hermetic unit test(s) in `tests/`, iterating quickly via targeted `python3 -m unittest <target>` checks.\n"
-        f"4. Once targeted tests pass, run a single final gate (`pre-commit run --all-files` + `pr_remediator.py test-local --workdir <WORKTREE_PATH>`) until `passed == true`.\n"
-        f"5. Commit and push the timestamped branch to `origin` via native `git` (never `main`):\n"
-        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py push-branch --workdir <WORKTREE_PATH> --title \"fix(<scope>): <summary>\" --scheduled`\n"
-        f"6. Return the JSON output from `push-branch` (including `branch_name`, `branch_timestamp`, `manual_pr_url`, `reviewer_subagent_definition`, and `reviewer_subagent_invocation`) so `{PR_REVIEWER_SUBAGENT_NAME}` (`Model=\"pro\"`) can evaluate immediately."
+        f"4. Once targeted tests pass, run the final local gate (`pre-commit run --all-files` + `pr_remediator.py test-local --workdir <WORKTREE_PATH>`) until `passed == true` so deterministic `verification_results` are persisted on `dev_pr_lock`.\n"
+        f"5. Stage the branch locally for independent review (Local-First Review — commits locally WITHOUT pushing to `origin` yet):\n"
+        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py prepare-review --workdir <WORKTREE_PATH> --title \"fix(<scope>): <summary>\" --executive-summary \"...\"`\n"
+        f"6. Return the JSON output (including `branch_name`, `branch_timestamp`, `staged_head_sha`, `reviewer_subagent_definition`, and `reviewer_subagent_invocation`) so `{PR_REVIEWER_SUBAGENT_NAME}` (`Model=\"pro\"`) can audit locally and publish ONLY upon `PASS (>90/100)`."
     )
 
     task_prompt = (
@@ -2227,14 +2612,14 @@ def build_code_developer_subagent_plan(
         + (f"- **Initial Proposed Solution**: {proposed_fix}\n" if proposed_fix else "")
         + (f"- **Target Files**: `{', '.join(files_list)}`\n" if files_list else "")
         + (f"- **Pre-Anchored Context & Contracts**:\n{anchored_clean}\n" if anchored_clean else "")
-        + "\nExecute the native `git` branch workflow now:\n"
+        + "\nExecute the Local-First Native Git branch workflow now:\n"
         f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation "
         f"--id {cid_clean} --action-id \"{action_id or 'code-change'}\"{workdir_arg} "
         f"--rca-summary \"<RCA_SUMMARY>\" --proposed-fix \"<PROPOSED_FIX>\"{files_arg}{sib_arg} --worktree`.\n"
         f"   - If `status == \"locked\"`, abort immediately and return the lock status.\n"
-        f"2. Implement modular fixes and hermetic unit tests on the worktree branch, iterate with targeted `python3 -m unittest <target>`, then run `pre-commit run --all-files` and `pr_remediator.py test-local --workdir <WORKTREE_PATH>` once until `passed == true`.\n"
-        f"3. Commit and push the timestamped branch via `pr_remediator.py push-branch --workdir <WORKTREE_PATH> --title \"fix: remediate {action_id or cid_clean[:8]}\"{sched_flag}`.\n"
-        f"4. Return the full JSON result so `{PR_REVIEWER_SUBAGENT_NAME}` can immediately evaluate the pushed branch."
+        f"2. Implement modular fixes and hermetic unit tests on the worktree branch, iterate with targeted `python3 -m unittest <target>`, then run `pre-commit run --all-files` and `pr_remediator.py test-local --workdir <WORKTREE_PATH>` until `passed == true`.\n"
+        f"3. Stage locally for review (without pushing to origin yet) via `pr_remediator.py prepare-review --workdir <WORKTREE_PATH> --title \"fix: remediate {action_id or cid_clean[:8]}\" --executive-summary \"...\"{sched_flag}`.\n"
+        f"4. Return the full JSON result so `{PR_REVIEWER_SUBAGENT_NAME}` can immediately audit the local branch and publish only on `PASS (>90/100)`."
     )
 
     return {
@@ -2242,7 +2627,7 @@ def build_code_developer_subagent_plan(
             "Name": PR_DEVELOPER_SUBAGENT_NAME,
             "Description": (
                 "VCS-Interoperable Native Git Code Developer Agent invoked when a code change is required (via audit or user prompt). "
-                "Creates a timestamped git branch, acquires per-repo dev_pr_locks entry, implements and tests the change locally, and pushes the branch to origin for human PR validation."
+                "Creates a timestamped git branch, acquires per-repo dev_pr_locks entry, implements and tests the change locally, and stages it locally for independent PASS>90 PR review."
             ),
             "SystemPrompt": system_prompt,
             "EnableWriteTools": True,
@@ -2273,52 +2658,51 @@ def build_pr_reviewer_subagent_plan(
     repo_slug: str = "",
 ) -> dict[str, Any]:
     """Build the `subagent_definition` and `subagent_invocation` for `agy-code-pr-reviewer` (`Model="pro"`)."""
-    _ = pr_number, issue_number, scheduled
+    _ = pr_number, issue_number, scheduled, pr_url, issue_url
     resolved_ts = branch_timestamp or ""
     wd_flag = f' --workdir "{workdir.strip()}"' if str(workdir or "").strip() else ""
     repo_line = f"- **Target Repository**: `{repo_slug.strip()}`\n" if str(repo_slug or "").strip() else ""
     system_prompt = (
         f"You are `{PR_REVIEWER_SUBAGENT_NAME}`, an independent Native Git Branch Quality & Security Evaluator Agent "
         f"(Maker-Checker pattern) for `agy-dev-plugin` and companion repositories (`agy-tam-plugin`, `g-control-tower`, etc.).\n"
-        f"You run in a completely isolated conversation context right after a timestamped branch is pushed.\n"
+        f"You run in a completely isolated conversation context right after a timestamped branch is staged locally (`AWAITING_AGENT_REVIEW`).\n"
+        f"Hard PR Readiness Gate: ONLY `verdict == \"PASS\"` with `score > 90` (`>= {PR_REVIEW_PASS_MIN_SCORE}/100`) publishes `origin/<branch>` and exposes `manual_pr_url`.\n"
         f"Your mandatory responsibilities:\n"
-        f"1. Inspect the pushed branch diff and changed files against `origin/main` using pure native `git` via:\n"
+        f"1. Inspect the local staged branch diff and changed files against `origin/main` using pure native `git` via:\n"
         f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch <BRANCH_NAME>{wd_flag}`\n"
         f"2. Independently evaluate the proposed branch changes across 4 criteria (0-100 score) and determine your verdict (`PASS`, `WARN`, or `NEEDS_REVISION`):\n"
         f"   - Criterion A (40 pts): Root Cause / Requirement Resolution — Does the diff accurately implement the change without regressions?\n"
         f"   - Criterion B (25 pts): Unit Test Coverage — Are new or updated deterministic unit tests included in `tests/`?\n"
         f"   - Criterion C (20 pts): Security & Zero-PII Guardrails — Zero hardcoded customer names, emails, `/Users/<user>/` paths, or secrets.\n"
         f"   - Criterion D (15 pts): Code Style, Typing & Documentation — Clean English docstrings, type hints, and plugin / `$HOME` parity.\n"
-        f"3. Record your structured verdict and dispatch review notification (embedding the exact branch timestamp `{resolved_ts}`) so the human can compare the branch against `main` and manually create the Pull Request:\n"
+        f"3. Record your structured verdict via `record-review` (which publishes `origin/<branch>`, starts `watch-pr-merge`, and dispatches `[🟩]` email ONLY if `PASS` and `score > 90`; otherwise keeps the branch local and returns `developer_remediation_plan` for auto-iteration up to {MAX_PR_REVIEW_ITERATIONS} rounds):\n"
         f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review --branch <BRANCH_NAME>{wd_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary \"...\" --send-email`\n"
-        f"4. Return the JSON evaluation summary and manual PR validation instructions."
+        f"4. Return the JSON evaluation summary (`ready_for_human_pr`, `needs_reiteration`, `manual_pr_url` only when `ready_for_human_pr == true`, or `developer_remediation_plan` otherwise)."
     )
 
     task_prompt = (
-        f"Evaluate the pushed timestamped branch `{branch_name}` (Timestamp: `{resolved_ts}`):\n"
+        f"Evaluate the locally staged timestamped branch `{branch_name}` (Timestamp: `{resolved_ts}`):\n"
         + repo_line
         + f"- **Conversation ID**: `{conversation_id}`\n"
-        f"- **Proposed Branch**: `{branch_name}`\n"
+        f"- **Proposed Branch**: `{branch_name}` (Local-First Review — NOT yet published to `origin`)\n"
         f"- **Branch Timestamp**: `{resolved_ts}`\n"
-        f"- **Manual PR / Compare URL**: {pr_url or issue_url or 'N/A'}\n"
         f"- **Root Cause / Rationale**: {rca_summary}\n"
         f"- **Proposed Solution**: {proposed_fix}\n\n"
         f"Execute the following steps:\n"
-        f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch \"{branch_name}\"{wd_flag}` to inspect the exact diff and files changed via native `git`.\n"
+        f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch \"{branch_name}\"{wd_flag}` to inspect the exact local diff and files changed via native `git`.\n"
         f"2. Score the branch changes (0-100) across Resolution Accuracy, Unit Tests, Zero-PII Security, and Code Quality, and give your verdict (`PASS`, `WARN`, or `NEEDS_REVISION`).\n"
         f"3. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review "
         f"--branch \"{branch_name}\"{wd_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <SCORE> "
-        f"--summary \"<Your detailed technical review comment>\" --send-email` so your verdict is recorded and the review notification (with timestamp `{resolved_ts}`) is dispatched to the human for manual Pull Request creation.\n"
-        f"4. Return the JSON evaluation summary."
+        f"--summary \"<Your detailed technical review comment>\" --send-email`.\n"
+        f"4. Return the full JSON evaluation summary (never surface any PR URL unless `ready_for_human_pr == true`)."
     )
 
     return {
         "subagent_definition": {
             "Name": PR_REVIEWER_SUBAGENT_NAME,
             "Description": (
-                "Independent Native Git Branch Reviewer Agent (agy-code-pr-reviewer) that evaluates pushed timestamped branch diffs, "
-                "unit tests, and security guardrails via native git, records its verdict, and sends the notification email (with matching branch_timestamp) "
-                "so the human can compare against main and manually create the Pull Request."
+                "Independent Native Git Branch Reviewer Agent (agy-code-pr-reviewer) that evaluates locally staged timestamped branch diffs, "
+                "unit tests, and security guardrails via native git, enforces the PASS>90/100 PR readiness gate, and publishes the branch only when approved."
             ),
             "SystemPrompt": system_prompt,
             "EnableWriteTools": True,
@@ -2345,12 +2729,15 @@ def build_canonical_pr_description(
     branch_timestamp: str = "",
     conversation_id: str = "",
     files_changed: list[dict[str, Any]] | None = None,
+    verification_results: dict[str, Any] | None = None,
     reviewer_verdict: str = "",
     reviewer_score: int | None = None,
     reviewer_summary: str = "",
     reviewer_subagent_id: str = "",
+    review_iteration: int | None = None,
+    max_review_iterations: int = MAX_PR_REVIEW_ITERATIONS,
 ) -> str:
-    """Build a deterministic, VCS-agnostic Pull Request description guaranteeing an `## 📋 Executive Summary` section.
+    """Build a deterministic, VCS-agnostic Pull Request description guaranteeing `## 📋 Executive Summary`, `## 🧪 Automated Verification Checks`, and `## 🤖 Independent PR Review`.
 
     This canonical Markdown body is written into both:
       1. The Git branch HEAD commit body (`git commit --amend -m <title> -m <body>`) so GitHub, GitLab, Bitbucket,
@@ -2408,6 +2795,8 @@ def build_canonical_pr_description(
             ]
         )
 
+    sections.extend(_format_verification_checks_markdown(verification_results))
+
     sections.extend(
         [
             "",
@@ -2417,9 +2806,12 @@ def build_canonical_pr_description(
     )
     if reviewer_verdict:
         v_norm = reviewer_verdict.strip().upper()
-        v_badge = "🟢 PASS" if v_norm == "PASS" else ("🟧 WARN" if v_norm == "WARN" else "🟥 NEEDS_REVISION")
         score_val = int(reviewer_score if reviewer_score is not None else 95)
+        passed_gate = v_norm == "PASS" and score_val >= PR_REVIEW_PASS_MIN_SCORE
+        v_badge = "🟢 PASS" if passed_gate else ("🟧 WARN" if v_norm == "WARN" else "🟥 NEEDS_REVISION")
         sections.append(f"- **Verdict**: **[ {v_badge} ({score_val}/100) ]**")
+        if review_iteration is not None and review_iteration > 0:
+            sections.append(f"- **Review Round**: `{review_iteration}/{max_review_iterations}`")
         if reviewer_subagent_id:
             sections.append(f"- **Reviewer Subagent ID**: `{reviewer_subagent_id}`")
         if reviewer_summary:
@@ -2430,23 +2822,60 @@ def build_canonical_pr_description(
     return "\n".join(sections).strip() + "\n"
 
 
-def _sync_branch_head_commit_message(
+def _resolve_worktree_for_branch(repo_dir: Path, branch_name: str) -> Path | None:
+    """Inspect `git worktree list --porcelain` and return the worktree directory where `branch_name` is checked out."""
+    if not (repo_dir / ".git").exists() or not branch_name:
+        return None
+    proc = subprocess.run(
+        ["git", "-C", str(repo_dir), "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+
+    target_ref = f"refs/heads/{branch_name.strip().removeprefix('refs/heads/')}"
+    current_wt = ""
+    for raw_line in (proc.stdout or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            current_wt = ""
+            continue
+        if line.startswith("worktree "):
+            current_wt = line[len("worktree ") :].strip()
+        elif line.startswith("branch ") and current_wt:
+            br_ref = line[len("branch ") :].strip()
+            if br_ref == target_ref:
+                wt_path = Path(current_wt)
+                if wt_path.is_dir():
+                    return wt_path.resolve()
+    return None
+
+
+def _sync_branch_head_commit_message_detailed(
     target_repo_dir: Path,
     branch_name: str,
     base_branch: str,
     commit_title: str,
     commit_body: str,
-) -> bool:
-    """Ensure the HEAD commit on `branch_name` embeds `commit_title` and `commit_body` (`## 📋 Executive Summary`).
-
-    Works deterministically even when the developer committed changes with a 1-line `git commit -m "..."` during
-    `pre-commit` prior to calling `push-branch` or `record-review`.
-    """
+) -> dict[str, Any]:
+    """Worktree-aware HEAD commit message amend returning structured `{amended, effective_repo_dir, head_sha, error}`."""
     if not (target_repo_dir / ".git").exists() or not branch_name or branch_name in ("main", "master"):
-        return False
+        return {
+            "amended": False,
+            "effective_repo_dir": target_repo_dir,
+            "head_sha": "",
+            "error": f"Invalid repository or protected branch for commit amend: repo={target_repo_dir}, branch={branch_name}",
+        }
+
+    # Resolve linked worktree where `branch_name` is already checked out to avoid "already used by worktree" errors
+    wt_dir = _resolve_worktree_for_branch(target_repo_dir, branch_name)
+    effective_dir = wt_dir if wt_dir is not None else target_repo_dir
 
     cur_proc = subprocess.run(
-        ["git", "-C", str(target_repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+        ["git", "-C", str(effective_dir), "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True,
         text=True,
         timeout=5,
@@ -2456,21 +2885,28 @@ def _sync_branch_head_commit_message(
     switched = False
     if original_branch != branch_name:
         co_proc = subprocess.run(
-            ["git", "-C", str(target_repo_dir), "checkout", branch_name],
+            ["git", "-C", str(effective_dir), "checkout", branch_name],
             capture_output=True,
             text=True,
             timeout=15,
             check=False,
         )
         if co_proc.returncode != 0:
-            return False
+            return {
+                "amended": False,
+                "effective_repo_dir": effective_dir,
+                "head_sha": "",
+                "error": (co_proc.stderr or co_proc.stdout or f"git checkout {branch_name} failed").strip(),
+            }
         switched = True
 
     amended = False
+    new_head_sha = ""
+    err_msg = ""
     try:
         base_ref = f"origin/{base_branch}"
         chk_base = subprocess.run(
-            ["git", "-C", str(target_repo_dir), "rev-parse", "--verify", base_ref],
+            ["git", "-C", str(effective_dir), "rev-parse", "--verify", base_ref],
             capture_output=True,
             text=True,
             timeout=5,
@@ -2480,19 +2916,21 @@ def _sync_branch_head_commit_message(
             base_ref = base_branch
 
         cnt_proc = subprocess.run(
-            ["git", "-C", str(target_repo_dir), "rev-list", "--count", f"{base_ref}..{branch_name}"],
+            ["git", "-C", str(effective_dir), "rev-list", "--count", f"{base_ref}..{branch_name}"],
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
         ahead_count = int((cnt_proc.stdout or "0").strip() or 0) if cnt_proc.returncode == 0 else 0
-        if ahead_count > 0:
+        if ahead_count <= 0:
+            err_msg = f"Branch '{branch_name}' has 0 commits ahead of '{base_ref}'; cannot amend HEAD commit message."
+        else:
             am_proc = subprocess.run(
                 [
                     "git",
                     "-C",
-                    str(target_repo_dir),
+                    str(effective_dir),
                     "commit",
                     "--amend",
                     "--no-verify",
@@ -2507,16 +2945,54 @@ def _sync_branch_head_commit_message(
                 check=False,
             )
             amended = am_proc.returncode == 0
+            if amended:
+                sha_proc = subprocess.run(
+                    ["git", "-C", str(effective_dir), "rev-parse", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                new_head_sha = (sha_proc.stdout or "").strip() if sha_proc.returncode == 0 else ""
+            else:
+                err_msg = (am_proc.stderr or am_proc.stdout or "git commit --amend failed").strip()
     finally:
         if switched and original_branch and original_branch != branch_name:
             subprocess.run(
-                ["git", "-C", str(target_repo_dir), "checkout", original_branch],
+                ["git", "-C", str(effective_dir), "checkout", original_branch],
                 capture_output=True,
                 text=True,
                 timeout=15,
                 check=False,
             )
-    return amended
+    return {
+        "amended": amended,
+        "effective_repo_dir": effective_dir,
+        "head_sha": new_head_sha,
+        "error": err_msg,
+    }
+
+
+def _sync_branch_head_commit_message(
+    target_repo_dir: Path,
+    branch_name: str,
+    base_branch: str,
+    commit_title: str,
+    commit_body: str,
+) -> bool:
+    """Ensure the HEAD commit on `branch_name` embeds `commit_title` and `commit_body` (`## 📋 Executive Summary`).
+
+    Worktree-aware wrapper returning `True` iff HEAD commit message was amended cleanly.
+    """
+    return bool(
+        _sync_branch_head_commit_message_detailed(
+            target_repo_dir=target_repo_dir,
+            branch_name=branch_name,
+            base_branch=base_branch,
+            commit_title=commit_title,
+            commit_body=commit_body,
+        ).get("amended")
+    )
 
 
 def _stage_preview_plugin_bundle(
@@ -2639,7 +3115,7 @@ def push_remediation_branch_and_build_reviewer_plan(
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
 ) -> dict[str, Any]:
-    """Commit pending changes onto the timestamped branch (never `main`), stamp the canonical `## 📋 Executive Summary` PR body into the branch commit and compare URL, push to `origin/<branch>` via native `git`, and build the `agy-code-pr-reviewer` invocation plan."""
+    """Local-First Review staging (`push-branch` / `prepare-review`): commit changes locally on the timestamped branch (never `main`), stamp canonical `## 📋 Executive Summary` + deterministic `## 🧪 Automated Verification Checks` into the local HEAD commit WITHOUT pushing to `origin`, invalidate prior review state, and return the `agy-code-pr-reviewer` invocation plan."""
     vcs = git_client or GitVcsIntegrationClient()
     scoped_slug, scoped_dir = _resolve_repo_slug_and_dir(
         repo_slug=repo_slug,
@@ -2657,7 +3133,7 @@ def push_remediation_branch_and_build_reviewer_plan(
         return {
             "status": "error",
             "error": (
-                "Cannot push remediation branch without an active development lock (`dev_pr_lock`). "
+                "Cannot stage remediation branch for review without an active development lock (`dev_pr_lock`). "
                 "Run `start-remediation` or `acquire-lock` first."
             ),
         }
@@ -2686,6 +3162,12 @@ def push_remediation_branch_and_build_reviewer_plan(
         or (str(repo_entry.get("branch_name") or "").strip() if isinstance(repo_entry, dict) else "")
         or str(lock_info.get("branch_name") or "").strip()
     )
+    if not resolved_head or resolved_head in ("main", "master"):
+        return {
+            "status": "error",
+            "error": f"Refusing to stage protected or empty branch '{resolved_head}' for review.",
+        }
+
     resolved_ts = (
         (str(repo_entry.get("branch_timestamp") or "").strip() if isinstance(repo_entry, dict) else "")
         or str(lock_info.get("branch_timestamp") or "").strip()
@@ -2696,6 +3178,12 @@ def push_remediation_branch_and_build_reviewer_plan(
     act_id = str(lock_info.get("action_id") or "")
     rca_summary = str(lock_info.get("summary") or "")
     proposed_fix = str(lock_info.get("proposed_fix") or "")
+    preserved_exec_summary = (
+        _sanitize_home_paths(executive_summary.strip())
+        or str(lock_info.get("executive_summary") or "").strip()
+        or proposed_fix
+        or rca_summary
+    )
 
     commit_title = format_remediation_commit_title(
         title.strip(),
@@ -2703,20 +3191,36 @@ def push_remediation_branch_and_build_reviewer_plan(
         conversation_id=cid_clean,
         branch_timestamp=resolved_ts,
     )
+    pre_commit_state = (
+        _snapshot_worktree_state(target_repo_dir)
+        if (target_repo_dir / ".git").exists()
+        else {"head_sha": "", "tree_sha": "", "dirty": False, "content_fingerprint": ""}
+    )
+    preliminary_vr = _resolve_valid_verification_results(
+        lock_info,
+        target_repo_dir,
+        branch_name=resolved_head,
+        pre_commit_state=pre_commit_state,
+    )
     preliminary_body = build_canonical_pr_description(
         commit_title=commit_title,
-        executive_summary=executive_summary,
+        executive_summary=preserved_exec_summary,
         rca_summary=rca_summary,
         proposed_fix=proposed_fix,
         custom_body=body,
         branch_name=resolved_head,
         branch_timestamp=resolved_ts,
         conversation_id=cid_clean,
+        verification_results=preliminary_vr,
     )
 
-    # If target_repo_dir is a real git checkout/worktree, ensure changes are committed on resolved_head (never on main)
+    # If target_repo_dir is a real git checkout/worktree, ensure changes are committed locally on resolved_head (never main)
     if (target_repo_dir / ".git").exists():
-        # Ensure we are on resolved_head before staging/committing any modified or untracked files
+        wt_for_branch = _resolve_worktree_for_branch(target_repo_dir, resolved_head)
+        if wt_for_branch is not None:
+            target_repo_dir = wt_for_branch
+            is_worktree = (target_repo_dir / ".git").is_file()
+
         cur_branch_proc = subprocess.run(
             ["git", "-C", str(target_repo_dir), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
@@ -2734,7 +3238,7 @@ def push_remediation_branch_and_build_reviewer_plan(
                 check=False,
             )
             if proc_existing_head.returncode == 0:
-                subprocess.run(
+                co_proc = subprocess.run(
                     ["git", "-C", str(target_repo_dir), "checkout", resolved_head],
                     capture_output=True,
                     text=True,
@@ -2742,13 +3246,20 @@ def push_remediation_branch_and_build_reviewer_plan(
                     check=False,
                 )
             else:
-                subprocess.run(
+                co_proc = subprocess.run(
                     ["git", "-C", str(target_repo_dir), "checkout", "-B", resolved_head],
                     capture_output=True,
                     text=True,
                     timeout=15,
                     check=False,
                 )
+            if co_proc.returncode != 0:
+                return {
+                    "status": "error",
+                    "step": "checkout_branch",
+                    "branch_name": resolved_head,
+                    "error": (co_proc.stderr or co_proc.stdout or f"Failed to checkout {resolved_head}").strip(),
+                }
 
         stamp_repo_version_manifests(target_repo_dir, branch_timestamp=resolved_ts)
 
@@ -2767,13 +3278,20 @@ def push_remediation_branch_and_build_reviewer_plan(
                 timeout=15,
                 check=False,
             )
-            subprocess.run(
+            cm_proc = subprocess.run(
                 ["git", "-C", str(target_repo_dir), "commit", "--no-verify", "-m", commit_title, "-m", preliminary_body],
                 capture_output=True,
                 text=True,
                 timeout=30,
                 check=False,
             )
+            if cm_proc.returncode != 0:
+                return {
+                    "status": "error",
+                    "step": "local_commit",
+                    "branch_name": resolved_head,
+                    "error": (cm_proc.stderr or cm_proc.stdout or "Failed to commit changes locally").strip(),
+                }
 
         # If not an isolated worktree, ensure local main is kept at origin/main so main is never ahead of origin/main
         if not is_worktree and base_branch in ("main", "master"):
@@ -2804,14 +3322,20 @@ def push_remediation_branch_and_build_reviewer_plan(
             "branch_name": resolved_head,
             "base_branch": base_branch,
             "error": (
-                f"Refusing to push branch '{resolved_head}' because it has 0 file changes compared to '{base_branch}'. "
-                f"All proposed code changes must be committed onto '{resolved_head}' before pushing."
+                f"Refusing to stage branch '{resolved_head}' for review because it has 0 file changes compared to '{base_branch}'. "
+                f"All proposed code changes must be committed onto '{resolved_head}' first."
             ),
         }
 
+    valid_vr = _resolve_valid_verification_results(
+        lock_info,
+        target_repo_dir,
+        branch_name=resolved_head,
+        pre_commit_state=pre_commit_state,
+    )
     final_body = build_canonical_pr_description(
         commit_title=commit_title,
-        executive_summary=executive_summary,
+        executive_summary=preserved_exec_summary,
         rca_summary=rca_summary,
         proposed_fix=proposed_fix,
         custom_body=body,
@@ -2819,38 +3343,35 @@ def push_remediation_branch_and_build_reviewer_plan(
         branch_timestamp=resolved_ts,
         conversation_id=cid_clean,
         files_changed=diff_res.get("files", []),
+        verification_results=valid_vr,
     )
 
-    # Deterministically amend the HEAD commit on resolved_head so the Git commit body ALWAYS carries `## 📋 Executive Summary`
-    _sync_branch_head_commit_message(
-        target_repo_dir=target_repo_dir,
-        branch_name=resolved_head,
-        base_branch=base_branch,
-        commit_title=commit_title,
-        commit_body=final_body,
-    )
+    staged_head_sha = str(diff_res.get("head_sha") or "")
+    if (target_repo_dir / ".git").exists():
+        amend_res = _sync_branch_head_commit_message_detailed(
+            target_repo_dir=target_repo_dir,
+            branch_name=resolved_head,
+            base_branch=base_branch,
+            commit_title=commit_title,
+            commit_body=final_body,
+        )
+        if not amend_res.get("amended"):
+            return {
+                "status": "error",
+                "step": "amend_local_commit",
+                "branch_name": resolved_head,
+                "branch_pushed": False,
+                "pr_gate_ready": False,
+                "manual_pr_url": "",
+                "pr_url": "",
+                "error": str(amend_res.get("error") or "Failed to amend local HEAD commit message before review."),
+            }
+        staged_head_sha = str(amend_res.get("head_sha") or staged_head_sha)
+        if isinstance(amend_res.get("effective_repo_dir"), Path):
+            target_repo_dir = amend_res["effective_repo_dir"]
 
-    try:
-        push_res = vcs.push_branch(
-            branch_name=resolved_head,
-            remote="origin",
-            base_branch=base_branch,
-            set_upstream=True,
-            force_with_lease=True,
-            title=commit_title,
-            body=final_body,
-            repo_dir=target_repo_dir,
-        )
-    except TypeError:
-        push_res = vcs.push_branch(
-            branch_name=resolved_head,
-            remote="origin",
-            base_branch=base_branch,
-            set_upstream=True,
-            repo_dir=target_repo_dir,
-        )
-    if push_res.get("status") != "ok":
-        return push_res
+    if valid_vr and staged_head_sha:
+        valid_vr = {**valid_vr, "head_sha": staged_head_sha, "dirty": False}
 
     frontend_changed = is_frontend_change_detected(diff_res.get("files", []))
     dev_preview_url = ""
@@ -2914,24 +3435,6 @@ def push_remediation_branch_and_build_reviewer_plan(
                     os.utime(staged_asset, None)
         restart_pro_api_server(portfolio_dir=portfolio_dir)
 
-    try:
-        built_url = vcs.build_manual_pr_url(
-            head_branch=resolved_head,
-            base_branch=base_branch,
-            title=commit_title,
-            body=final_body,
-            repo_dir=target_repo_dir,
-        )
-    except TypeError:
-        built_url = vcs.build_manual_pr_url(
-            head_branch=resolved_head,
-            base_branch=base_branch,
-            title=commit_title,
-            repo_dir=target_repo_dir,
-        )
-    manual_pr_url = str(built_url or push_res.get("manual_pr_url") or "")
-    head_sha = str(push_res.get("head_sha") or diff_res.get("head_sha") or "")
-
     updated_rb = {
         str(k): dict(v)
         for k, v in (raw_rb or {}).items()
@@ -2949,30 +3452,36 @@ def push_remediation_branch_and_build_reviewer_plan(
             "branch_name": resolved_head,
             "branch_timestamp": resolved_ts,
             "target_repo_dir": _sanitize_home_paths(str(persistent_repo_dir)),
-            "manual_pr_url": manual_pr_url,
-            "branch_pushed": True,
-            "head_sha": head_sha,
+            "manual_pr_url": "",
+            "branch_pushed": False,
+            "head_sha": staged_head_sha,
             "updated_at": _utc_now_iso(),
         }
 
+    # Local-First Review: DO NOT push to origin or expose manual_pr_url until agy-code-pr-reviewer passes (>90/100)
     updated_lock = update_dev_pr_lock(
         {
             "branch_name": resolved_head,
             "branch_timestamp": resolved_ts,
             "notification_source": "Ad-Hoc",
-            "branch_pushed": True,
-            "head_sha": head_sha,
+            "branch_pushed": False,
+            "pr_gate_ready": False,
+            "reviewed_head_sha": "",
+            "staged_head_sha": staged_head_sha,
+            "head_sha": staged_head_sha,
             "target_repo_dir": _sanitize_home_paths(str(persistent_repo_dir)),
             "worktree_path": wt_recorded,
             "repo_branches": updated_rb,
-            "manual_pr_url": manual_pr_url,
-            "pr_url": manual_pr_url,
+            "manual_pr_url": "",
+            "pr_url": "",
             "frontend_changed": frontend_changed,
             "dev_preview_url": dev_preview_url,
             "pro_url": pro_url,
             "proposal_title": commit_title,
             "proposal_body": final_body,
-            "status": "BRANCH_PUSHED_AWAITING_AGENT_REVIEW",
+            "executive_summary": preserved_exec_summary,
+            "verification_results": valid_vr,
+            "status": "AWAITING_AGENT_REVIEW",
         },
         portfolio_dir=portfolio_dir,
         repo_slug=resolved_repo_slug,
@@ -2980,18 +3489,27 @@ def push_remediation_branch_and_build_reviewer_plan(
         branch_name=resolved_head,
     )
 
-    watcher_res = spawn_pr_merge_watcher_daemon(portfolio_dir=portfolio_dir)
+    if cid_clean:
+        with contextlib.suppress(Exception):
+            update_dev_queue_item_status(
+                conversation_id=cid_clean,
+                status="in_progress",
+                branch_names=[resolved_head],
+                strip_pr_urls_for_branches=[resolved_head],
+                strip_repo_slug=resolved_repo_slug,
+                portfolio_dir=portfolio_dir,
+            )
 
     reviewer_plan = build_pr_reviewer_subagent_plan(
         pr_number=None,
-        pr_url=manual_pr_url,
+        pr_url="",
         issue_number=int(resolved_issue) if resolved_issue else None,
-        issue_url=manual_pr_url,
+        issue_url="",
         conversation_id=cid_clean,
         branch_name=resolved_head,
         branch_timestamp=resolved_ts,
         rca_summary=rca_summary,
-        proposed_fix=final_body,
+        proposed_fix=preserved_exec_summary,
         scheduled=scheduled,
         workdir=str(target_repo_dir),
         repo_slug=resolved_repo_slug,
@@ -3004,11 +3522,15 @@ def push_remediation_branch_and_build_reviewer_plan(
         "commit_title": commit_title,
         "branch_name": resolved_head,
         "branch_timestamp": resolved_ts,
-        "head_sha": head_sha,
+        "head_sha": staged_head_sha,
+        "staged_head_sha": staged_head_sha,
+        "branch_pushed": False,
+        "pr_gate_ready": False,
+        "awaiting_agent_review": True,
         "returned_to_base_branch": returned_to_base,
-        "pr_merge_watcher": watcher_res,
-        "manual_pr_url": manual_pr_url,
-        "pr_url": manual_pr_url,
+        "pr_merge_watcher": {"status": "deferred_until_review_pass", "spawned": False},
+        "manual_pr_url": "",
+        "pr_url": "",
         "frontend_changed": frontend_changed,
         "dev_preview_url": dev_preview_url,
         "pro_url": pro_url,
@@ -3017,6 +3539,7 @@ def push_remediation_branch_and_build_reviewer_plan(
         "issue_number": resolved_issue,
         "files_changed": diff_res.get("files", []),
         "files_count": diff_res.get("files_count", 0),
+        "verification_results": valid_vr,
         "lock": updated_lock.get("lock", {}),
         "reviewer_subagent_definition": reviewer_plan["subagent_definition"],
         "reviewer_subagent_invocation": reviewer_plan["subagent_invocation"],
@@ -3024,8 +3547,69 @@ def push_remediation_branch_and_build_reviewer_plan(
 
 
 # ==============================================================================
-# Agent 2 (`agy-code-pr-reviewer`) Evaluation, Email Notification & Manual Gate
+# Agent 2 (`agy-code-pr-reviewer`) Evaluation, Hard PR Readiness Gate & Iteration Loop
 # ==============================================================================
+
+
+def _build_developer_remediation_plan(
+    *,
+    conversation_id: str,
+    action_id: str,
+    repo_slug: str,
+    branch_name: str,
+    workdir: str,
+    review_iteration: int,
+    verdict: str,
+    score: int,
+    reviewer_feedback: str,
+    rca_summary: str,
+    proposed_fix: str,
+    target_files: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a structured remediation brief so the orchestrator can auto-iterate `agy-code-developer`."""
+    anchored = (
+        f"Review Round {review_iteration}/{MAX_PR_REVIEW_ITERATIONS} FAILED PR Readiness Gate "
+        f"({verdict} {score}/100 — requires PASS >= {PR_REVIEW_PASS_MIN_SCORE}/100).\n"
+        f"- Worktree / Branch: `{workdir}` on `{branch_name}` (reuse active lock/worktree).\n"
+        f"- Reviewer Critique to Fix:\n{reviewer_feedback}\n"
+        f"- Required Steps: (1) address all reviewer findings in `{workdir}`, (2) add/update hermetic tests, "
+        f"(3) run `pre-commit run --all-files` + `pr_remediator.py test-local --workdir \"{workdir}\"`, "
+        f"(4) re-stage via `pr_remediator.py prepare-review --workdir \"{workdir}\" --title \"...\"`, "
+        f"(5) re-invoke `agy-code-pr-reviewer` (`Model=\"pro\"`)."
+    )
+    dev_subagent = build_code_developer_subagent_plan(
+        conversation_id=conversation_id,
+        action_id=action_id,
+        rca_summary=rca_summary,
+        proposed_fix=proposed_fix,
+        target_files=target_files,
+        scheduled=False,
+        anchored_context=anchored,
+        workdir=workdir,
+        repo_slug=repo_slug,
+    )
+    return {
+        "conversation_id": conversation_id,
+        "action_id": action_id,
+        "repo_slug": repo_slug,
+        "branch_name": branch_name,
+        "workdir": _sanitize_home_paths(workdir),
+        "review_iteration": review_iteration,
+        "max_review_iterations": MAX_PR_REVIEW_ITERATIONS,
+        "verdict": verdict,
+        "score": score,
+        "required_min_score": PR_REVIEW_PASS_MIN_SCORE,
+        "reviewer_feedback": reviewer_feedback,
+        "required_actions": [
+            f"Address reviewer findings in worktree `{_sanitize_home_paths(workdir)}` on branch `{branch_name}`.",
+            "Add or update deterministic hermetic unit tests covering every fix.",
+            f"Run `pre-commit run --all-files` and `pr_remediator.py test-local --workdir \"{_sanitize_home_paths(workdir)}\"`.",
+            f"Re-stage locally via `pr_remediator.py prepare-review --workdir \"{_sanitize_home_paths(workdir)}\" --title \"...\"`.",
+            "Re-invoke independent `agy-code-pr-reviewer` (`Model=\"pro\"`) until `ready_for_human_pr == true`.",
+        ],
+        "developer_subagent_definition": dev_subagent["subagent_definition"],
+        "developer_subagent_invocation": dev_subagent["subagent_invocation"],
+    }
 
 
 def record_pr_review_evaluation(
@@ -3042,11 +3626,23 @@ def record_pr_review_evaluation(
     workdir: Path | str | None = None,
     repo_slug: str = "",
 ) -> dict[str, Any]:
-    """Record `agy-code-pr-reviewer`'s evaluation on the pushed timestamped branch, stamp the canonical `## 📋 Executive Summary` + Reviewer Verdict into the branch commit & compare URL, keep `dev_pr_lock` active for manual validation, and send the notification email."""
+    """Record `agy-code-pr-reviewer`'s evaluation and enforce the Hard PR Readiness Gate (`PASS` AND `score > 90`).
+
+    - On non-PASS or `score <= 90`: suppresses `manual_pr_url`, keeps branch local (never pushed), increments
+      `review_iteration`, strips stale compare `pr_urls`, preserves the real Executive Summary, suppresses
+      Ready-for-PR email (rounds 1..2 -> `NEEDS_REVISION_ITERATING` + `developer_remediation_plan`;
+      round >= 3 -> `ESCALATED_MAX_REVIEW_ITERATIONS` + `hitl_blocked` + `[🟥]` escalation email when `--send-email`).
+    - On `PASS` (`score >= 91`): resolves the active worktree via `git worktree list --porcelain`, amends HEAD commit
+      with preserved Executive Summary + deterministic `## 🧪 Automated Verification Checks` + `## 🤖 Independent PR Review`,
+      pushes to `origin/<branch>` (failing loudly on any amend or push error), sets `pr_gate_ready=True`,
+      publishes rich `manual_pr_url`, transitions queue to `pr_open`, spawns `watch-pr-merge`, and sends `[🟩]` email.
+    """
     vcs = git_client or GitVcsIntegrationClient()
+    score_int = int(score)
     norm_verdict = verdict.strip().upper()
     if norm_verdict not in ("PASS", "WARN", "NEEDS_REVISION"):
-        norm_verdict = "PASS" if score >= 90 else "NEEDS_REVISION"
+        norm_verdict = "PASS" if score_int >= PR_REVIEW_PASS_MIN_SCORE else "NEEDS_REVISION"
+    gate_passed = (norm_verdict == "PASS") and (score_int >= PR_REVIEW_PASS_MIN_SCORE)
 
     lock_info = get_dev_pr_lock(
         portfolio_dir=portfolio_dir,
@@ -3068,7 +3664,8 @@ def record_pr_review_evaluation(
     act_id = str(lock_info.get("action_id") or "")
     rca_summary = str(lock_info.get("summary") or "")
     proposed_fix = str(lock_info.get("proposed_fix") or "")
-    head_sha = str(lock_info.get("head_sha") or "")
+    lock_exec_summary = str(lock_info.get("executive_summary") or "").strip()
+    head_sha = str(lock_info.get("head_sha") or lock_info.get("staged_head_sha") or "")
 
     wt_str = str(workdir or lock_info.get("worktree_path") or "").strip()
     wt_expanded = Path(wt_str.replace("$HOME", str(Path.home()))).expanduser() if wt_str else None
@@ -3118,7 +3715,7 @@ def record_pr_review_evaluation(
 
     existing_commit_subject = ""
     existing_commit_body = ""
-    if not lock_info.get("active") and isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists():
+    if isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists():
         for ref_cand in (resolved_branch, f"origin/{resolved_branch}"):
             proc_log = subprocess.run(
                 ["git", "-C", str(target_repo_dir), "log", "-1", "--format=%s%x00%b", ref_cand],
@@ -3134,6 +3731,15 @@ def record_pr_review_evaluation(
                     existing_commit_subject = subj_cand
                     existing_commit_body = log_parts[1].strip() if len(log_parts) > 1 else ""
                     break
+        proc_cur_sha = subprocess.run(
+            ["git", "-C", str(target_repo_dir), "rev-parse", "--verify", resolved_branch],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc_cur_sha.returncode == 0 and (proc_cur_sha.stdout or "").strip():
+            head_sha = (proc_cur_sha.stdout or "").strip()
 
     proposal_title = (
         str(lock_info.get("proposal_title") or "").strip()
@@ -3161,12 +3767,35 @@ def record_pr_review_evaluation(
         if m_exec and m_exec.group(1).strip():
             existing_exec_summary = m_exec.group(1).strip()
 
+    # Strictly preserve real Executive Summary — NEVER overwrite it with reviewer critique `summary`
     resolved_exec_summary = (
-        executive_summary.strip()
+        _sanitize_home_paths(executive_summary.strip())
+        or lock_exec_summary
         or (proposed_fix if proposed_fix and not proposed_fix.startswith("Inspect the failing CLI command flags") else "")
         or (rca_summary if rca_summary and rca_summary != "Tool/step execution error" else "")
         or existing_exec_summary
-        or summary.strip()
+        or proposal_title
+    )
+
+    current_iteration = int(lock_info.get("review_iteration") or 0) + 1
+    existing_history = list(lock_info.get("review_history") or [])
+    now_iso = _utc_now_iso()
+    review_entry = {
+        "iteration": current_iteration,
+        "verdict": norm_verdict,
+        "score": score_int,
+        "gate_passed": gate_passed,
+        "summary": _sanitize_home_paths(summary.strip()),
+        "reviewer_subagent_id": reviewer_subagent_id.strip(),
+        "head_sha": head_sha,
+        "evaluated_at_utc": now_iso,
+    }
+    updated_history = [*existing_history, review_entry]
+
+    valid_vr = _resolve_valid_verification_results(
+        lock_info,
+        target_repo_dir,
+        branch_name=resolved_branch,
     )
 
     canonical_pr_body = build_canonical_pr_description(
@@ -3178,21 +3807,239 @@ def record_pr_review_evaluation(
         branch_timestamp=resolved_ts,
         conversation_id=cid_clean,
         files_changed=files_changed,
+        verification_results=valid_vr,
         reviewer_verdict=norm_verdict,
-        reviewer_score=int(score),
+        reviewer_score=score_int,
         reviewer_summary=summary.strip(),
         reviewer_subagent_id=reviewer_subagent_id.strip(),
+        review_iteration=current_iteration,
+        max_review_iterations=MAX_PR_REVIEW_ITERATIONS,
     )
 
-    if lock_info.get("active") and isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists():
-        amended = _sync_branch_head_commit_message(
+    created_by_label = f"{PR_DEVELOPER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL}) · {PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL})"
+    validator_banner_label = (
+        f"{PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL}) [{norm_verdict} {score_int}/100 · Round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS}]"
+    )
+    recorded_subagents = _normalize_str_list(
+        [*(lock_info.get("subagent_conversation_ids") or []), reviewer_subagent_id.strip()]
+    )
+
+    raw_rb = lock_info.get("repo_branches") if isinstance(lock_info.get("repo_branches"), dict) else {}
+    updated_rb = {
+        str(k): dict(v)
+        for k, v in (raw_rb or {}).items()
+        if str(k).strip() and isinstance(v, dict)
+    }
+
+    # ==========================================================================
+    # HARD GATE PATH A: Review FAILED (non-PASS or score <= 90)
+    # ==========================================================================
+    if not gate_passed:
+        circuit_breaker_tripped = current_iteration >= MAX_PR_REVIEW_ITERATIONS
+        lock_status_next = "ESCALATED_MAX_REVIEW_ITERATIONS" if circuit_breaker_tripped else "NEEDS_REVISION_ITERATING"
+        queue_status_next = "hitl_blocked" if circuit_breaker_tripped else "in_progress"
+        badge = "🟧 WARN" if norm_verdict == "WARN" else "🟥 NEEDS_REVISION"
+        worktree_for_plan = str(
+            lock_info.get("worktree_path")
+            or (str(target_repo_dir) if target_repo_dir is not None else "")
+        )
+
+        developer_remediation_plan = _build_developer_remediation_plan(
+            conversation_id=cid_clean or resolved_ts,
+            action_id=act_id,
+            repo_slug=resolved_repo_slug,
+            branch_name=resolved_branch,
+            workdir=worktree_for_plan,
+            review_iteration=current_iteration,
+            verdict=norm_verdict,
+            score=score_int,
+            reviewer_feedback=summary.strip(),
+            rca_summary=rca_summary,
+            proposed_fix=proposed_fix,
+            target_files=list(lock_info.get("target_files") or []),
+        )
+
+        review_markdown = (
+            f"### {'🚨' if circuit_breaker_tripped else '🔁'} Branch Review Gate NOT Passed (`{PR_REVIEWER_SUBAGENT_NAME}` · `{PR_SUBAGENT_MODEL}`)\n\n"
+            f"- **Branch Status**: `{lock_status_next}` (NOT pushed to `origin`, `manual_pr_url` suppressed)\n"
+            f"- **Local Branch**: `{resolved_branch}` (Timestamp `{resolved_ts}`)\n"
+            f"- **Verdict**: **{badge}** (`{score_int}/100` — requires `PASS >= {PR_REVIEW_PASS_MIN_SCORE}/100`)\n"
+            f"- **Review Round**: `{current_iteration}/{MAX_PR_REVIEW_ITERATIONS}`\n"
+            f"- **Evaluated At (UTC)**: `{now_iso}`\n"
+            + (f"- **Reviewer Subagent ID**: `{reviewer_subagent_id}`\n" if reviewer_subagent_id else "")
+            + f"\n{canonical_pr_body}\n"
+        )
+
+        if lock_info.get("active"):
+            if resolved_repo_slug and resolved_repo_slug in updated_rb:
+                updated_rb[resolved_repo_slug]["manual_pr_url"] = ""
+                updated_rb[resolved_repo_slug]["branch_pushed"] = False
+                updated_rb[resolved_repo_slug]["updated_at"] = now_iso
+            update_dev_pr_lock(
+                {
+                    "status": lock_status_next,
+                    "branch_action": lock_status_next,
+                    "branch_pushed": False,
+                    "pr_gate_ready": False,
+                    "reviewed_head_sha": "",
+                    "manual_pr_url": "",
+                    "pr_url": "",
+                    "repo_branches": updated_rb,
+                    "proposal_title": proposal_title,
+                    "executive_summary": resolved_exec_summary,
+                    "review_iteration": current_iteration,
+                    "review_history": updated_history,
+                    "reviewer_verdict": norm_verdict,
+                    "reviewer_score": score_int,
+                    "reviewer_summary": summary.strip(),
+                    "reviewer_subagent_id": reviewer_subagent_id.strip(),
+                    "subagent_conversation_ids": recorded_subagents,
+                    "review_markdown": review_markdown,
+                },
+                portfolio_dir=portfolio_dir,
+                repo_slug=resolved_repo_slug,
+                workdir=target_repo_dir,
+                branch_name=resolved_branch,
+            )
+            if cid_clean:
+                with contextlib.suppress(Exception):
+                    update_dev_queue_item_status(
+                        conversation_id=cid_clean,
+                        status=queue_status_next,
+                        branch_names=[resolved_branch],
+                        strip_pr_urls_for_branches=[resolved_branch],
+                        strip_repo_slug=resolved_repo_slug,
+                        subagent_conversation_ids=recorded_subagents,
+                        notes=(
+                            f"Circuit breaker tripped after {current_iteration}/{MAX_PR_REVIEW_ITERATIONS} failed review rounds "
+                            f"(last: {norm_verdict} {score_int}/100); requires HITL intervention."
+                            if circuit_breaker_tripped
+                            else f"Review round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS} returned {norm_verdict} ({score_int}/100); auto-iterating."
+                        ),
+                        portfolio_dir=portfolio_dir,
+                    )
+
+        email_sent = False
+        email_subject = (
+            f"[ESCALATION] Max Review Iterations ({current_iteration}/{MAX_PR_REVIEW_ITERATIONS}) Reached: "
+            f"{resolved_branch} [{resolved_ts}] ({norm_verdict} {score_int}/100)"
+            if circuit_breaker_tripped
+            else f"Review Iteration {current_iteration}/{MAX_PR_REVIEW_ITERATIONS} ({norm_verdict} {score_int}/100) — {resolved_branch}"
+        )
+        # Suppress Ready-for-PR email during rounds 1..2; ONLY dispatch [🟥] escalation alert at round >= 3
+        if circuit_breaker_tripped and send_email:
+            history_lines = "\n".join(
+                f"  - Round {h.get('iteration')}: **{h.get('verdict')} ({h.get('score')}/100)** — {h.get('summary')}"
+                for h in updated_history
+            )
+            esc_body = (
+                f"# 🚨 Escalation: PR Review Circuit Breaker Tripped (`{resolved_branch}` · `{resolved_ts}`)\n\n"
+                f"Branch **`{resolved_branch}`** failed `{PR_REVIEWER_SUBAGENT_NAME}` across "
+                f"**`{current_iteration}/{MAX_PR_REVIEW_ITERATIONS}`** consecutive rounds and was **NOT pushed to `origin`** "
+                f"(`pr_gate_ready=False`, `dev_queue.json` status=`hitl_blocked`).\n\n"
+                f"- **Repository**: `{resolved_repo_slug}`\n"
+                f"- **Conversation ID**: `{cid_clean}`\n"
+                f"- **Latest Verdict**: **{badge} ({score_int}/100)** (requires `PASS >= {PR_REVIEW_PASS_MIN_SCORE}/100`)\n"
+                f"- **Local Worktree**: `{_sanitize_home_paths(worktree_for_plan)}`\n\n"
+                f"## Review Iteration History\n{history_lines}\n\n"
+                f"## Next Steps (HITL)\n"
+                f"- Inspect local worktree `{_sanitize_home_paths(worktree_for_plan)}` to resolve findings manually, OR\n"
+                f"- Reject and unlock via: `pr_remediator.py evaluate-branch --branch \"{resolved_branch}\" --decision reject --comment \"Escalated after max review rounds\"`\n"
+            )
+            notify_res = dev_common.try_send_branch_review_notification(
+                status="KO",
+                subject=email_subject,
+                body=esc_body,
+                conversation_id=cid_clean or resolved_ts,
+                validator=validator_banner_label,
+                branch_name=resolved_branch,
+                errors_only_override=False,
+            )
+            email_sent = bool(notify_res.get("sent"))
+
+        return {
+            "status": "ok",
+            "vcs_mode": "native_git",
+            "repo_slug": resolved_repo_slug,
+            "branch_action": lock_status_next,
+            "notification_source": "Ad-Hoc",
+            "email_subject": email_subject,
+            "created_by": created_by_label,
+            "branch_name": resolved_branch,
+            "branch_timestamp": resolved_ts,
+            "head_sha": head_sha,
+            "manual_pr_url": "",
+            "pr_url": "",
+            "pr_gate_ready": False,
+            "ready_for_human_pr": False,
+            "branch_pushed": False,
+            "needs_reiteration": not circuit_breaker_tripped,
+            "circuit_breaker_tripped": circuit_breaker_tripped,
+            "review_iteration": current_iteration,
+            "max_review_iterations": MAX_PR_REVIEW_ITERATIONS,
+            "review_history": updated_history,
+            "pr_number": int(pr_number or 0),
+            "verdict": norm_verdict,
+            "score": score_int,
+            "review_markdown": review_markdown,
+            "notification_email_sent": email_sent,
+            "developer_remediation_plan": developer_remediation_plan,
+            "pr_merge_watcher": {"status": "skipped", "spawned": False},
+        }
+
+    # ==========================================================================
+    # HARD GATE PATH B: Review PASSED (`verdict == "PASS"` AND `score > 90`)
+    # ==========================================================================
+    effective_repo_dir = target_repo_dir
+    branch_published = False
+    if lock_info.get("active"):
+        if not isinstance(target_repo_dir, Path) or not (target_repo_dir / ".git").exists():
+            return {
+                "status": "error",
+                "step": "resolve_repo_dir",
+                "ready_for_human_pr": False,
+                "pr_gate_ready": False,
+                "branch_pushed": False,
+                "manual_pr_url": "",
+                "pr_url": "",
+                "branch_name": resolved_branch,
+                "verdict": norm_verdict,
+                "score": score_int,
+                "error": f"Cannot amend and publish branch '{resolved_branch}': git repository directory not found ({target_repo_dir}).",
+            }
+
+        amend_res = _sync_branch_head_commit_message_detailed(
             target_repo_dir=target_repo_dir,
             branch_name=resolved_branch,
             base_branch="main",
             commit_title=proposal_title,
             commit_body=canonical_pr_body,
         )
-        if amended:
+        if not amend_res.get("amended"):
+            return {
+                "status": "error",
+                "step": "amend_commit_message",
+                "ready_for_human_pr": False,
+                "pr_gate_ready": False,
+                "branch_pushed": False,
+                "manual_pr_url": "",
+                "pr_url": "",
+                "branch_name": resolved_branch,
+                "verdict": norm_verdict,
+                "score": score_int,
+                "error": str(amend_res.get("error") or f"Failed to amend HEAD commit message on '{resolved_branch}'."),
+            }
+
+        effective_repo_dir = (
+            amend_res["effective_repo_dir"]
+            if isinstance(amend_res.get("effective_repo_dir"), Path)
+            else target_repo_dir
+        )
+        amended_head_sha = str(amend_res.get("head_sha") or head_sha)
+        if valid_vr and amended_head_sha:
+            valid_vr = {**valid_vr, "head_sha": amended_head_sha, "dirty": False}
+
+        try:
             try:
                 push_amend = vcs.push_branch(
                     branch_name=resolved_branch,
@@ -3202,22 +4049,61 @@ def record_pr_review_evaluation(
                     force_with_lease=True,
                     title=proposal_title,
                     body=canonical_pr_body,
-                    repo_dir=target_repo_dir,
+                    repo_dir=effective_repo_dir,
                 )
-                if isinstance(push_amend, dict) and push_amend.get("head_sha"):
-                    head_sha = str(push_amend.get("head_sha") or head_sha)
-            except Exception:
-                pass
+            except TypeError:
+                push_amend = vcs.push_branch(
+                    branch_name=resolved_branch,
+                    remote="origin",
+                    base_branch="main",
+                    set_upstream=True,
+                    repo_dir=effective_repo_dir,
+                )
+        except Exception as exc:
+            push_amend = {"status": "error", "error": str(exc)}
+
+        if not isinstance(push_amend, dict) or push_amend.get("status") != "ok":
+            return {
+                "status": "error",
+                "step": "push_branch",
+                "ready_for_human_pr": False,
+                "pr_gate_ready": False,
+                "branch_pushed": False,
+                "manual_pr_url": "",
+                "pr_url": "",
+                "branch_name": resolved_branch,
+                "verdict": norm_verdict,
+                "score": score_int,
+                "error": str((push_amend or {}).get("error") or f"Failed to push verified branch '{resolved_branch}' to origin."),
+                "push_result": push_amend if isinstance(push_amend, dict) else {},
+            }
+
+        branch_published = True
+        head_sha = str(push_amend.get("head_sha") or amended_head_sha or head_sha)
+        if valid_vr and head_sha:
+            valid_vr = {**valid_vr, "head_sha": head_sha, "dirty": False}
+        review_entry["head_sha"] = head_sha
+        updated_history[-1] = review_entry
+
+        # Keep primary checkout on main if this was a non-worktree checkout
+        if (effective_repo_dir / ".git").is_dir():
+            subprocess.run(
+                ["git", "-C", str(effective_repo_dir), "checkout", "main"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
 
     built_url = ""
-    if isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists():
+    if isinstance(effective_repo_dir, Path) and (effective_repo_dir / ".git").exists():
         try:
             built_url = vcs.build_manual_pr_url(
                 head_branch=resolved_branch,
                 base_branch="main",
                 title=proposal_title,
                 body=canonical_pr_body,
-                repo_dir=target_repo_dir,
+                repo_dir=effective_repo_dir,
             )
         except TypeError:
             built_url = vcs.build_manual_pr_url(head_branch=resolved_branch, base_branch="main")
@@ -3228,53 +4114,69 @@ def record_pr_review_evaluation(
         or ""
     )
 
-    badge = "🟢 PASS" if norm_verdict == "PASS" else ("🟧 WARN" if norm_verdict == "WARN" else "🟥 NEEDS_REVISION")
-    created_by_label = f"{PR_DEVELOPER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL}) · {PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL})"
-    validator_banner_label = (
-        f"{PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL}) [{norm_verdict} {int(score)}/100]"
-    )
+    badge = "🟢 PASS"
     review_markdown = (
-        f"### 🛡️ New Branch Created & Evaluated (`{PR_REVIEWER_SUBAGENT_NAME}` · `{PR_SUBAGENT_MODEL}`)\n\n"
+        f"### 🛡️ New Branch Validated & Published (`{PR_REVIEWER_SUBAGENT_NAME}` · `{PR_SUBAGENT_MODEL}`)\n\n"
         f"- **Branch Action**: **NEW BRANCH CREATED** (`origin/{resolved_branch}`)\n"
         f"- **New Branch Created**: `{resolved_branch}`\n"
         f"- **Created & Validated By**: `{created_by_label}`\n"
         f"- **Branch Timestamp**: `{resolved_ts}`\n"
         f"- **Proposed Branch**: `{resolved_branch}`\n"
-        f"- **Verdict**: **{badge}** (`{int(score)}/100`)\n"
-        f"- **Evaluated At (UTC)**: `{_utc_now_iso()}`\n"
+        f"- **Verdict**: **{badge}** (`{score_int}/100` · Round `{current_iteration}/{MAX_PR_REVIEW_ITERATIONS}`)\n"
+        f"- **Evaluated At (UTC)**: `{now_iso}`\n"
         + (f"- **Reviewer Subagent ID**: `{reviewer_subagent_id}`\n" if reviewer_subagent_id else "")
         + f"\n{canonical_pr_body}\n"
         f"---\n"
-        f"**Manual Pull Request Gate (`dev_pr_lock` ACTIVE)**:\n"
+        f"**Manual Pull Request Gate (`dev_pr_lock` ACTIVE · `pr_gate_ready=True`)**:\n"
         f"1. Compare `{resolved_branch}` against `main` and manually create the Pull Request / Merge Request in your VCS:\n"
         f"   - Compare / Create Manual PR: {manual_pr_url}\n"
         f"   - Native Git Diff: `git fetch origin && git diff origin/main...origin/{resolved_branch}`\n"
-        f"2. While `{resolved_branch}` (`{resolved_ts}`) is pending your evaluation, **no other agent or conversation can make code changes**.\n"
+        f"2. While `{resolved_branch}` (`{resolved_ts}`) is pending your evaluation, **no other agent or conversation can make code changes in `{resolved_repo_slug}`**.\n"
         f"3. Once you create/merge the Pull Request (or decide to reject this branch), release the lock via:\n"
         f"   - Approve (PR Created / Merged): `pr_remediator.py evaluate-branch --branch \"{resolved_branch}\" --decision approve --comment \"<your comment>\"`\n"
         f"   - Reject (Delete Branch & Unlock): `pr_remediator.py evaluate-branch --branch \"{resolved_branch}\" --decision reject --comment \"<your comment>\"`\n"
     )
 
     if lock_info.get("active"):
-        recorded_subagents = _normalize_str_list(
-            [*(lock_info.get("subagent_conversation_ids") or []), reviewer_subagent_id.strip()]
+        persistent_repo_dir = (
+            _resolve_main_git_repo_root(effective_repo_dir)
+            if isinstance(effective_repo_dir, Path)
+            else lock_main_dir
         )
+        if resolved_repo_slug:
+            updated_rb[resolved_repo_slug] = {
+                "repo_slug": resolved_repo_slug,
+                "branch_name": resolved_branch,
+                "branch_timestamp": resolved_ts,
+                "target_repo_dir": _sanitize_home_paths(str(persistent_repo_dir or "")),
+                "manual_pr_url": manual_pr_url,
+                "branch_pushed": True,
+                "head_sha": head_sha,
+                "updated_at": now_iso,
+            }
         update_dev_pr_lock(
             {
                 "status": "PENDING_HUMAN_PR_VALIDATION",
                 "branch_action": "NEW_BRANCH_CREATED",
                 "branch_pushed": True,
+                "pr_gate_ready": True,
+                "reviewed_head_sha": head_sha,
                 "notification_source": "Ad-Hoc",
                 "created_by": created_by_label,
                 "branch_name": resolved_branch,
                 "branch_timestamp": resolved_ts,
                 "head_sha": head_sha,
+                "repo_branches": updated_rb,
                 "manual_pr_url": manual_pr_url,
                 "pr_url": manual_pr_url,
                 "proposal_title": proposal_title,
                 "proposal_body": canonical_pr_body,
+                "executive_summary": resolved_exec_summary,
+                "verification_results": valid_vr,
+                "review_iteration": current_iteration,
+                "review_history": updated_history,
                 "reviewer_verdict": norm_verdict,
-                "reviewer_score": int(score),
+                "reviewer_score": score_int,
                 "reviewer_summary": summary.strip(),
                 "reviewer_subagent_id": reviewer_subagent_id.strip(),
                 "subagent_conversation_ids": recorded_subagents,
@@ -3282,7 +4184,7 @@ def record_pr_review_evaluation(
             },
             portfolio_dir=portfolio_dir,
             repo_slug=resolved_repo_slug,
-            workdir=target_repo_dir,
+            workdir=effective_repo_dir,
             branch_name=resolved_branch,
         )
         if cid_clean:
@@ -3323,34 +4225,33 @@ def record_pr_review_evaluation(
                     "manual_pr_url": manual_pr_url,
                     "created_by": created_by_label,
                     "reviewer_verdict": norm_verdict,
-                    "reviewer_score": int(score),
+                    "reviewer_score": score_int,
+                    "review_iteration": current_iteration,
                     "summary": (
-                        f"New branch created by {PR_DEVELOPER_SUBAGENT_NAME} / {PR_REVIEWER_SUBAGENT_NAME}: "
-                        f"{resolved_branch} [{resolved_ts}] ({norm_verdict} {int(score)}/100) — pending manual PR validation."
+                        f"New branch validated & published by {PR_DEVELOPER_SUBAGENT_NAME} / {PR_REVIEWER_SUBAGENT_NAME}: "
+                        f"{resolved_branch} [{resolved_ts}] ({norm_verdict} {score_int}/100, round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS}) — ready for manual PR."
                     ),
-                    "updated_at": _utc_now_iso(),
+                    "updated_at": now_iso,
                 }
                 dev_common.try_sync_actions_ledger_verdicts({cid_clean: updated_verdict}, state_dir=p_dir)
                 audit_state.pop("audited_runs", None)
                 state_obj["actions_log_audit_state"] = audit_state
                 tmp_path = state_path.with_suffix(".tmp")
                 tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                try:
+                with contextlib.suppress(OSError):
                     os.chmod(tmp_path, 0o600)
-                except OSError:
-                    pass
                 os.replace(tmp_path, state_path)
 
     email_sent = False
     email_subject = (
         f"New Branch Created (by {PR_REVIEWER_SUBAGENT_NAME}): "
-        f"Branch {resolved_branch} [{resolved_ts}] Ready for Manual PR ({norm_verdict} {int(score)}/100)"
+        f"Branch {resolved_branch} [{resolved_ts}] Ready for Manual PR ({norm_verdict} {score_int}/100)"
     )
 
     if send_email:
         email_body = (
-            f"# 🌿 New Branch Created by `{PR_DEVELOPER_SUBAGENT_NAME}` / `{PR_REVIEWER_SUBAGENT_NAME}`: `{resolved_branch}` (`{resolved_ts}`)\n\n"
-            f"A **new timestamped Git branch** **`{resolved_branch}`** (`{resolved_ts}`) has been created and pushed via native Git "
+            f"# 🌿 New Branch Validated & Published by `{PR_DEVELOPER_SUBAGENT_NAME}` / `{PR_REVIEWER_SUBAGENT_NAME}`: `{resolved_branch}` (`{resolved_ts}`)\n\n"
+            f"A **new timestamped Git branch** **`{resolved_branch}`** (`{resolved_ts}`) passed independent review and has been published via native Git "
             f"(`git_client.py` — never merged directly into `main`) following implementation by **`{PR_DEVELOPER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL})`** "
             f"and independent review by **`{PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL})`**:\n\n"
             f"- **Branch Action**: **NEW BRANCH CREATED (`origin/{resolved_branch}`)**\n"
@@ -3363,10 +4264,10 @@ def record_pr_review_evaluation(
             f"- **Conversation ID**: `{cid_clean}`\n"
             + (f"- **Root Cause (RCA)**: {rca_summary}\n" if rca_summary else "")
             + (f"- **Proposed Solution**: {proposed_fix}\n" if proposed_fix else "")
-            + f"- **Review Verdict (`{PR_REVIEWER_SUBAGENT_NAME}`)**: **{badge} ({int(score)}/100)**\n"
+            + f"- **Review Verdict (`{PR_REVIEWER_SUBAGENT_NAME}`)**: **{badge} ({score_int}/100 · Round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS})**\n"
             f"- **Evaluation Details**: {summary.strip()}\n"
             f"- **Concurrency Lock (`dev_pr_lock`)**: `ACTIVE (PENDING_HUMAN_PR_VALIDATION)` — "
-            f"No other code changes are permitted until you evaluate this newly created branch (by creating the Pull Request manually or rejecting it).\n\n"
+            f"No other code changes are permitted in `{resolved_repo_slug}` until you evaluate this newly created branch.\n\n"
             f"{canonical_pr_body}\n"
             f"## 🚀 How to Compare with `main`, Create the Manual Pull Request & Release the Lock\n"
             f"1. Compare the newly created branch against `main` and create the Pull Request manually at [{manual_pr_url}]({manual_pr_url}) (or run `git fetch origin && git diff origin/main...origin/{resolved_branch}`).\n"
@@ -3376,7 +4277,7 @@ def record_pr_review_evaluation(
             f"   `pr_remediator.py evaluate-branch --branch \"{resolved_branch}\" --decision reject --comment \"Branch rejected\"`"
         )
         notify_res = dev_common.try_send_branch_review_notification(
-            status="OK" if norm_verdict == "PASS" else ("WARN" if norm_verdict == "WARN" else "KO"),
+            status="OK",
             subject=email_subject,
             body=email_body,
             conversation_id=cid_clean or resolved_ts,
@@ -3389,7 +4290,7 @@ def record_pr_review_evaluation(
     ask_question_prompt = {
         "question": (
             f"New Branch Created ({resolved_branch}, Timestamp: {resolved_ts}) by {PR_REVIEWER_SUBAGENT_NAME}: "
-            f"{norm_verdict} ({int(score)}/100). Have you validated the new branch to create the Pull Request manually, or do you want to reject it?"
+            f"{norm_verdict} ({score_int}/100). Have you validated the new branch to create the Pull Request manually, or do you want to reject it?"
         ),
         "options": [
             f"(Recommended) Approve New Branch {resolved_branch} [{resolved_ts}] (Manual PR created/merged — release dev_pr_lock)",
@@ -3414,12 +4315,23 @@ def record_pr_review_evaluation(
     return {
         "status": "ok",
         "vcs_mode": "native_git",
+        "repo_slug": resolved_repo_slug,
         "branch_action": "NEW_BRANCH_CREATED",
         "notification_source": "Ad-Hoc",
         "email_subject": email_subject,
         "created_by": created_by_label,
         "branch_name": resolved_branch,
         "branch_timestamp": resolved_ts,
+        "head_sha": head_sha,
+        "reviewed_head_sha": head_sha if lock_info.get("active") else "",
+        "branch_pushed": branch_published if lock_info.get("active") else bool(lock_info.get("branch_pushed")),
+        "pr_gate_ready": True,
+        "ready_for_human_pr": True,
+        "needs_reiteration": False,
+        "circuit_breaker_tripped": False,
+        "review_iteration": current_iteration,
+        "max_review_iterations": MAX_PR_REVIEW_ITERATIONS,
+        "review_history": updated_history,
         "manual_pr_url": manual_pr_url,
         "pr_url": manual_pr_url,
         "frontend_changed": frontend_changed,
@@ -3427,7 +4339,7 @@ def record_pr_review_evaluation(
         "pro_url": pro_url,
         "pr_number": int(pr_number or 0),
         "verdict": norm_verdict,
-        "score": int(score),
+        "score": score_int,
         "review_markdown": review_markdown,
         "notification_email_sent": email_sent,
         "pr_merge_watcher": watcher_res,
@@ -3445,8 +4357,12 @@ def evaluate_branch_and_release_lock(
     git_client: GitVcsIntegrationClient | None = None,
     repo_slug: str = "",
     workdir: Path | str | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Execute the manual validation gate: record user decision (`approve` after manual PR creation/merge, or `reject` to delete the branch via native `git`) and release the scoped repository lock."""
+    """Execute the manual validation gate: record user decision (`approve` after manual PR creation/merge, or `reject` to delete the branch via native `git`) and release the scoped repository lock.
+
+    Enforces `pr_gate_ready == True` and `reviewed_head_sha == head_sha` on `approve` unless `force=True` is passed explicitly.
+    """
     vcs = git_client or GitVcsIntegrationClient()
     norm_decision = decision.strip().lower()
     if norm_decision not in ("approve", "merge", "reject", "close"):
@@ -3484,6 +4400,57 @@ def evaluate_branch_and_release_lock(
     )
 
     if norm_decision in ("approve", "merge"):
+        if lock_info.get("active") and not force:
+            if not bool(lock_info.get("pr_gate_ready")):
+                return {
+                    "status": "error",
+                    "vcs_mode": "native_git",
+                    "repo_slug": resolved_slug,
+                    "decision": "blocked_pr_gate_not_ready",
+                    "branch_name": resolved_branch,
+                    "lock_released": False,
+                    "error": (
+                        f"Refusing to approve branch '{resolved_branch}': PR readiness gate has not passed "
+                        f"(pr_gate_ready=False, status={lock_info.get('status')}). Run agy-code-pr-reviewer "
+                        f"(PASS >= {PR_REVIEW_PASS_MIN_SCORE}/100) via `record-review` first, or pass `--force` explicitly."
+                    ),
+                }
+            reviewed_sha = str(lock_info.get("reviewed_head_sha") or "").strip()
+            live_head_sha = str(lock_info.get("head_sha") or "").strip()
+            probe_dirs: list[Path] = []
+            wt_raw = str(lock_info.get("worktree_path") or "").strip()
+            if wt_raw:
+                probe_dirs.append(Path(wt_raw.replace("$HOME", str(Path.home()))).expanduser())
+            if lock_repo_dir is not None:
+                probe_dirs.append(lock_repo_dir)
+            for p_dir_cand in probe_dirs:
+                if p_dir_cand.exists() and (p_dir_cand / ".git").exists() and resolved_branch:
+                    sha_proc = subprocess.run(
+                        ["git", "-C", str(p_dir_cand), "rev-parse", "--verify", resolved_branch],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                    )
+                    if sha_proc.returncode == 0 and (sha_proc.stdout or "").strip():
+                        live_head_sha = (sha_proc.stdout or "").strip()
+                        break
+            if not reviewed_sha or (live_head_sha and reviewed_sha != live_head_sha):
+                return {
+                    "status": "error",
+                    "vcs_mode": "native_git",
+                    "repo_slug": resolved_slug,
+                    "decision": "blocked_unreviewed_commits",
+                    "branch_name": resolved_branch,
+                    "reviewed_head_sha": reviewed_sha,
+                    "head_sha": live_head_sha,
+                    "lock_released": False,
+                    "error": (
+                        f"Refusing to approve branch '{resolved_branch}': current HEAD SHA '{live_head_sha[:12]}' "
+                        f"does not match reviewed_head_sha '{reviewed_sha[:12]}'. Re-run agy-code-pr-reviewer "
+                        f"or pass `--force` explicitly."
+                    ),
+                }
         repo_sync = (
             vcs.sync_and_clean_local_repo(base_branch="main")
             if hasattr(vcs, "sync_and_clean_local_repo")
@@ -3846,7 +4813,7 @@ def enqueue_dev_queue_item(
             "proposed_fix": _sanitize_home_paths(proposed_fix.strip()) or str(existing.get("proposed_fix") or ""),
             "target_files": _normalize_str_list([*(existing.get("target_files") or []), *(target_files or [])]),
             "branch_names": _normalize_str_list([*(existing.get("branch_names") or []), *(branch_names or [])]),
-            "pr_urls": _normalize_str_list([*(existing.get("pr_urls") or []), *(pr_urls or [])]),
+            "pr_urls": _dedupe_richest_pr_urls([*(existing.get("pr_urls") or []), *(pr_urls or [])]),
             "subagent_conversation_ids": _normalize_str_list(
                 [*(existing.get("subagent_conversation_ids") or []), *(subagent_conversation_ids or [])]
             ),
@@ -3886,8 +4853,11 @@ def update_dev_queue_item_status(
     notes: str | None = None,
     orchestrator_conversation_id: str = "",
     portfolio_dir: Path | str | None = None,
+    *,
+    strip_pr_urls_for_branches: list[str] | None = None,
+    strip_repo_slug: str = "",
 ) -> dict[str, Any]:
-    """Transition an existing `dev_queue.json` entry to `status` and append branch/PR/subagent artifacts."""
+    """Transition an existing `dev_queue.json` entry to `status`, append artifacts, and deduplicate `pr_urls` keeping the richest verified URL per `(repo_slug, branch_name)`."""
     cid_clean = str(conversation_id or "").strip()
     norm_status = str(status or "").strip().lower()
     if norm_status not in DEV_QUEUE_STATUSES:
@@ -3913,7 +4883,11 @@ def update_dev_queue_item_status(
         item = dict(items[idx])
         item["status"] = norm_status
         item["branch_names"] = _normalize_str_list([*(item.get("branch_names") or []), *(branch_names or [])])
-        item["pr_urls"] = _normalize_str_list([*(item.get("pr_urls") or []), *(pr_urls or [])])
+        item["pr_urls"] = _dedupe_richest_pr_urls(
+            [*(item.get("pr_urls") or []), *(pr_urls or [])],
+            strip_branches=strip_pr_urls_for_branches,
+            strip_repo_slug=strip_repo_slug,
+        )
         item["subagent_conversation_ids"] = _normalize_str_list(
             [*(item.get("subagent_conversation_ids") or []), *(subagent_conversation_ids or [])]
         )
@@ -3938,7 +4912,114 @@ _STALE_PR_COMPARE_MARKERS = (
     "/-/merge_requests/new",
     "/pull-requests/new",
 )
+_CREATED_PR_URL_RE = re.compile(
+    r"^(.*?)/(?:pull|pull-requests|-/merge_requests)/(\d+)(?:/|$)",
+    re.IGNORECASE,
+)
 _MERGED_LOCK_RELEASE_REASONS = ("BRANCH_MERGED_INTO_MAIN", "HUMAN_VALIDATED_MANUAL_PR")
+
+
+def _extract_created_pr_repo_and_number(raw_url: str) -> tuple[str, str]:
+    """Return `(normalized_repo_slug, pr_number)` if `raw_url` is a created PR/MR URL, else `('', '')`."""
+    url_str = str(raw_url or "").strip()
+    if not url_str:
+        return "", ""
+    parsed = urllib.parse.urlsplit(url_str)
+    path = parsed.path or ""
+    m = _CREATED_PR_URL_RE.match(path)
+    if not m:
+        return "", ""
+    parts = [p for p in m.group(1).strip("/").split("/") if p]
+    slug = dev_common.normalize_repo_slug(f"{parts[-2]}/{parts[-1]}") if len(parts) >= 2 else ""
+    return slug, m.group(2)
+
+
+def _score_pr_url_richness(raw_url: str) -> tuple[int, int]:
+    """Rank PR/Compare URL richness: created `/pull/` (400) > verified PASS compare with title+body (300) > compare with title+body (200) > partial compare (150) > bare compare (100)."""
+    url_str = str(raw_url or "").strip()
+    if not url_str:
+        return (0, 0)
+    pr_slug, pr_num = _extract_created_pr_repo_and_number(url_str)
+    if pr_num:
+        return (400, len(url_str))
+    parsed = urllib.parse.urlsplit(url_str)
+    path_lower = (parsed.path or "").lower()
+    if any(marker in path_lower for marker in _STALE_PR_COMPARE_MARKERS):
+        qs = urllib.parse.parse_qs(parsed.query)
+        has_title = bool(qs.get("title") or qs.get("merge_request[title]"))
+        body_vals = qs.get("body") or qs.get("merge_request[description]") or qs.get("description") or []
+        body_text = str(body_vals[0]) if body_vals else ""
+        has_body = bool(body_text.strip())
+        has_verified_pass = has_body and (
+            "PASS" in body_text
+            and (
+                "Independent PR Review" in body_text
+                or "Verdict" in body_text
+                or "Automated Verification Checks" in body_text
+            )
+        )
+        if has_title and has_verified_pass:
+            return (300, len(url_str))
+        if has_title and has_body:
+            return (200, len(url_str))
+        if has_title or has_body:
+            return (150, len(url_str))
+        return (100, len(url_str))
+    _ = pr_slug
+    return (50, len(url_str))
+
+
+def _dedupe_richest_pr_urls(
+    pr_urls: list[str] | tuple[str, ...] | None,
+    *,
+    strip_branches: list[str] | None = None,
+    strip_repo_slug: str = "",
+) -> list[str]:
+    """Deduplicate `pr_urls` per `(repo_slug, branch_name)` keeping the richest verified URL (and letting created `/pull/` supersede compare links for that repo)."""
+    norm_urls = _normalize_str_list(pr_urls)
+    if not norm_urls:
+        return []
+
+    strip_branch_set = {
+        str(b).strip().removeprefix("refs/heads/")
+        for b in (strip_branches or ())
+        if str(b).strip()
+    }
+    norm_strip_slug = dev_common.normalize_repo_slug(strip_repo_slug).lower()
+
+    # Track repos that already have a created /pull/<n> URL so compare URLs for those repos are superseded
+    created_pr_repos: set[str] = set()
+    for url in norm_urls:
+        c_slug, c_num = _extract_created_pr_repo_and_number(url)
+        if c_num and c_slug:
+            created_pr_repos.add(c_slug.lower())
+
+    best_by_key: dict[tuple[str, ...], tuple[int, tuple[int, int], str]] = {}
+    for idx, url in enumerate(norm_urls):
+        c_slug, c_num = _extract_created_pr_repo_and_number(url)
+        score = _score_pr_url_richness(url)
+        if c_num:
+            key: tuple[str, ...] = ("created_pr", c_slug.lower(), c_num)
+        else:
+            cmp_slug, cmp_branch = _extract_repo_slug_and_branch_from_pr_url(url)
+            if cmp_branch:
+                if cmp_branch in strip_branch_set and (
+                    not norm_strip_slug or not cmp_slug or cmp_slug.lower() == norm_strip_slug
+                ):
+                    continue
+                if cmp_slug and cmp_slug.lower() in created_pr_repos:
+                    continue
+                key = ("compare", cmp_slug.lower(), cmp_branch)
+            else:
+                key = ("raw", url)
+
+        existing = best_by_key.get(key)
+        if existing is None or score > existing[1]:
+            first_idx = existing[0] if existing is not None else idx
+            best_by_key[key] = (first_idx, score, url)
+
+    ordered = sorted(best_by_key.values(), key=lambda entry: entry[0])
+    return [entry[2] for entry in ordered]
 
 
 def _extract_repo_slug_and_branch_from_pr_url(raw_url: str) -> tuple[str, str]:
@@ -5396,23 +6477,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Reuse the currently active open PR branch when addressing PR comments or CI fixes.",
     )
 
-    p_test = sub.add_parser("test-local", help="Run local offline unit tests and static QA auditor.")
+    p_test = sub.add_parser("test-local", help="Run local offline unit tests, static QA auditor, and persist verification_results on dev_pr_lock.")
     p_test.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
     p_test.add_argument("--targets", nargs="*", default=[], help="Optional unittest target modules.")
+    p_test.add_argument("--pre-commit", dest="run_pre_commit", action="store_true", help="Also execute `pre-commit run --all-files` and record status.")
+    p_test.add_argument(
+        "--pre-commit-status",
+        choices=("", "pass", "fail", "skipped"),
+        default="",
+        help="Optional recorded status from an external `pre-commit run --all-files` invocation.",
+    )
 
-    for push_cmd in ("push-branch", "create-pr"):
+    for push_cmd in ("push-branch", "prepare-review", "create-pr"):
         p_push = sub.add_parser(
             push_cmd,
-            help="Push the timestamped branch to origin via native git (never main) and generate the agy-code-pr-reviewer invocation plan.",
+            help="Local-First Review: commit locally on the timestamped branch (WITHOUT pushing to origin yet), stamp verification checks, and return the agy-code-pr-reviewer invocation plan.",
         )
         p_push.add_argument("--title", required=True, help="Commit / proposal title.")
         p_push.add_argument("--body", default="", help="Commit / proposal Markdown body.")
-        p_push.add_argument("--executive-summary", default="", help="Explicit Executive Summary for the PR description.")
+        p_push.add_argument("--executive-summary", "--summary", dest="executive_summary", default="", help="Explicit Executive Summary for the PR description.")
         p_push.add_argument("--head", "--branch", dest="head", default="", help="Branch name (defaults to locked branch_name).")
         p_push.add_argument("--base", default="main", help="Base branch name (default: main).")
         p_push.add_argument("--issue", type=int, default=None, help="Optional legacy issue number.")
         p_push.add_argument("--workdir", default="", help="Optional worktree or repo directory.")
-        p_push.add_argument("--scheduled", action="store_true", help="Mark as scheduled run so Agent 2 sends notification email.")
+        p_push.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
+        p_push.add_argument("--scheduled", action="store_true", help="Mark as scheduled run so Agent 2 sends notification email upon PASS (>90/100).")
 
     p_diff = sub.add_parser("branch-diff", help="Compute changed files and unified diff for a branch via native git.")
     p_diff.add_argument("--branch", "--head", dest="branch", default="", help="Target branch name (defaults to locked branch_name).")
@@ -5459,6 +6548,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         p_fin.add_argument("--close-issue", action="store_true", help="Optional legacy flag.")
         p_fin.add_argument("--cleanup-conversations", action="store_true", help="Safely clean up merged root and child conversations after approve release.")
         p_fin.add_argument("--exclude-id", "--exclude-ids", dest="exclude_ids", nargs="*", default=[], help="Protected conversation IDs (e.g., active orchestrator) to preserve during cleanup.")
+        p_fin.add_argument("--force", action="store_true", help="Override PR readiness gate verification on approve (emergency HITL escape hatch only).")
 
     p_qlist = sub.add_parser("queue-list", help="Inspect persistent orchestrator development queue (`dev_queue.json`).")
     p_qlist.add_argument("--status", default="", help="Optional status filter.")
@@ -5604,11 +6694,13 @@ def main(argv: list[str] | None = None) -> int:
         res = run_local_validation_suite(
             workdir=args.workdir or None,
             test_targets=args.targets or None,
+            run_pre_commit=bool(getattr(args, "run_pre_commit", False)),
+            pre_commit_status=str(getattr(args, "pre_commit_status", "") or ""),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("passed") else 1
 
-    if args.subcommand in ("push-branch", "create-pr"):
+    if args.subcommand in ("push-branch", "prepare-review", "create-pr"):
         res = push_remediation_branch_and_build_reviewer_plan(
             title=args.title,
             body=args.body,
@@ -5618,6 +6710,7 @@ def main(argv: list[str] | None = None) -> int:
             issue_number=args.issue,
             scheduled=args.scheduled,
             workdir=args.workdir or None,
+            repo_slug=getattr(args, "repo_slug", ""),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
@@ -5683,6 +6776,7 @@ def main(argv: list[str] | None = None) -> int:
             pr_number=args.pr,
             repo_slug=getattr(args, "repo_slug", ""),
             workdir=getattr(args, "workdir", "") or None,
+            force=bool(getattr(args, "force", False)),
         )
         if res.get("status") == "ok" and getattr(args, "cleanup_conversations", False) and str(args.decision).lower() in ("approve", "merge"):
             prev_lock = (res.get("release_result") or {}).get("previous_lock") or {}

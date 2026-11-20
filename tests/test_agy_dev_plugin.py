@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import stat
 import subprocess
 import sys
@@ -102,9 +103,9 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
 
     def test_deterministic_checks_catalog_and_pre_tool_use_blocks(self) -> None:
         all_checks = dev_common.get_deterministic_dev_checks()
-        self.assertEqual(len(all_checks), 5)
+        self.assertEqual(len(all_checks), 6)
         pre_checks = dev_common.get_deterministic_dev_checks("PreToolUse")
-        self.assertEqual(len(pre_checks), 4)
+        self.assertEqual(len(pre_checks), 5)
         self.assertEqual(
             {c["check_id"] for c in pre_checks},
             {
@@ -112,6 +113,7 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
                 "pretool:proprietary-vcs-cli",
                 "pretool:santa-lockdown-binary",
                 "pretool:dotenv-write-protection",
+                "pretool:unvalidated-branch-push",
             },
         )
 
@@ -228,6 +230,122 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
             self.assertIn("acme-org/repo-a", other_unlocked_repo["additionalContext"])
             self.assertNotIn("Do not start a new branch", other_unlocked_repo["additionalContext"])
 
+    def test_pretool_unvalidated_branch_push_and_session_start_unready_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            state_dir = troot / "state"
+            state_dir.mkdir(parents=True)
+            _, repo_a = _create_bare_and_clone(troot, name="repo-a")
+            subprocess.run(
+                ["git", "-C", str(repo_a), "remote", "set-url", "origin", "git@github.com:acme-org/repo-a.git"],
+                check=True,
+                capture_output=True,
+            )
+            branch_a = "fix/20261120-150000-gate-aaaaaaaa"
+            wt_a = troot / "wt-a"
+            subprocess.run(
+                ["git", "-C", str(repo_a), "worktree", "add", "-b", branch_a, str(wt_a), "main"],
+                check=True,
+                capture_output=True,
+            )
+            (wt_a / "patch.py").write_text("VALUE = 1\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(wt_a), "add", "patch.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(wt_a), "commit", "-m", "feat: patch v1"], check=True, capture_output=True)
+            sha_v1 = subprocess.run(
+                ["git", "-C", str(wt_a), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+            def _write_lock(status_val: str, gate_ready: bool, rev_sha: str = "") -> None:
+                dev_common.atomic_write_json(
+                    state_dir / "actions_state.json",
+                    {
+                        "actions_log_audit_state": {
+                            "dev_pr_locks": {
+                                "acme-org/repo-a": {
+                                    "active": True,
+                                    "repo_slug": "acme-org/repo-a",
+                                    "conversation_id": "11111111-1111-4111-8111-111111111111",
+                                    "branch_name": branch_a,
+                                    "target_repo_dir": str(repo_a),
+                                    "worktree_path": str(wt_a),
+                                    "head_sha": sha_v1,
+                                    "pr_gate_ready": gate_ready,
+                                    "reviewed_head_sha": rev_sha,
+                                    "status": status_val,
+                                }
+                            }
+                        }
+                    },
+                )
+
+            evaluator = dev_common.DevLifecycleGuardrailEvaluator(home_dir=troot, state_dir=state_dir)
+
+            # 1. PreToolUse denies direct git push while pr_gate_ready=False across explicit & implicit forms
+            _write_lock("AWAITING_AGENT_REVIEW", gate_ready=False)
+            for cmd in (
+                f"git push origin {branch_a}",
+                f"git push -u origin HEAD:{branch_a}",
+                f"git push origin refs/heads/{branch_a}",
+                f"git -C {wt_a} push -u origin HEAD",
+                f"cd {wt_a} && git push",
+            ):
+                res = evaluator.evaluate_pre_tool_use(
+                    {"toolName": "run_command", "arguments": {"CommandLine": cmd}}
+                )
+                self.assertEqual(res["decision"], "deny", msg=f"Expected deny for: {cmd}")
+                self.assertEqual(res.get("check_id"), "pretool:unvalidated-branch-push")
+
+            # Implicit git push using payload cwd inside worktree is also denied
+            res_cwd = evaluator.evaluate_pre_tool_use(
+                {"toolName": "run_command", "cwd": str(wt_a), "arguments": {"CommandLine": "git push"}}
+            )
+            self.assertEqual(res_cwd["decision"], "deny")
+
+            # Delete push, unrelated branch push, and non-git commands mentioning 'git push' remain allowed
+            for allowed_cmd in (
+                f"git push origin --delete {branch_a}",
+                f"git push origin :{branch_a}",
+                "git push -u origin fix/20261120-unrelated",
+                f"python3 pr_remediator.py record-review --summary 'fixes git push {branch_a}'",
+            ):
+                res_ok = evaluator.evaluate_pre_tool_use(
+                    {"toolName": "run_command", "arguments": {"CommandLine": allowed_cmd}}
+                )
+                self.assertEqual(res_ok["decision"], "allow", msg=f"Expected allow for: {allowed_cmd}")
+
+            # 2. SessionStart warns never to surface PR links for all 3 unready gate statuses
+            for unready_status in (
+                "AWAITING_AGENT_REVIEW",
+                "NEEDS_REVISION_ITERATING",
+                "ESCALATED_MAX_REVIEW_ITERATIONS",
+            ):
+                _write_lock(unready_status, gate_ready=False)
+                ss = evaluator.evaluate_session_start(
+                    {"conversationId": "11111111-1111-4111-8111-111111111111", "cwd": str(repo_a)}
+                )
+                self.assertIn("NEVER surface Compare/PR links", ss["additionalContext"])
+                self.assertIn(unready_status, ss["additionalContext"])
+
+            # 3. Once pr_gate_ready=True and reviewed_head_sha == live HEAD SHA, push is allowed
+            _write_lock("PENDING_HUMAN_PR_VALIDATION", gate_ready=True, rev_sha=sha_v1)
+            res_ready = evaluator.evaluate_pre_tool_use(
+                {"toolName": "run_command", "arguments": {"CommandLine": f"git push origin {branch_a}"}}
+            )
+            self.assertEqual(res_ready["decision"], "allow")
+
+            # 4. Subsequent unreviewed commit in worktree invalidates reviewed_head_sha -> push denied again
+            (wt_a / "patch.py").write_text("VALUE = 2\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(wt_a), "add", "patch.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(wt_a), "commit", "-m", "feat: unreviewed v2"], check=True, capture_output=True)
+            res_stale = evaluator.evaluate_pre_tool_use(
+                {"toolName": "run_command", "arguments": {"CommandLine": f"git push origin {branch_a}"}}
+            )
+            self.assertEqual(res_stale["decision"], "deny")
+            self.assertEqual(res_stale.get("check_id"), "pretool:unvalidated-branch-push")
+
 
 class TestGitClientAndRemediation(unittest.TestCase):
     """Tests for `clients/git_client.py` and `pr_remediator.py`."""
@@ -294,7 +412,22 @@ class TestGitClientAndRemediation(unittest.TestCase):
                 git_client=vcs,
             )
             self.assertEqual(start["status"], "ok")
+            self.assertEqual(start["manual_pr_url"], "")
             branch_name = start["branch_name"]
+
+            # Commit a real change and stage locally via Local-First Review (`push-branch` / `prepare-review`)
+            (clone / "parser_guard.py").write_text("GUARD_ENABLED = True\n", encoding="utf-8")
+            staged = pr_remediator.push_remediation_branch_and_build_reviewer_plan(
+                title="fix(acme-fix): add parser validation check",
+                executive_summary="Add defensive validation guard in parser.",
+                workdir=clone,
+                portfolio_dir=pdir,
+                git_client=vcs,
+            )
+            self.assertEqual(staged["status"], "ok")
+            self.assertFalse(staged["branch_pushed"])
+            self.assertFalse(staged["pr_gate_ready"])
+            self.assertEqual(staged["manual_pr_url"], "")
 
             # Create fake notify hook script to verify end-to-end AGY_DEV_NOTIFY_CMD dispatch
             notify_log = troot / "notify.log"
@@ -313,6 +446,9 @@ class TestGitClientAndRemediation(unittest.TestCase):
                     git_client=vcs,
                 )
             self.assertEqual(rev["status"], "ok")
+            self.assertTrue(rev["ready_for_human_pr"])
+            self.assertTrue(rev["pr_gate_ready"])
+            self.assertTrue(rev["branch_pushed"])
             self.assertTrue(rev["notification_email_sent"])
             self.assertTrue(notify_log.is_file())
             self.assertIn(branch_name, notify_log.read_text(encoding="utf-8"))
@@ -390,6 +526,15 @@ class TestGitClientAndRemediation(unittest.TestCase):
                 portfolio_dir=pdir,
                 git_client=vcs,
             )
+            (clone / "notify_fix.py").write_text("NOTIFY_OK = True\n", encoding="utf-8")
+            staged_notify = pr_remediator.push_remediation_branch_and_build_reviewer_plan(
+                title="fix(notify-check): pass errors_only_override=False",
+                executive_summary="Forward errors_only_override=False on PASS review email.",
+                workdir=clone,
+                portfolio_dir=pdir,
+                git_client=vcs,
+            )
+            self.assertEqual(staged_notify["status"], "ok")
             with mock.patch.object(
                 dev_common,
                 "try_send_branch_review_notification",
@@ -405,6 +550,7 @@ class TestGitClientAndRemediation(unittest.TestCase):
                     git_client=vcs,
                 )
             self.assertEqual(rev["status"], "ok")
+            self.assertTrue(rev["ready_for_human_pr"])
             self.assertTrue(rev["notification_email_sent"])
             mock_notify.assert_called_once()
             self.assertIs(mock_notify.call_args.kwargs.get("errors_only_override"), False)
@@ -553,6 +699,40 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
 
         readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("co-design-and-discovery.md", readme_text)
+
+    def test_sync_pr_verification_workflow_contract(self) -> None:
+        wf_path = REPO_ROOT / ".github" / "workflows" / "sync-pr-verification.yml"
+        self.assertTrue(wf_path.is_file(), msg=".github/workflows/sync-pr-verification.yml must exist")
+        wf_text = wf_path.read_text(encoding="utf-8")
+
+        # Minimal permissions, pinned runner, pull_request opened/synchronize trigger, no push trigger, no PATs
+        self.assertIn("runs-on: ubuntu-24.04", wf_text)
+        self.assertIn("pull_request:", wf_text)
+        self.assertIn("opened", wf_text)
+        self.assertIn("synchronize", wf_text)
+        self.assertNotRegex(wf_text, r"(?m)^[ \t]+push\s*:")
+        self.assertIn("contents: read", wf_text)
+        self.assertIn("pull-requests: write", wf_text)
+        self.assertNotIn("contents: write", wf_text)
+        self.assertNotIn("write-all", wf_text)
+        self.assertNotIn("PERSONAL_ACCESS_TOKEN", wf_text)
+        self.assertNotIn("GH_PAT", wf_text)
+
+        # Every `uses:` action must be pinned to a 40-char hexadecimal commit SHA
+        uses_matches = re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", wf_text)
+        self.assertTrue(uses_matches, msg="Expected at least one pinned GitHub Action in workflow")
+        for action_ref in uses_matches:
+            self.assertRegex(
+                action_ref,
+                r"^[^@]+@[0-9a-f]{40}$",
+                msg=f"Action '{action_ref}' in sync-pr-verification.yml must be pinned to a full 40-char commit SHA",
+            )
+
+        # Bounded idempotent HTML markers & deterministic verification/review headings
+        self.assertIn("<!-- agy-verifications:start -->", wf_text)
+        self.assertIn("<!-- agy-verifications:end -->", wf_text)
+        self.assertIn("## 🧪 Automated Verification Checks", wf_text)
+        self.assertIn("## 🤖 Independent PR Review", wf_text)
 
 
 if __name__ == "__main__":
