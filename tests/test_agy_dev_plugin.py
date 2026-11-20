@@ -520,6 +520,40 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
             if wf.name == "pre-commit.yml":
                 self.assertIn("bats", wf_text, msg="pre-commit.yml must install bats before running bats-suite")
 
+    def test_phase0_co_design_grill_me_rule_and_planner_contract(self) -> None:
+        co_design_rule = REPO_ROOT / "rules" / "co-design-and-discovery.md"
+        self.assertTrue(co_design_rule.is_file(), msg="rules/co-design-and-discovery.md must exist")
+        self.assertLess(co_design_rule.stat().st_size, 24000)
+
+        co_design_text = co_design_rule.read_text(encoding="utf-8")
+        self.assertTrue(co_design_text.startswith("---\n"))
+        self.assertIn("trigger: model_decision", co_design_text)
+        self.assertIn("description:", co_design_text)
+        for required_phrase in (
+            "Adaptive Activation Gate",
+            "Silent Codebase-First Discovery",
+            "Demanding Partner Pushback",
+            "Hybrid Interview Cadence",
+            "Design Contract",
+            "agy-dev-executor",
+            "dev_queue.json",
+        ):
+            self.assertIn(required_phrase, co_design_text, msg=f"Missing co-design contract section/term: {required_phrase}")
+
+        pillars_text = (REPO_ROOT / "rules" / "engineering-pillars.md").read_text(encoding="utf-8")
+        self.assertIn("trigger: always_on", pillars_text)
+        self.assertIn("co-design-and-discovery.md", pillars_text)
+        self.assertIn("Grill-Me", pillars_text)
+
+        planner_text = (REPO_ROOT / "agents" / "agy-dev-planner.md").read_text(encoding="utf-8")
+        self.assertIn("ask_question", planner_text)
+        self.assertIn("co-design-and-discovery.md", planner_text)
+        self.assertIn("Design Contract", planner_text)
+        self.assertIn("Non-Interactive Subagent Mode", planner_text)
+
+        readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("co-design-and-discovery.md", readme_text)
+
 
 if __name__ == "__main__":
     unittest.main()
