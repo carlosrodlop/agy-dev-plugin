@@ -318,6 +318,97 @@ class TestGitClientAndRemediation(unittest.TestCase):
             self.assertIn(branch_name, notify_log.read_text(encoding="utf-8"))
             self.assertNotIn("agy-qa-validator", rev["review_markdown"])
 
+    def test_branch_review_notification_forwards_force_notify_ok_when_errors_only_false(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            fake_home = troot / "home"
+            args_log = troot / "gmail_args.json"
+            fake_gmail = (
+                fake_home
+                / ".gemini"
+                / "config"
+                / "plugins"
+                / "wiz-tam-plugin"
+                / "clients"
+                / "gmail_draft_client.py"
+            )
+            fake_gmail.parent.mkdir(parents=True, exist_ok=True)
+            fake_gmail.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"pathlib.Path({str(args_log)!r}).write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            fake_gmail.chmod(0o755)
+
+            with mock.patch.dict(os.environ, {"AGY_DEV_NOTIFY_CMD": ""}):
+                # 1. errors_only_override=True suppresses OK notifications cleanly
+                suppressed = dev_common.try_send_branch_review_notification(
+                    status="OK",
+                    subject="PR Review OK",
+                    body="All checks passed",
+                    conversation_id="44444444-4444-4444-8444-444444444444",
+                    validator="agy-code-pr-reviewer",
+                    branch_name="fix/20261120-110000-demo-44444444",
+                    errors_only_override=True,
+                    home_dir=fake_home,
+                )
+                self.assertFalse(suppressed["sent"])
+                self.assertEqual(suppressed["skipped_reason"], "errors_only_policy")
+                self.assertFalse(args_log.exists())
+
+                # 2. errors_only_override=False dispatches with --force-notify-ok
+                dispatched = dev_common.try_send_branch_review_notification(
+                    status="OK",
+                    subject="PR Review OK",
+                    body="All checks passed",
+                    conversation_id="44444444-4444-4444-8444-444444444444",
+                    validator="agy-code-pr-reviewer",
+                    branch_name="fix/20261120-110000-demo-44444444",
+                    errors_only_override=False,
+                    home_dir=fake_home,
+                )
+                self.assertTrue(dispatched["sent"])
+                self.assertEqual(dispatched["transport"], "gmail_draft_client")
+                self.assertTrue(args_log.is_file())
+                argv_logged = json.loads(args_log.read_text(encoding="utf-8"))
+                self.assertIn("--send-notification", argv_logged)
+                self.assertIn("--force-notify-ok", argv_logged)
+
+            # 3. record_pr_review_evaluation(send_email=True) explicitly passes errors_only_override=False
+            pdir = troot / "state"
+            pdir.mkdir(parents=True, exist_ok=True)
+            _, clone = _create_bare_and_clone(troot, name="notify-repo")
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(clone)})
+            start = pr_remediator.start_remediation_branch_and_lock(
+                conversation_id="55555555-5555-4555-8555-555555555555",
+                action_id="notify-check",
+                rca_summary="Notify suppressed",
+                proposed_fix="Pass errors_only_override=False",
+                checkout_branch=True,
+                branch_timestamp="20261120-111000",
+                portfolio_dir=pdir,
+                git_client=vcs,
+            )
+            with mock.patch.object(
+                dev_common,
+                "try_send_branch_review_notification",
+                return_value={"sent": True, "transport": "gmail_draft_client"},
+            ) as mock_notify:
+                rev = pr_remediator.record_pr_review_evaluation(
+                    branch_name=start["branch_name"],
+                    verdict="PASS",
+                    score=98,
+                    summary="Verified notify override.",
+                    send_email=True,
+                    portfolio_dir=pdir,
+                    git_client=vcs,
+                )
+            self.assertEqual(rev["status"], "ok")
+            self.assertTrue(rev["notification_email_sent"])
+            mock_notify.assert_called_once()
+            self.assertIs(mock_notify.call_args.kwargs.get("errors_only_override"), False)
+
 
 class TestProjectAuditAndPluginContracts(unittest.TestCase):
     """Tests for `project_audit.py`, `qa_static_audit.py`, and repo plugin manifests."""

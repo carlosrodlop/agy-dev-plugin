@@ -50,6 +50,48 @@ def _init_bare_and_clone_repo(base: pathlib.Path, name: str = "acme-plugin") -> 
     return bare, clone
 
 
+def _git_rev_parse(repo_path: pathlib.Path, ref: str = "main") -> str:
+    """Return the resolved commit SHA for `ref` in `repo_path`."""
+    return subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", ref],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _init_org_bare_and_clone_repo(
+    remotes_org: pathlib.Path,
+    checkouts_dir: pathlib.Path,
+    name: str,
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """Create a hermetic `file://` bare remote under `<org>/<name>.git` and local clone with an initial `main` commit."""
+    bare = remotes_org / f"{name}.git"
+    clone = checkouts_dir / name
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(bare)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "clone", f"file://{bare}", str(clone)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(clone), "config", "user.name", "Acme Bot"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(clone), "config", "user.email", "acme-bot@example.com"], check=True, capture_output=True)
+    (clone / "README.md").write_text(f"# {name}\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(clone), "add", "README.md"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(clone), "commit", "-m", "chore: initial"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(clone), "push", "-u", "origin", "main"], check=True, capture_output=True)
+    return bare, clone
+
+
+def _push_upstream_commit(bare_path: pathlib.Path, scratch_root: pathlib.Path, fname: str, body: str) -> str:
+    """Push a new commit directly to `bare_path`'s `main` branch and return its SHA."""
+    pusher = scratch_root / f"push-{fname.replace('.', '-')}"
+    subprocess.run(["git", "clone", f"file://{bare_path}", str(pusher)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(pusher), "config", "user.name", "Acme Bot"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(pusher), "config", "user.email", "acme-bot@example.com"], check=True, capture_output=True)
+    (pusher / fname).write_text(body, encoding="utf-8")
+    subprocess.run(["git", "-C", str(pusher), "add", fname], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(pusher), "commit", "-m", f"feat: {fname}"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(pusher), "push", "origin", "main"], check=True, capture_output=True)
+    return _git_rev_parse(pusher, "HEAD")
+
+
 def _write_fake_conversation(
     brain_dir: pathlib.Path,
     convs_dir: pathlib.Path,
@@ -598,6 +640,214 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             )["item"]
             self.assertEqual(completed["merged_repos"], ["acme-org/acme-plugin", "acme-org/acme-tower"])
             self.assertEqual(completed["status"], "merged")
+
+    def test_sync_dev_pr_lock_with_git_honors_workdir_when_unlocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme-org"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+            scratch = troot / "scratch"
+            scratch.mkdir(parents=True, exist_ok=True)
+
+            bare_default, repo_default = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-default")
+            bare_other, repo_other = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-other")
+            initial_default_sha = _git_rev_parse(repo_default)
+
+            # Advance both upstream remotes so syncing the wrong repo is immediately observable
+            _push_upstream_commit(bare_default, scratch, "default-ahead.txt", "default upstream\n")
+            upstream_other_sha_1 = _push_upstream_commit(bare_other, scratch, "other-v1.txt", "other upstream 1\n")
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_default)}),
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+            ):
+                # 1. Empty active_map: sync_dev_pr_lock_with_git(workdir=repo_other) must sync ONLY repo_other
+                res_empty = prs.sync_dev_pr_lock_with_git(
+                    portfolio_dir=pdir,
+                    workdir=repo_other,
+                )
+                self.assertEqual(res_empty["status"], "ok")
+                self.assertFalse(res_empty["active"])
+                self.assertEqual(res_empty["repo_slug"], "acme-org/acme-other")
+                self.assertEqual(res_empty["lock"]["repo_slug"], "acme-org/acme-other")
+                self.assertFalse(res_empty["lock"]["active"])
+                self.assertTrue(res_empty["repo_sync"]["synced"])
+                self.assertEqual(res_empty["repo_sync"]["local_base_sha"], upstream_other_sha_1)
+                self.assertEqual(_git_rev_parse(repo_other), upstream_other_sha_1)
+                self.assertEqual(_git_rev_parse(repo_default), initial_default_sha)
+
+                # 2. Non-empty active_map holding a lock on repo_default: workdir=repo_other must still sync ONLY repo_other
+                prs.acquire_dev_pr_lock(
+                    conversation_id="99999999-1111-4111-8111-999999999999",
+                    action_id="hold-default",
+                    branch_name="fix/20261120-100000-hold-default-99999999",
+                    summary="Active lock on default repo",
+                    proposed_fix="Keep default locked",
+                    target_repo_dir=str(repo_default),
+                    repo_slug="acme-org/acme-default",
+                    portfolio_dir=pdir,
+                )
+                upstream_other_sha_2 = _push_upstream_commit(bare_other, scratch, "other-v2.txt", "other upstream 2\n")
+
+                res_sibling_locked = prs.sync_dev_pr_lock_with_git(
+                    portfolio_dir=pdir,
+                    workdir=repo_other,
+                )
+                self.assertEqual(res_sibling_locked["status"], "ok")
+                self.assertTrue(res_sibling_locked["active"])
+                self.assertFalse(res_sibling_locked["repo_active"])
+                self.assertEqual(res_sibling_locked["repo_slug"], "acme-org/acme-other")
+                self.assertEqual(res_sibling_locked["lock"]["repo_slug"], "acme-org/acme-other")
+                self.assertFalse(res_sibling_locked["lock"]["active"])
+                self.assertTrue(res_sibling_locked["repo_sync"]["synced"])
+                self.assertEqual(res_sibling_locked["repo_sync"]["local_base_sha"], upstream_other_sha_2)
+                self.assertEqual(_git_rev_parse(repo_other), upstream_other_sha_2)
+                self.assertEqual(_git_rev_parse(repo_default), initial_default_sha)
+                self.assertIn("acme-org/acme-default", prs.get_all_dev_pr_locks(portfolio_dir=pdir))
+
+    def test_sync_dev_pr_lock_with_git_repo_slug_injected_client_and_unscoped_compat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme-org"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+            scratch = troot / "scratch"
+            scratch.mkdir(parents=True, exist_ok=True)
+
+            bare_default, repo_default = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-default")
+            bare_other, repo_other = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-other")
+            initial_default_sha = _git_rev_parse(repo_default)
+            upstream_default_sha = _push_upstream_commit(bare_default, scratch, "default-next.txt", "default next\n")
+            upstream_other_sha = _push_upstream_commit(bare_other, scratch, "other-slug.txt", "other slug\n")
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(repo_default)}),
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+            ):
+                # 1. Explicit --repo slug without workdir resolves sibling checkout and never syncs default repo
+                res_slug = prs.sync_dev_pr_lock_with_git(
+                    portfolio_dir=pdir,
+                    repo_slug="acme-org/acme-other",
+                )
+                self.assertEqual(res_slug["repo_slug"], "acme-org/acme-other")
+                self.assertTrue(res_slug["repo_sync"]["synced"])
+                self.assertEqual(_git_rev_parse(repo_other), upstream_other_sha)
+                self.assertEqual(_git_rev_parse(repo_default), initial_default_sha)
+
+                # 2. Unknown --repo slug without local checkout skips sync instead of falling back to default repo
+                res_unknown = prs.sync_dev_pr_lock_with_git(
+                    portfolio_dir=pdir,
+                    repo_slug="acme-org/missing-repo",
+                )
+                self.assertEqual(res_unknown["repo_sync"]["status"], "skipped")
+                self.assertEqual(res_unknown["repo_sync"]["reason"], "repo_dir_not_found_for_slug")
+                self.assertEqual(_git_rev_parse(repo_default), initial_default_sha)
+
+                # 3. Injected git_client is used as-is without mutation
+                class _StubVcs:
+                    def __init__(self) -> None:
+                        self.calls: list[str] = []
+
+                    def sync_and_clean_local_repo(self, base_branch: str = "main") -> dict[str, str]:
+                        self.calls.append(base_branch)
+                        return {"status": "ok", "stub_branch": base_branch}
+
+                stub = _StubVcs()
+                res_stub = prs.sync_dev_pr_lock_with_git(
+                    portfolio_dir=pdir,
+                    git_client=stub,  # type: ignore[arg-type]
+                    workdir=repo_other,
+                )
+                self.assertEqual(stub.calls, ["main"])
+                self.assertEqual(res_stub["repo_sync"]["stub_branch"], "main")
+                self.assertEqual(set(stub.__dict__.keys()), {"calls"})
+
+                # 4. Unscoped call (neither repo_slug nor workdir) preserves default-repo sync backward compatibility
+                res_unscoped = prs.sync_dev_pr_lock_with_git(portfolio_dir=pdir)
+                self.assertTrue(res_unscoped["repo_sync"]["synced"])
+                self.assertEqual(_git_rev_parse(repo_default), upstream_default_sha)
+
+    def test_sync_and_clean_local_repo_protects_active_dev_pr_lock_branch_and_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme-org"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            _, repo_main = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-guarded")
+
+            active_branch = "fix/20261120-110127-active-dev-11111111"
+            orphan_branch = "fix/20261120-090000-stale-orphan-22222222"
+            active_wt = troot / "wt-active"
+            orphan_wt = troot / "wt-orphan"
+
+            # Create two unpushed local fix/* branches + worktrees (neither exists on origin)
+            subprocess.run(
+                ["git", "-C", str(repo_main), "worktree", "add", "-b", active_branch, str(active_wt), "main"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_main), "worktree", "add", "-b", orphan_branch, str(orphan_wt), "main"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            # Record ONLY active_branch as an active DEVELOPING (unpushed) lock in actions_state.json
+            prs.acquire_dev_pr_lock(
+                conversation_id="11111111-aaaa-4111-8111-111111111111",
+                action_id="active-dev",
+                branch_name=active_branch,
+                worktree_path=str(active_wt),
+                summary="In-progress unpushed worktree",
+                proposed_fix="Must never be pruned",
+                target_repo_dir=str(repo_main),
+                repo_slug="acme-org/acme-guarded",
+                portfolio_dir=pdir,
+            )
+
+            vcs = git_client.GitVcsIntegrationClient(
+                env_overrides={"AGY_CONF_REPO_DIR": str(repo_main), "AGY_DEV_STATE_DIR": str(pdir)}
+            )
+            # Call sync_and_clean_local_repo WITHOUT passing protected_branches explicitly
+            sync_res = vcs.sync_and_clean_local_repo(base_branch="main")
+            self.assertEqual(sync_res["status"], "ok")
+            self.assertTrue(sync_res["synced"])
+            # Active DEVELOPING unpushed branch and worktree MUST survive intact
+            self.assertTrue(active_wt.is_dir())
+            self.assertNotIn(active_branch, sync_res["deleted_local_branches"])
+            self.assertNotIn(str(active_wt.resolve()), [str(pathlib.Path(p).resolve()) for p in sync_res["deleted_worktrees"]])
+            local_branches = subprocess.run(
+                ["git", "-C", str(repo_main), "branch", "--format=%(refname:short)"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            self.assertIn(active_branch, local_branches)
+            # Unrelated orphaned fix/* branch and worktree ARE pruned normally
+            self.assertIn(orphan_branch, sync_res["deleted_local_branches"])
+            self.assertFalse(orphan_wt.exists())
+
+            # Explicitly passing force_clean_branches (post-merge cleanup before lock release) STILL removes it
+            clean_res = vcs.sync_and_clean_local_repo(
+                base_branch="main",
+                force_clean_branches=[active_branch],
+            )
+            self.assertEqual(clean_res["status"], "ok")
+            self.assertIn(active_branch, clean_res["deleted_local_branches"])
+            self.assertFalse(active_wt.exists())
 
 
 if __name__ == "__main__":

@@ -915,11 +915,13 @@ def _sync_single_repo_lock_with_git(
     if git_client is not None:
         vcs = git_client
     else:
+        env_ov: dict[str, str] = {}
         lock_repo_path = _resolve_lock_target_repo_dir(lock_info)
         if lock_repo_path and (lock_repo_path / ".git").exists():
-            vcs = GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(lock_repo_path)})
-        else:
-            vcs = GitVcsIntegrationClient()
+            env_ov["AGY_CONF_REPO_DIR"] = str(lock_repo_path)
+        if portfolio_dir is not None:
+            env_ov["AGY_DEV_STATE_DIR"] = str(dev_common.resolve_state_dir(portfolio_dir=portfolio_dir))
+        vcs = GitVcsIntegrationClient(env_overrides=env_ov) if env_ov else GitVcsIntegrationClient()
 
     branch_name = str(lock_info.get("branch_name") or "").strip()
     branch_pushed = bool(lock_info.get("branch_pushed"))
@@ -1036,6 +1038,122 @@ def _sync_single_repo_lock_with_git(
     }
 
 
+def _resolve_repo_dir_for_slug(
+    repo_slug: str,
+    *,
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+) -> Path | None:
+    """Resolve a local Git checkout root for an explicit `owner/repo` slug when `workdir` is not provided."""
+    clean_slug = dev_common.normalize_repo_slug(repo_slug)
+    if not clean_slug:
+        return None
+
+    all_known_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir, include_inactive=True)
+    known_entry = all_known_locks.get(clean_slug)
+    if isinstance(known_entry, dict):
+        cand_dir = _resolve_lock_target_repo_dir(known_entry)
+        if cand_dir is not None and (cand_dir / ".git").exists():
+            return _resolve_main_git_repo_root(cand_dir)
+        last_rb = known_entry.get("last_repo_branches")
+        if isinstance(last_rb, dict):
+            rb_item = last_rb.get(clean_slug)
+            if isinstance(rb_item, dict):
+                raw_dir = str(rb_item.get("target_repo_dir") or "").strip()
+                if raw_dir:
+                    cand_rb = Path(raw_dir.replace("$HOME", str(Path.home()))).expanduser()
+                    if (cand_rb / ".git").exists():
+                        return _resolve_main_git_repo_root(cand_rb)
+
+    base_vcs = git_client or GitVcsIntegrationClient()
+    base_dir = base_vcs.resolve_repo_dir()
+    main_base_dir = _resolve_main_git_repo_root(base_dir) if (base_dir / ".git").exists() else base_dir
+    candidates: list[Path] = []
+    if (main_base_dir / ".git").exists():
+        candidates.append(main_base_dir)
+    repo_name = clean_slug.rsplit("/", 1)[-1]
+    if repo_name:
+        candidates.append(main_base_dir.parent / repo_name)
+        candidates.append(base_dir.parent / repo_name)
+    if "/" in clean_slug:
+        owner_part, name_part = clean_slug.split("/", 1)
+        candidates.append(Path.home() / "Code" / "Github" / owner_part / name_part)
+
+    seen: set[str] = set()
+    for cand in candidates:
+        key = str(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (cand / ".git").exists():
+            cand_slug = dev_common.resolve_repo_slug_from_path(cand)
+            if cand_slug == clean_slug:
+                return _resolve_main_git_repo_root(cand)
+    return None
+
+
+def _sync_unlocked_repo_with_git(
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    scoped_slug: str = "",
+    resolved_dir: Path | None = None,
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve and sync an unlocked repository using `workdir`/`repo_slug` without mutating injected `git_client`."""
+    is_scoped = bool(repo_slug.strip() or workdir)
+    target_slug = scoped_slug
+    target_dir = resolved_dir
+
+    if is_scoped:
+        if not target_slug:
+            target_slug, target_dir = _resolve_repo_slug_and_dir(
+                repo_slug=repo_slug,
+                workdir=workdir,
+                git_client=git_client,
+                prefer_cwd=False,
+            )
+        if git_client is None and target_dir is None and target_slug and target_slug != "default":
+            target_dir = _resolve_repo_dir_for_slug(
+                target_slug,
+                portfolio_dir=portfolio_dir,
+            )
+        if target_dir is not None and (target_dir / ".git").exists():
+            target_dir = _resolve_main_git_repo_root(target_dir)
+
+    state_dir_str = str(dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)) if portfolio_dir is not None else ""
+    if git_client is not None:
+        vcs = git_client
+    elif target_dir is not None:
+        env_ov: dict[str, str] = {"AGY_CONF_REPO_DIR": str(target_dir)}
+        if state_dir_str:
+            env_ov["AGY_DEV_STATE_DIR"] = state_dir_str
+        vcs = GitVcsIntegrationClient(env_overrides=env_ov)
+    elif is_scoped:
+        return target_slug, {
+            "status": "skipped",
+            "synced": False,
+            "reason": "repo_dir_not_found_for_slug",
+            "repo_slug": target_slug,
+            "base_branch": "main",
+        }
+    else:
+        vcs = (
+            GitVcsIntegrationClient(env_overrides={"AGY_DEV_STATE_DIR": state_dir_str})
+            if state_dir_str
+            else GitVcsIntegrationClient()
+        )
+
+    if not hasattr(vcs, "sync_and_clean_local_repo"):
+        return target_slug, {}
+    if isinstance(vcs, GitVcsIntegrationClient) and portfolio_dir is not None:
+        repo_sync = vcs.sync_and_clean_local_repo(base_branch="main", state_dir=portfolio_dir)
+    else:
+        repo_sync = vcs.sync_and_clean_local_repo(base_branch="main")
+    return target_slug, repo_sync
+
+
 def sync_dev_pr_lock_with_git(
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
@@ -1046,21 +1164,28 @@ def sync_dev_pr_lock_with_git(
     """Inspect active per-repository locks via native `git`, release merged/deleted branches, and synchronize local `main`."""
     active_map = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
     if not active_map:
-        vcs = git_client or GitVcsIntegrationClient()
         stop_dev_api_server(portfolio_dir=portfolio_dir)
-        repo_sync = vcs.sync_and_clean_local_repo(base_branch="main") if hasattr(vcs, "sync_and_clean_local_repo") else {}
-        return {
+        scoped_slug, repo_sync = _sync_unlocked_repo_with_git(
+            repo_slug=repo_slug,
+            workdir=workdir,
+            portfolio_dir=portfolio_dir,
+            git_client=git_client,
+        )
+        res: dict[str, Any] = {
             "status": "ok",
             "active": False,
             "released": False,
-            "lock": get_dev_pr_lock(portfolio_dir=portfolio_dir),
+            "lock": get_dev_pr_lock(portfolio_dir=portfolio_dir, repo_slug=repo_slug, workdir=workdir),
             "locks": {},
             "repo_sync": repo_sync,
         }
+        if scoped_slug:
+            res["repo_slug"] = scoped_slug
+        return res
 
     target_entries: list[tuple[str, dict[str, Any]]]
     if repo_slug.strip() or workdir:
-        scoped_slug, _ = _resolve_repo_slug_and_dir(
+        scoped_slug, resolved_dir = _resolve_repo_slug_and_dir(
             repo_slug=repo_slug,
             workdir=workdir,
             git_client=git_client,
@@ -1069,14 +1194,21 @@ def sync_dev_pr_lock_with_git(
         if scoped_slug in active_map:
             target_entries = [(scoped_slug, active_map[scoped_slug])]
         else:
-            vcs = git_client or GitVcsIntegrationClient()
-            repo_sync = vcs.sync_and_clean_local_repo(base_branch="main") if hasattr(vcs, "sync_and_clean_local_repo") else {}
+            scoped_slug, repo_sync = _sync_unlocked_repo_with_git(
+                repo_slug=repo_slug,
+                workdir=workdir,
+                scoped_slug=scoped_slug,
+                resolved_dir=resolved_dir,
+                portfolio_dir=portfolio_dir,
+                git_client=git_client,
+            )
             return {
                 "status": "ok",
                 "active": bool(active_map),
                 "repo_active": False,
                 "released": False,
                 "repo_slug": scoped_slug,
+                "lock": get_dev_pr_lock(portfolio_dir=portfolio_dir, repo_slug=repo_slug, workdir=workdir),
                 "locks": active_map,
                 "repo_sync": repo_sync,
             }
@@ -3000,6 +3132,7 @@ def record_pr_review_evaluation(
             conversation_id=cid_clean or resolved_ts,
             validator=validator_banner_label,
             branch_name=resolved_branch,
+            errors_only_override=False,
         )
         email_sent = bool(notify_res.get("sent"))
 
