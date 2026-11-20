@@ -56,6 +56,7 @@ from typing import Any
 import urllib.parse
 
 import dev_common  # noqa: E402
+import git_client as _git_client  # noqa: E402
 from git_client import GitVcsIntegrationClient, stamp_repo_version_manifests  # noqa: E402
 
 build_pro_dashboard_ui_url = dev_common.try_build_control_tower_ui_url
@@ -3612,6 +3613,25 @@ def _build_developer_remediation_plan(
     }
 
 
+def _format_pr_notification_subject_summary(
+    proposal_title: str,
+    executive_summary: str,
+    branch_name: str,
+    max_len: int = 80,
+) -> str:
+    """Build a normalized single-line summary (`<= 80` chars) for PR readiness email subjects."""
+    raw = (
+        str(proposal_title or "").strip()
+        or str(executive_summary or "").strip()
+        or str(branch_name or "").strip()
+        or "branch"
+    )
+    single_line = re.sub(r"\s+", " ", raw).strip()
+    if len(single_line) <= max_len:
+        return single_line
+    return single_line[: max(1, max_len - 3)].rstrip() + "..."
+
+
 def record_pr_review_evaluation(
     pr_number: int | None = None,
     verdict: str = "PASS",
@@ -3953,6 +3973,7 @@ def record_pr_review_evaluation(
                 conversation_id=cid_clean or resolved_ts,
                 validator=validator_banner_label,
                 branch_name=resolved_branch,
+                target_url="",
                 errors_only_override=False,
             )
             email_sent = bool(notify_res.get("sent"))
@@ -4242,10 +4263,40 @@ def record_pr_review_evaluation(
                     os.chmod(tmp_path, 0o600)
                 os.replace(tmp_path, state_path)
 
+    clean_slug_for_name = str(resolved_repo_slug or "").strip().strip("/")
+    if clean_slug_for_name and clean_slug_for_name.lower() != "default":
+        repo_name = clean_slug_for_name.split("/")[-1]
+    elif isinstance(effective_repo_dir, Path) and effective_repo_dir.name:
+        repo_name = effective_repo_dir.name
+    else:
+        repo_name = "repo"
+    summary_or_branch = _format_pr_notification_subject_summary(
+        proposal_title,
+        resolved_exec_summary,
+        resolved_branch,
+    )
+
+    remote_url = ""
+    if isinstance(effective_repo_dir, Path) and (effective_repo_dir / ".git").exists():
+        resolver = getattr(vcs, "resolve_remote_url", None)
+        if callable(resolver):
+            try:
+                cand_remote = resolver(repo_dir=effective_repo_dir)
+            except TypeError:
+                cand_remote = resolver()
+            if isinstance(cand_remote, str):
+                remote_url = cand_remote.strip()
+    notification_target_url = _git_client.build_vcs_pr_notification_url(
+        branch_name=resolved_branch,
+        base_branch="main",
+        remote_url=remote_url,
+        pr_url=manual_pr_url,
+        repo_slug=resolved_repo_slug,
+    )
+
     email_sent = False
     email_subject = (
-        f"New Branch Created (by {PR_REVIEWER_SUBAGENT_NAME}): "
-        f"Branch {resolved_branch} [{resolved_ts}] Ready for Manual PR ({norm_verdict} {score_int}/100)"
+        f"PR Ready for Validation [{repo_name}]: {summary_or_branch} ({norm_verdict} {score_int}/100)"
     )
 
     if send_email:
@@ -4283,6 +4334,7 @@ def record_pr_review_evaluation(
             conversation_id=cid_clean or resolved_ts,
             validator=validator_banner_label,
             branch_name=resolved_branch,
+            target_url=notification_target_url,
             errors_only_override=False,
         )
         email_sent = bool(notify_res.get("sent"))
@@ -4334,6 +4386,7 @@ def record_pr_review_evaluation(
         "review_history": updated_history,
         "manual_pr_url": manual_pr_url,
         "pr_url": manual_pr_url,
+        "notification_target_url": notification_target_url,
         "frontend_changed": frontend_changed,
         "dev_preview_url": dev_preview_url,
         "pro_url": pro_url,

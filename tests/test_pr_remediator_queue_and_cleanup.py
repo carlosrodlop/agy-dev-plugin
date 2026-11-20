@@ -1870,6 +1870,15 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertTrue(rev_pass["notification_email_sent"])
             mock_notify_pass.assert_called_once()
             self.assertEqual(mock_notify_pass.call_args.kwargs.get("status"), "OK")
+            expected_clean_target_url = f"https://github.com/acme/repo-a/compare/main...{branch_name}?expand=1"
+            self.assertEqual(
+                mock_notify_pass.call_args.kwargs.get("subject"),
+                "PR Ready for Validation [repo-a]: feat(pr-gate): enforce local-first review (PASS 96/100)",
+            )
+            self.assertEqual(mock_notify_pass.call_args.kwargs.get("target_url"), expected_clean_target_url)
+            self.assertEqual(rev_pass["notification_target_url"], expected_clean_target_url)
+            self.assertNotIn("title=", rev_pass["notification_target_url"])
+            self.assertNotIn("body=", rev_pass["notification_target_url"])
 
             # Confirm bare remote NOW HAS the branch and its commit carries real Executive Summary + Verification Checks + Round 3/3 Review
             remote_heads_post = subprocess.run(
@@ -2006,6 +2015,7 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertTrue(r3["notification_email_sent"])
             mock_notify.assert_called_once()
             self.assertEqual(mock_notify.call_args.kwargs.get("status"), "KO")
+            self.assertEqual(mock_notify.call_args.kwargs.get("target_url"), "")
 
             lock_cb = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt_path)
             self.assertEqual(lock_cb["status"], "ESCALATED_MAX_REVIEW_ITERATIONS")

@@ -4,7 +4,7 @@
 Provides 100% VCS-interoperable (GitHub, GitLab, Bitbucket, Gitea, self-hosted Git) operations
 using exclusively native `/usr/bin/git` and `/usr/bin/ssh` with zero proprietary REST API calls:
   - Repository & remote URL discovery (`resolve_repo_dir`, `resolve_remote_url`, `resolve_repo`)
-  - Dynamic VCS provider & web compare/MR URL builder (`detect_vcs_provider_from_remote`, `build_vcs_manual_pr_url`)
+  - Dynamic VCS provider & web compare/MR URL builder (`detect_vcs_provider_from_remote`, `build_vcs_manual_pr_url`, `build_vcs_pr_notification_url`)
   - Native SSH & Git authentication check (`check_ssh_git_auth`, `auth_status`, `probe_health`)
   - Unified branch diff, changed files & commit log (`get_branch_diff`)
   - Protected timestamped branch push (`push_branch` — refuses pushing `main`/`master`)
@@ -308,19 +308,30 @@ def parse_git_repo_slug(raw_url_or_slug: str) -> str:
 def detect_vcs_provider_from_remote(remote_url: str) -> tuple[str, str, str]:
     """Return `(provider, web_base_url, repo_slug)` from any Git SSH or HTTPS remote URL.
 
-    Works natively across GitHub, GitLab, Bitbucket, Gitea, and self-hosted Git remotes.
+    Works natively across GitHub, GitLab, Bitbucket, Gitea, and self-hosted Git remotes,
+    stripping HTTPS userinfo (`user@`) and custom SSH ports (`:2222/`) cleanly.
     """
     cleaned = (remote_url or "").strip()
     host = "github.com"
     slug = parse_git_repo_slug(cleaned)
-    m_ssh = re.match(r"^(?:ssh://)?git@([^:/]+)[:/](.+?)(?:\.git)?$", cleaned)
-    m_http = re.match(r"^https?://([^/]+)/(.+?)(?:\.git)?$", cleaned)
-    if m_ssh:
-        host = m_ssh.group(1).strip()
-        slug = m_ssh.group(2).strip().strip("/")
-    elif m_http:
-        host = m_http.group(1).strip()
-        slug = m_http.group(2).strip().strip("/")
+    m_scp = re.match(r"^[^@:/\s]+@([^:/\s]+):(.+?)$", cleaned)
+    if re.match(r"^(?:https?|ssh|git)://", cleaned, re.IGNORECASE):
+        parsed = urllib.parse.urlsplit(cleaned)
+        scheme_lower = parsed.scheme.lower()
+        if parsed.hostname:
+            if scheme_lower in ("http", "https") and parsed.port:
+                default_port = 443 if scheme_lower == "https" else 80
+                host = parsed.hostname if parsed.port == default_port else f"{parsed.hostname}:{parsed.port}"
+            else:
+                host = parsed.hostname
+        raw_path = (parsed.path or "").strip().strip("/").removesuffix(".git")
+        if raw_path:
+            slug = raw_path
+    elif m_scp:
+        host = m_scp.group(1).strip()
+        raw_path = m_scp.group(2).strip().strip("/").removesuffix(".git")
+        if raw_path:
+            slug = raw_path
 
     host_lower = host.lower()
     if "gitlab" in host_lower:
@@ -333,6 +344,143 @@ def detect_vcs_provider_from_remote(remote_url: str) -> tuple[str, str, str]:
         provider = "generic-git"
     web_base = f"https://{host}/{slug}"
     return provider, web_base, slug
+
+
+_BLOATED_PR_QUERY_KEYS = frozenset(
+    {
+        "title",
+        "body",
+        "description",
+        "merge_request[title]",
+        "merge_request[description]",
+    }
+)
+_DIRECT_PR_URL_PATH_RE = re.compile(
+    r"^(.*?/(?:pull|pulls|pull-requests|-/merge_requests)/\d+)(?:/.*)?$"
+)
+_VALID_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$")
+
+
+def _is_local_or_unresolvable_remote(remote_url: str) -> bool:
+    """Return True when `remote_url` is empty or points to a local filesystem checkout/bare path."""
+    cleaned = (remote_url or "").strip()
+    if not cleaned:
+        return True
+    if cleaned.startswith(("/", "~", "./", "../")):
+        return True
+    if re.match(r"^[A-Za-z]:[/\\]", cleaned):
+        return True
+    if cleaned.lower().startswith("file://"):
+        return True
+    has_network_scheme = bool(re.match(r"^(?:https?|ssh|git)://", cleaned, re.IGNORECASE))
+    has_scp_syntax = bool(re.match(r"^[^@:/\s]+@[^:/\s]+:.+$", cleaned))
+    return not (has_network_scheme or has_scp_syntax)
+
+
+def _extract_clean_direct_pr_url(pr_url: str) -> str:
+    """Return a clean canonical direct PR/MR URL if `pr_url` references an existing PR/MR ID, else `""`."""
+    raw = (pr_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        return ""
+    host_part = parsed.netloc.split("@")[-1]
+    clean_path = re.sub(r"/+$", "", parsed.path or "")
+    m_direct = _DIRECT_PR_URL_PATH_RE.match(clean_path)
+    if not m_direct:
+        return ""
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), host_part, m_direct.group(1), "", ""))
+
+
+def _strip_bloated_pr_query_params(raw_url: str) -> str:
+    """Strip bloated title/body/description query params from an HTTP(S) PR/Compare URL."""
+    raw = (raw_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
+        return ""
+    host_part = parsed.netloc.split("@")[-1]
+    kept_pairs = [
+        (k, v)
+        for k, v in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if k not in _BLOATED_PR_QUERY_KEYS
+    ]
+    clean_query = urllib.parse.urlencode(kept_pairs, doseq=True)
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), host_part, parsed.path, clean_query, ""))
+
+
+def _build_vcs_branch_url(provider: str, web_base: str, enc_branch: str) -> str:
+    """Return the provider-appropriate branch tree URL."""
+    if provider == "gitlab":
+        return f"{web_base}/-/tree/{enc_branch}"
+    if provider == "bitbucket":
+        return f"{web_base}/src/{enc_branch}"
+    return f"{web_base}/tree/{enc_branch}"
+
+
+def build_vcs_pr_notification_url(
+    branch_name: str = "",
+    base_branch: str = "main",
+    remote_url: str = "",
+    *,
+    pr_url: str = "",
+    repo_slug: str = "",
+    head_branch: str = "",
+) -> str:
+    """Build a clean, concise VCS URL for PR validation notification emails.
+
+    Fallback chain:
+      1. Clean direct PR/MR link (`/pull/<id>`, `/-/merge_requests/<id>`, `/pull-requests/<id>`).
+      2. Clean Compare/Create PR link without bloated `?title=...&body=...` params.
+      3. Branch URL (`/tree/<branch>`, `/-/tree/<branch>`, `/src/<branch>`) when comparing is inapplicable.
+      4. Repository URL (`web_base`) when `branch_name` is empty (`repo_slug` fallback for local bare remotes).
+      5. `""` when unresolvable.
+    """
+    if head_branch and not remote_url and ("@" in branch_name or "://" in branch_name):
+        remote_url = branch_name
+        resolved_branch = head_branch.strip()
+    else:
+        resolved_branch = (branch_name or head_branch).strip()
+
+    direct_pr = _extract_clean_direct_pr_url(pr_url)
+    if direct_pr:
+        return direct_pr
+
+    provider = ""
+    web_base = ""
+    if not _is_local_or_unresolvable_remote(remote_url):
+        provider, web_base, _ = detect_vcs_provider_from_remote(remote_url)
+    else:
+        clean_slug = (repo_slug or "").strip().strip("/").removesuffix(".git")
+        if clean_slug and clean_slug.lower() != "default" and _VALID_REPO_SLUG_RE.match(clean_slug):
+            provider = "github"
+            web_base = f"https://github.com/{clean_slug}"
+
+    if not web_base:
+        return _strip_bloated_pr_query_params(pr_url)
+
+    if not resolved_branch:
+        cleaned_pr = _strip_bloated_pr_query_params(pr_url)
+        return cleaned_pr or web_base
+
+    enc_branch = urllib.parse.quote(resolved_branch, safe="/")
+    clean_base = (base_branch or "").strip()
+    if not clean_base or resolved_branch == clean_base or provider == "generic-git":
+        return _build_vcs_branch_url(provider, web_base, enc_branch)
+
+    enc_base = urllib.parse.quote(clean_base, safe="/")
+    if provider == "gitlab":
+        return (
+            f"{web_base}/-/merge_requests/new?"
+            f"merge_request%5Bsource_branch%5D={enc_branch}&merge_request%5Btarget_branch%5D={enc_base}"
+        )
+    if provider == "bitbucket":
+        return f"{web_base}/pull-requests/new?source={enc_branch}&dest={enc_base}"
+    if provider == "github":
+        return f"{web_base}/compare/{enc_base}...{enc_branch}?expand=1"
+    return _build_vcs_branch_url(provider, web_base, enc_branch)
 
 
 def build_vcs_manual_pr_url(
@@ -682,6 +830,28 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
             remote_url=remote_url,
             title=title,
             body=body,
+        )
+
+    def build_pr_notification_url(
+        self,
+        branch_name: str = "",
+        base_branch: str = "main",
+        remote: str = "origin",
+        repo_dir: Path | None = None,
+        *,
+        pr_url: str = "",
+        repo_slug: str = "",
+        head_branch: str = "",
+    ) -> str:
+        """Build a clean, concise VCS notification URL (PR/Compare -> Branch -> Repo) from the native `git remote`."""
+        resolved_branch = (branch_name or head_branch).strip()
+        remote_url = self.resolve_remote_url(remote=remote, repo_dir=repo_dir)
+        return build_vcs_pr_notification_url(
+            branch_name=resolved_branch,
+            base_branch=base_branch,
+            remote_url=remote_url,
+            pr_url=pr_url,
+            repo_slug=repo_slug,
         )
 
     def get_branch_diff(
