@@ -1016,6 +1016,57 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
         readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn("co-design-and-discovery.md", readme_text)
 
+    def test_locked_repo_auto_enqueue_contract_across_rules_agents_and_skills(self) -> None:
+        contract_files = (
+            REPO_ROOT / "rules" / "co-design-and-discovery.md",
+            REPO_ROOT / "rules" / "git-and-pr-workflow.md",
+            REPO_ROOT / "agents" / "agy-dev-planner.md",
+            REPO_ROOT / "skills" / "agy-dev-queue-orchestrator" / "SKILL.md",
+            REPO_ROOT / "skills" / "agy-code-remediation-pr" / "SKILL.md",
+        )
+        forbidden_stale_patterns = (
+            r"recommend\s+\*{0,2}enqueueing",
+            r"ask\s+(?:the\s+user\s+)?before\s+enqueueing",
+            r"offer\s+to\s+enqueue",
+            r"\bagy-tam-plugin\b",
+            r"\bg-control-tower\b",
+        )
+        for md_path in contract_files:
+            self.assertTrue(md_path.is_file(), msg=f"Missing policy contract file: {md_path}")
+            self.assertLess(md_path.stat().st_size, 24000, msg=f"{md_path} exceeds 24,000-byte ceiling")
+            text = md_path.read_text(encoding="utf-8")
+            lower = text.lower()
+
+            # 1. Must forbid confirmation/priority prompts whenever a target repo holds an active lock
+            self.assertIn("dev_pr_lock", text, msg=f"{md_path} must reference active dev_pr_lock")
+            self.assertIn(
+                "do not ask the user for confirmation or priority",
+                lower,
+                msg=f"{md_path} must forbid confirmation/priority prompts on locked repos",
+            )
+
+            # 2. Must calibrate numeric priority automatically from queue, architecture, dependencies, and urgency
+            self.assertIn("calibrated numeric priority", lower, msg=f"{md_path} must require calibrated numeric priority")
+            for signal in ("dev_queue.json", "architecture", "depends_on", "urgency"):
+                self.assertIn(signal, lower, msg=f"{md_path} must include priority calibration signal '{signal}'")
+
+            # 3. Must immediately execute queue-add --status pending with full payload metadata
+            self.assertIn("queue-add --status pending", text, msg=f"{md_path} must mandate queue-add --status pending")
+            for payload_field in ("rca_summary", "proposed_fix", "target_files", "repo_slugs"):
+                self.assertIn(payload_field, text, msg=f"{md_path} must document queue-add field '{payload_field}'")
+
+            # 4. Must render a concise visual confirmation showing blocker lock and active queue state
+            self.assertIn("visual confirmation", lower, msg=f"{md_path} must mandate concise visual confirmation")
+            self.assertIn("blocker lock", lower, msg=f"{md_path} must surface active blocker lock in visual confirmation")
+
+            # 5. Must not retain stale recommendation/confirmation contradictions or hardcoded companion repo names
+            for bad_pattern in forbidden_stale_patterns:
+                self.assertNotRegex(
+                    lower,
+                    bad_pattern,
+                    msg=f"{md_path} contains forbidden stale or hardcoded pattern '{bad_pattern}'",
+                )
+
     def test_sync_pr_verification_workflow_contract(self) -> None:
         wf_path = REPO_ROOT / ".github" / "workflows" / "sync-pr-verification.yml"
         self.assertTrue(wf_path.is_file(), msg=".github/workflows/sync-pr-verification.yml must exist")

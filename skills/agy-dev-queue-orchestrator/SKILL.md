@@ -5,12 +5,13 @@ description: Multi-repo development queue orchestrator paired with agy-dev-orche
 
 # Persistent Multi-Repo Dev Queue Orchestrator (`agy-dev-queue-orchestrator`)
 
-Coordinates multiple pending engineering tasks across `agy-dev-plugin`, `agy-tam-plugin`, `g-control-tower`, and companion repos without per-repo lock collisions—serializing edits within the same repository while allowing distinct unlocked repositories to progress in parallel.
+Coordinates multiple pending engineering tasks across managed repositories without per-repo lock collisions—serializing edits within the same repository while allowing distinct unlocked repositories to progress in parallel.
 
 ## Persistent Queue Commands (`dev_queue.json` · `0600` + `file_lock`)
 All operations run deterministically via [`pr_remediator.py`]($HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py):
 - **Inspect queue & active repo locks**: `pr_remediator.py lock-status --all --sync-git` and `pr_remediator.py queue-list`
-- **Enqueue / update item**: `pr_remediator.py queue-add --id <CID> --title "..." --priority <10-90> --repos <repo1> <repo2> --target-files <f1> <f2> --orchestrator-id <ORCH_CID>`
+- **Enqueue / update item**: `pr_remediator.py queue-add --id <CID> --title "..." --priority <10-90> --repos <repo1> <repo2> --status pending --target-files <f1> <f2> --depends-on <dep_cid> --rca-summary "..." --proposed-fix "..." --orchestrator-id <ORCH_CID>`
+- **Locked-Repo Auto-Enqueue Policy (Zero Confirmation Prompt)**: When a **Design Contract** converges (or an approved task is ready) and one or more target repositories currently hold an active `dev_pr_lock`, **DO NOT ask the user for confirmation or priority** (never prompt *"Do you want me to enqueue this?"* or *"What priority should I assign?"*). Immediately inspect `dev_queue.json`, active `dev_pr_locks`, application architecture, dependencies (`depends_on`), and user urgency to assign a calibrated numeric priority automatically relative to existing queued tasks, execute `pr_remediator.py queue-add --status pending` immediately (including full `rca_summary`, `proposed_fix`, `target_files`, `depends_on`, and `repo_slugs` via `--repos`), and render a concise visual confirmation of the newly queued item and active queue state (compact Markdown table showing queue position, calibrated priority, target repo(s), active blocker lock, and next-up sequence).
 - **Pick next unblocked item (skipping locked repos)**: `pr_remediator.py queue-next --unlocked --orchestrator-id <ORCH_CID>`
 - **Reconcile merged `pr_open` items & prune stale compare `pr_urls`**: `pr_remediator.py queue-sync [--repo <owner/repo>] [--workdir <DIR>] [--fetch]` (also executed automatically during `lock-status --sync-git`)
 - **Transition item state**: `pr_remediator.py queue-set-status --id <CID> --status <pending|in_progress|pr_open|merged|standby|hitl_blocked|cleaned|cancelled|rejected> --branches ... --pr-urls ...` (automatically deduplicates `pr_urls` per `(repo_slug, branch_name)` keeping the richest verified URL: `/pull/` > rich verified `/compare/` > bare `?expand=1`)
@@ -19,6 +20,7 @@ All operations run deterministically via [`pr_remediator.py`]($HOME/.gemini/conf
 1. **Sync & Inspect Locks Per Repo**: Run `lock-status --all --sync-git` and `queue-list`. If any repo branch merged, fast-forward local `main`, update `merged_repos` cleanly (only marking multi-repo items `merged` once all target repos merge), and deploy plugins via `git_client.py deploy-home`.
 2. **Plan Before Executing (`agy-dev-planner`)**:
    - Locate exact files, line numbers, API contracts, cross-repo dependencies, and unit test targets upfront before reserving a worktree.
+   - If any target repository holds an active `dev_pr_lock`, immediately auto-enqueue as `pending` via `queue-add` with calibrated numeric priority and a concise visual queue confirmation table (never prompt for confirmation or priority).
    - Pass structured `anchored_context` to `agy-dev-executor` / `agy-code-developer` (`Model="flash"` for focused pre-anchored fixes, `Model="pro"` for multi-file refactors).
 3. **Execute Per-Repo Worktrees, Local-First Review & Hard `PASS > 90` Auto-Iteration Loop (`agy-dev-executor`)**:
    - Work in isolated repo-scoped worktrees (`pr-worktree-<repo>-<branch>`), run `pre-commit run --all-files` + `test-local --workdir <WORKTREE_PATH>`, and stage locally via `prepare-review` (`push-branch`) without pushing to `origin` yet.

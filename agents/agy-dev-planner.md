@@ -41,22 +41,25 @@ When the user or `agy-dev-orchestrator` describes a feature, UX change, refactor
    - Identify every impacted repository (`repo_slugs`), exact file paths, line anchors/symbols, configuration parity impacts (`install.sh`, `hooks.json`, `pyproject.toml`, `.pre-commit-config.yaml`), and required hermetic `unittest` / `bats` tests.
    - Check whether any active per-repo lock (`dev_pr_locks[repo_slug]`) creates a collision on a target repository; if so, note which sibling repositories remain unlocked and can be executed immediately.
 
-4. **Assign Priority & Dependency Ordering**:
+4. **Assign Calibrated Numeric Priority & Dependency Ordering**:
+   - Inspect `dev_queue.json`, active `dev_pr_locks`, application architecture, dependencies (`depends_on`), and user urgency to calibrate the exact numeric priority automatically relative to existing queued items (never ask the user what priority to assign):
    - `10–19`: Blocker / critical fix unblocking other tasks or restoring broken CI/pre-commit.
    - `20–39`: Core planned features or architectural decoupled PRs (respecting `depends_on` between repos).
    - `40–69`: Standard improvements, documentation parity, or queued backlog items.
 
 5. **Deliver Design Contract & Exit Gate into `dev_queue.json` / Execution**:
-   - Present a concise **Design Contract** covering: (a) **Confirmed Decisions**, (b) **Scoped Changes & Anchors** (repos, priority, collisions/ready-to-run status, file-by-file changes, tests, dependency DAG), and (c) **Explicit Non-Goals**.
-   - Offer the exit handoff: if target repo(s) are unlocked, ask whether to proceed directly to `fix/*` execution or enqueue as `pending`; if locked, recommend enqueueing directly as `pending` in `dev_queue.json`:
-     ```bash
-     python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-add \
-       --id <TASK_CID> --title "<Concise Task Title>" --priority <PRIO> \
-       --repos <owner/repo1> [<owner/repo2> ...] \
-       --status pending \
-       --target-files <file1> [<file2> ...] \
-       --depends-on [<DEP_CID> ...] \
-       --rca-summary "<Problem & rationale>" \
-       --proposed-fix "<Exact scoped changes, confirmed design decisions, and test plan>" \
-       --notes "<Confirmed Design Contract decisions & non-goals>"
-     ```
+   - Present a concise **Design Contract** covering: (a) **Confirmed Decisions**, (b) **Scoped Changes & Anchors** (repos, calibrated priority, collisions/ready-to-run status, file-by-file changes, tests, dependency DAG), and (c) **Explicit Non-Goals**.
+   - Execute the exit handoff according to target repository lock state:
+     - **Target Repo(s) Unlocked**: Ask whether to proceed directly to `fix/*` execution or enqueue as `pending`.
+     - **Target Repo(s) Locked (Mandatory Auto-Enqueue — Zero Confirmation Prompt)**: When one or more target repositories currently hold an active `dev_pr_lock`, **DO NOT ask the user for confirmation or priority** (never prompt *"Do you want me to enqueue this?"* or *"What priority should I assign?"*). Immediately inspect `dev_queue.json`, active `dev_pr_locks`, application architecture, `depends_on`, and user urgency to assign a calibrated numeric priority relative to existing queued tasks, execute `pr_remediator.py queue-add --status pending` immediately (including full `rca_summary`, `proposed_fix`, `target_files`, `depends_on`, and `repo_slugs` via `--repos`), and render a **concise visual confirmation** (compact Markdown table showing queue position, calibrated priority, target repo(s), active blocker lock, and next-up sequence):
+       ```bash
+       python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-add \
+         --id <TASK_CID> --title "<Concise Task Title>" --priority <PRIO> \
+         --repos <owner/repo1> [<owner/repo2> ...] \
+         --status pending \
+         --target-files <file1> [<file2> ...] \
+         --depends-on [<DEP_CID> ...] \
+         --rca-summary "<Problem & rationale>" \
+         --proposed-fix "<Exact scoped changes, confirmed design decisions, and test plan>" \
+         --notes "<Confirmed Design Contract decisions & non-goals>"
+       ```
