@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -76,6 +77,22 @@ DETERMINISTIC_DEV_PRETOOL_CHECKS: tuple[dict[str, str], ...] = (
         "decision": "deny",
         "description": "Blocks direct agent writes or edits to live '~/.env' credentials; mock placeholders belong in .env.example.",
     },
+    {
+        "check_id": "pretool:unvalidated-branch-push",
+        "event": "PreToolUse",
+        "title": "Unvalidated Feature Branch Push Blocker (PR Readiness Gate)",
+        "target": "run_command (git push targeting active locked branch with pr_gate_ready=False)",
+        "decision": "deny",
+        "description": "Blocks direct 'git push' commands targeting an active locked branch before agy-code-pr-reviewer passes (>90/100) and sets pr_gate_ready=True.",
+    },
+)
+
+UNREADY_PR_GATE_LOCK_STATUSES: frozenset[str] = frozenset(
+    {
+        "AWAITING_AGENT_REVIEW",
+        "NEEDS_REVISION_ITERATING",
+        "ESCALATED_MAX_REVIEW_ITERATIONS",
+    }
 )
 
 DETERMINISTIC_DEV_SESSION_CHECKS: tuple[dict[str, str], ...] = (
@@ -85,7 +102,7 @@ DETERMINISTIC_DEV_SESSION_CHECKS: tuple[dict[str, str], ...] = (
         "title": "Per-Repository Cross-Conversation dev_pr_locks Context Injector",
         "target": "SessionStart (dev_pr_locks / dev_pr_lock.json / actions_state.json)",
         "decision": "inject_context",
-        "description": "Inspects active per-repository dev_pr_locks state at session start and injects a systemMessage scoping concurrency to the active repository.",
+        "description": "Inspects active per-repository dev_pr_locks state at session start, scopes concurrency per repo, and warns never to surface PR links while a lock is awaiting review or iterating.",
     },
 )
 
@@ -775,6 +792,10 @@ class DevLifecycleGuardrailEvaluator:
                     ),
                 }
 
+            unvalidated_push_deny = self._check_unvalidated_branch_push(cmd_line, payload, args)
+            if unvalidated_push_deny is not None:
+                return unvalidated_push_deny
+
         elif tool_name in ("write_file", "edit_file", "replace_file_content", "multi_replace_file_content"):
             raw_target = str(args.get("Path") or args.get("TargetFile") or args.get("path") or "").strip()
             if raw_target:
@@ -796,13 +817,219 @@ class DevLifecycleGuardrailEvaluator:
         return {"decision": "allow"}
 
     @staticmethod
+    def _read_git_head_branch_and_sha(target_dir: Path | None, branch_name: str = "") -> tuple[str, str]:
+        """Return `(checked_out_branch, head_sha_for_branch)` for a git checkout or worktree without network calls."""
+        if target_dir is None or not target_dir.exists() or not (target_dir / ".git").exists():
+            return "", ""
+        branch_out = ""
+        sha_out = ""
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc_br = subprocess.run(
+                ["git", "-C", str(target_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if proc_br.returncode == 0:
+                branch_out = (proc_br.stdout or "").strip()
+            ref_target = branch_name.strip() or "HEAD"
+            proc_sha = subprocess.run(
+                ["git", "-C", str(target_dir), "rev-parse", "--verify", ref_target],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if proc_sha.returncode == 0:
+                sha_out = (proc_sha.stdout or "").strip()
+        return branch_out, sha_out
+
+    def _is_lock_pr_gate_ready(self, lock_data: dict[str, Any]) -> bool:
+        """Return True iff `lock_data` passed review (`pr_gate_ready=True`) and HEAD SHA matches `reviewed_head_sha`."""
+        if not bool(lock_data.get("pr_gate_ready")):
+            return False
+        reviewed_sha = str(lock_data.get("reviewed_head_sha") or "").strip()
+        if not reviewed_sha:
+            return True
+        lock_head = str(lock_data.get("head_sha") or "").strip()
+        if lock_head and lock_head != reviewed_sha:
+            return False
+        branch_name = str(lock_data.get("branch_name") or "").strip()
+        for pkey in ("worktree_path", "target_repo_dir"):
+            raw_p = str(lock_data.get(pkey) or "").strip()
+            if not raw_p:
+                continue
+            cand = Path(raw_p.replace("$HOME", str(self.home_dir))).expanduser()
+            if cand.exists() and (cand / ".git").exists():
+                _, live_sha = self._read_git_head_branch_and_sha(cand, branch_name=branch_name)
+                if live_sha and live_sha != reviewed_sha:
+                    return False
+                break
+        return True
+
+    def _check_unvalidated_branch_push(
+        self,
+        cmd_line: str,
+        payload: dict[str, Any],
+        args: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Deny direct `git push` commands targeting an active locked branch before `pr_gate_ready=True`."""
+        if "git" not in cmd_line or "push" not in cmd_line:
+            return None
+        active_map = self._read_active_locks_map()
+        if not active_map:
+            return None
+
+        unvalidated_locks: list[tuple[str, dict[str, Any]]] = [
+            (slug, ldata)
+            for slug, ldata in active_map.items()
+            if str(ldata.get("branch_name") or "").strip() and not self._is_lock_pr_gate_ready(ldata)
+        ]
+        if not unvalidated_locks:
+            return None
+
+        raw_cwd = str(args.get("Cwd") or args.get("cwd") or payload.get("cwd") or "").strip()
+        current_dir: Path | None = Path(raw_cwd.replace("$HOME", str(self.home_dir))).expanduser() if raw_cwd else None
+
+        segments = re.split(r"(?:&&|\|\||[;|\n])", cmd_line)
+        for seg in segments:
+            seg_clean = seg.strip()
+            if not seg_clean:
+                continue
+            try:
+                tokens = shlex.split(seg_clean)
+            except ValueError:
+                tokens = seg_clean.split()
+            if not tokens:
+                continue
+
+            # Track `cd <dir>` across chained shell segments
+            if tokens[0] == "cd" and len(tokens) >= 2:
+                cd_raw = tokens[1].replace("$HOME", str(self.home_dir))
+                cd_path = Path(cd_raw).expanduser()
+                current_dir = cd_path if cd_path.is_absolute() or current_dir is None else (current_dir / cd_path)
+                continue
+
+            # Skip leading env assignments or `env` wrapper
+            idx = 0
+            if idx < len(tokens) and tokens[idx] == "env":
+                idx += 1
+            while idx < len(tokens) and "=" in tokens[idx] and not tokens[idx].startswith("-"):
+                idx += 1
+            if idx >= len(tokens):
+                continue
+            exe_name = Path(tokens[idx]).name
+            if exe_name != "git":
+                continue
+
+            idx += 1
+            git_c_dir: Path | None = None
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                opt = tokens[idx]
+                if opt in ("-C", "--git-dir", "--work-tree", "-c") and idx + 1 < len(tokens):
+                    if opt == "-C":
+                        c_raw = tokens[idx + 1].replace("$HOME", str(self.home_dir))
+                        c_path = Path(c_raw).expanduser()
+                        git_c_dir = c_path if c_path.is_absolute() or current_dir is None else (current_dir / c_path)
+                    idx += 2
+                elif opt.startswith("--git-dir=") or opt.startswith("--work-tree="):
+                    idx += 1
+                else:
+                    idx += 1
+            if idx >= len(tokens) or tokens[idx] != "push":
+                continue
+
+            push_tokens = tokens[idx + 1 :]
+            if any(t in ("--delete", "-d") for t in push_tokens):
+                continue
+
+            pos_args: list[str] = []
+            p_idx = 0
+            while p_idx < len(push_tokens):
+                tok = push_tokens[p_idx]
+                if tok in ("-o", "--push-option", "--repo", "--receive-pack", "--exec") and p_idx + 1 < len(push_tokens):
+                    p_idx += 2
+                    continue
+                if tok.startswith("-"):
+                    p_idx += 1
+                    continue
+                pos_args.append(tok)
+                p_idx += 1
+
+            refspecs = pos_args[1:] if len(pos_args) >= 2 else []
+            explicit_branches: set[str] = set()
+            targets_head_or_implicit = len(refspecs) == 0
+            for spec in refspecs:
+                clean_spec = spec.lstrip("+")
+                if clean_spec.startswith(":"):
+                    # Delete refspec (`git push origin :branch`) is always allowed
+                    continue
+                if ":" in clean_spec:
+                    src_part, dst_part = clean_spec.split(":", 1)
+                    for part in (src_part, dst_part):
+                        norm_p = part.strip().removeprefix("refs/heads/")
+                        if norm_p == "HEAD":
+                            targets_head_or_implicit = True
+                        elif norm_p:
+                            explicit_branches.add(norm_p)
+                else:
+                    norm_s = clean_spec.strip().removeprefix("refs/heads/")
+                    if norm_s == "HEAD":
+                        targets_head_or_implicit = True
+                    elif norm_s:
+                        explicit_branches.add(norm_s)
+
+            eff_dir = git_c_dir or current_dir
+            eff_dir_resolved: Path | None = None
+            if eff_dir is not None:
+                with contextlib.suppress(OSError):
+                    eff_dir_resolved = eff_dir.resolve()
+            eff_branch, _ = self._read_git_head_branch_and_sha(eff_dir_resolved)
+            eff_slug = resolve_repo_slug_from_path(eff_dir_resolved) if eff_dir_resolved is not None else ""
+
+            for slug, lock_data in unvalidated_locks:
+                lock_branch = str(lock_data.get("branch_name") or "").strip()
+                lock_status = str(lock_data.get("status") or "DEVELOPING").strip()
+                matched = lock_branch in explicit_branches
+                if not matched and targets_head_or_implicit:
+                    if eff_branch and eff_branch == lock_branch:
+                        matched = True
+                    elif eff_dir_resolved is not None:
+                        for pkey in ("worktree_path", "target_repo_dir"):
+                            raw_lp = str(lock_data.get(pkey) or "").strip()
+                            if not raw_lp:
+                                continue
+                            lp = Path(raw_lp.replace("$HOME", str(self.home_dir))).expanduser()
+                            with contextlib.suppress(OSError):
+                                lp_res = lp.resolve()
+                                if eff_dir_resolved == lp_res or lp_res in eff_dir_resolved.parents:
+                                    matched = True
+                                    break
+                        if not matched and eff_slug and slug and eff_slug == slug:
+                            matched = True
+                if matched:
+                    return {
+                        "decision": "deny",
+                        "check_id": "pretool:unvalidated-branch-push",
+                        "reason": (
+                            f"Guardrail violation (PR Readiness Gate — pretool:unvalidated-branch-push): "
+                            f"direct 'git push' targeting locked branch '{lock_branch}' (repo '{slug}') "
+                            f"is blocked while pr_gate_ready=False (status={lock_status}). "
+                            f"Complete independent agy-code-pr-reviewer evaluation (PASS > 90/100) via "
+                            f"pr_remediator.py record-review to publish the branch."
+                        ),
+                    }
+        return None
+
+    @staticmethod
     def _extract_repo_slug_from_lock(lock_data: dict[str, Any], default_key: str = "") -> str:
         """Infer normalized `owner/repo` slug from a lock dictionary or fallback key."""
         for key in ("repo_slug", "repo"):
             val = normalize_repo_slug(str(lock_data.get(key) or ""))
             if val:
                 return val
-        for path_key in ("target_repo_dir", "worktree_dir"):
+        for path_key in ("target_repo_dir", "worktree_path", "worktree_dir"):
             raw_p = str(lock_data.get(path_key) or "").strip()
             if raw_p:
                 resolved = resolve_repo_slug_from_path(raw_p.replace("$HOME", str(Path.home())))
@@ -879,6 +1106,20 @@ class DevLifecycleGuardrailEvaluator:
 
         messages: list[str] = []
         other_locked: list[str] = []
+        unready_warnings: list[str] = []
+
+        def _append_unready_warning(slug_key: str, ldata: dict[str, Any]) -> None:
+            lock_status = str(ldata.get("status") or "").strip().upper()
+            br_name = str(ldata.get("branch_name") or "").strip()
+            if br_name and lock_status in UNREADY_PR_GATE_LOCK_STATUSES:
+                warn_msg = (
+                    f"[Antigravity PR Readiness Gate] Repo '{slug_key}' branch '{br_name}' is in status "
+                    f"'{lock_status}' (pr_gate_ready=False). NEVER surface Compare/PR links or claim the PR "
+                    f"is ready until agy-code-pr-reviewer passes (>90/100) and pr_remediator.py publishes the branch."
+                )
+                if warn_msg not in unready_warnings:
+                    unready_warnings.append(warn_msg)
+
         if workspace_repos:
             matched_repos = [r for r in workspace_repos if r in active_map]
             free_repos = [r for r in workspace_repos if r not in active_map]
@@ -900,11 +1141,13 @@ class DevLifecycleGuardrailEvaluator:
                         f"held by conversation '{owner_cid[:8]}' on branch '{branch_name}'. Do not start a new branch "
                         f"or modify tracked repository files in '{r}' from another conversation until that branch is merged into main or evaluated."
                     )
+                _append_unready_warning(r, lock_data)
             for slug, lock_data in active_map.items():
                 if slug not in workspace_repos and lock_data.get("branch_name"):
                     other_locked.append(
                         f"{slug}: '{lock_data.get('branch_name')}' (cid {str(lock_data.get('conversation_id') or '')[:8]})"
                     )
+                    _append_unready_warning(slug, lock_data)
             if free_repos and other_locked:
                 messages.append(
                     f"[Antigravity Dev Guardrail] Active workspace repository {', '.join(free_repos)} is UNLOCKED "
@@ -928,6 +1171,9 @@ class DevLifecycleGuardrailEvaluator:
                         f"held by conversation '{owner_cid[:8]}' on branch '{branch_name}'. Do not start a new branch "
                         f"or modify tracked repository files in '{slug}' from another conversation until that branch is merged into main or evaluated."
                     )
+                _append_unready_warning(slug, lock_data)
+
+        messages.extend(unready_warnings)
 
         if not messages:
             return {"decision": "allow"}

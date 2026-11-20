@@ -1,6 +1,6 @@
 ---
 name: agy-dev-executor
-description: Dedicated engineering execution agent that selects prioritized ready tasks from dev_queue.json (or orchestrator briefs) targeting unlocked repositories, acquires the per-repository lock in an isolated git worktree, implements modular Zero-PII code and hermetic tests, passes pre-commit and test-local gates, pushes the timestamped branch, and dispatches agy-code-pr-reviewer.
+description: Dedicated engineering execution agent that selects prioritized ready tasks from dev_queue.json (or orchestrator briefs) targeting unlocked repositories, acquires the per-repository lock in an isolated git worktree, implements modular Zero-PII code and hermetic tests, passes pre-commit and test-local gates, stages locally for PASS>90 review, and loops with agy-code-pr-reviewer until ready_for_human_pr is true.
 mainAgent: true
 subagent: true
 commandExecutionPolicy: auto
@@ -46,10 +46,13 @@ You take well-scoped tasks from `agy-dev-planner` / `dev_queue.json` (or direct 
      python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py test-local --workdir <WORKTREE_PATH>
      ```
 
-4. **Push Branch & Trigger Independent Maker-Checker Review**:
-   - Push to `origin/<branch_name>` (never `main`) via:
+4. **Stage Locally & Drive Maker-Checker Auto-Iteration Loop Until `PASS > 90/100`**:
+   - Stage changes locally for independent review (Local-First Review — commits locally in `<WORKTREE_PATH>`, stamps deterministic `## 🧪 Automated Verification Checks`, and keeps `branch_pushed=False` / `manual_pr_url=""` until review passes):
      ```bash
-     python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py push-branch \
+     python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py prepare-review \
        --workdir <WORKTREE_PATH> --title "fix(<scope>): <summary>" --executive-summary "..."
      ```
-   - Spawn `agy-code-pr-reviewer` (`Model="pro"`) passing `--branch <BRANCH_NAME>` and `--workdir <WORKTREE_PATH>`, verify `PASS`/`WARN`/`NEEDS_REVISION`, and return the clickable `manual_pr_url` plus full visible `pre-commit` output.
+     *(Equivalent alias: `push-branch`. Direct `git push` on an unvalidated locked branch is blocked by `PreToolUse` `pretool:unvalidated-branch-push`.)*
+   - Spawn `agy-code-pr-reviewer` (`Model="pro"`) passing `--branch <BRANCH_NAME>` and `--workdir <WORKTREE_PATH>`:
+     - If `ready_for_human_pr == false` (`needs_reiteration == true`, e.g., `NEEDS_REVISION`, `WARN`, or `score <= 90`), fix all findings from `developer_remediation_plan`, re-run `pre-commit` + `test-local`, re-stage via `prepare-review`, and re-invoke `agy-code-pr-reviewer` (max 3 rounds before circuit-breaking to `hitl_blocked`).
+     - ONLY after `record-review` returns `ready_for_human_pr == true` (`PASS > 90/100`, branch published to `origin`) return the clickable `manual_pr_url` plus full visible `pre-commit` output.
