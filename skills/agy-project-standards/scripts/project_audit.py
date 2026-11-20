@@ -5,6 +5,7 @@ Validates any repository or Antigravity plugin against core engineering pillars:
   - Python AST safety (syntax, bare `except:`, mutable default arguments)
   - Zero-PII & secret leak guardrails (high-confidence token patterns, machine `/Users/<name>/` paths)
   - Antigravity plugin/rule/skill contracts (`plugin.json`, `<24,000` byte ceiling, YAML frontmatter)
+  - Optional Copilot review instructions size hygiene (`.github/copilot-instructions.md` `<= 4,000` bytes)
   - Santa Lockdown compliance (`curl|sh`, `wget|sh`, `mise` pipes blocked; declarative tooling checks)
   - POSIX shell syntax (`bash -n`) and GitHub Actions runner pinning (`ubuntu-24.04`)
 """
@@ -24,6 +25,8 @@ import sys
 from typing import Any
 
 MAX_MARKDOWN_INSTRUCTION_BYTES = 24000
+MAX_COPILOT_INSTRUCTIONS_BYTES = 4000
+COPILOT_INSTRUCTIONS_REL_PATH = ".github/copilot-instructions.md"
 
 SKIP_DIR_NAMES = frozenset(
     {
@@ -219,8 +222,28 @@ def _check_secrets_and_pii(
 
 
 def _check_markdown_limits(fpath: Path, rel: str, errors: list[AuditFinding], warnings: list[AuditFinding]) -> None:
-    """Verify Antigravity rules, skills, and agent personas respect 24 KB limit and YAML frontmatter."""
-    rel_parts = Path(rel).parts[:1]
+    """Verify Antigravity rules/skills/agents (24 KB + YAML frontmatter) and optional Copilot 4 KB hygiene cap."""
+    normalized_rel = rel.replace(os.sep, "/")
+    if normalized_rel.startswith("./"):
+        normalized_rel = normalized_rel[2:]
+    if normalized_rel == COPILOT_INSTRUCTIONS_REL_PATH:
+        size_bytes = fpath.stat().st_size
+        if size_bytes > MAX_COPILOT_INSTRUCTIONS_BYTES:
+            warnings.append(
+                AuditFinding(
+                    "warning",
+                    "agy:copilot-instructions-bloat",
+                    COPILOT_INSTRUCTIONS_REL_PATH,
+                    0,
+                    (
+                        f"Copilot instructions file is {size_bytes} bytes "
+                        f"(> {MAX_COPILOT_INSTRUCTIONS_BYTES} byte hygiene cap); keep concise to limit AI credit usage."
+                    ),
+                )
+            )
+        return
+
+    rel_parts = Path(normalized_rel).parts[:1]
     is_rule = rel_parts == ("rules",) and fpath.suffix == ".md"
     is_agent = rel_parts == ("agents",) and fpath.suffix == ".md"
     is_skill = fpath.name == "SKILL.md"
@@ -388,9 +411,12 @@ def audit_repository(repo_dir: Path | str, *, strict: bool = False) -> AuditRepo
     self_resolved = Path(__file__).resolve()
     errors: list[AuditFinding] = []
     warnings: list[AuditFinding] = []
+    checked_copilot_instructions = False
 
     for fpath in files:
         rel = str(fpath.relative_to(resolved_repo)).replace(os.sep, "/")
+        if rel == COPILOT_INSTRUCTIONS_REL_PATH:
+            checked_copilot_instructions = True
         if fpath.suffix == ".py":
             _check_python_ast(fpath, rel, errors, warnings)
         elif fpath.suffix == ".json":
@@ -402,6 +428,10 @@ def audit_repository(repo_dir: Path | str, *, strict: bool = False) -> AuditRepo
         _check_secrets_and_pii(fpath, rel, self_resolved, errors)
         _check_markdown_limits(fpath, rel, errors, warnings)
         _check_shell_and_workflows(fpath, rel, errors, warnings)
+
+    copilot_path = resolved_repo / ".github" / "copilot-instructions.md"
+    if not checked_copilot_instructions and copilot_path.is_file():
+        _check_markdown_limits(copilot_path, COPILOT_INSTRUCTIONS_REL_PATH, errors, warnings)
 
     if (resolved_repo / "plugin.json").is_file():
         for expected in (".gitignore", ".tool-versions", "pyproject.toml", "install.sh"):
