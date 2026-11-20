@@ -178,11 +178,17 @@ def _sanitize_full_url(url: str) -> str:
 
 
 def _escape_md_url(url: str) -> str:
-    """Escape whitespace and parentheses so rich PR URLs remain valid Markdown `[label](url)` links."""
+    """Escape whitespace, parentheses, and pipes so rich PR URLs never break Markdown tables or links."""
     clean = _sanitize_full_url(url)
     if not clean:
         return ""
-    return clean.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+    return clean.replace(" ", "%20").replace("(", "%28").replace(")", "%29").replace("|", "%7C")
+
+
+def _sanitize_md_table_cell(text: str) -> str:
+    """Collapse newlines/control whitespace and replace pipes so Markdown table rows never break."""
+    collapsed = " ".join(str(text or "").split())
+    return collapsed.replace("|", "/")
 
 
 def _clean_clickable_url(url: str) -> str:
@@ -352,9 +358,12 @@ def _load_locks(state_dir: Path) -> tuple[dict[str, dict[str, Any]], dict[str, d
         if isinstance(raw_map, dict):
             for slug, info in raw_map.items():
                 if isinstance(info, dict):
-                    all_locks[str(slug)] = info
+                    slug_key = str(slug)
+                    all_locks[slug_key] = info
                     if info.get("active"):
-                        active[str(slug)] = info
+                        active[slug_key] = info
+                    else:
+                        active.pop(slug_key, None)
     return (active, all_locks)
 
 
@@ -630,13 +639,36 @@ def _find_live_unmerged_remote_branch_for_cid(
     return ""
 
 
+def _extract_reconciled_count(stdout_text: str) -> int:
+    """Parse `reconciled_count` / `reconciled_items` from `pr_remediator.py` JSON stdout."""
+    raw = (stdout_text or "").strip()
+    if not raw:
+        return 0
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    for obj in (payload, payload.get("queue_reconciliation")):
+        if not isinstance(obj, dict):
+            continue
+        raw_cnt = obj.get("reconciled_count")
+        if isinstance(raw_cnt, int):
+            return raw_cnt
+        raw_items = obj.get("reconciled_items")
+        if isinstance(raw_items, list):
+            return len(raw_items)
+    return 0
+
+
 def _run_live_sync(
     state_dir: Path,
     repo_local_dirs: dict[str, Path],
     *,
     offline: bool | None = None,
 ) -> str:
-    """Synchronize remote refs (unless offline) and reconcile merged `pr_open` queue entries."""
+    """Synchronize remote refs (unless offline) and delegate reconciliation to `pr_remediator.py queue-sync`."""
     is_offline = bool(offline) if offline is not None else (os.environ.get("AGY_OFFLINE_ONLY") == "1")
     sub_env = {**os.environ, "AGY_DEV_STATE_DIR": str(state_dir)}
     if is_offline:
@@ -658,74 +690,42 @@ def _run_live_sync(
             except Exception:
                 pass
 
+    reconciled = 0
     pr_rem = _resolve_pr_remediator_script()
     if pr_rem.is_file():
-        cmd = [sys.executable, str(pr_rem), "lock-status", "--all"]
+        lock_cmd = [sys.executable, str(pr_rem), "lock-status", "--all"]
         if not is_offline:
-            cmd.append("--sync-git")
+            lock_cmd.append("--sync-git")
         try:
-            subprocess.run(
-                cmd,
+            proc_lock = subprocess.run(
+                lock_cmd,
                 env=sub_env,
                 capture_output=True,
                 text=True,
                 timeout=10.0,
                 check=False,
             )
+            if proc_lock.returncode == 0:
+                reconciled += _extract_reconciled_count(proc_lock.stdout)
         except Exception:
             pass
 
-    reconciled = 0
-    q_data = _load_json(state_dir / "dev_queue.json")
-    items = q_data.get("items") or []
-    if items and pr_rem.is_file():
-        for it in items:
-            if str(it.get("status") or "").lower() != "pr_open":
-                continue
-            cid = str(it.get("conversation_id") or "")
-            cid8 = cid[:8]
-            repos = [str(r) for r in (it.get("repo_slugs") or []) if r]
-            merged = {str(r) for r in (it.get("merged_repos") or []) if r}
-            unmerged = [r for r in repos if r not in merged]
-            if not unmerged:
-                continue
-            all_done = True
-            for slug in unmerged:
-                if slug not in repo_local_dirs:
-                    all_done = False
-                    break
-                if _find_live_unmerged_remote_branch_for_cid(slug, cid8, repo_local_dirs):
-                    all_done = False
-                    break
-                for br in it.get("branch_names") or []:
-                    if _check_local_remote_branch_state(slug, str(br), repo_local_dirs) in ("open", "unknown"):
-                        all_done = False
-                        break
-                if not all_done:
-                    break
-            if all_done:
-                try:
-                    subprocess.run(
-                        [
-                            sys.executable,
-                            str(pr_rem),
-                            "queue-set-status",
-                            "--id",
-                            cid,
-                            "--status",
-                            "merged",
-                            "--notes",
-                            "Auto-reconciled by agy-queue --sync (remote branch merged/removed).",
-                        ],
-                        env=sub_env,
-                        capture_output=True,
-                        text=True,
-                        timeout=5.0,
-                        check=False,
-                    )
-                    reconciled += 1
-                except Exception:
-                    pass
+        queue_cmd = [sys.executable, str(pr_rem), "queue-sync"]
+        if not is_offline:
+            queue_cmd.append("--fetch")
+        try:
+            proc_q = subprocess.run(
+                queue_cmd,
+                env=sub_env,
+                capture_output=True,
+                text=True,
+                timeout=15.0,
+                check=False,
+            )
+            if proc_q.returncode == 0:
+                reconciled += _extract_reconciled_count(proc_q.stdout)
+        except Exception:
+            pass
 
     mode_lbl = "Offline sync" if is_offline else "Sync"
     return f"↻ {mode_lbl} OK ({fetched} repos fetched, {reconciled} PRs reconciled)"
@@ -1253,6 +1253,24 @@ def _resolve_board_artifact_path(state_dir: Path, explicit: str = "") -> Path | 
     return None
 
 
+def _collect_lock_extra_urls(
+    lk: dict[str, Any],
+    item_urls_by_cid: dict[str, list[str]],
+) -> list[str]:
+    """Gather candidate PR URLs across a lock's primary and sibling conversation IDs."""
+    collected: list[str] = []
+    primary = str(lk.get("conversation_id") or "").strip()
+    if primary:
+        collected.extend(item_urls_by_cid.get(primary, []))
+    raw_sibs = lk.get("sibling_conversation_ids")
+    if isinstance(raw_sibs, list):
+        for sib in raw_sibs:
+            sib_clean = str(sib or "").strip()
+            if sib_clean:
+                collected.extend(item_urls_by_cid.get(sib_clean, []))
+    return collected
+
+
 def _write_live_antigravity_board(
     board_path: Path,
     *,
@@ -1315,13 +1333,12 @@ def _write_live_antigravity_board(
                     tag = "agent review"
                 else:
                     tag = f"{int(lp.get('pct') or 0)}%"  # type: ignore[arg-type]
-                lcid = str(lk.get("conversation_id") or "")
                 _, u, lock_has_pr, _ = _resolve_lock_human_pr_link(
                     slug,
                     lk,
                     repo_web_bases,
                     repo_local_dirs,
-                    extra_urls=item_urls_by_cid.get(lcid),
+                    extra_urls=_collect_lock_extra_urls(lk, item_urls_by_cid),
                 )
                 u_md = _escape_md_url(u) if (is_pr and lock_has_pr) else (_clean_clickable_url(u) or u)
                 link_part = (
@@ -1398,28 +1415,23 @@ def render(
     label_map = _build_repo_labels(all_managed_slugs)
 
     locks_by_cid: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+    seen_lock_cid_pairs: set[tuple[str, str]] = set()
     for slug, lk in locks.items():
-        lcid = str(lk.get("conversation_id") or "")
-        if lcid:
-            locks_by_cid.setdefault(lcid, []).append((slug, lk))
-
-    if args.json:
-        payload = json.dumps(
-            {
-                "state_dir": str(state_dir),
-                "updated_at": queue_data.get("updated_at", ""),
-                "orchestrator_conversation_id": queue_data.get("orchestrator_conversation_id", ""),
-                "managed_repos": sorted(all_managed_slugs),
-                "active_locks": {
-                    slug: {**lk, "progress": lock_progress_cache.get(slug, {})}
-                    for slug, lk in locks.items()
-                },
-                "items": items,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-        return (payload, {}, {}, None, state_dir, repo_local_dirs)
+        lock_cids: list[str] = []
+        primary_cid = str(lk.get("conversation_id") or "").strip()
+        if primary_cid:
+            lock_cids.append(primary_cid)
+        raw_siblings = lk.get("sibling_conversation_ids")
+        if isinstance(raw_siblings, list):
+            for sib in raw_siblings:
+                sib_clean = str(sib or "").strip()
+                if sib_clean:
+                    lock_cids.append(sib_clean)
+        for lcid in lock_cids:
+            pair = (lcid, slug)
+            if pair not in seen_lock_cid_pairs:
+                seen_lock_cid_pairs.add(pair)
+                locks_by_cid.setdefault(lcid, []).append((slug, lk))
 
     counts: dict[str, int] = {}
     for it in items:
@@ -1450,6 +1462,36 @@ def render(
     display_ids = _build_display_ids(filtered)
     all_filtered_cids = [str(it.get("conversation_id") or "") for it in filtered]
     ag_titles = _load_conversation_titles(all_filtered_cids, db_path=conv_db_path)
+    managed_list = [s for s in sorted(all_managed_slugs) if not repo_filter or repo_filter in s.lower()]
+
+    if args.json:
+        enriched_items: list[dict[str, Any]] = []
+        for it in filtered:
+            entry = dict(it)
+            cid_full = str(it.get("conversation_id") or "")
+            if cid_full in ag_titles:
+                entry["sidebar_title"] = ag_titles[cid_full]
+            enriched_items.append(entry)
+        active_locks_payload = {
+            slug: {**lk, "progress": lock_progress_cache.get(slug, {})}
+            for slug, lk in locks.items()
+            if not repo_filter or repo_filter in slug.lower()
+        }
+        payload = json.dumps(
+            {
+                "state_dir": str(state_dir),
+                "updated_at": queue_data.get("updated_at", ""),
+                "orchestrator_conversation_id": queue_data.get("orchestrator_conversation_id", ""),
+                "counts": counts,
+                "managed_repos": managed_list,
+                "locks": active_locks_payload,
+                "active_locks": active_locks_payload,
+                "items": enriched_items,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        return (payload, {}, {}, None, state_dir, repo_local_dirs)
 
     now_local = datetime.now().strftime("%H:%M:%S")
     now_full = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1478,7 +1520,6 @@ def render(
         lines.append(header_left)
         lines.append(summary_str)
 
-    managed_list = [s for s in sorted(all_managed_slugs) if not repo_filter or repo_filter in s.lower()]
     if managed_list:
         repo_pills: list[str] = []
         for slug in managed_list:
@@ -1496,13 +1537,12 @@ def render(
                 )
                 dot_code = "1;33" if is_human_pr else ("1;35" if is_esc else "1;36")
                 dot = _color("●", dot_code, color_on)
-                lcid = str(lk.get("conversation_id") or "")
                 _, repo_u, _, _ = _resolve_lock_human_pr_link(
                     slug,
                     lk,
                     repo_web_bases,
                     repo_local_dirs,
-                    extra_urls=item_urls_by_cid.get(lcid),
+                    extra_urls=_collect_lock_extra_urls(lk, item_urls_by_cid),
                 )
                 styled_name = _color(lbl, "1;33" if is_human_pr else "1", color_on)
                 repo_pills.append(
@@ -1643,9 +1683,9 @@ def render(
                     "idx": str(hitl_idx),
                     "prio": str(prio),
                     "cid": cid_full,
-                    "ag_title": ag_t.replace("|", "/"),
+                    "ag_title": _sanitize_md_table_cell(ag_t),
                     "repos": repos_md,
-                    "notes": _trunc(str(it.get("notes") or title).replace("|", "/"), 180),
+                    "notes": _trunc(_sanitize_md_table_cell(str(it.get("notes") or title)), 180),
                     "artifact_link": art_link,
                 }
             )
@@ -1663,7 +1703,7 @@ def render(
         lines.append(
             f"{idx:>2} {prio:>4}  {_status_badge(st, color_on)}  {prog_cell}  "
             f"{repos_str:<{repo_col}}  {_color(f'{cid_disp:<8}', '36', color_on)}  "
-            f"{_trunc(title, title_col):<{title_col}}  {action_cell}"
+            f"{_trunc(' '.join(title.split()), title_col):<{title_col}}  {action_cell}"
         )
         board_rows.append(
             {
@@ -1672,7 +1712,7 @@ def render(
                 "status": st.upper(),
                 "progress": prog_md,
                 "repos": repos_md,
-                "title": _trunc(title.replace("|", "/"), 72),
+                "title": _trunc(_sanitize_md_table_cell(title), 72),
                 "action_md": action_md,
             }
         )
@@ -1735,24 +1775,41 @@ def render(
 
 
 def _clamp_lines_to_viewport(all_lines: list[str], term_w: int, term_h: int, footer: str) -> list[str]:
-    """Clamp rendered lines (accounting for soft wrapping) to fit inside the terminal viewport height."""
-    budget = max(4, term_h - 1)
+    """Clamp rendered lines (accounting for soft wrapping of body and footer) to fit inside the terminal height."""
+    safe_w = max(1, term_w)
+    footer_rows = max(1, math.ceil(_visible_len(footer) / safe_w))
+    budget = max(1, term_h - footer_rows)
     kept: list[str] = []
     used_rows = 0
     for idx, line in enumerate(all_lines):
         vlen = _visible_len(line)
-        rows = max(1, math.ceil(vlen / max(1, term_w)))
+        rows = max(1, math.ceil(vlen / safe_w))
         remaining_items = len(all_lines) - idx
         if used_rows + rows > budget:
             if used_rows + 1 <= budget:
-                kept.append(f"… ({remaining_items} more lines — enlarge terminal or filter with -r/-s)")
+                kept.append(
+                    _trunc(f"… ({remaining_items} more lines — enlarge terminal or filter with -r/-s)", safe_w)
+                )
             elif kept:
-                kept[-1] = f"… ({remaining_items + 1} more lines — enlarge terminal or filter with -r/-s)"
+                kept[-1] = _trunc(
+                    f"… ({remaining_items + 1} more lines — enlarge terminal or filter with -r/-s)",
+                    safe_w,
+                )
             break
         kept.append(line)
         used_rows += rows
     kept.append(footer)
     return kept
+
+
+def _handle_board_hotkey(args: argparse.Namespace, state_dir: Path) -> str:
+    """Sync the configured board artifact (if any) and focus Antigravity Desktop cleanly."""
+    board_path = _resolve_board_artifact_path(state_dir, getattr(args, "write_board", ""))
+    if board_path is None:
+        return "No board path configured (pass --write-board PATH or set dev_queue_board_path.txt)"
+    render(args)
+    _focus_antigravity_app()
+    return f"✓ Board synced ({board_path.name}) · Antigravity focused"
 
 
 def _build_watch_frame(body_lines: list[str], term_w: int, term_h: int, footer: str) -> str:
@@ -1829,8 +1886,12 @@ def run_watch_loop(
         nonlocal stop
         stop = True
 
+    prev_sigterm: Any = None
+    sigterm_installed = False
     with contextlib.suppress(ValueError, OSError):
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGTERM, _handle_stop)
+        sigterm_installed = True
 
     interval = max(0.5, float(args.watch))
     use_tty = bool(getattr(out_stream, "isatty", lambda: False)()) if use_tty_override is None else bool(use_tty_override)
@@ -1947,8 +2008,7 @@ def run_watch_loop(
                         awaiting_hitl_digit = True
                     break
                 if key == "b":
-                    _focus_antigravity_app()
-                    status_msg = "✓ dev_queue_board.md synced · Antigravity focused"
+                    status_msg = _handle_board_hotkey(args, st_dir)
                     status_until = time.monotonic() + 3.5
                     break
                 if key == "r":
@@ -1987,6 +2047,9 @@ def run_watch_loop(
     except KeyboardInterrupt:
         return 0
     finally:
+        if sigterm_installed and prev_sigterm is not None:
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(signal.SIGTERM, prev_sigterm)
         if tty_fd is not None:
             if orig_termios is not None:
                 with contextlib.suppress(Exception):

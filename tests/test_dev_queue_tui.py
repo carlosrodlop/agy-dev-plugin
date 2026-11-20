@@ -784,6 +784,387 @@ class TestDevQueueTui(unittest.TestCase):
             self.assertTrue(deployed_sh.is_file())
             self.assertEqual(deployed_sh.stat().st_mode & 0o777, 0o755)
 
+    def test_live_sync_delegates_to_queue_sync_and_never_prematurely_merges_partial_multi_repo_item(self) -> None:
+        """`_run_live_sync()` delegates to `pr_remediator.py queue-sync` and never falsely merges an unstarted 2nd repo."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+
+            # Repo A: real bare origin + merged feature branch
+            origin_a = root / "origin-a.git"
+            origin_a.mkdir()
+            _git(origin_a, "init", "--bare", "-b", "main")
+            repo_a = root / "repo-a"
+            repo_a.mkdir()
+            _git(repo_a, "init", "-b", "main")
+            _git(repo_a, "remote", "add", "origin", str(origin_a))
+            (repo_a / "base.txt").write_text("base\n", encoding="utf-8")
+            _git(repo_a, "add", "base.txt")
+            _git(repo_a, "commit", "-m", "chore: init repo-a")
+            _git(repo_a, "push", "-u", "origin", "main")
+
+            br_a = "fix/20261120-part1-77778888"
+            _git(repo_a, "checkout", "-b", br_a)
+            (repo_a / "part1.txt").write_text("part1\n", encoding="utf-8")
+            _git(repo_a, "add", "part1.txt")
+            _git(repo_a, "commit", "-m", "feat: part 1")
+            _git(repo_a, "push", "-u", "origin", br_a)
+            _git(repo_a, "checkout", "main")
+            _git(repo_a, "merge", "--no-ff", br_a, "-m", f"Merge {br_a}")
+            _git(repo_a, "push", "origin", "main")
+
+            # Repo B: fresh unstarted repo (no feature branch exists yet!)
+            origin_b = root / "origin-b.git"
+            origin_b.mkdir()
+            _git(origin_b, "init", "--bare", "-b", "main")
+            repo_b = root / "repo-b"
+            repo_b.mkdir()
+            _git(repo_b, "init", "-b", "main")
+            _git(repo_b, "remote", "add", "origin", str(origin_b))
+            (repo_b / "base.txt").write_text("base\n", encoding="utf-8")
+            _git(repo_b, "add", "base.txt")
+            _git(repo_b, "commit", "-m", "chore: init repo-b")
+            _git(repo_b, "push", "-u", "origin", "main")
+
+            cid = "77778888-2222-4333-8444-555555555555"
+            _write_state(
+                state_dir,
+                items=[
+                    {
+                        "conversation_id": cid,
+                        "priority": 10,
+                        "status": "pr_open",
+                        "repo_slugs": ["acme/repo-a", "acme/repo-b"],
+                        "merged_repos": [],
+                        "branch_names": [br_a],
+                        "pr_urls": [f"https://github.com/acme/repo-a/compare/main...{br_a}?expand=1"],
+                        "title": "Two-repo progressive rollout",
+                    }
+                ],
+                locks={
+                    "acme/repo-a": {
+                        "active": False,
+                        "repo_slug": "acme/repo-a",
+                        "target_repo_dir": str(repo_a),
+                    },
+                    "acme/repo-b": {
+                        "active": False,
+                        "repo_slug": "acme/repo-b",
+                        "target_repo_dir": str(repo_b),
+                    },
+                },
+            )
+
+            msg = tui._run_live_sync(
+                state_dir,
+                {"acme/repo-a": repo_a, "acme/repo-b": repo_b},
+                offline=True,
+            )
+            self.assertIn("Offline sync OK (0 repos fetched, 1 PRs reconciled)", msg)
+
+            q_after = json.loads((state_dir / "dev_queue.json").read_text(encoding="utf-8"))
+            updated_item = q_after["items"][0]
+            self.assertIn("acme/repo-a", updated_item["merged_repos"])
+            self.assertNotIn("acme/repo-b", updated_item["merged_repos"])
+            self.assertNotEqual(updated_item["status"], "merged")
+            self.assertIn(updated_item["status"], ("pr_open", "in_progress"))
+
+            # Verify --fetch flag is passed to queue-sync ONLY when offline=False
+            with mock.patch.object(tui.subprocess, "run") as mock_run:
+                mock_run.return_value = mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"status": "ok", "reconciled_count": 2, "reconciled_items": [{}, {}]}),
+                    stderr="",
+                )
+                msg_online = tui._run_live_sync(state_dir, {"acme/repo-a": repo_a}, offline=False)
+                self.assertIn("Sync OK (1 repos fetched", msg_online)
+                queue_sync_calls = [c.args[0] for c in mock_run.call_args_list if "queue-sync" in c.args[0]]
+                self.assertEqual(len(queue_sync_calls), 1)
+                self.assertIn("--fetch", queue_sync_calls[0])
+
+                mock_run.reset_mock()
+                msg_off = tui._run_live_sync(state_dir, {"acme/repo-a": repo_a}, offline=True)
+                self.assertIn("Offline sync OK (0 repos fetched", msg_off)
+                queue_sync_off = [c.args[0] for c in mock_run.call_args_list if "queue-sync" in c.args[0]]
+                self.assertEqual(len(queue_sync_off), 1)
+                self.assertNotIn("--fetch", queue_sync_off[0])
+
+    def test_json_mode_applies_status_repo_all_filters_sorting_and_sidebar_title_enrichment(self) -> None:
+        """`--json` honors `--status`, `--repo`, `--all`, priority sorting, `counts`, `locks`, and `sidebar_title`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            db_path = root / "conversation_summaries.db"
+
+            cid_hitl_low = "40404040-2222-4333-8444-555555555555"
+            cid_hitl_high = "10101010-2222-4333-8444-555555555555"
+            cid_pending = "20202020-2222-4333-8444-555555555555"
+            cid_merged = "30303030-2222-4333-8444-555555555555"
+
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)")
+            conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", (cid_hitl_low, "Later HITL Decision"))
+            conn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", (cid_hitl_high, "Urgent HITL Decision"))
+            conn.commit()
+            conn.close()
+
+            _write_state(
+                state_dir,
+                items=[
+                    {
+                        "conversation_id": cid_hitl_low,
+                        "priority": 40,
+                        "status": "hitl_blocked",
+                        "repo_slugs": ["acme/repo-b"],
+                        "merged_repos": [],
+                        "title": "Low prio HITL",
+                    },
+                    {
+                        "conversation_id": cid_pending,
+                        "priority": 15,
+                        "status": "pending",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "title": "Pending repo-a",
+                    },
+                    {
+                        "conversation_id": cid_hitl_high,
+                        "priority": 10,
+                        "status": "hitl_blocked",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "title": "High prio HITL",
+                    },
+                    {
+                        "conversation_id": cid_merged,
+                        "priority": 5,
+                        "status": "merged",
+                        "repo_slugs": ["acme/repo-b"],
+                        "merged_repos": ["acme/repo-b"],
+                        "title": "Merged repo-b",
+                    },
+                ],
+                locks={
+                    "acme/repo-b": {
+                        "active": True,
+                        "status": "DEVELOPING",
+                        "pr_gate_ready": False,
+                        "conversation_id": cid_hitl_low,
+                    }
+                },
+            )
+
+            # `--status hitl_blocked --json`: filtered, sorted by priority asc, enriched with sidebar_title
+            raw_hitl, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, status="hitl_blocked", json=True),
+                conv_db_path=db_path,
+            )
+            data_hitl = json.loads(raw_hitl)
+            self.assertEqual([it["conversation_id"] for it in data_hitl["items"]], [cid_hitl_high, cid_hitl_low])
+            self.assertEqual(data_hitl["items"][0]["sidebar_title"], "Urgent HITL Decision")
+            self.assertEqual(data_hitl["items"][1]["sidebar_title"], "Later HITL Decision")
+            self.assertEqual(data_hitl["counts"]["hitl_blocked"], 2)
+            self.assertEqual(data_hitl["counts"]["merged"], 1)
+            self.assertIn("acme/repo-b", data_hitl["locks"])
+
+            # `--repo acme/repo-b --json` without `--all`: excludes merged item, filters repos/locks
+            raw_repo, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, repo="acme/repo-b", json=True),
+                conv_db_path=db_path,
+            )
+            data_repo = json.loads(raw_repo)
+            self.assertEqual([it["conversation_id"] for it in data_repo["items"]], [cid_hitl_low])
+            self.assertEqual(data_repo["managed_repos"], ["acme/repo-b"])
+            self.assertEqual(list(data_repo["locks"].keys()), ["acme/repo-b"])
+
+            # `--repo acme/repo-b --all --json`: includes merged item
+            raw_all, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, repo="acme/repo-b", all=True, json=True),
+                conv_db_path=db_path,
+            )
+            data_all = json.loads(raw_all)
+            self.assertEqual({it["conversation_id"] for it in data_all["items"]}, {cid_hitl_low, cid_merged})
+
+    def test_lock_parity_inactive_override_and_sibling_conversation_pr_gate(self) -> None:
+        """`_load_locks()` pops inactive overrides and `sibling_conversation_ids` enforces the unready PR gate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            (state_dir / "dev_pr_lock.json").write_text(
+                json.dumps(
+                    {
+                        "dev_pr_locks": {
+                            "acme/repo-a": {"active": True, "status": "PENDING_HUMAN_PR_VALIDATION"},
+                            "acme/repo-b": {"active": True, "status": "DEVELOPING"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state_dir / "actions_state.json").write_text(
+                json.dumps(
+                    {
+                        "actions_log_audit_state": {
+                            "dev_pr_locks": {
+                                "acme/repo-a": {"active": False, "status": "RELEASED"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            active_locks, all_locks = tui._load_locks(state_dir)
+            self.assertNotIn("acme/repo-a", active_locks)
+            self.assertIn("acme/repo-b", active_locks)
+            self.assertIn("acme/repo-a", all_locks)
+
+            # Active unready lock linked ONLY via sibling_conversation_ids must still block stale item pr_urls
+            state_dir_sib = Path(tmp) / "state_sib"
+            child_cid = "88881111-2222-4333-8444-555555555555"
+            parent_cid = "99990000-2222-4333-8444-555555555555"
+            stale_url = "https://github.com/acme/repo-a/compare/main...fix/20261120-sib-88881111?expand=1"
+            _write_state(
+                state_dir_sib,
+                items=[
+                    {
+                        "conversation_id": child_cid,
+                        "priority": 10,
+                        "status": "pr_open",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "pr_urls": [stale_url],
+                        "title": "Sibling-locked task",
+                    }
+                ],
+                locks={
+                    "acme/repo-a": {
+                        "active": True,
+                        "status": "AWAITING_AGENT_REVIEW",
+                        "pr_gate_ready": False,
+                        "conversation_id": parent_cid,
+                        "sibling_conversation_ids": [child_cid],
+                        "branch_name": "fix/20261120-sib-88881111",
+                        "manual_pr_url": stale_url,
+                    }
+                },
+            )
+            out, row_links, _, first_pr, _, _ = tui.render(
+                _make_args(state_dir_sib, no_color=True, plain_urls=True),
+                is_tty_override=False,
+                term_width_override=124,
+            )
+            self.assertIsNone(first_pr)
+            self.assertEqual(row_links, {})
+            self.assertNotIn("[1] PR", out)
+            self.assertNotIn(stale_url, out)
+
+    def test_markdown_board_escaping_and_watch_sigterm_footer_board_hotkey_hardening(self) -> None:
+        """Pipes/newlines never break `dev_queue_board.md`, wrapped footer stays in budget, SIGTERM restores, `[b]` is honest."""
+        import math
+        import signal
+
+        url_with_pipe = (
+            "https://github.com/acme/repo-a/compare/main...fix/20261120-esc-55556666"
+            "?expand=1&title=feat(a|b):+ok&body=PASS+|+98/100"
+        )
+        escaped = tui._escape_md_url(url_with_pipe)
+        self.assertNotIn("|", escaped)
+        self.assertIn("%7C", escaped)
+        self.assertIn("%28", escaped)
+        self.assertIn("%29", escaped)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            board_path = root / "board.md"
+            pr_cid = "55556666-2222-4333-8444-555555555555"
+            hitl_cid = "66667777-2222-4333-8444-555555555555"
+            _write_state(
+                state_dir,
+                items=[
+                    {
+                        "conversation_id": pr_cid,
+                        "priority": 10,
+                        "status": "pr_open",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "pr_urls": [url_with_pipe],
+                        "title": "Line one\nLine two | pipe",
+                    },
+                    {
+                        "conversation_id": hitl_cid,
+                        "priority": 20,
+                        "status": "hitl_blocked",
+                        "repo_slugs": ["acme/repo-b"],
+                        "merged_repos": [],
+                        "title": "HITL\r\nTitle | Pipe",
+                        "notes": "Option A | Option B\nSecond line detail",
+                    },
+                ],
+                locks={
+                    "acme/repo-a": {
+                        "active": True,
+                        "status": "PENDING_HUMAN_PR_VALIDATION",
+                        "pr_gate_ready": True,
+                        "conversation_id": pr_cid,
+                        "branch_name": "fix/20261120-esc-55556666",
+                        "manual_pr_url": url_with_pipe,
+                    }
+                },
+            )
+            tui.render(
+                _make_args(state_dir, write_board=str(board_path), no_color=True),
+                is_tty_override=False,
+                term_width_override=124,
+            )
+            board_lines = board_path.read_text(encoding="utf-8").splitlines()
+            table_rows = [ln for ln in board_lines if ln.startswith("|")]
+            self.assertGreaterEqual(len(table_rows), 5)
+            # Every Markdown table row must have balanced unescaped column separators and no raw newlines
+            self.assertTrue(any("Line one Line two / pipe" in ln for ln in table_rows))
+            self.assertTrue(any("Option A / Option B Second line detail" in ln for ln in table_rows))
+            self.assertTrue(any(f"[Abrir PR]({escaped})" in ln for ln in table_rows))
+
+            # Wrapped footer budget inside _clamp_lines_to_viewport
+            long_footer = "[o] PR · [1-9] open · [h+#] Agy · [b] board · [s] sync · [a] merged · [q] quit (3s) EXTRA TEXT"
+            body = [f"row-{i:02d}" for i in range(15)]
+            clamped = tui._clamp_lines_to_viewport(body, term_w=40, term_h=8, footer=long_footer)
+            total_wrapped_rows = sum(max(1, math.ceil(tui._visible_len(ln) / 40)) for ln in clamped)
+            self.assertLessEqual(total_wrapped_rows, 8)
+            self.assertEqual(clamped[-1], long_footer)
+
+            # SIGTERM handler saved & restored cleanly in run_watch_loop
+            custom_handler = lambda _sig, _frame: None  # noqa: E731
+            orig_sigterm = signal.getsignal(signal.SIGTERM)
+            try:
+                signal.signal(signal.SIGTERM, custom_handler)
+                buf = io.StringIO()
+                tui.run_watch_loop(
+                    _make_args(state_dir, watch=0.5, no_color=True),
+                    stream=buf,
+                    use_tty_override=True,
+                    open_tty=False,
+                    max_iterations=1,
+                    term_size_override=(90, 20),
+                )
+                self.assertIs(signal.getsignal(signal.SIGTERM), custom_handler)
+            finally:
+                signal.signal(signal.SIGTERM, orig_sigterm)
+
+            # Hotkey [b] reports honestly when unconfigured and syncs + focuses when configured
+            msg_unconfigured = tui._handle_board_hotkey(_make_args(state_dir), state_dir)
+            self.assertIn("No board path configured", msg_unconfigured)
+
+            board_path_2 = root / "hotkey_board.md"
+            with mock.patch.object(tui, "_focus_antigravity_app", return_value=True) as mock_focus:
+                msg_configured = tui._handle_board_hotkey(
+                    _make_args(state_dir, write_board=str(board_path_2)),
+                    state_dir,
+                )
+            self.assertIn("hotkey_board.md", msg_configured)
+            self.assertTrue(board_path_2.is_file())
+            mock_focus.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()
