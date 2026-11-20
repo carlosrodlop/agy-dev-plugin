@@ -12,7 +12,11 @@ import subprocess
 import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ALL_TEST_MODULES = ["tests.test_agy_dev_plugin", "tests.test_pr_remediator_queue_and_cleanup"]
+ALL_TEST_MODULES = [
+    "tests.test_agy_dev_plugin",
+    "tests.test_dev_queue_tui",
+    "tests.test_pr_remediator_queue_and_cleanup",
+]
 
 
 def detect_changed_files(repo_dir: Path) -> list[str]:
@@ -60,6 +64,13 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_pr_remediator_queue_and_cleanup" not in selected:
                 selected.append("tests.test_pr_remediator_queue_and_cleanup")
+        if (
+            norm.endswith(("dev_queue_tui.py", "test_dev_queue_tui.py", "agy_dev_queue.sh", "dev_common.py", "git_client.py"))
+            or norm.startswith("skills/agy-dev-queue-orchestrator/")
+            or norm.startswith("shell/")
+        ):
+            if "tests.test_dev_queue_tui" not in selected:
+                selected.append("tests.test_dev_queue_tui")
         if "tests.test_agy_dev_plugin" not in selected:
             selected.append("tests.test_agy_dev_plugin")
     return selected or list(ALL_TEST_MODULES)

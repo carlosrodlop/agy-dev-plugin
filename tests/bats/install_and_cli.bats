@@ -32,9 +32,24 @@ setup() {
   [ -f "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/clients/dev_common.py" ]
   [ -f "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/clients/git_client.py" ]
   [ -f "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-project-standards/scripts/project_audit.py" ]
+  [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-dev-queue-orchestrator/scripts/dev_queue_tui.py" ]
+  [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/shell/agy_dev_queue.sh" ]
+  [ -L "${TMP_HOME}/.local/bin/agy-queue" ]
+  run env HOME="${TMP_HOME}" "${TMP_HOME}/.local/bin/agy-queue" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"agy-queue"* ]]
   run grep -F "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/clients/dev_common.py" "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/hooks.json"
   [ "$status" -eq 0 ]
   rm -rf "${TMP_HOME}"
+}
+
+@test "shell/agy_dev_queue.sh supports direct execution and Bash sourcing" {
+  run "${REPO_ROOT}/shell/agy_dev_queue.sh" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"dev_queue.json"* ]]
+  run bash -c "source '${REPO_ROOT}/shell/agy_dev_queue.sh' && agy_queue --help"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"dev_queue.json"* ]]
 }
 
 @test "core CLIs respond cleanly to --help" {
@@ -43,6 +58,8 @@ setup() {
   run python3 "${REPO_ROOT}/clients/git_client.py" --help
   [ "$status" -eq 0 ]
   run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/pr_remediator.py" --help
+  [ "$status" -eq 0 ]
+  run python3 "${REPO_ROOT}/skills/agy-dev-queue-orchestrator/scripts/dev_queue_tui.py" --help
   [ "$status" -eq 0 ]
   run python3 "${REPO_ROOT}/skills/agy-project-standards/scripts/project_audit.py" --help
   [ "$status" -eq 0 ]

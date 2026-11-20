@@ -26,3 +26,26 @@ All operations run deterministically via [`pr_remediator.py`]($HOME/.gemini/conf
    - If `needs_reiteration == true`, automatically re-dispatch `agy-code-developer` with `developer_remediation_plan` and loop until `ready_for_human_pr == true` (max 3 rounds before circuit-breaking to `hitl_blocked` with zero PR links). Never surface PR URLs while locks are in `AWAITING_AGENT_REVIEW`, `NEEDS_REVISION_ITERATING`, or `ESCALATED_MAX_REVIEW_ITERATIONS`.
 4. **Poll Merge Status & Clean Up**:
    - Use `/schedule` (2-minute intervals while awaiting manual PR merges) or `watch-pr-merge --daemon`, then run `cleanup-merged-conversations --confirm-merged --exclude-id <ORCH_CID>` after merge verification.
+
+## Compact Zero-Hardcode Dev Queue TUI (`agy-queue` / `dev_queue_tui.py`)
+Monitor all active queue items, per-repository locks, verified PR compare links, and `HITL_BLOCK` items from any terminal without hardcoded repository names, owners, or paths:
+- **Script & Wrapper**: [`dev_queue_tui.py`]($HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-dev-queue-orchestrator/scripts/dev_queue_tui.py) wrapped by [`shell/agy_dev_queue.sh`]($HOME/.gemini/config/plugins/agy-dev-plugin/shell/agy_dev_queue.sh) (symlinked to `$HOME/.local/bin/agy-queue` by `./install.sh`, exposed as `[project.scripts]` `agy-queue`, and sourceable in Bash/Zsh for `agy-queue` and `agy-queue-watch` aliases).
+- **Dynamic Discovery & Single-Table UX**:
+  - Resolves state via `dev_common.resolve_state_dir()` and discovers managed repos/checkouts dynamically from `dev_queue.json`, `dev_pr_locks`, and `git_client.py` (optionally `--repos-dir`).
+  - Displays a 1-line summary header, 1-line clickable `REPOS` strip (`●` locked / `○ FREE`), and 1 unified table with collision-safe short IDs.
+  - **Multi-Repo PR Clarity**: Never averages a human-ready PR with unstarted downstream repos (`PR 1/2 listo` full bright-yellow bar when downstream repos remain; `PR listo` / `PR 2/2 listo` bright-green bar on the final repo; numeric `%` + ETA reserved strictly for active `IN_PROGRESS` work). Marks the exact PR-ready repo with `★` (prioritized first on `+N` truncation) and prints sequencing in the footer (`[1] <repo> (<cid> · parte 1/2 · desbloquea <next_repo>) [+verificaciones]`).
+  - **Richest PR URL Ranking & Preservation**: Ranks created `/pull/` / `/merge_requests/` and verified `?expand=1&title=...&body=...` URLs ahead of bare `?expand=1` URLs, strictly gating on `HUMAN_READY_LOCK_STATUSES` and `pr_gate_ready` (`AWAITING_AGENT_REVIEW`, `NEEDS_REVISION_ITERATING`, `ESCALATED_MAX_REVIEW_ITERATIONS`, or `pr_gate_ready=False` never surface PR links). Preserves full query parameters in OSC-8 hyperlink targets, browser hotkeys (`[o]`, `[1-9]`), and `dev_queue_board.md` `[Abrir PR](...)` links (escaping parentheses for valid Markdown).
+  - **Flicker-Free Watch Mode & Hotkeys (`agy-queue --watch [SECS]`)**: Alternate screen + cursor hide/restore + viewport clamping + local offline-safe git ref checks (`AGY_OFFLINE_ONLY=1`). Hotkeys: `[o]` open first PR, `[1-9]` open row link, `[h+#]` copy exact `conversation_summaries.db` sidebar title & focus Antigravity Desktop App (never spawns `agy --conversation`), `[b]` sync board & focus Antigravity, `[s]` fetch+reconcile, `[a]` toggle merged items, `[r]` refresh, `[q]` quit.
+- **Live Antigravity HITL Board Artifact (`dev_queue_board.md`)**:
+  - Pass `--write-board <ARTIFACT_PATH>` (or store the path in `<state_dir>/dev_queue_board_path.txt`) so every render atomically refreshes a Markdown artifact containing native 1-click `[Title](conversation://<uuid>)` links for `HITL_BLOCK` threads and full clickable PR links.
+
+## In-App `/hitl-review` Workflow (`hitl_blocked` -> `pending`)
+Whenever the operator invokes `/hitl-review` (or asks to resolve `HITL_BLOCK` items inside Antigravity without manually hunting sidebar tabs):
+1. **Enumerate Blocked Items**: Run `dev_queue_tui.py --status hitl_blocked --json` (or `pr_remediator.py queue-list`), sorted by ascending `priority`, resolving sidebar titles from `conversation_summaries.db`.
+2. **Read Transcripts & Proposals**: For each `hitl_blocked` conversation ID, inspect its transcript via `dev_common.try_inspect_antigravity_conversation(<CID>)` (and any proposal `.md` artifacts under `$HOME/.gemini/antigravity/brain/<CID>/`) to extract the blocking question, candidate options, recommended path, and impacted repositories.
+3. **Collect Explicit Decisions via `ask_question`**: Present a crisp decision prompt for each blocked item (or compact batch when independent) via `ask_question` with concrete options (`Approve recommended`, alternative options, `Defer to standby`, `Reject`).
+4. **Auto-Promote Queue State**:
+   - On approval/choice: immediately promote `hitl_blocked -> pending` with the ratified decision recorded in notes:
+     `pr_remediator.py queue-set-status --id <CID> --status pending --notes "HITL approved via /hitl-review: <decision>"`
+   - On deferral or rejection: transition cleanly to `standby` or `rejected` with `--notes`.
+5. **Re-Sync Board & Resume Queue**: Run `dev_queue_tui.py` (auto-syncing `dev_queue_board.md` if registered) and pick the next unblocked task via `pr_remediator.py queue-next --unlocked`.
