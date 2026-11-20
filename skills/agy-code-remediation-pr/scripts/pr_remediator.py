@@ -192,6 +192,91 @@ def _resolve_main_git_repo_root(repo_or_wt: Path) -> Path:
     return cand
 
 
+def _find_git_root_from_path(candidate: Path) -> Path | None:
+    """Walk `candidate` and its ancestors for an existing `.git` root without falling back to the default repo."""
+    try:
+        cand = candidate.expanduser()
+    except OSError:
+        return None
+    if not cand.exists():
+        return None
+    try:
+        resolved = cand.resolve()
+    except OSError:
+        resolved = cand
+    if (resolved / ".git").exists():
+        return resolved
+    for parent in resolved.parents:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def _infer_repo_slug_from_missing_path(
+    raw_path: str,
+    *,
+    locks_map: dict[str, dict[str, Any]] | None = None,
+    portfolio_dir: Path | str | None = None,
+) -> str:
+    """Infer `owner/repo` for a missing/cleaned worktree path strictly from known locks, or return empty string."""
+    clean_raw = str(raw_path or "").strip()
+    if not clean_raw:
+        return ""
+    home_str = str(Path.home())
+    cand_expanded = str(Path(clean_raw.replace("$HOME", home_str)).expanduser())
+    cand_sanitized = _sanitize_home_paths(cand_expanded)
+    cand_name = Path(cand_expanded).name
+
+    known_locks = (
+        locks_map
+        if locks_map is not None
+        else get_all_dev_pr_locks(portfolio_dir=portfolio_dir, include_inactive=True)
+    )
+    if not known_locks:
+        return ""
+
+    def _matches_path(recorded_raw: str) -> bool:
+        rec = str(recorded_raw or "").strip()
+        if not rec:
+            return False
+        rec_exp = str(Path(rec.replace("$HOME", home_str)).expanduser())
+        rec_san = _sanitize_home_paths(rec_exp)
+        if rec_exp == cand_expanded or rec_san == cand_sanitized:
+            return True
+        if cand_name.startswith("pr-worktree-") and Path(rec_exp).name == cand_name:
+            return True
+        return False
+
+    for slug, entry in known_locks.items():
+        if not isinstance(entry, dict):
+            continue
+        for key in ("worktree_path", "target_repo_dir"):
+            if _matches_path(str(entry.get(key) or "")):
+                return dev_common.normalize_repo_slug(slug) or slug
+        for rb_key in ("repo_branches", "last_repo_branches"):
+            rb_map = entry.get(rb_key)
+            if not isinstance(rb_map, dict):
+                continue
+            for rb_slug, rb_item in rb_map.items():
+                if not isinstance(rb_item, dict):
+                    continue
+                for key in ("worktree_path", "target_repo_dir"):
+                    if _matches_path(str(rb_item.get(key) or "")):
+                        return dev_common.normalize_repo_slug(rb_slug) or dev_common.normalize_repo_slug(slug) or slug
+
+    m_wt = re.match(r"^pr-worktree-([a-z0-9-]+)-fix-", cand_name.lower())
+    if m_wt:
+        wt_repo_token = m_wt.group(1)
+        matched_slugs = [
+            slug
+            for slug in known_locks
+            if _slugify_branch_token(slug.rsplit("/", 1)[-1], max_len=24) == wt_repo_token
+        ]
+        if len(matched_slugs) == 1:
+            return dev_common.normalize_repo_slug(matched_slugs[0]) or matched_slugs[0]
+    return ""
+
+
 def _resolve_repo_slug_and_dir(
     *,
     repo_slug: str = "",
@@ -199,21 +284,24 @@ def _resolve_repo_slug_and_dir(
     workdir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
     prefer_cwd: bool = False,
+    portfolio_dir: Path | str | None = None,
+    locks_map: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[str, Path | None]:
-    """Resolve normalized `owner/repo` slug and repository directory from explicit overrides or git checkout."""
+    """Resolve normalized `owner/repo` slug and repository directory from explicit overrides or git checkout.
+
+    Never silently falls back to the default repository when an explicit `workdir`/`target_repo_dir`
+    no longer exists on disk or is outside any Git checkout.
+    """
     vcs = git_client or GitVcsIntegrationClient()
     explicit_dir = workdir if workdir else target_repo_dir
     resolved_dir: Path | None = None
+    explicit_dir_provided = False
+    raw_explicit = ""
     if explicit_dir:
-        raw_s = str(explicit_dir).replace("$HOME", str(Path.home())).strip()
-        if raw_s:
-            cand = Path(raw_s).expanduser()
-            if hasattr(vcs, "resolve_active_repo_dir"):
-                resolved_dir = vcs.resolve_active_repo_dir(workdir=cand, prefer_cwd=False)
-            elif (cand / ".git").exists():
-                resolved_dir = cand.resolve()
-            else:
-                resolved_dir = cand
+        raw_explicit = str(explicit_dir).replace("$HOME", str(Path.home())).strip()
+        if raw_explicit:
+            explicit_dir_provided = True
+            resolved_dir = _find_git_root_from_path(Path(raw_explicit))
     elif prefer_cwd or not str(repo_slug or "").strip():
         resolved_dir = (
             vcs.resolve_active_repo_dir(prefer_cwd=prefer_cwd)
@@ -232,7 +320,14 @@ def _resolve_repo_slug_and_dir(
             clean_slug = dev_common.resolve_repo_slug_from_path(resolved_dir)
     if not clean_slug and resolved_dir is not None:
         clean_slug = resolved_dir.name.lower()
-    return clean_slug or "default", resolved_dir
+    if not clean_slug and explicit_dir_provided and resolved_dir is None:
+        clean_slug = _infer_repo_slug_from_missing_path(
+            raw_explicit,
+            locks_map=locks_map,
+            portfolio_dir=portfolio_dir,
+        )
+        return clean_slug, None
+    return clean_slug or ("" if explicit_dir_provided else "default"), resolved_dir
 
 
 def _extract_repo_slug_from_lock_dict(lock_obj: dict[str, Any] | None, fallback_key: str = "") -> str:
@@ -328,6 +423,30 @@ def _write_locks_state(
     audit_state["dev_pr_lock"] = snap or _inactive_lock_snapshot(legacy if isinstance(legacy, dict) else None)
 
 
+def _entry_matches_branch(entry: dict[str, Any], clean_branch: str, *, include_inactive: bool = False) -> bool:
+    """Return True if a lock entry references `clean_branch` in active or (optionally) released metadata."""
+    if not isinstance(entry, dict) or not clean_branch:
+        return False
+    if str(entry.get("branch_name") or "").strip() == clean_branch:
+        return True
+    rb = entry.get("repo_branches")
+    if isinstance(rb, dict) and any(
+        isinstance(rb_v, dict) and str(rb_v.get("branch_name") or "").strip() == clean_branch
+        for rb_v in rb.values()
+    ):
+        return True
+    if include_inactive:
+        if str(entry.get("last_branch_name") or "").strip() == clean_branch:
+            return True
+        last_rb = entry.get("last_repo_branches")
+        if isinstance(last_rb, dict) and any(
+            isinstance(rb_v, dict) and str(rb_v.get("branch_name") or "").strip() == clean_branch
+            for rb_v in last_rb.values()
+        ):
+            return True
+    return False
+
+
 def _match_lock_entry(
     locks_map: dict[str, dict[str, Any]],
     *,
@@ -335,31 +454,48 @@ def _match_lock_entry(
     workdir: Path | str | None = None,
     branch_name: str = "",
     prefer_cwd: bool = True,
+    portfolio_dir: Path | str | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Select the most specific `(repo_slug, lock_dict)` from `locks_map` for a query/operation."""
+    """Select the most specific `(repo_slug, lock_dict)` from `locks_map` for a query/operation.
+
+    When any explicit selector (`branch_name`, `repo_slug`, or `workdir`) is supplied, strictly
+    scopes lookup and NEVER falls through to `prefer_cwd` or an unrelated repository's active lock.
+    """
     clean_branch = branch_name.strip()
+    has_explicit_repo_or_dir = bool(repo_slug.strip() or workdir)
+
     if clean_branch:
         for slug, entry in locks_map.items():
-            if not isinstance(entry, dict) or not bool(entry.get("active")):
-                continue
-            if str(entry.get("branch_name") or "").strip() == clean_branch:
+            if isinstance(entry, dict) and bool(entry.get("active")) and _entry_matches_branch(entry, clean_branch):
                 return slug, entry
-            rb = entry.get("repo_branches")
-            if isinstance(rb, dict) and any(
-                isinstance(rb_v, dict) and str(rb_v.get("branch_name") or "").strip() == clean_branch
-                for rb_v in rb.values()
+        for slug, entry in locks_map.items():
+            if isinstance(entry, dict) and not bool(entry.get("active")) and _entry_matches_branch(
+                entry, clean_branch, include_inactive=True
             ):
                 return slug, entry
 
-    if repo_slug.strip() or workdir:
+    if has_explicit_repo_or_dir:
         resolved_slug, _ = _resolve_repo_slug_and_dir(
             repo_slug=repo_slug,
             workdir=workdir,
             prefer_cwd=False,
+            portfolio_dir=portfolio_dir,
+            locks_map=locks_map,
         )
-        if resolved_slug in locks_map:
-            return resolved_slug, locks_map[resolved_slug]
+        if resolved_slug and resolved_slug in locks_map:
+            cand_entry = locks_map[resolved_slug]
+            if (
+                clean_branch
+                and isinstance(cand_entry, dict)
+                and bool(cand_entry.get("active"))
+                and not _entry_matches_branch(cand_entry, clean_branch)
+            ):
+                return resolved_slug, {}
+            return resolved_slug, cand_entry
         return resolved_slug, {}
+
+    if clean_branch:
+        return "", {}
 
     if prefer_cwd:
         cwd_slug = dev_common.resolve_repo_slug_from_path(Path.cwd())
@@ -416,11 +552,14 @@ def get_dev_pr_lock(
         workdir=workdir,
         branch_name=branch_name,
         prefer_cwd=True,
+        portfolio_dir=portfolio_dir,
     )
     if isinstance(lock_obj, dict) and bool(lock_obj.get("active")):
         return dict(lock_obj)
+    has_selector = bool(repo_slug.strip() or workdir or branch_name.strip())
     legacy = audit_state.get("dev_pr_lock") if isinstance(audit_state.get("dev_pr_lock"), dict) else {}
-    return _inactive_lock_snapshot(lock_obj if lock_obj else legacy, repo_slug=matched_slug)
+    snap_source = lock_obj if lock_obj else ({} if has_selector else legacy)
+    return _inactive_lock_snapshot(snap_source, repo_slug=matched_slug)
 
 
 def is_dev_pr_locked(
@@ -628,15 +767,38 @@ def update_dev_pr_lock(
         if not isinstance(audit_state, dict):
             audit_state = {}
         locks_map = _read_locks_state(audit_state)
+        req_branch = (branch_name or str(updates.get("branch_name") or "")).strip()
         target_slug, cand_lock = _match_lock_entry(
             locks_map,
             repo_slug=repo_slug,
             workdir=workdir,
-            branch_name=branch_name or str(updates.get("branch_name") or ""),
+            branch_name=req_branch,
             prefer_cwd=True,
+            portfolio_dir=portfolio_dir,
         )
         if not isinstance(cand_lock, dict) or not bool(cand_lock.get("active")):
             return {"status": "error", "error": f"No active dev_pr_lock to update for `{target_slug or 'default'}`."}
+        existing_branch = str(cand_lock.get("branch_name") or "").strip()
+        if req_branch and existing_branch and not _entry_matches_branch(cand_lock, req_branch):
+            req_cid = str(updates.get("conversation_id") or "").strip()
+            holder_cid = str(cand_lock.get("conversation_id") or "").strip()
+            same_conv = bool(
+                req_cid
+                and holder_cid
+                and (
+                    req_cid == holder_cid
+                    or req_cid.startswith(holder_cid[:8])
+                    or holder_cid.startswith(req_cid[:8])
+                )
+            )
+            if not same_conv:
+                return {
+                    "status": "error",
+                    "error": (
+                        f"Refusing cross-branch/cross-repo lock overwrite on `{target_slug}`: "
+                        f"active lock holds `{existing_branch}`, requested `{req_branch}`."
+                    ),
+                }
         current_lock = dict(cand_lock)
         for k, v in updates.items():
             if v is not None:
@@ -802,6 +964,7 @@ def release_dev_pr_lock(
                 workdir=workdir,
                 branch_name=branch_name,
                 prefer_cwd=False,
+                portfolio_dir=portfolio_dir,
             )
             if cand:
                 target_slugs = [matched_slug]
@@ -1098,6 +1261,7 @@ def _sync_unlocked_repo_with_git(
     workdir: Path | str | None = None,
     scoped_slug: str = "",
     resolved_dir: Path | None = None,
+    already_resolved: bool = False,
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -1107,14 +1271,15 @@ def _sync_unlocked_repo_with_git(
     target_dir = resolved_dir
 
     if is_scoped:
-        if not target_slug:
+        if not already_resolved and not target_slug and target_dir is None:
             target_slug, target_dir = _resolve_repo_slug_and_dir(
                 repo_slug=repo_slug,
                 workdir=workdir,
                 git_client=git_client,
                 prefer_cwd=False,
+                portfolio_dir=portfolio_dir,
             )
-        if git_client is None and target_dir is None and target_slug and target_slug != "default":
+        if git_client is None and target_dir is None and not workdir and target_slug and target_slug != "default":
             target_dir = _resolve_repo_dir_for_slug(
                 target_slug,
                 portfolio_dir=portfolio_dir,
@@ -1131,10 +1296,11 @@ def _sync_unlocked_repo_with_git(
             env_ov["AGY_DEV_STATE_DIR"] = state_dir_str
         vcs = GitVcsIntegrationClient(env_overrides=env_ov)
     elif is_scoped:
+        skip_reason = "workdir_not_a_git_repo" if workdir and not target_slug else "repo_dir_not_found_for_slug"
         return target_slug, {
             "status": "skipped",
             "synced": False,
-            "reason": "repo_dir_not_found_for_slug",
+            "reason": skip_reason,
             "repo_slug": target_slug,
             "base_branch": "main",
         }
@@ -1190,8 +1356,9 @@ def sync_dev_pr_lock_with_git(
             workdir=workdir,
             git_client=git_client,
             prefer_cwd=False,
+            portfolio_dir=portfolio_dir,
         )
-        if scoped_slug in active_map:
+        if scoped_slug and scoped_slug in active_map:
             target_entries = [(scoped_slug, active_map[scoped_slug])]
         else:
             scoped_slug, repo_sync = _sync_unlocked_repo_with_git(
@@ -1199,6 +1366,7 @@ def sync_dev_pr_lock_with_git(
                 workdir=workdir,
                 scoped_slug=scoped_slug,
                 resolved_dir=resolved_dir,
+                already_resolved=True,
                 portfolio_dir=portfolio_dir,
                 git_client=git_client,
             )
@@ -2874,50 +3042,104 @@ def record_pr_review_evaluation(
     act_id = str(lock_info.get("action_id") or "")
     rca_summary = str(lock_info.get("summary") or "")
     proposed_fix = str(lock_info.get("proposed_fix") or "")
-    proposal_title = str(lock_info.get("proposal_title") or "").strip() or format_remediation_commit_title(
-        f"update {act_id or resolved_branch}",
-        action_id=act_id,
-        conversation_id=cid_clean,
-        branch_timestamp=resolved_ts,
-    )
     head_sha = str(lock_info.get("head_sha") or "")
 
     wt_str = str(workdir or lock_info.get("worktree_path") or "").strip()
     wt_expanded = Path(wt_str.replace("$HOME", str(Path.home()))).expanduser() if wt_str else None
     is_worktree = bool(wt_expanded and wt_expanded.exists())
     lock_main_dir = _resolve_lock_target_repo_dir(lock_info)
-    target_repo_dir = (
-        wt_expanded.resolve()
-        if is_worktree and wt_expanded is not None
-        else (
-            lock_main_dir
-            if lock_main_dir is not None and (lock_main_dir / ".git").exists()
-            else (
+
+    inferred_slug = dev_common.normalize_repo_slug(
+        repo_slug or str(lock_info.get("repo_slug") or lock_info.get("repo") or "")
+    )
+    if not inferred_slug and workdir:
+        inferred_slug, _ = _resolve_repo_slug_and_dir(
+            repo_slug=repo_slug,
+            workdir=workdir,
+            git_client=git_client,
+            prefer_cwd=False,
+            portfolio_dir=portfolio_dir,
+        )
+
+    target_repo_dir: Path | None = None
+    if is_worktree and wt_expanded is not None:
+        wt_git_root = _find_git_root_from_path(wt_expanded)
+        if wt_git_root is not None:
+            target_repo_dir = wt_git_root
+    if target_repo_dir is None and lock_main_dir is not None and (lock_main_dir / ".git").exists():
+        target_repo_dir = lock_main_dir
+    if target_repo_dir is None and inferred_slug and inferred_slug != "default":
+        target_repo_dir = _resolve_repo_dir_for_slug(
+            inferred_slug,
+            portfolio_dir=portfolio_dir,
+            git_client=git_client,
+        )
+    if target_repo_dir is None:
+        if workdir and not is_worktree and not lock_info.get("active"):
+            target_repo_dir = None
+        else:
+            target_repo_dir = (
                 vcs.resolve_active_repo_dir(workdir=workdir, prefer_cwd=True)
                 if hasattr(vcs, "resolve_active_repo_dir")
                 else vcs.resolve_repo_dir()
             )
-        )
-    )
-    resolved_repo_slug = _extract_repo_slug_from_lock_dict(
+    resolved_repo_slug = inferred_slug or _extract_repo_slug_from_lock_dict(
         {
             "repo_slug": repo_slug or lock_info.get("repo_slug") or lock_info.get("repo"),
-            "target_repo_dir": str(target_repo_dir),
+            "target_repo_dir": str(target_repo_dir) if target_repo_dir is not None else "",
         }
     )
 
+    existing_commit_subject = ""
+    existing_commit_body = ""
+    if not lock_info.get("active") and isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists():
+        for ref_cand in (resolved_branch, f"origin/{resolved_branch}"):
+            proc_log = subprocess.run(
+                ["git", "-C", str(target_repo_dir), "log", "-1", "--format=%s%x00%b", ref_cand],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if proc_log.returncode == 0 and proc_log.stdout:
+                log_parts = proc_log.stdout.split("\x00", 1)
+                subj_cand = log_parts[0].strip()
+                if subj_cand:
+                    existing_commit_subject = subj_cand
+                    existing_commit_body = log_parts[1].strip() if len(log_parts) > 1 else ""
+                    break
+
+    proposal_title = (
+        str(lock_info.get("proposal_title") or "").strip()
+        or existing_commit_subject
+        or format_remediation_commit_title(
+            f"update {act_id or resolved_branch}",
+            action_id=act_id,
+            conversation_id=cid_clean,
+            branch_timestamp=resolved_ts,
+        )
+    )
+
     files_changed: list[dict[str, Any]] = []
-    try:
-        diff_info = vcs.get_branch_diff(head_branch=resolved_branch, base_branch="main", repo_dir=target_repo_dir)
-        if isinstance(diff_info, dict):
-            files_changed = list(diff_info.get("files") or diff_info.get("changed_files") or [])
-    except Exception:
-        files_changed = []
+    if isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists():
+        try:
+            diff_info = vcs.get_branch_diff(head_branch=resolved_branch, base_branch="main", repo_dir=target_repo_dir)
+            if isinstance(diff_info, dict):
+                files_changed = list(diff_info.get("files") or diff_info.get("changed_files") or [])
+        except Exception:
+            files_changed = []
+
+    existing_exec_summary = ""
+    if existing_commit_body:
+        m_exec = re.search(r"-\s*\*\*Summary of Changes\*\*:\s*(.+)", existing_commit_body)
+        if m_exec and m_exec.group(1).strip():
+            existing_exec_summary = m_exec.group(1).strip()
 
     resolved_exec_summary = (
         executive_summary.strip()
         or (proposed_fix if proposed_fix and not proposed_fix.startswith("Inspect the failing CLI command flags") else "")
         or (rca_summary if rca_summary and rca_summary != "Tool/step execution error" else "")
+        or existing_exec_summary
         or summary.strip()
     )
 
@@ -2936,7 +3158,7 @@ def record_pr_review_evaluation(
         reviewer_subagent_id=reviewer_subagent_id.strip(),
     )
 
-    if isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists():
+    if lock_info.get("active") and isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists():
         amended = _sync_branch_head_commit_message(
             target_repo_dir=target_repo_dir,
             branch_name=resolved_branch,
@@ -2961,16 +3183,18 @@ def record_pr_review_evaluation(
             except Exception:
                 pass
 
-    try:
-        built_url = vcs.build_manual_pr_url(
-            head_branch=resolved_branch,
-            base_branch="main",
-            title=proposal_title,
-            body=canonical_pr_body,
-            repo_dir=target_repo_dir if isinstance(target_repo_dir, Path) else None,
-        )
-    except TypeError:
-        built_url = vcs.build_manual_pr_url(head_branch=resolved_branch, base_branch="main")
+    built_url = ""
+    if isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists():
+        try:
+            built_url = vcs.build_manual_pr_url(
+                head_branch=resolved_branch,
+                base_branch="main",
+                title=proposal_title,
+                body=canonical_pr_body,
+                repo_dir=target_repo_dir,
+            )
+        except TypeError:
+            built_url = vcs.build_manual_pr_url(head_branch=resolved_branch, base_branch="main")
     manual_pr_url = str(
         built_url
         or lock_info.get("manual_pr_url")
