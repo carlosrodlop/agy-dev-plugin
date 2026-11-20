@@ -12,9 +12,9 @@ Provides a deterministic, reusable quality and security gate for any Python/Shel
 | :--- | :--- |
 | **Python AST & Safety** | Valid syntax across `*.py`, zero bare `except:`, zero mutable default args, zero unsafe `shell=True` where avoidable |
 | **Zero-PII & Secrets** | Zero leaked API keys/tokens, PEM keys, or unmasked machine-local `/Users/<name>/` paths; `.gitignore` protects `.env` & local caches |
-| **Antigravity Plugin Layout** | Valid `plugin.json`, `hooks.json` JSON, YAML frontmatter & strictly `< 24,000` bytes across `rules/*.md` and `skills/*/SKILL.md` |
+| **Antigravity Plugin Layout** | Valid `plugin.json` (`suggestedPrompts <= 3`), flat/named `hooks.json` schema, and valid YAML frontmatter (`tools:` on `agents/*.md`) strictly `< 24,000` bytes across `rules/*.md`, `skills/*/SKILL.md`, and `agents/*.md` |
 | **Santa & Declarative Tooling** | Zero `curl\|sh`, `wget\|sh`, or `mise` pipes; checks `.tool-versions`, `pyproject.toml`, `.pre-commit-config.yaml`, `Makefile` |
-| **POSIX Shell & CI Hygiene** | `bash -n` syntax validation across `*.sh`; GitHub Actions pin `ubuntu-24.04` (no unpinned `ubuntu-latest`) |
+| **POSIX Shell & CI Hygiene** | `bash -n` syntax validation across `*.sh` + BATS suites (`tests/bats/*.bats`); GitHub Actions pin `ubuntu-24.04` (no unpinned `ubuntu-latest`) |
 
 ## 2. Usage
 ```bash

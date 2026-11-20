@@ -219,10 +219,12 @@ def _check_secrets_and_pii(
 
 
 def _check_markdown_limits(fpath: Path, rel: str, errors: list[AuditFinding], warnings: list[AuditFinding]) -> None:
-    """Verify Antigravity rules and skills respect 24 KB limit and YAML frontmatter."""
-    is_rule = Path(rel).parts[:1] == ("rules",) and fpath.suffix == ".md"
+    """Verify Antigravity rules, skills, and agent personas respect 24 KB limit and YAML frontmatter."""
+    rel_parts = Path(rel).parts[:1]
+    is_rule = rel_parts == ("rules",) and fpath.suffix == ".md"
+    is_agent = rel_parts == ("agents",) and fpath.suffix == ".md"
     is_skill = fpath.name == "SKILL.md"
-    if not (is_rule or is_skill):
+    if not (is_rule or is_skill or is_agent):
         return
     size_bytes = fpath.stat().st_size
     if size_bytes >= MAX_MARKDOWN_INSTRUCTION_BYTES:
@@ -240,6 +242,101 @@ def _check_markdown_limits(fpath: Path, rel: str, errors: list[AuditFinding], wa
         warnings.append(
             AuditFinding("warning", "agy:missing-frontmatter", rel, 1, "Missing YAML frontmatter block.")
         )
+        return
+    if is_agent:
+        fm_block = text[4 : text.index("\n---\n", 4)]
+        for req_key in ("name:", "description:"):
+            if req_key not in fm_block:
+                errors.append(
+                    AuditFinding("error", "agy:agent-frontmatter", rel, 1, f"Agent missing required '{req_key}' frontmatter field.")
+                )
+        if "tools:" not in fm_block:
+            warnings.append(
+                AuditFinding("warning", "agy:agent-tools-missing", rel, 1, "Agent should declare explicit 'tools:' frontmatter list.")
+            )
+
+
+def _check_hooks_and_plugin_manifest(
+    resolved_repo: Path,
+    errors: list[AuditFinding],
+    warnings: list[AuditFinding],
+) -> None:
+    """Validate Antigravity `plugin.json` manifest bounds and flat/named `hooks.json` schema."""
+    plugin_path = resolved_repo / "plugin.json"
+    if plugin_path.is_file():
+        try:
+            pdata = json.loads(plugin_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pdata = None
+        if isinstance(pdata, dict):
+            prompts = pdata.get("suggestedPrompts")
+            if isinstance(prompts, list) and len(prompts) > 3:
+                warnings.append(
+                    AuditFinding(
+                        "warning",
+                        "agy:suggested-prompts-limit",
+                        "plugin.json",
+                        0,
+                        f"suggestedPrompts has {len(prompts)} entries; Antigravity recommends at most 3.",
+                    )
+                )
+
+    hooks_path = resolved_repo / "hooks.json"
+    if not hooks_path.is_file():
+        return
+    try:
+        hdata = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(hdata, dict):
+        errors.append(AuditFinding("error", "agy:hooks-schema", "hooks.json", 0, "hooks.json root must be a JSON object."))
+        return
+    if "hooks" in hdata and isinstance(hdata["hooks"], dict):
+        errors.append(
+            AuditFinding(
+                "error",
+                "agy:hooks-invalid-root-wrapper",
+                "hooks.json",
+                0,
+                "hooks.json must map top-level named hook keys directly (remove deprecated outer 'hooks' wrapper).",
+            )
+        )
+        return
+
+    flat_events = {"SessionStart", "PreInvocation", "PostInvocation", "Stop"}
+    grouped_events = {"PreToolUse", "PostToolUse"}
+    allowed_keys = flat_events | grouped_events | {"enabled"}
+    for hook_name, hook_spec in hdata.items():
+        if not isinstance(hook_spec, dict):
+            errors.append(AuditFinding("error", "agy:hooks-schema", "hooks.json", 0, f"Hook '{hook_name}' must be an object."))
+            continue
+        for ev_key, ev_val in hook_spec.items():
+            if ev_key not in allowed_keys:
+                warnings.append(AuditFinding("warning", "agy:hooks-unknown-key", "hooks.json", 0, f"Unknown hook field '{ev_key}' under '{hook_name}'."))
+            elif ev_key in flat_events:
+                if not isinstance(ev_val, list) or any(not isinstance(it, dict) or "command" not in it for it in ev_val):
+                    errors.append(
+                        AuditFinding(
+                            "error",
+                            "agy:hooks-flat-event-schema",
+                            "hooks.json",
+                            0,
+                            f"{hook_name}.{ev_key} must be a flat list of handler objects containing 'command' (no matcher wrapper).",
+                        )
+                    )
+            elif ev_key in grouped_events:
+                if not isinstance(ev_val, list) or any(
+                    not isinstance(it, dict) or not isinstance(it.get("hooks"), list) for it in ev_val
+                ):
+                    errors.append(
+                        AuditFinding(
+                            "error",
+                            "agy:hooks-grouped-event-schema",
+                            "hooks.json",
+                            0,
+                            f"{hook_name}.{ev_key} must contain matcher groups with 'hooks' arrays.",
+                        )
+                    )
 
 
 def _check_shell_and_workflows(
@@ -312,6 +409,7 @@ def audit_repository(repo_dir: Path | str, *, strict: bool = False) -> AuditRepo
                 warnings.append(
                     AuditFinding("warning", "plugin:missing-standard-file", expected, 0, f"Recommended baseline file missing: {expected}")
                 )
+        _check_hooks_and_plugin_manifest(resolved_repo, errors, warnings)
 
     passed = len(errors) == 0 and (len(warnings) == 0 if strict else True)
     return AuditReport(

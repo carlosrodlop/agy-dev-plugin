@@ -166,35 +166,273 @@ def format_timestamped_branch_name(
 
 
 # ==============================================================================
-# Cross-Conversation Pending-Branch Lock State Machine
+# Per-Repository Cross-Conversation Pending-Branch Lock State Machine
 # ==============================================================================
 
 
-def get_dev_pr_lock(portfolio_dir: Path | str | None = None) -> dict[str, Any]:
-    """Read the current cross-conversation remediation branch lock (`dev_pr_lock`) from `actions_state.json`."""
+def _resolve_main_git_repo_root(repo_or_wt: Path) -> Path:
+    """Resolve the persistent primary repository root from either a checkout or an isolated git worktree."""
+    cand = repo_or_wt.expanduser().resolve()
+    dot_git = cand / ".git"
+    if dot_git.is_dir():
+        return cand
+    if dot_git.is_file():
+        proc = subprocess.run(
+            ["git", "-C", str(cand), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0 and (proc.stdout or "").strip():
+            common_raw = Path((proc.stdout or "").strip())
+            common_abs = common_raw if common_raw.is_absolute() else (cand / common_raw).resolve()
+            if common_abs.name == ".git" and (common_abs.parent / ".git").exists():
+                return common_abs.parent.resolve()
+    return cand
+
+
+def _resolve_repo_slug_and_dir(
+    *,
+    repo_slug: str = "",
+    target_repo_dir: Path | str | None = None,
+    workdir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+    prefer_cwd: bool = False,
+) -> tuple[str, Path | None]:
+    """Resolve normalized `owner/repo` slug and repository directory from explicit overrides or git checkout."""
+    vcs = git_client or GitVcsIntegrationClient()
+    explicit_dir = workdir if workdir else target_repo_dir
+    resolved_dir: Path | None = None
+    if explicit_dir:
+        raw_s = str(explicit_dir).replace("$HOME", str(Path.home())).strip()
+        if raw_s:
+            cand = Path(raw_s).expanduser()
+            if hasattr(vcs, "resolve_active_repo_dir"):
+                resolved_dir = vcs.resolve_active_repo_dir(workdir=cand, prefer_cwd=False)
+            elif (cand / ".git").exists():
+                resolved_dir = cand.resolve()
+            else:
+                resolved_dir = cand
+    elif prefer_cwd or not str(repo_slug or "").strip():
+        resolved_dir = (
+            vcs.resolve_active_repo_dir(prefer_cwd=prefer_cwd)
+            if hasattr(vcs, "resolve_active_repo_dir")
+            else vcs.resolve_repo_dir()
+        )
+
+    clean_slug = dev_common.normalize_repo_slug(repo_slug)
+    if not clean_slug and resolved_dir is not None:
+        if hasattr(vcs, "resolve_repo"):
+            try:
+                clean_slug = dev_common.normalize_repo_slug(str(vcs.resolve_repo(repo_dir=resolved_dir) or ""))
+            except TypeError:
+                clean_slug = dev_common.normalize_repo_slug(str(vcs.resolve_repo() or ""))
+        if not clean_slug:
+            clean_slug = dev_common.resolve_repo_slug_from_path(resolved_dir)
+    if not clean_slug and resolved_dir is not None:
+        clean_slug = resolved_dir.name.lower()
+    return clean_slug or "default", resolved_dir
+
+
+def _extract_repo_slug_from_lock_dict(lock_obj: dict[str, Any] | None, fallback_key: str = "") -> str:
+    """Resolve normalized `owner/repo` slug stored on a lock object or fallback key."""
+    if isinstance(lock_obj, dict):
+        for key in ("repo_slug", "repo"):
+            slug = dev_common.normalize_repo_slug(str(lock_obj.get(key) or ""))
+            if slug:
+                return slug
+        for path_key in ("target_repo_dir", "worktree_path"):
+            raw_p = str(lock_obj.get(path_key) or "").strip()
+            if raw_p:
+                resolved = dev_common.resolve_repo_slug_from_path(raw_p.replace("$HOME", str(Path.home())))
+                if resolved:
+                    return resolved
+    return dev_common.normalize_repo_slug(fallback_key) or "default"
+
+
+def _inactive_lock_snapshot(lock_obj: dict[str, Any] | None = None, repo_slug: str = "") -> dict[str, Any]:
+    """Build a canonical inactive lock snapshot preserving `last_*` metadata."""
+    obj = lock_obj if isinstance(lock_obj, dict) else {}
+    return {
+        "active": False,
+        "repo_slug": repo_slug or str(obj.get("repo_slug") or obj.get("repo") or ""),
+        "last_released_at": str(obj.get("last_released_at") or ""),
+        "last_release_reason": str(obj.get("last_release_reason") or ""),
+        "last_conversation_id": str(obj.get("last_conversation_id") or obj.get("conversation_id") or ""),
+        "last_branch_name": str(obj.get("last_branch_name") or obj.get("branch_name") or ""),
+        "last_branch_timestamp": str(obj.get("last_branch_timestamp") or obj.get("branch_timestamp") or ""),
+    }
+
+
+def _read_locks_state(audit_state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Load `dev_pr_locks` map from `actions_log_audit_state`, migrating active legacy `dev_pr_lock` cleanly."""
+    locks_map: dict[str, dict[str, Any]] = {}
+    raw_locks = audit_state.get("dev_pr_locks")
+    if isinstance(raw_locks, dict):
+        for k, v in raw_locks.items():
+            if not isinstance(v, dict):
+                continue
+            slug = _extract_repo_slug_from_lock_dict(v, fallback_key=str(k))
+            entry = dict(v)
+            entry.setdefault("repo_slug", slug)
+            entry.setdefault("repo", slug)
+            locks_map[slug] = entry
+
+    legacy = audit_state.get("dev_pr_lock")
+    if isinstance(legacy, dict) and bool(legacy.get("active")):
+        leg_slug = _extract_repo_slug_from_lock_dict(legacy)
+        existing_entry = locks_map.get(leg_slug)
+        if not isinstance(existing_entry, dict) or not bool(existing_entry.get("active")):
+            migrated = dict(legacy)
+            migrated["repo_slug"] = leg_slug
+            migrated["repo"] = leg_slug
+            locks_map[leg_slug] = migrated
+    return locks_map
+
+
+def _write_locks_state(
+    audit_state: dict[str, Any],
+    locks_map: dict[str, dict[str, Any]],
+    *,
+    touched_repo_slug: str = "",
+    released_snapshot: dict[str, Any] | None = None,
+) -> None:
+    """Persist `dev_pr_locks` while maintaining `dev_pr_lock` parity and preserving foreign legacy locks untouched."""
+    audit_state["dev_pr_locks"] = locks_map
+    legacy = audit_state.get("dev_pr_lock")
+    foreign_legacy_active = False
+    if isinstance(legacy, dict) and bool(legacy.get("active")):
+        legacy_slug = _extract_repo_slug_from_lock_dict(legacy)
+        if touched_repo_slug and legacy_slug != touched_repo_slug:
+            foreign_legacy_active = True
+
+    if foreign_legacy_active:
+        # Preserve an in-flight foreign legacy lock (e.g., sibling conversation using pre-migration plugin).
+        return
+
+    touched_lock = locks_map.get(touched_repo_slug) if touched_repo_slug else None
+    if isinstance(touched_lock, dict) and bool(touched_lock.get("active")):
+        audit_state["dev_pr_lock"] = dict(touched_lock)
+        return
+
+    active_candidates = [
+        v for v in locks_map.values() if isinstance(v, dict) and bool(v.get("active"))
+    ]
+    if active_candidates:
+        active_candidates.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        audit_state["dev_pr_lock"] = dict(active_candidates[0])
+        return
+
+    snap = released_snapshot if isinstance(released_snapshot, dict) else {}
+    audit_state["dev_pr_lock"] = snap or _inactive_lock_snapshot(legacy if isinstance(legacy, dict) else None)
+
+
+def _match_lock_entry(
+    locks_map: dict[str, dict[str, Any]],
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    branch_name: str = "",
+    prefer_cwd: bool = True,
+) -> tuple[str, dict[str, Any]]:
+    """Select the most specific `(repo_slug, lock_dict)` from `locks_map` for a query/operation."""
+    clean_branch = branch_name.strip()
+    if clean_branch:
+        for slug, entry in locks_map.items():
+            if not isinstance(entry, dict) or not bool(entry.get("active")):
+                continue
+            if str(entry.get("branch_name") or "").strip() == clean_branch:
+                return slug, entry
+            rb = entry.get("repo_branches")
+            if isinstance(rb, dict) and any(
+                isinstance(rb_v, dict) and str(rb_v.get("branch_name") or "").strip() == clean_branch
+                for rb_v in rb.values()
+            ):
+                return slug, entry
+
+    if repo_slug.strip() or workdir:
+        resolved_slug, _ = _resolve_repo_slug_and_dir(
+            repo_slug=repo_slug,
+            workdir=workdir,
+            prefer_cwd=False,
+        )
+        if resolved_slug in locks_map:
+            return resolved_slug, locks_map[resolved_slug]
+        return resolved_slug, {}
+
+    if prefer_cwd:
+        cwd_slug = dev_common.resolve_repo_slug_from_path(Path.cwd())
+        if cwd_slug and cwd_slug in locks_map and bool(locks_map[cwd_slug].get("active")):
+            return cwd_slug, locks_map[cwd_slug]
+
+    for slug, entry in locks_map.items():
+        if isinstance(entry, dict) and bool(entry.get("active")):
+            return slug, entry
+    for slug, entry in locks_map.items():
+        if isinstance(entry, dict):
+            return slug, entry
+    return "", {}
+
+
+def get_all_dev_pr_locks(
+    portfolio_dir: Path | str | None = None,
+    *,
+    include_inactive: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Return per-repository locks keyed by `repo_slug` from `actions_state.json`."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
-    state_path = p_dir / "actions_state.json"
-    state_obj = dev_common.atomic_read_json(state_path, default={})
+    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
     audit_state = (
         state_obj.get("actions_log_audit_state")
         if isinstance(state_obj.get("actions_log_audit_state"), dict)
         else {}
     )
-    lock_obj = audit_state.get("dev_pr_lock")
+    locks_map = _read_locks_state(audit_state)
+    if include_inactive:
+        return {k: dict(v) for k, v in locks_map.items()}
+    return {k: dict(v) for k, v in locks_map.items() if bool(v.get("active"))}
+
+
+def get_dev_pr_lock(
+    portfolio_dir: Path | str | None = None,
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    branch_name: str = "",
+) -> dict[str, Any]:
+    """Read the per-repository remediation branch lock matching `repo_slug`/`workdir`/`branch_name` (or active fallback)."""
+    p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
+    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
+    audit_state = (
+        state_obj.get("actions_log_audit_state")
+        if isinstance(state_obj.get("actions_log_audit_state"), dict)
+        else {}
+    )
+    locks_map = _read_locks_state(audit_state)
+    matched_slug, lock_obj = _match_lock_entry(
+        locks_map,
+        repo_slug=repo_slug,
+        workdir=workdir,
+        branch_name=branch_name,
+        prefer_cwd=True,
+    )
     if isinstance(lock_obj, dict) and bool(lock_obj.get("active")):
         return dict(lock_obj)
-    return {
-        "active": False,
-        "last_released_at": str(lock_obj.get("last_released_at") or "") if isinstance(lock_obj, dict) else "",
-        "last_release_reason": str(lock_obj.get("last_release_reason") or "") if isinstance(lock_obj, dict) else "",
-        "last_branch_name": str(lock_obj.get("last_branch_name") or "") if isinstance(lock_obj, dict) else "",
-        "last_branch_timestamp": str(lock_obj.get("last_branch_timestamp") or "") if isinstance(lock_obj, dict) else "",
-    }
+    legacy = audit_state.get("dev_pr_lock") if isinstance(audit_state.get("dev_pr_lock"), dict) else {}
+    return _inactive_lock_snapshot(lock_obj if lock_obj else legacy, repo_slug=matched_slug)
 
 
-def is_dev_pr_locked(portfolio_dir: Path | str | None = None) -> bool:
-    """Return True if a remediation/prompt branch is currently locked / pending manual PR validation."""
-    return bool(get_dev_pr_lock(portfolio_dir=portfolio_dir).get("active"))
+def is_dev_pr_locked(
+    portfolio_dir: Path | str | None = None,
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+) -> bool:
+    """Return True if the scoped repository (or any repository when unscoped) has an active pending PR lock."""
+    if repo_slug.strip() or workdir:
+        return bool(get_dev_pr_lock(portfolio_dir=portfolio_dir, repo_slug=repo_slug, workdir=workdir).get("active"))
+    return bool(get_all_dev_pr_locks(portfolio_dir=portfolio_dir))
 
 
 def acquire_dev_pr_lock(
@@ -214,11 +452,12 @@ def acquire_dev_pr_lock(
     portfolio_dir: Path | str | None = None,
     target_repo_dir: str = "",
     repo_slug: str = "",
+    workdir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Acquire the exclusive cross-conversation pending-branch lock.
+    """Acquire the exclusive cross-conversation pending-branch lock scoped to a single repository (`dev_pr_locks[repo_slug]`).
 
-    While a timestamped branch is active or pending manual validation to create a Pull Request
-    or reject it, no other conversation, prompt, or scheduled run can make new code changes.
+    While a timestamped branch is active or pending manual validation on `repo_slug`, no other conversation
+    can start a competing branch in that same repository; sibling repositories remain free to acquire their own locks.
     """
     _ = scheduled
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
@@ -231,7 +470,7 @@ def acquire_dev_pr_lock(
     now_iso = _utc_now_iso()
     resolved_ts = (branch_timestamp or "").strip() or generate_branch_timestamp()
     clean_siblings = [
-        str(s).strip()
+        s_val
         for s in (sibling_ids or [])
         for s_val in [str(s).strip()]
         if s_val and s_val != cid_clean
@@ -241,8 +480,14 @@ def acquire_dev_pr_lock(
         action_id=action_id,
         conversation_id=cid_clean,
     )
-    clean_repo_slug = str(repo_slug or "").strip()
-    clean_repo_dir = _sanitize_home_paths(str(target_repo_dir or "").strip())
+    resolved_slug, resolved_dir = _resolve_repo_slug_and_dir(
+        repo_slug=repo_slug,
+        target_repo_dir=target_repo_dir,
+        workdir=workdir,
+        prefer_cwd=not bool(repo_slug or target_repo_dir or workdir),
+    )
+    persistent_repo_dir = _resolve_main_git_repo_root(resolved_dir) if resolved_dir is not None else None
+    clean_repo_dir = _sanitize_home_paths(str(persistent_repo_dir or target_repo_dir or "").strip())
 
     with dev_common.file_lock(lock_file):
         state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
@@ -251,7 +496,8 @@ def acquire_dev_pr_lock(
         audit_state = state_obj.get("actions_log_audit_state")
         if not isinstance(audit_state, dict):
             audit_state = {}
-        existing_lock = audit_state.get("dev_pr_lock")
+        locks_map = _read_locks_state(audit_state)
+        existing_lock = locks_map.get(resolved_slug)
         repo_branches: dict[str, dict[str, Any]] = {}
         if isinstance(existing_lock, dict) and bool(existing_lock.get("active")):
             holder_cid = str(existing_lock.get("conversation_id") or "").strip()
@@ -271,48 +517,48 @@ def acquire_dev_pr_lock(
                     for k, v in raw_rb.items()
                     if str(k).strip() and isinstance(v, dict)
                 }
-            existing_repo_entry = repo_branches.get(clean_repo_slug) if clean_repo_slug else None
+            existing_repo_entry = repo_branches.get(resolved_slug)
             if same_conv and existing_repo_entry and existing_repo_entry.get("branch_name"):
                 default_branch = str(existing_repo_entry.get("branch_name") or default_branch)
                 resolved_ts = str(existing_repo_entry.get("branch_timestamp") or resolved_ts)
-            elif reuse_active_branch and same_conv and (
-                not clean_repo_slug or not repo_branches
-            ):
+            elif reuse_active_branch and same_conv:
                 resolved_ts = str(existing_lock.get("branch_timestamp") or resolved_ts)
                 default_branch = str(existing_lock.get("branch_name") or default_branch)
             elif not same_conv or (
                 existing_status == "PENDING_HUMAN_PR_VALIDATION"
                 and branch_timestamp
                 and branch_timestamp != existing_lock.get("branch_timestamp")
-                and (not clean_repo_slug or clean_repo_slug in repo_branches or not repo_branches)
             ):
                 return {
                     "status": "locked",
                     "acquired": False,
+                    "repo_slug": resolved_slug,
                     "error": (
-                        f"Branch `{existing_lock.get('branch_name')}` (timestamp `{existing_lock.get('branch_timestamp')}`, "
-                        f"Conversation ID `{holder_cid}`, status={existing_status}) is pending manual validation "
-                        f"to create or reject a Pull Request. No other code changes can be made until that branch is evaluated."
+                        f"Repository `{resolved_slug}` is locked by branch `{existing_lock.get('branch_name')}` "
+                        f"(timestamp `{existing_lock.get('branch_timestamp')}`, Conversation ID `{holder_cid}`, "
+                        f"status={existing_status}) pending manual PR validation. Sibling repositories remain unlocked."
                     ),
                     "active_lock": existing_lock,
                 }
 
-        if clean_repo_slug:
-            prev_entry = repo_branches.get(clean_repo_slug, {})
-            repo_branches[clean_repo_slug] = {
-                "repo_slug": clean_repo_slug,
-                "branch_name": default_branch,
-                "branch_timestamp": resolved_ts,
-                "target_repo_dir": clean_repo_dir or str(prev_entry.get("target_repo_dir") or ""),
-                "manual_pr_url": str(prev_entry.get("manual_pr_url") or issue_url or ""),
-                "branch_pushed": bool(prev_entry.get("branch_pushed", False)),
-                "head_sha": str(prev_entry.get("head_sha") or ""),
-                "updated_at": now_iso,
-            }
+        prev_entry = repo_branches.get(resolved_slug, {})
+        repo_branches[resolved_slug] = {
+            "repo_slug": resolved_slug,
+            "branch_name": default_branch,
+            "branch_timestamp": resolved_ts,
+            "target_repo_dir": clean_repo_dir or str(prev_entry.get("target_repo_dir") or ""),
+            "manual_pr_url": str(prev_entry.get("manual_pr_url") or issue_url or ""),
+            "branch_pushed": bool(prev_entry.get("branch_pushed", False)),
+            "head_sha": str(prev_entry.get("head_sha") or ""),
+            "updated_at": now_iso,
+        }
 
+        same_prev = isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
         new_lock: dict[str, Any] = {
             "active": True,
             "vcs_mode": "native_git",
+            "repo_slug": resolved_slug,
+            "repo": resolved_slug,
             "lock_id": f"lock-{cid_clean[:8]}-{resolved_ts}",
             "conversation_id": cid_clean,
             "sibling_conversation_ids": clean_siblings,
@@ -320,62 +566,55 @@ def acquire_dev_pr_lock(
             "notification_source": "Ad-Hoc",
             "branch_timestamp": resolved_ts,
             "branch_name": default_branch,
-            "branch_pushed": bool(existing_lock.get("branch_pushed"))
-            if isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
-            else False,
-            "head_sha": str(existing_lock.get("head_sha") or "")
-            if isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
-            else "",
-            "manual_pr_url": str(existing_lock.get("manual_pr_url") or "")
-            if isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
-            else "",
-            "target_repo_dir": clean_repo_dir
-            or (
-                str(existing_lock.get("target_repo_dir") or "")
-                if isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
-                else ""
-            ),
+            "branch_pushed": bool(existing_lock.get("branch_pushed")) if same_prev else False,
+            "head_sha": str(existing_lock.get("head_sha") or "") if same_prev else "",
+            "manual_pr_url": str(existing_lock.get("manual_pr_url") or "") if same_prev else "",
+            "target_repo_dir": clean_repo_dir or (str(existing_lock.get("target_repo_dir") or "") if same_prev else ""),
             "repo_branches": repo_branches,
-            "worktree_path": str(worktree_path or "").strip(),
+            "worktree_path": _sanitize_home_paths(str(worktree_path or "").strip()),
             "issue_number": int(issue_number) if issue_number is not None else None,
             "issue_url": str(issue_url or "").strip(),
-            "pr_number": existing_lock.get("pr_number")
-            if isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
-            else None,
-            "pr_url": str(existing_lock.get("pr_url") or "")
-            if isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
-            else "",
+            "pr_number": existing_lock.get("pr_number") if same_prev else None,
+            "pr_url": str(existing_lock.get("pr_url") or "") if same_prev else "",
             "status": "DEVELOPING",
             "summary": _sanitize_home_paths(str(summary or "").strip()),
             "proposed_fix": _sanitize_home_paths(str(proposed_fix or "").strip()),
             "target_files": [str(f).strip() for f in (target_files or []) if str(f).strip()],
             "acquired_at": (
                 str(existing_lock.get("acquired_at"))
-                if isinstance(existing_lock, dict)
-                and existing_lock.get("conversation_id") == cid_clean
-                and existing_lock.get("acquired_at")
+                if same_prev and existing_lock.get("acquired_at")
                 else now_iso
             ),
             "updated_at": now_iso,
         }
-        audit_state["dev_pr_lock"] = new_lock
+        locks_map[resolved_slug] = new_lock
+        _write_locks_state(audit_state, locks_map, touched_repo_slug=resolved_slug)
         state_obj["actions_log_audit_state"] = audit_state
         tmp_path = state_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(tmp_path, 0o600)
-        except OSError:
-            pass
         os.replace(tmp_path, state_path)
 
-    return {"status": "ok", "acquired": True, "lock": new_lock}
+    active_count = sum(1 for v in locks_map.values() if isinstance(v, dict) and bool(v.get("active")))
+    return {
+        "status": "ok",
+        "acquired": True,
+        "repo_slug": resolved_slug,
+        "active_locks_count": active_count,
+        "lock": new_lock,
+    }
 
 
 def update_dev_pr_lock(
     updates: dict[str, Any],
     portfolio_dir: Path | str | None = None,
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    branch_name: str = "",
 ) -> dict[str, Any]:
-    """Update fields on the active `dev_pr_lock` inside `actions_state.json`."""
+    """Update fields on the matching active per-repository lock inside `actions_state.json`."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
     state_path = p_dir / "actions_state.json"
     lock_file = state_path.with_suffix(".json.lock")
@@ -388,26 +627,35 @@ def update_dev_pr_lock(
         audit_state = state_obj.get("actions_log_audit_state")
         if not isinstance(audit_state, dict):
             audit_state = {}
-        current_lock = audit_state.get("dev_pr_lock")
-        if not isinstance(current_lock, dict) or not bool(current_lock.get("active")):
-            return {"status": "error", "error": "No active dev_pr_lock to update."}
+        locks_map = _read_locks_state(audit_state)
+        target_slug, cand_lock = _match_lock_entry(
+            locks_map,
+            repo_slug=repo_slug,
+            workdir=workdir,
+            branch_name=branch_name or str(updates.get("branch_name") or ""),
+            prefer_cwd=True,
+        )
+        if not isinstance(cand_lock, dict) or not bool(cand_lock.get("active")):
+            return {"status": "error", "error": f"No active dev_pr_lock to update for `{target_slug or 'default'}`."}
+        current_lock = dict(cand_lock)
         for k, v in updates.items():
             if v is not None:
-                if k in ("summary", "proposed_fix", "proposal_title", "proposal_body") and isinstance(v, str):
+                if k in ("summary", "proposed_fix", "proposal_title", "proposal_body", "target_repo_dir", "worktree_path") and isinstance(v, str):
                     current_lock[k] = _sanitize_home_paths(v)
                 else:
                     current_lock[k] = v
+        current_lock["repo_slug"] = target_slug
+        current_lock["repo"] = target_slug
         current_lock["updated_at"] = now_iso
-        audit_state["dev_pr_lock"] = current_lock
+        locks_map[target_slug] = current_lock
+        _write_locks_state(audit_state, locks_map, touched_repo_slug=target_slug)
         state_obj["actions_log_audit_state"] = audit_state
         tmp_path = state_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(tmp_path, 0o600)
-        except OSError:
-            pass
         os.replace(tmp_path, state_path)
-    return {"status": "ok", "lock": current_lock}
+    return {"status": "ok", "repo_slug": target_slug, "lock": current_lock}
 
 
 def _resolve_lock_target_repo_dir(lock_info: dict[str, Any] | None) -> Path | None:
@@ -423,17 +671,17 @@ def _resolve_lock_target_repo_dir(lock_info: dict[str, Any] | None) -> Path | No
     if not lock_repo_raw:
         return None
     cand = Path(lock_repo_raw.replace("$HOME", str(Path.home()))).expanduser()
-    return cand.resolve() if (cand / ".git").exists() else cand
+    return _resolve_main_git_repo_root(cand) if (cand / ".git").exists() else cand
 
 
 def cleanup_worktree(worktree_path: str | Path, repo_dir: Path | None = None) -> None:
     """Safely remove an isolated git worktree directory if it exists."""
     if not worktree_path:
         return
-    wt = Path(worktree_path).expanduser()
+    wt = Path(str(worktree_path).replace("$HOME", str(Path.home()))).expanduser()
     if not wt.exists():
         return
-    resolved_repo = repo_dir or GitVcsIntegrationClient().resolve_repo_dir()
+    resolved_repo = repo_dir or _resolve_main_git_repo_root(wt)
     if (resolved_repo / ".git").exists():
         subprocess.run(
             ["git", "-C", str(resolved_repo), "worktree", "remove", "--force", str(wt)],
@@ -446,19 +694,94 @@ def cleanup_worktree(worktree_path: str | Path, repo_dir: Path | None = None) ->
         shutil.rmtree(wt, ignore_errors=True)
 
 
+def _finalize_single_released_lock(
+    *,
+    released_lock: dict[str, Any],
+    released_slug: str,
+    audit_state: dict[str, Any],
+    state_dir: Path,
+    reason: str,
+    resolution: str,
+    summary: str,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Build released lock snapshot and sync ledger verdicts for one unlocked repository."""
+    cid_clean = str(released_lock.get("conversation_id") or "").strip()
+    siblings = list(released_lock.get("sibling_conversation_ids") or [])
+    legacy_audited = audit_state.get("audited_runs") if isinstance(audit_state.get("audited_runs"), dict) else {}
+    audited_runs = dev_common.try_sync_actions_ledger_verdicts(
+        state_dir=state_dir,
+        legacy_audited=legacy_audited,
+    )
+    pending_tier2 = (
+        audit_state.get("pending_tier2_proposals")
+        if isinstance(audit_state.get("pending_tier2_proposals"), dict)
+        else {}
+    )
+    if cid_clean:
+        rec = dict(audited_runs.get(cid_clean) or {})
+        rec.update(
+            {
+                "conversation_id": cid_clean,
+                "tier": "TIER_2",
+                "resolution": resolution,
+                "summary": summary.strip() or str(rec.get("summary") or f"Branch resolved ({reason})"),
+                "repo_slug": released_slug,
+                "branch_name": released_lock.get("branch_name", ""),
+                "branch_timestamp": released_lock.get("branch_timestamp", ""),
+                "issue_number": released_lock.get("issue_number"),
+                "pr_number": released_lock.get("pr_number"),
+                "pr_url": released_lock.get("manual_pr_url") or released_lock.get("pr_url", ""),
+                "updated_at": now_iso,
+            }
+        )
+        verdict_updates: dict[str, dict[str, Any]] = {cid_clean: rec}
+        pending_tier2.pop(cid_clean, None)
+        for sib in siblings:
+            sib_rec = dict(rec)
+            sib_rec["conversation_id"] = sib
+            sib_rec["grouped_with"] = cid_clean
+            verdict_updates[sib] = sib_rec
+            pending_tier2.pop(sib, None)
+        dev_common.try_sync_actions_ledger_verdicts(verdict_updates, state_dir=state_dir)
+
+    audit_state.pop("audited_runs", None)
+    audit_state["pending_tier2_proposals"] = pending_tier2
+    return {
+        "active": False,
+        "repo_slug": released_slug,
+        "repo": released_slug,
+        "last_released_at": now_iso,
+        "last_release_reason": reason,
+        "last_conversation_id": cid_clean,
+        "last_branch_name": released_lock.get("branch_name", ""),
+        "last_branch_timestamp": released_lock.get("branch_timestamp", ""),
+        "last_repo_branches": released_lock.get("repo_branches") or {},
+        "last_subagent_conversation_ids": list(released_lock.get("subagent_conversation_ids") or []),
+        "last_pr_number": released_lock.get("pr_number"),
+        "last_issue_number": released_lock.get("issue_number"),
+    }
+
+
 def release_dev_pr_lock(
     reason: str = "PR_MERGED",
     resolution: str = "APPLIED_AND_SYNCED",
     summary: str = "",
     portfolio_dir: Path | str | None = None,
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    branch_name: str = "",
+    release_all: bool = False,
 ) -> dict[str, Any]:
-    """Delete/release the cross-conversation branch development lock to enable new code changes."""
+    """Release one repository's pending-branch lock (`repo_slug`/`workdir`/`branch_name`), or all locks when `release_all=True`."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
     state_path = p_dir / "actions_state.json"
     lock_file = state_path.with_suffix(".json.lock")
     now_iso = _utc_now_iso()
 
-    released_lock: dict[str, Any] = {}
+    released_entries: list[tuple[str, dict[str, Any]]] = []
+    remaining_active_slugs: list[str] = []
     with dev_common.file_lock(lock_file):
         state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
         if not isinstance(state_obj, dict):
@@ -466,138 +789,137 @@ def release_dev_pr_lock(
         audit_state = state_obj.get("actions_log_audit_state")
         if not isinstance(audit_state, dict):
             audit_state = {}
-        existing_lock = audit_state.get("dev_pr_lock")
-        if isinstance(existing_lock, dict):
-            released_lock = dict(existing_lock)
-        cid_clean = str(released_lock.get("conversation_id") or "").strip()
-        siblings = list(released_lock.get("sibling_conversation_ids") or [])
+        locks_map = _read_locks_state(audit_state)
+        active_slugs = [k for k, v in locks_map.items() if isinstance(v, dict) and bool(v.get("active"))]
 
-        legacy_audited = audit_state.get("audited_runs") if isinstance(audit_state.get("audited_runs"), dict) else {}
-        audited_runs = dev_common.try_sync_actions_ledger_verdicts(
-            state_dir=state_path.parent,
-            legacy_audited=legacy_audited,
-        )
-        pending_tier2 = (
-            audit_state.get("pending_tier2_proposals")
-            if isinstance(audit_state.get("pending_tier2_proposals"), dict)
-            else {}
-        )
-        if cid_clean:
-            rec = dict(audited_runs.get(cid_clean) or {})
-            rec.update(
-                {
-                    "conversation_id": cid_clean,
-                    "tier": "TIER_2",
-                    "resolution": resolution,
-                    "summary": summary.strip() or str(rec.get("summary") or f"Branch resolved ({reason})"),
-                    "branch_name": released_lock.get("branch_name", ""),
-                    "branch_timestamp": released_lock.get("branch_timestamp", ""),
-                    "issue_number": released_lock.get("issue_number"),
-                    "pr_number": released_lock.get("pr_number"),
-                    "pr_url": released_lock.get("manual_pr_url") or released_lock.get("pr_url", ""),
-                    "updated_at": now_iso,
-                }
+        target_slugs: list[str] = []
+        if release_all:
+            target_slugs = active_slugs or list(locks_map.keys())
+        elif repo_slug.strip() or workdir or branch_name.strip():
+            matched_slug, cand = _match_lock_entry(
+                locks_map,
+                repo_slug=repo_slug,
+                workdir=workdir,
+                branch_name=branch_name,
+                prefer_cwd=False,
             )
-            verdict_updates: dict[str, dict[str, Any]] = {cid_clean: rec}
-            pending_tier2.pop(cid_clean, None)
-            for sib in siblings:
-                sib_rec = dict(rec)
-                sib_rec["conversation_id"] = sib
-                sib_rec["grouped_with"] = cid_clean
-                verdict_updates[sib] = sib_rec
-                pending_tier2.pop(sib, None)
-            dev_common.try_sync_actions_ledger_verdicts(verdict_updates, state_dir=state_path.parent)
+            if cand:
+                target_slugs = [matched_slug]
+        elif len(active_slugs) == 1:
+            target_slugs = [active_slugs[0]]
+        elif len(active_slugs) > 1:
+            matched_slug, cand = _match_lock_entry(locks_map, prefer_cwd=True)
+            if not matched_slug or not cand.get("active"):
+                return {
+                    "status": "error",
+                    "released": False,
+                    "error": f"Multiple active repository locks exist ({', '.join(active_slugs)}); pass --repo, --workdir, --branch, or --all.",
+                    "active_repos": active_slugs,
+                }
+            target_slugs = [matched_slug]
+        elif locks_map:
+            first_slug = next(iter(locks_map))
+            target_slugs = [first_slug]
 
-        audit_state.pop("audited_runs", None)
-        audit_state["pending_tier2_proposals"] = pending_tier2
-        audit_state["dev_pr_lock"] = {
-            "active": False,
-            "last_released_at": now_iso,
-            "last_release_reason": reason,
-            "last_conversation_id": cid_clean,
-            "last_branch_name": released_lock.get("branch_name", ""),
-            "last_branch_timestamp": released_lock.get("branch_timestamp", ""),
-            "last_repo_branches": released_lock.get("repo_branches") or {},
-            "last_subagent_conversation_ids": list(released_lock.get("subagent_conversation_ids") or []),
-            "last_pr_number": released_lock.get("pr_number"),
-            "last_issue_number": released_lock.get("issue_number"),
-        }
+        last_snap: dict[str, Any] = {}
+        last_slug = ""
+        for slug in target_slugs:
+            rel_lock = dict(locks_map.get(slug) or {})
+            released_entries.append((slug, rel_lock))
+            snap = _finalize_single_released_lock(
+                released_lock=rel_lock,
+                released_slug=slug,
+                audit_state=audit_state,
+                state_dir=state_path.parent,
+                reason=reason,
+                resolution=resolution,
+                summary=summary,
+                now_iso=now_iso,
+            )
+            locks_map[slug] = snap
+            last_snap = snap
+            last_slug = slug
+
+        if not released_entries:
+            last_snap = _inactive_lock_snapshot(
+                audit_state.get("dev_pr_lock") if isinstance(audit_state.get("dev_pr_lock"), dict) else None
+            )
+            last_snap["last_released_at"] = now_iso
+            last_snap["last_release_reason"] = reason
+
+        _write_locks_state(
+            audit_state,
+            locks_map,
+            touched_repo_slug=last_slug,
+            released_snapshot=last_snap,
+        )
+        remaining_active_slugs = [k for k, v in locks_map.items() if isinstance(v, dict) and bool(v.get("active"))]
         state_obj["actions_log_audit_state"] = audit_state
         tmp_path = state_path.with_suffix(".tmp")
         tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        try:
+        with contextlib.suppress(OSError):
             os.chmod(tmp_path, 0o600)
-        except OSError:
-            pass
         os.replace(tmp_path, state_path)
 
-    if reason in ("BRANCH_MERGED_INTO_MAIN", "HUMAN_VALIDATED_MANUAL_PR") and cid_clean:
-        with contextlib.suppress(Exception):
-            rb_map = released_lock.get("repo_branches") if isinstance(released_lock.get("repo_branches"), dict) else {}
-            merged_branches = [
-                str(entry.get("branch_name") or "")
-                for entry in rb_map.values()
-                if isinstance(entry, dict) and entry.get("branch_name")
-            ] or ([str(released_lock.get("branch_name") or "")] if released_lock.get("branch_name") else [])
-            for q_cid in [cid_clean, *siblings]:
-                update_dev_queue_item_status(
-                    conversation_id=q_cid,
-                    status="merged",
-                    branch_names=merged_branches,
-                    subagent_conversation_ids=list(released_lock.get("subagent_conversation_ids") or []),
-                    portfolio_dir=portfolio_dir,
-                )
+    if reason in ("BRANCH_MERGED_INTO_MAIN", "HUMAN_VALIDATED_MANUAL_PR"):
+        for released_slug, released_lock in released_entries:
+            cid_clean = str(released_lock.get("conversation_id") or "").strip()
+            if not cid_clean:
+                continue
+            siblings = list(released_lock.get("sibling_conversation_ids") or [])
+            with contextlib.suppress(Exception):
+                rb_map = released_lock.get("repo_branches") if isinstance(released_lock.get("repo_branches"), dict) else {}
+                merged_branches = [
+                    str(entry.get("branch_name") or "")
+                    for entry in rb_map.values()
+                    if isinstance(entry, dict) and entry.get("branch_name")
+                ] or ([str(released_lock.get("branch_name") or "")] if released_lock.get("branch_name") else [])
+                for q_cid in [cid_clean, *siblings]:
+                    _mark_queue_item_repo_merged(
+                        conversation_id=q_cid,
+                        released_repo_slug=released_slug,
+                        branch_names=merged_branches,
+                        subagent_conversation_ids=list(released_lock.get("subagent_conversation_ids") or []),
+                        remaining_active_locks=get_all_dev_pr_locks(portfolio_dir=portfolio_dir),
+                        portfolio_dir=portfolio_dir,
+                    )
 
-    wt_path = str(released_lock.get("worktree_path") or "").strip()
-    if wt_path:
-        cleanup_worktree(wt_path, repo_dir=_resolve_lock_target_repo_dir(released_lock))
+    for _, released_lock in released_entries:
+        wt_path = str(released_lock.get("worktree_path") or "").strip()
+        if wt_path:
+            cleanup_worktree(wt_path, repo_dir=_resolve_lock_target_repo_dir(released_lock))
 
     stop_dev_api_server(portfolio_dir=portfolio_dir)
     restart_pro_api_server(portfolio_dir=portfolio_dir)
 
+    primary_prev = released_entries[0][1] if released_entries else {}
     return {
         "status": "ok",
         "released": True,
+        "released_repos": [s for s, _ in released_entries],
+        "remaining_active_repos": remaining_active_slugs,
         "reason": reason,
         "resolution": resolution,
-        "previous_lock": released_lock,
+        "previous_lock": primary_prev,
     }
 
 
-def sync_dev_pr_lock_with_git(
+def _sync_single_repo_lock_with_git(
+    *,
+    repo_slug: str,
+    lock_info: dict[str, Any],
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
 ) -> dict[str, Any]:
-    """Inspect the active `dev_pr_lock` via native `git`, auto-release it if the branch was merged into `main` or deleted on `origin`, and synchronize local `main` and branches."""
-    lock_info = get_dev_pr_lock(portfolio_dir=portfolio_dir)
+    """Synchronize one repository's active lock against `origin` via native `git`."""
     if git_client is not None:
         vcs = git_client
     else:
-        lock_repo_raw = str(lock_info.get("target_repo_dir") or lock_info.get("worktree_path") or "").strip()
-        if not lock_repo_raw and isinstance(lock_info.get("repo_branches"), dict):
-            for rb_entry in lock_info["repo_branches"].values():
-                if isinstance(rb_entry, dict) and str(rb_entry.get("target_repo_dir") or "").strip():
-                    lock_repo_raw = str(rb_entry.get("target_repo_dir") or "").strip()
-                    break
-        lock_repo_path = Path(lock_repo_raw.replace("$HOME", str(Path.home()))).expanduser() if lock_repo_raw else None
+        lock_repo_path = _resolve_lock_target_repo_dir(lock_info)
         if lock_repo_path and (lock_repo_path / ".git").exists():
-            vcs = GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(lock_repo_path.resolve())})
+            vcs = GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(lock_repo_path)})
         else:
             vcs = GitVcsIntegrationClient()
-    if not lock_info.get("active"):
-        stop_dev_api_server(portfolio_dir=portfolio_dir)
-        repo_sync = (
-            vcs.sync_and_clean_local_repo(base_branch="main")
-            if hasattr(vcs, "sync_and_clean_local_repo")
-            else {}
-        )
-        return {
-            "status": "ok",
-            "active": False,
-            "released": False,
-            "lock": lock_info,
-            "repo_sync": repo_sync,
-        }
 
     branch_name = str(lock_info.get("branch_name") or "").strip()
     branch_pushed = bool(lock_info.get("branch_pushed"))
@@ -613,6 +935,7 @@ def sync_dev_pr_lock_with_git(
         )
         return {
             "status": "ok",
+            "repo_slug": repo_slug,
             "active": True,
             "released": False,
             "lock": lock_info,
@@ -623,6 +946,7 @@ def sync_dev_pr_lock_with_git(
     if branch_state.get("status") != "ok":
         return {
             "status": "ok",
+            "repo_slug": repo_slug,
             "active": True,
             "released": False,
             "lock": lock_info,
@@ -651,9 +975,12 @@ def sync_dev_pr_lock_with_git(
             resolution="APPLIED_AND_SYNCED",
             summary=f"Branch `{branch_name}` (`{lock_info.get('branch_timestamp', '')}`) merged into main via manual PR.",
             portfolio_dir=portfolio_dir,
+            repo_slug=repo_slug,
+            branch_name=branch_name,
         )
         return {
             "status": "ok",
+            "repo_slug": repo_slug,
             "active": False,
             "released": True,
             "reason": "BRANCH_MERGED_INTO_MAIN",
@@ -676,9 +1003,12 @@ def sync_dev_pr_lock_with_git(
             resolution="VERIFIED_OK",
             summary=f"Remote branch `{branch_name}` was deleted on origin after human evaluation; lock released.",
             portfolio_dir=portfolio_dir,
+            repo_slug=repo_slug,
+            branch_name=branch_name,
         )
         return {
             "status": "ok",
+            "repo_slug": repo_slug,
             "active": False,
             "released": True,
             "reason": "REMOTE_BRANCH_DELETED_AFTER_EVALUATION",
@@ -697,11 +1027,99 @@ def sync_dev_pr_lock_with_git(
     )
     return {
         "status": "ok",
+        "repo_slug": repo_slug,
         "active": True,
         "released": False,
         "lock": lock_info,
         "branch_state": branch_state,
         "repo_sync": repo_sync,
+    }
+
+
+def sync_dev_pr_lock_with_git(
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Inspect active per-repository locks via native `git`, release merged/deleted branches, and synchronize local `main`."""
+    active_map = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
+    if not active_map:
+        vcs = git_client or GitVcsIntegrationClient()
+        stop_dev_api_server(portfolio_dir=portfolio_dir)
+        repo_sync = vcs.sync_and_clean_local_repo(base_branch="main") if hasattr(vcs, "sync_and_clean_local_repo") else {}
+        return {
+            "status": "ok",
+            "active": False,
+            "released": False,
+            "lock": get_dev_pr_lock(portfolio_dir=portfolio_dir),
+            "locks": {},
+            "repo_sync": repo_sync,
+        }
+
+    target_entries: list[tuple[str, dict[str, Any]]]
+    if repo_slug.strip() or workdir:
+        scoped_slug, _ = _resolve_repo_slug_and_dir(
+            repo_slug=repo_slug,
+            workdir=workdir,
+            git_client=git_client,
+            prefer_cwd=False,
+        )
+        if scoped_slug in active_map:
+            target_entries = [(scoped_slug, active_map[scoped_slug])]
+        else:
+            vcs = git_client or GitVcsIntegrationClient()
+            repo_sync = vcs.sync_and_clean_local_repo(base_branch="main") if hasattr(vcs, "sync_and_clean_local_repo") else {}
+            return {
+                "status": "ok",
+                "active": bool(active_map),
+                "repo_active": False,
+                "released": False,
+                "repo_slug": scoped_slug,
+                "locks": active_map,
+                "repo_sync": repo_sync,
+            }
+    elif git_client is not None and len(active_map) > 1:
+        first_slug = next(iter(active_map))
+        target_entries = [(first_slug, active_map[first_slug])]
+    else:
+        target_entries = list(active_map.items())
+
+    per_repo_results: dict[str, dict[str, Any]] = {}
+    any_released = False
+    first_release_reason = ""
+    first_release_result: dict[str, Any] = {}
+    for slug, linfo in target_entries:
+        res_item = _sync_single_repo_lock_with_git(
+            repo_slug=slug,
+            lock_info=linfo,
+            portfolio_dir=portfolio_dir,
+            git_client=git_client if len(target_entries) == 1 else None,
+        )
+        per_repo_results[slug] = res_item
+        if res_item.get("released"):
+            any_released = True
+            if not first_release_reason:
+                first_release_reason = str(res_item.get("reason") or "")
+                first_release_result = dict(res_item.get("release_result") or {})
+
+    remaining = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
+    if len(target_entries) == 1:
+        single_res = next(iter(per_repo_results.values()))
+        single_res.setdefault("locks", remaining)
+        if repo_slug.strip() or workdir:
+            single_res["any_active"] = bool(remaining)
+        return single_res
+
+    return {
+        "status": "ok",
+        "active": bool(remaining),
+        "released": any_released,
+        "reason": first_release_reason or ("active_locks_remaining" if remaining else "all_locks_released"),
+        "release_result": first_release_result,
+        "results_by_repo": per_repo_results,
+        "locks": remaining,
     }
 
 
@@ -955,7 +1373,8 @@ def prepare_isolated_worktree(
         return {"status": "error", "error": f"Git repository not found at {resolved_repo}"}
 
     safe_slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", branch_name)
-    wt_dir = p_dir / "tmp" / f"pr-worktree-{safe_slug}"
+    repo_token = _slugify_branch_token(_resolve_main_git_repo_root(resolved_repo).name, max_len=24)
+    wt_dir = p_dir / "tmp" / f"pr-worktree-{repo_token}-{safe_slug}"
     if wt_dir.exists():
         cleanup_worktree(wt_dir, repo_dir=resolved_repo)
     wt_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1085,22 +1504,27 @@ def start_remediation_branch_and_lock(
 ) -> dict[str, Any]:
     """Execute Steps 1–2: inspect/RCA, verify no pending branch is awaiting validation (or reuse active PR branch), create timestamped git branch, and acquire `dev_pr_lock`."""
     vcs = git_client or GitVcsIntegrationClient()
-    target_repo_dir = (
-        vcs.resolve_active_repo_dir(workdir=workdir, prefer_cwd=True)
-        if hasattr(vcs, "resolve_active_repo_dir")
-        else vcs.resolve_repo_dir()
+    resolved_slug, resolved_target_dir = _resolve_repo_slug_and_dir(
+        workdir=workdir,
+        git_client=vcs,
+        prefer_cwd=True,
     )
-    repo_slug = ""
-    if hasattr(vcs, "resolve_repo"):
-        try:
-            repo_slug = str(vcs.resolve_repo(repo_dir=target_repo_dir if isinstance(target_repo_dir, Path) else None) or "").strip()
-        except TypeError:
-            repo_slug = str(vcs.resolve_repo() or "").strip()
+    target_repo_dir = resolved_target_dir or vcs.resolve_repo_dir()
+    repo_slug = resolved_slug
 
-    # Synchronize lock state via native git in case a previous branch was already merged or deleted on origin
-    sync_dev_pr_lock_with_git(portfolio_dir=portfolio_dir, git_client=git_client)
+    # Synchronize ONLY this repository's lock via native git in case a previous branch was merged/deleted
+    sync_dev_pr_lock_with_git(
+        portfolio_dir=portfolio_dir,
+        git_client=git_client,
+        repo_slug=repo_slug,
+        workdir=target_repo_dir,
+    )
 
-    existing_lock = get_dev_pr_lock(portfolio_dir=portfolio_dir)
+    existing_lock = get_dev_pr_lock(
+        portfolio_dir=portfolio_dir,
+        repo_slug=repo_slug,
+        workdir=target_repo_dir,
+    )
     cid_clean = str(conversation_id or "").strip()
     holder_cid = str(existing_lock.get("conversation_id") or "").strip()
     existing_siblings = [str(s).strip() for s in (existing_lock.get("sibling_conversation_ids") or [])]
@@ -1112,11 +1536,9 @@ def start_remediation_branch_and_lock(
         or cid_clean in existing_siblings
     )
     existing_status = str(existing_lock.get("status") or "")
-    existing_rb = existing_lock.get("repo_branches") if isinstance(existing_lock.get("repo_branches"), dict) else {}
-    same_repo_locked = bool(not repo_slug or not existing_rb or repo_slug in existing_rb)
     if existing_lock.get("active") and (
         not same_conv
-        or (not reuse_active_branch and existing_status == "PENDING_HUMAN_PR_VALIDATION" and same_repo_locked)
+        or (not reuse_active_branch and existing_status == "PENDING_HUMAN_PR_VALIDATION")
     ):
         pending_branch = existing_lock.get("branch_name") or "unknown-branch"
         pending_ts = existing_lock.get("branch_timestamp") or ""
@@ -1128,16 +1550,18 @@ def start_remediation_branch_and_lock(
                 rca_summary=rca_summary,
                 proposed_fix=proposed_fix,
                 target_files=target_files,
+                repo_slugs=[repo_slug] if repo_slug else None,
                 blocked_by_lock_id=str(existing_lock.get("lock_id") or ""),
                 portfolio_dir=portfolio_dir,
             )
         return {
             "status": "locked",
             "acquired": False,
+            "repo_slug": repo_slug,
             "queued": bool(q_res.get("status") == "ok"),
             "queue_entry": q_res.get("item"),
             "error": (
-                f"Cannot start new branch or make code changes for `{cid_clean}`: "
+                f"Cannot start new branch or make code changes in `{repo_slug}` for `{cid_clean}`: "
                 f"branch `{pending_branch}` (timestamp `{pending_ts}`, conversation `{existing_lock.get('conversation_id')}`) "
                 f"is currently pending manual validation to generate a Pull Request or reject it."
             ),
@@ -1425,12 +1849,14 @@ def build_code_developer_subagent_plan(
     scheduled: bool = True,
     model: str = "",
     anchored_context: str = "",
+    workdir: str = "",
+    repo_slug: str = "",
 ) -> dict[str, Any]:
     """Build the `subagent_definition` and `subagent_invocation` for `agy-code-developer`.
 
     Supports optional model tiering (`flash` for bounded/pre-anchored tasks or `pro` [default]
     for complex multi-module/security work) while keeping `agy-code-pr-reviewer` on `pro`.
-    Executes Steps 1–4 using pure native `git` (RCA -> Create Timestamped Branch & Acquire `dev_pr_lock` ->
+    Executes Steps 1–4 using pure native `git` (RCA -> Create Timestamped Branch & Acquire per-repo `dev_pr_locks` entry ->
     Propose Changes on Branch & Run Local Unit Tests -> Push Branch to Remote `origin/<branch_name>`)
     and returns the branch details + `agy-code-pr-reviewer` invocation plan.
     """
@@ -1443,6 +1869,8 @@ def build_code_developer_subagent_plan(
     sched_flag = " --scheduled" if scheduled else ""
     files_arg = (" --target-files " + " ".join(f'"{f}"' for f in files_list)) if files_list else ""
     sib_arg = (" --sibling-ids " + " ".join(sib_list)) if sib_list else ""
+    workdir_arg = f' --workdir "{workdir.strip()}"' if str(workdir or "").strip() else ""
+    repo_line = f"- **Target Repository**: `{repo_slug.strip()}`\n" if str(repo_slug or "").strip() else ""
     anchored_clean = str(anchored_context or "").strip()
 
     system_prompt = (
@@ -1453,19 +1881,20 @@ def build_code_developer_subagent_plan(
         f"NEVER commit, merge, or push directly to `main`.\n"
         f"Your mandatory responsibilities:\n"
         f"1. Consume coordinator-provided file anchors, exact line ranges, and contracts cleanly without redundant full-repo discovery; inspect `rca` only if additional root-cause detail is missing.\n"
-        f"2. Create a timestamped branch (`fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>`) and acquire `dev_pr_lock` via:\n"
-        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation --id <CONVERSATION_ID> --action-id <ACTION_ID> --rca-summary \"...\" --proposed-fix \"...\" --worktree`\n"
-        f"   - If `status == \"locked\"`, `dev_queue.json` records the blocked item automatically; stop immediately and return the active lock status.\n"
+        f"2. Create a timestamped branch (`fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>`) and acquire the per-repository lock (`dev_pr_locks[repo_slug]`) via:\n"
+        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation --id <CONVERSATION_ID> --action-id <ACTION_ID> --workdir <REPO_DIR> --rca-summary \"...\" --proposed-fix \"...\" --worktree`\n"
+        f"   - If `status == \"locked\"` on this repository, `dev_queue.json` records the blocked item automatically; stop immediately and return the active lock status.\n"
         f"3. Implement modular Zero-PII code/skill fixes and hermetic unit test(s) in `tests/`, iterating quickly via targeted `python3 -m unittest <target>` checks.\n"
         f"4. Once targeted tests pass, run a single final gate (`pre-commit run --all-files` + `pr_remediator.py test-local --workdir <WORKTREE_PATH>`) until `passed == true`.\n"
         f"5. Commit and push the timestamped branch to `origin` via native `git` (never `main`):\n"
-        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py push-branch --title \"fix(<scope>): <summary>\" --scheduled`\n"
+        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py push-branch --workdir <WORKTREE_PATH> --title \"fix(<scope>): <summary>\" --scheduled`\n"
         f"6. Return the JSON output from `push-branch` (including `branch_name`, `branch_timestamp`, `manual_pr_url`, `reviewer_subagent_definition`, and `reviewer_subagent_invocation`) so `{PR_REVIEWER_SUBAGENT_NAME}` (`Model=\"pro\"`) can evaluate immediately."
     )
 
     task_prompt = (
         f"A code/skill change requires a native `git` timestamped branch proposal:\n"
-        f"- **Incident / Conversation ID**: `{cid_clean}`\n"
+        + repo_line
+        + f"- **Incident / Conversation ID**: `{cid_clean}`\n"
         f"- **Action / Trigger ID**: `{action_id or 'code-change'}`\n"
         + (f"- **Sibling Conversation IDs**: `{', '.join(sib_list)}`\n" if sib_list else "")
         + (f"- **Initial RCA / Rationale**: {rca_summary}\n" if rca_summary else "")
@@ -1474,7 +1903,7 @@ def build_code_developer_subagent_plan(
         + (f"- **Pre-Anchored Context & Contracts**:\n{anchored_clean}\n" if anchored_clean else "")
         + "\nExecute the native `git` branch workflow now:\n"
         f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation "
-        f"--id {cid_clean} --action-id \"{action_id or 'code-change'}\" "
+        f"--id {cid_clean} --action-id \"{action_id or 'code-change'}\"{workdir_arg} "
         f"--rca-summary \"<RCA_SUMMARY>\" --proposed-fix \"<PROPOSED_FIX>\"{files_arg}{sib_arg} --worktree`.\n"
         f"   - If `status == \"locked\"`, abort immediately and return the lock status.\n"
         f"2. Implement modular fixes and hermetic unit tests on the worktree branch, iterate with targeted `python3 -m unittest <target>`, then run `pre-commit run --all-files` and `pr_remediator.py test-local --workdir <WORKTREE_PATH>` once until `passed == true`.\n"
@@ -1487,7 +1916,7 @@ def build_code_developer_subagent_plan(
             "Name": PR_DEVELOPER_SUBAGENT_NAME,
             "Description": (
                 "VCS-Interoperable Native Git Code Developer Agent invoked when a code change is required (via audit or user prompt). "
-                "Creates a timestamped git branch, acquires dev_pr_lock, implements and tests the change locally, and pushes the branch to origin for human PR validation."
+                "Creates a timestamped git branch, acquires per-repo dev_pr_locks entry, implements and tests the change locally, and pushes the branch to origin for human PR validation."
             ),
             "SystemPrompt": system_prompt,
             "EnableWriteTools": True,
@@ -1514,40 +1943,45 @@ def build_pr_reviewer_subagent_plan(
     rca_summary: str = "",
     proposed_fix: str = "",
     scheduled: bool = True,
+    workdir: str = "",
+    repo_slug: str = "",
 ) -> dict[str, Any]:
     """Build the `subagent_definition` and `subagent_invocation` for `agy-code-pr-reviewer` (`Model="pro"`)."""
     _ = pr_number, issue_number, scheduled
     resolved_ts = branch_timestamp or ""
+    wd_flag = f' --workdir "{workdir.strip()}"' if str(workdir or "").strip() else ""
+    repo_line = f"- **Target Repository**: `{repo_slug.strip()}`\n" if str(repo_slug or "").strip() else ""
     system_prompt = (
         f"You are `{PR_REVIEWER_SUBAGENT_NAME}`, an independent Native Git Branch Quality & Security Evaluator Agent "
         f"(Maker-Checker pattern) for `agy-dev-plugin` and companion repositories (`agy-tam-plugin`, `g-control-tower`, etc.).\n"
         f"You run in a completely isolated conversation context right after a timestamped branch is pushed.\n"
         f"Your mandatory responsibilities:\n"
         f"1. Inspect the pushed branch diff and changed files against `origin/main` using pure native `git` via:\n"
-        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch <BRANCH_NAME>`\n"
+        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch <BRANCH_NAME>{wd_flag}`\n"
         f"2. Independently evaluate the proposed branch changes across 4 criteria (0-100 score) and determine your verdict (`PASS`, `WARN`, or `NEEDS_REVISION`):\n"
         f"   - Criterion A (40 pts): Root Cause / Requirement Resolution — Does the diff accurately implement the change without regressions?\n"
         f"   - Criterion B (25 pts): Unit Test Coverage — Are new or updated deterministic unit tests included in `tests/`?\n"
         f"   - Criterion C (20 pts): Security & Zero-PII Guardrails — Zero hardcoded customer names, emails, `/Users/<user>/` paths, or secrets.\n"
         f"   - Criterion D (15 pts): Code Style, Typing & Documentation — Clean English docstrings, type hints, and plugin / `$HOME` parity.\n"
         f"3. Record your structured verdict and dispatch review notification (embedding the exact branch timestamp `{resolved_ts}`) so the human can compare the branch against `main` and manually create the Pull Request:\n"
-        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review --branch <BRANCH_NAME> --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary \"...\" --send-email`\n"
+        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review --branch <BRANCH_NAME>{wd_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary \"...\" --send-email`\n"
         f"4. Return the JSON evaluation summary and manual PR validation instructions."
     )
 
     task_prompt = (
         f"Evaluate the pushed timestamped branch `{branch_name}` (Timestamp: `{resolved_ts}`):\n"
-        f"- **Conversation ID**: `{conversation_id}`\n"
+        + repo_line
+        + f"- **Conversation ID**: `{conversation_id}`\n"
         f"- **Proposed Branch**: `{branch_name}`\n"
         f"- **Branch Timestamp**: `{resolved_ts}`\n"
         f"- **Manual PR / Compare URL**: {pr_url or issue_url or 'N/A'}\n"
         f"- **Root Cause / Rationale**: {rca_summary}\n"
         f"- **Proposed Solution**: {proposed_fix}\n\n"
         f"Execute the following steps:\n"
-        f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch \"{branch_name}\"` to inspect the exact diff and files changed via native `git`.\n"
+        f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch \"{branch_name}\"{wd_flag}` to inspect the exact diff and files changed via native `git`.\n"
         f"2. Score the branch changes (0-100) across Resolution Accuracy, Unit Tests, Zero-PII Security, and Code Quality, and give your verdict (`PASS`, `WARN`, or `NEEDS_REVISION`).\n"
         f"3. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review "
-        f"--branch \"{branch_name}\" --verdict <PASS|WARN|NEEDS_REVISION> --score <SCORE> "
+        f"--branch \"{branch_name}\"{wd_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <SCORE> "
         f"--summary \"<Your detailed technical review comment>\" --send-email` so your verdict is recorded and the review notification (with timestamp `{resolved_ts}`) is dispatched to the human for manual Pull Request creation.\n"
         f"4. Return the JSON evaluation summary."
     )
@@ -1875,11 +2309,24 @@ def push_remediation_branch_and_build_reviewer_plan(
     issue_number: int | None = None,
     scheduled: bool = False,
     workdir: Path | str | None = None,
+    repo_slug: str = "",
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
 ) -> dict[str, Any]:
     """Commit pending changes onto the timestamped branch (never `main`), stamp the canonical `## 📋 Executive Summary` PR body into the branch commit and compare URL, push to `origin/<branch>` via native `git`, and build the `agy-code-pr-reviewer` invocation plan."""
-    lock_info = get_dev_pr_lock(portfolio_dir=portfolio_dir)
+    vcs = git_client or GitVcsIntegrationClient()
+    scoped_slug, scoped_dir = _resolve_repo_slug_and_dir(
+        repo_slug=repo_slug,
+        workdir=workdir,
+        git_client=vcs,
+        prefer_cwd=False,
+    )
+    lock_info = get_dev_pr_lock(
+        portfolio_dir=portfolio_dir,
+        repo_slug=repo_slug or (scoped_slug if (repo_slug or workdir) else ""),
+        workdir=workdir,
+        branch_name=head_branch,
+    )
     if not lock_info.get("active"):
         return {
             "status": "error",
@@ -1889,24 +2336,25 @@ def push_remediation_branch_and_build_reviewer_plan(
             ),
         }
 
-    vcs = git_client or GitVcsIntegrationClient()
     wt_str = str(workdir or lock_info.get("worktree_path") or "").strip()
-    is_worktree = bool(wt_str and Path(wt_str).expanduser().exists())
-    if is_worktree:
-        target_repo_dir = Path(wt_str).expanduser().resolve()
+    wt_expanded = Path(wt_str.replace("$HOME", str(Path.home()))).expanduser() if wt_str else None
+    is_worktree = bool(wt_expanded and wt_expanded.exists())
+    if is_worktree and wt_expanded is not None:
+        target_repo_dir = wt_expanded.resolve()
+    elif scoped_dir is not None:
+        target_repo_dir = scoped_dir
     elif hasattr(vcs, "resolve_active_repo_dir"):
         target_repo_dir = vcs.resolve_active_repo_dir(workdir=workdir, prefer_cwd=True)
     else:
         target_repo_dir = vcs.resolve_repo_dir()
 
-    repo_slug = ""
-    if hasattr(vcs, "resolve_repo"):
-        try:
-            repo_slug = str(vcs.resolve_repo(repo_dir=target_repo_dir if isinstance(target_repo_dir, Path) else None) or "").strip()
-        except TypeError:
-            repo_slug = str(vcs.resolve_repo() or "").strip()
+    resolved_repo_slug = _extract_repo_slug_from_lock_dict(
+        {"repo_slug": repo_slug or scoped_slug, "target_repo_dir": str(target_repo_dir)}
+    )
+    if resolved_repo_slug == "default" and lock_info.get("repo_slug"):
+        resolved_repo_slug = str(lock_info["repo_slug"])
     raw_rb = lock_info.get("repo_branches") if isinstance(lock_info.get("repo_branches"), dict) else {}
-    repo_entry = raw_rb.get(repo_slug) if (repo_slug and isinstance(raw_rb, dict)) else None
+    repo_entry = raw_rb.get(resolved_repo_slug) if (resolved_repo_slug and isinstance(raw_rb, dict)) else None
     resolved_head = (
         head_branch.strip()
         or (str(repo_entry.get("branch_name") or "").strip() if isinstance(repo_entry, dict) else "")
@@ -2163,12 +2611,18 @@ def push_remediation_branch_and_build_reviewer_plan(
         for k, v in (raw_rb or {}).items()
         if str(k).strip() and isinstance(v, dict)
     }
-    if repo_slug:
-        updated_rb[repo_slug] = {
-            "repo_slug": repo_slug,
+    persistent_repo_dir = _resolve_main_git_repo_root(target_repo_dir)
+    wt_recorded = (
+        _sanitize_home_paths(str(target_repo_dir))
+        if (target_repo_dir / ".git").is_file()
+        else _sanitize_home_paths(str(lock_info.get("worktree_path") or ""))
+    )
+    if resolved_repo_slug:
+        updated_rb[resolved_repo_slug] = {
+            "repo_slug": resolved_repo_slug,
             "branch_name": resolved_head,
             "branch_timestamp": resolved_ts,
-            "target_repo_dir": _sanitize_home_paths(str(target_repo_dir)),
+            "target_repo_dir": _sanitize_home_paths(str(persistent_repo_dir)),
             "manual_pr_url": manual_pr_url,
             "branch_pushed": True,
             "head_sha": head_sha,
@@ -2182,7 +2636,8 @@ def push_remediation_branch_and_build_reviewer_plan(
             "notification_source": "Ad-Hoc",
             "branch_pushed": True,
             "head_sha": head_sha,
-            "target_repo_dir": _sanitize_home_paths(str(target_repo_dir)),
+            "target_repo_dir": _sanitize_home_paths(str(persistent_repo_dir)),
+            "worktree_path": wt_recorded,
             "repo_branches": updated_rb,
             "manual_pr_url": manual_pr_url,
             "pr_url": manual_pr_url,
@@ -2194,6 +2649,9 @@ def push_remediation_branch_and_build_reviewer_plan(
             "status": "BRANCH_PUSHED_AWAITING_AGENT_REVIEW",
         },
         portfolio_dir=portfolio_dir,
+        repo_slug=resolved_repo_slug,
+        workdir=target_repo_dir,
+        branch_name=resolved_head,
     )
 
     watcher_res = spawn_pr_merge_watcher_daemon(portfolio_dir=portfolio_dir)
@@ -2209,11 +2667,14 @@ def push_remediation_branch_and_build_reviewer_plan(
         rca_summary=rca_summary,
         proposed_fix=final_body,
         scheduled=scheduled,
+        workdir=str(target_repo_dir),
+        repo_slug=resolved_repo_slug,
     )
 
     return {
         "status": "ok",
         "vcs_mode": "native_git",
+        "repo_slug": resolved_repo_slug,
         "commit_title": commit_title,
         "branch_name": resolved_head,
         "branch_timestamp": resolved_ts,
@@ -2252,6 +2713,8 @@ def record_pr_review_evaluation(
     send_email: bool = False,
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
+    workdir: Path | str | None = None,
+    repo_slug: str = "",
 ) -> dict[str, Any]:
     """Record `agy-code-pr-reviewer`'s evaluation on the pushed timestamped branch, stamp the canonical `## 📋 Executive Summary` + Reviewer Verdict into the branch commit & compare URL, keep `dev_pr_lock` active for manual validation, and send the notification email."""
     vcs = git_client or GitVcsIntegrationClient()
@@ -2259,7 +2722,12 @@ def record_pr_review_evaluation(
     if norm_verdict not in ("PASS", "WARN", "NEEDS_REVISION"):
         norm_verdict = "PASS" if score >= 90 else "NEEDS_REVISION"
 
-    lock_info = get_dev_pr_lock(portfolio_dir=portfolio_dir)
+    lock_info = get_dev_pr_lock(
+        portfolio_dir=portfolio_dir,
+        repo_slug=repo_slug,
+        workdir=workdir,
+        branch_name=branch_name,
+    )
     resolved_branch = (
         branch_name.strip()
         or str(lock_info.get("branch_name") or "").strip()
@@ -2282,16 +2750,28 @@ def record_pr_review_evaluation(
     )
     head_sha = str(lock_info.get("head_sha") or "")
 
-    wt_str = str(lock_info.get("worktree_path") or "").strip()
-    is_worktree = bool(wt_str and Path(wt_str).expanduser().exists())
+    wt_str = str(workdir or lock_info.get("worktree_path") or "").strip()
+    wt_expanded = Path(wt_str.replace("$HOME", str(Path.home()))).expanduser() if wt_str else None
+    is_worktree = bool(wt_expanded and wt_expanded.exists())
+    lock_main_dir = _resolve_lock_target_repo_dir(lock_info)
     target_repo_dir = (
-        Path(wt_str).expanduser().resolve()
-        if is_worktree
+        wt_expanded.resolve()
+        if is_worktree and wt_expanded is not None
         else (
-            vcs.resolve_active_repo_dir(prefer_cwd=True)
-            if hasattr(vcs, "resolve_active_repo_dir")
-            else vcs.resolve_repo_dir()
+            lock_main_dir
+            if lock_main_dir is not None and (lock_main_dir / ".git").exists()
+            else (
+                vcs.resolve_active_repo_dir(workdir=workdir, prefer_cwd=True)
+                if hasattr(vcs, "resolve_active_repo_dir")
+                else vcs.resolve_repo_dir()
+            )
         )
+    )
+    resolved_repo_slug = _extract_repo_slug_from_lock_dict(
+        {
+            "repo_slug": repo_slug or lock_info.get("repo_slug") or lock_info.get("repo"),
+            "target_repo_dir": str(target_repo_dir),
+        }
     )
 
     files_changed: list[dict[str, Any]] = []
@@ -2419,6 +2899,9 @@ def record_pr_review_evaluation(
                 "review_markdown": review_markdown,
             },
             portfolio_dir=portfolio_dir,
+            repo_slug=resolved_repo_slug,
+            workdir=target_repo_dir,
+            branch_name=resolved_branch,
         )
         if cid_clean:
             with contextlib.suppress(Exception):
@@ -2577,8 +3060,10 @@ def evaluate_branch_and_release_lock(
     delete_remote_on_reject: bool = True,
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Execute the manual validation gate: record user decision (`approve` after manual PR creation/merge, or `reject` to delete the branch via native `git`) and release `dev_pr_lock`."""
+    """Execute the manual validation gate: record user decision (`approve` after manual PR creation/merge, or `reject` to delete the branch via native `git`) and release the scoped repository lock."""
     vcs = git_client or GitVcsIntegrationClient()
     norm_decision = decision.strip().lower()
     if norm_decision not in ("approve", "merge", "reject", "close"):
@@ -2587,8 +3072,19 @@ def evaluate_branch_and_release_lock(
             "error": f"Invalid decision '{decision}'. Expected 'approve' or 'reject'.",
         }
 
-    lock_info = get_dev_pr_lock(portfolio_dir=portfolio_dir)
+    lock_info = get_dev_pr_lock(
+        portfolio_dir=portfolio_dir,
+        repo_slug=repo_slug,
+        workdir=workdir,
+        branch_name=branch_name,
+    )
+    resolved_slug = (
+        dev_common.normalize_repo_slug(repo_slug)
+        or str(lock_info.get("repo_slug") or lock_info.get("repo") or "").strip()
+    )
     lock_repo_dir = _resolve_lock_target_repo_dir(lock_info)
+    if lock_repo_dir is None and workdir:
+        lock_repo_dir = _resolve_repo_slug_and_dir(workdir=workdir, prefer_cwd=False)[1]
     if git_client is None and lock_repo_dir is not None and (lock_repo_dir / ".git").exists():
         vcs = GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(lock_repo_dir)})
     resolved_branch = (
@@ -2615,10 +3111,14 @@ def evaluate_branch_and_release_lock(
             resolution="APPLIED_AND_SYNCED",
             summary=f"Branch `{resolved_branch}` (`{resolved_ts}`) approved for manual PR ({review_comment})",
             portfolio_dir=portfolio_dir,
+            repo_slug=resolved_slug,
+            workdir=workdir or lock_repo_dir,
+            branch_name=resolved_branch,
         )
         return {
             "status": "ok",
             "vcs_mode": "native_git",
+            "repo_slug": resolved_slug,
             "decision": "approved_and_unlocked",
             "branch_name": resolved_branch,
             "branch_timestamp": resolved_ts,
@@ -2675,10 +3175,14 @@ def evaluate_branch_and_release_lock(
         resolution="VERIFIED_OK",
         summary=f"Branch `{resolved_branch}` (`{resolved_ts}`) rejected and removed ({review_comment})",
         portfolio_dir=portfolio_dir,
+        repo_slug=resolved_slug,
+        workdir=workdir or lock_repo_dir,
+        branch_name=resolved_branch,
     )
     return {
         "status": "ok",
         "vcs_mode": "native_git",
+        "repo_slug": resolved_slug,
         "decision": "rejected_and_deleted",
         "branch_name": resolved_branch,
         "branch_timestamp": resolved_ts,
@@ -3042,21 +3546,85 @@ def update_dev_queue_item_status(
     }
 
 
+def _mark_queue_item_repo_merged(
+    *,
+    conversation_id: str,
+    released_repo_slug: str,
+    branch_names: list[str] | None = None,
+    subagent_conversation_ids: list[str] | None = None,
+    remaining_active_locks: dict[str, dict[str, Any]] | None = None,
+    portfolio_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Record a merged repository on a queue item and promote status to `merged` once all target repos finish."""
+    cid_clean = str(conversation_id or "").strip()
+    clean_slug = dev_common.normalize_repo_slug(released_repo_slug)
+    q_path = get_dev_queue_path(portfolio_dir=portfolio_dir)
+    now_iso = _utc_now_iso()
+    with dev_common.file_lock(q_path.with_suffix(".json.lock")):
+        data = _read_dev_queue_locked(q_path)
+        items = list(data["items"])
+        idx = _find_queue_item_index(items, cid_clean)
+        if idx < 0:
+            return {"status": "error", "updated": False, "error": f"Queue item `{cid_clean}` not found."}
+        item = dict(items[idx])
+        target_repos = [
+            norm
+            for r in (item.get("repo_slugs") or [])
+            for norm in [dev_common.normalize_repo_slug(str(r))]
+            if norm
+        ]
+        merged_repos = _normalize_str_list(
+            [
+                *[dev_common.normalize_repo_slug(str(r)) for r in (item.get("merged_repos") or [])],
+                *([clean_slug] if clean_slug and clean_slug != "default" else []),
+            ]
+        )
+        still_locked_for_item = False
+        for act_lock in (remaining_active_locks or {}).values():
+            act_cid = str(act_lock.get("conversation_id") or "").strip()
+            act_sibs = [str(s).strip() for s in (act_lock.get("sibling_conversation_ids") or [])]
+            if _matches_cid(act_cid, cid_clean) or any(_matches_cid(s, cid_clean) for s in act_sibs):
+                still_locked_for_item = True
+                break
+        all_target_repos_merged = (not target_repos) or (
+            len(target_repos) <= 1 and not still_locked_for_item
+        ) or (set(target_repos).issubset(set(merged_repos)) and not still_locked_for_item)
+
+        item["merged_repos"] = merged_repos
+        item["branch_names"] = _normalize_str_list([*(item.get("branch_names") or []), *(branch_names or [])])
+        item["subagent_conversation_ids"] = _normalize_str_list(
+            [*(item.get("subagent_conversation_ids") or []), *(subagent_conversation_ids or [])]
+        )
+        if all_target_repos_merged:
+            item["status"] = "merged"
+        else:
+            cur_st = str(item.get("status") or "pr_open").lower()
+            item["status"] = cur_st if cur_st in ("in_progress", "pr_open") else "pr_open"
+        item["updated_at"] = now_iso
+        items[idx] = item
+        data["items"] = _sort_dev_queue_items(items)
+        data["updated_at"] = now_iso
+        _atomic_write_json_0600(q_path, data)
+    return {"status": "ok", "updated": True, "item": item}
+
+
 def _auto_enqueue_blocked_task(
     conversation_id: str,
     action_id: str = "",
     rca_summary: str = "",
     proposed_fix: str = "",
     target_files: list[str] | None = None,
+    repo_slugs: list[str] | None = None,
     blocked_by_lock_id: str = "",
     portfolio_dir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Best-effort deterministic enqueue when `dev_pr_lock` blocks a concurrent remediation attempt."""
+    """Best-effort deterministic enqueue when a repository lock blocks a concurrent remediation attempt."""
     try:
         return enqueue_dev_queue_item(
             conversation_id=conversation_id,
             action_id=action_id,
             priority=40,
+            repo_slugs=repo_slugs,
             status="pending",
             rca_summary=rca_summary,
             proposed_fix=proposed_fix,
@@ -3072,6 +3640,8 @@ def _auto_enqueue_blocked_task(
 def get_next_dev_queue_item(
     orchestrator_conversation_id: str = "",
     portfolio_dir: Path | str | None = None,
+    *,
+    skip_locked_repos: bool = False,
 ) -> dict[str, Any]:
     """Return the highest-priority runnable item from `dev_queue.json`, skipping standby/HITL-blocked/unmet deps."""
     if orchestrator_conversation_id.strip():
@@ -3079,6 +3649,8 @@ def get_next_dev_queue_item(
     data = load_dev_queue(portfolio_dir=portfolio_dir)
     items: list[dict[str, Any]] = list(data.get("items") or [])
     status_by_cid = {str(it.get("conversation_id") or ""): str(it.get("status") or "").lower() for it in items}
+    active_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
+    locked_repos = sorted(active_locks.keys())
 
     def _deps_unmet(item: dict[str, Any]) -> list[str]:
         unmet: list[str] = []
@@ -3095,9 +3667,25 @@ def get_next_dev_queue_item(
                 unmet.append(f"{dep_clean}({matched_st})")
         return unmet
 
+    def _item_repo_conflict(item: dict[str, Any]) -> list[str]:
+        item_repos = [
+            dev_common.normalize_repo_slug(str(r))
+            for r in (item.get("repo_slugs") or [])
+            if str(r).strip()
+        ]
+        item_cid = str(item.get("conversation_id") or "").strip()
+        conflicts: list[str] = []
+        for rslug in item_repos:
+            act = active_locks.get(rslug)
+            if act and not _matches_cid(str(act.get("conversation_id") or ""), item_cid):
+                conflicts.append(rslug)
+        return conflicts
+
     next_item: dict[str, Any] | None = None
     next_pending_item: dict[str, Any] | None = None
+    next_unlocked_item: dict[str, Any] | None = None
     blocked_deps: list[dict[str, Any]] = []
+    blocked_repos: list[dict[str, Any]] = []
 
     for it in items:
         st = str(it.get("status") or "pending").lower()
@@ -3113,6 +3701,20 @@ def get_next_dev_queue_item(
                 }
             )
             continue
+        repo_conflicts = _item_repo_conflict(it)
+        if repo_conflicts:
+            blocked_repos.append(
+                {
+                    "conversation_id": it.get("conversation_id"),
+                    "title": it.get("title"),
+                    "locked_repos": repo_conflicts,
+                }
+            )
+            if skip_locked_repos:
+                continue
+        else:
+            if next_unlocked_item is None:
+                next_unlocked_item = it
         if next_item is None:
             next_item = it
         if st == "pending" and next_pending_item is None:
@@ -3125,7 +3727,10 @@ def get_next_dev_queue_item(
         "has_next": next_item is not None,
         "next_item": next_item,
         "next_pending_item": next_pending_item,
+        "next_unlocked_item": next_unlocked_item,
+        "locked_repos": locked_repos,
         "blocked_by_dependencies": blocked_deps,
+        "blocked_by_repo_locks": blocked_repos,
         "summary": data.get("summary", {}),
     }
 
@@ -3323,12 +3928,13 @@ def collect_protected_conversation_ids(
         if isinstance(state_obj.get("actions_log_audit_state"), dict)
         else {}
     )
-    active_lock = audit_state.get("dev_pr_lock") if isinstance(audit_state.get("dev_pr_lock"), dict) else {}
-    if active_lock.get("active"):
-        _protect(str(active_lock.get("conversation_id") or ""), "active_dev_pr_lock")
-        for key in ("sibling_conversation_ids", "subagent_conversation_ids"):
-            for cid in active_lock.get(key) or []:
-                _protect(str(cid), "active_dev_pr_lock")
+    all_locks_map = _read_locks_state(audit_state)
+    for active_lock in all_locks_map.values():
+        if isinstance(active_lock, dict) and active_lock.get("active"):
+            _protect(str(active_lock.get("conversation_id") or ""), "active_dev_pr_lock")
+            for key in ("sibling_conversation_ids", "subagent_conversation_ids"):
+                for cid in active_lock.get(key) or []:
+                    _protect(str(cid), "active_dev_pr_lock")
     pending_t2 = audit_state.get("pending_tier2_proposals")
     if isinstance(pending_t2, dict):
         for cid in pending_t2:
@@ -3415,7 +4021,11 @@ def verify_branches_merged_into_base(
         if isinstance(state_obj.get("actions_log_audit_state"), dict)
         else {}
     )
+    all_locks_map = _read_locks_state(audit_state)
     lock_obj = audit_state.get("dev_pr_lock") if isinstance(audit_state.get("dev_pr_lock"), dict) else {}
+    all_lock_entries: list[dict[str, Any]] = list(all_locks_map.values())
+    if lock_obj and lock_obj not in all_lock_entries:
+        all_lock_entries.append(lock_obj)
     q_data = load_dev_queue(portfolio_dir=portfolio_dir)
 
     targets: list[tuple[Path | None, str]] = []
@@ -3476,18 +4086,19 @@ def verify_branches_merged_into_base(
 
     cids_clean = [str(c).strip() for c in (conversation_ids or ()) if str(c).strip()]
     if not targets and cids_clean:
-        last_cid = str(lock_obj.get("conversation_id") or lock_obj.get("last_conversation_id") or "")
-        if any(_matches_cid(c, last_cid) for c in cids_clean):
-            rb_map = lock_obj.get("repo_branches") if lock_obj.get("active") else lock_obj.get("last_repo_branches")
-            if isinstance(rb_map, dict) and rb_map:
-                for entry in rb_map.values():
-                    if isinstance(entry, dict) and entry.get("branch_name"):
-                        _add_target(entry.get("target_repo_dir") or entry.get("repo_slug"), str(entry["branch_name"]))
-            elif lock_obj.get("branch_name") or lock_obj.get("last_branch_name"):
-                _add_target(
-                    lock_obj.get("target_repo_dir"),
-                    str(lock_obj.get("branch_name") or lock_obj.get("last_branch_name") or ""),
-                )
+        for cand_lock in all_lock_entries:
+            last_cid = str(cand_lock.get("conversation_id") or cand_lock.get("last_conversation_id") or "")
+            if any(_matches_cid(c, last_cid) for c in cids_clean):
+                rb_map = cand_lock.get("repo_branches") if cand_lock.get("active") else cand_lock.get("last_repo_branches")
+                if isinstance(rb_map, dict) and rb_map:
+                    for entry in rb_map.values():
+                        if isinstance(entry, dict) and entry.get("branch_name"):
+                            _add_target(entry.get("target_repo_dir") or entry.get("repo_slug"), str(entry["branch_name"]))
+                elif cand_lock.get("branch_name") or cand_lock.get("last_branch_name"):
+                    _add_target(
+                        cand_lock.get("target_repo_dir"),
+                        str(cand_lock.get("branch_name") or cand_lock.get("last_branch_name") or ""),
+                    )
         for q_item in q_data.get("items") or []:
             q_cid = str(q_item.get("conversation_id") or "")
             if any(_matches_cid(c, q_cid) for c in cids_clean):
@@ -3496,16 +4107,17 @@ def verify_branches_merged_into_base(
                 for br in q_item.get("branch_names") or []:
                     _add_target(fallback_repo, str(br))
 
-    if lock_obj.get("active"):
-        lock_cid = str(lock_obj.get("conversation_id") or "")
-        if any(_matches_cid(c, lock_cid) for c in cids_clean):
-            return {
-                "all_merged": False,
-                "reason": "active_dev_pr_lock_still_held",
-                "checked_count": 0,
-                "branches": [],
-                "unmerged": [{"branch_name": lock_obj.get("branch_name", ""), "reason": "active_dev_pr_lock_still_held"}],
-            }
+    for cand_lock in all_lock_entries:
+        if cand_lock.get("active"):
+            lock_cid = str(cand_lock.get("conversation_id") or "")
+            if any(_matches_cid(c, lock_cid) for c in cids_clean):
+                return {
+                    "all_merged": False,
+                    "reason": "active_dev_pr_lock_still_held",
+                    "checked_count": 0,
+                    "branches": [],
+                    "unmerged": [{"branch_name": cand_lock.get("branch_name", ""), "reason": "active_dev_pr_lock_still_held"}],
+                }
 
     if not targets:
         return {
@@ -3749,15 +4361,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     sub = parser.add_subparsers(dest="subcommand")
 
-    p_lock = sub.add_parser("lock-status", help="Inspect or sync the cross-conversation branch development lock (`dev_pr_lock`).")
+    p_lock = sub.add_parser("lock-status", help="Inspect or sync per-repository cross-conversation branch locks (`dev_pr_locks`).")
     p_lock.add_argument(
         "--sync-git",
         dest="sync_git",
         action="store_true",
         help="Inspect remote branch state via native git and auto-release lock if merged into main or deleted on origin.",
     )
+    p_lock.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug filter.")
+    p_lock.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
+    p_lock.add_argument("--all", dest="all_repos", action="store_true", help="Include all active repository locks.")
 
-    p_acq = sub.add_parser("acquire-lock", help="Acquire the cross-conversation branch development lock.")
+    p_acq = sub.add_parser("acquire-lock", help="Acquire a per-repository cross-conversation branch development lock.")
     p_acq.add_argument("--id", "--conversation-id", dest="conversation_id", required=True, help="Conversation ID.")
     p_acq.add_argument("--action-id", default="", help="Action or prompt scope ID (e.g., customer-sync-prep or prompt-refactor).")
     p_acq.add_argument("--issue", type=int, default=None, help="Optional Issue number.")
@@ -3767,11 +4382,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_acq.add_argument("--summary", default="", help="RCA / change summary.")
     p_acq.add_argument("--proposed-fix", default="", help="Proposed fix summary.")
     p_acq.add_argument("--sibling-ids", nargs="*", default=[], help="Optional sibling Conversation IDs.")
+    p_acq.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
+    p_acq.add_argument("--workdir", default="", help="Optional target repository directory.")
     p_acq.add_argument("--scheduled", action="store_true", help="Mark as scheduled run.")
 
-    p_rel = sub.add_parser("release-lock", help="Release/delete the branch development lock.")
+    p_rel = sub.add_parser("release-lock", help="Release/delete a per-repository branch development lock.")
     p_rel.add_argument("--reason", default="MANUAL_RELEASE", help="Release reason.")
     p_rel.add_argument("--summary", default="", help="Resolution summary.")
+    p_rel.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
+    p_rel.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
+    p_rel.add_argument("--branch", default="", help="Optional branch name to match lock.")
+    p_rel.add_argument("--all", dest="release_all", action="store_true", help="Release all active repository locks.")
 
     p_plan_dev = sub.add_parser(
         "plan-developer",
@@ -3786,6 +4407,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_plan_dev.add_argument("--scheduled", action="store_true", help="Mark as scheduled run.")
     p_plan_dev.add_argument("--model", choices=("pro", "flash", "inherit"), default="", help="Optional developer model tier.")
     p_plan_dev.add_argument("--anchored-context", default="", help="Optional pre-anchored file line ranges and contracts.")
+    p_plan_dev.add_argument("--repo", dest="repo_slug", default="", help="Optional target owner/repo slug.")
+    p_plan_dev.add_argument("--workdir", default="", help="Optional target repository directory.")
 
     p_start = sub.add_parser(
         "start-remediation",
@@ -3832,12 +4455,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_diff.add_argument("--branch", "--head", dest="branch", default="", help="Target branch name (defaults to locked branch_name).")
     p_diff.add_argument("--base", default="main", help="Base branch name (default: main).")
     p_diff.add_argument("--workdir", default="", help="Optional target repository directory.")
+    p_diff.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
 
     p_rev = sub.add_parser(
         "record-review",
         help="Record Agent 2 (agy-code-pr-reviewer) evaluation for the pushed branch and send the notification email with matching timestamp.",
     )
     p_rev.add_argument("--branch", default="", help="Timestamped branch name (defaults to locked branch_name).")
+    p_rev.add_argument("--workdir", default="", help="Optional worktree or target repository directory.")
+    p_rev.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
     p_rev.add_argument("--pr", type=int, default=None, help="Optional legacy PR number.")
     p_rev.add_argument("--verdict", choices=("PASS", "WARN", "NEEDS_REVISION"), required=True, help="Reviewer verdict.")
     p_rev.add_argument("--score", type=int, required=True, help="Quality score (0-100).")
@@ -3848,7 +4474,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     p_watch = sub.add_parser(
         "watch-pr-merge",
-        help="Run or spawn the self-terminating background watcher that polls origin while dev_pr_lock is active and fast-forwards main + cleans the local branch once the PR is merged.",
+        help="Run or spawn the self-terminating background watcher that polls origin while dev_pr_locks are active and fast-forwards main + cleans the local branch once merged.",
     )
     p_watch.add_argument("--interval", type=float, default=15.0, help="Polling interval in seconds (default: 15).")
     p_watch.add_argument("--max-duration", type=float, default=14400.0, help="Maximum watcher lifetime in seconds (default: 14400 / 4h).")
@@ -3858,9 +4484,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     for eval_cmd in ("evaluate-branch", "finalize-pr"):
         p_fin = sub.add_parser(
             eval_cmd,
-            help="Record manual validation decision (approve after manual PR creation, or reject to delete branch) and release dev_pr_lock.",
+            help="Record manual validation decision (approve after manual PR creation, or reject to delete branch) and release the repository lock.",
         )
         p_fin.add_argument("--branch", default="", help="Timestamped branch name (defaults to locked branch_name).")
+        p_fin.add_argument("--workdir", default="", help="Optional target repository directory.")
+        p_fin.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
         p_fin.add_argument("--pr", type=int, default=None, help="Optional legacy PR number.")
         p_fin.add_argument("--decision", choices=("approve", "reject"), required=True, help="Evaluation decision.")
         p_fin.add_argument("--comment", required=True, help="Review/validation comment.")
@@ -3898,6 +4526,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     p_qnext = sub.add_parser("queue-next", help="Select the highest-priority runnable item from `dev_queue.json`.")
     p_qnext.add_argument("--orchestrator-id", default="", help="Optional active orchestrator conversation ID to record.")
+    p_qnext.add_argument("--unlocked", action="store_true", help="Skip queue items whose target repo currently holds an active lock.")
 
     p_clean = sub.add_parser(
         "cleanup-merged-conversations",
@@ -3920,10 +4549,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     if args.subcommand == "lock-status":
+        repo_s = getattr(args, "repo_slug", "")
+        workdir_s = getattr(args, "workdir", "") or None
+        all_locks = get_all_dev_pr_locks()
         if getattr(args, "sync_git", False):
-            res = sync_dev_pr_lock_with_git()
+            res = sync_dev_pr_lock_with_git(repo_slug=repo_s, workdir=workdir_s)
         else:
-            res = {"status": "ok", "lock": get_dev_pr_lock()}
+            res = {
+                "status": "ok",
+                "active_count": len(all_locks),
+                "lock": get_dev_pr_lock(repo_slug=repo_s, workdir=workdir_s),
+                "locks": all_locks,
+            }
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
 
@@ -3939,14 +4576,23 @@ def main(argv: list[str] | None = None) -> int:
             proposed_fix=args.proposed_fix,
             sibling_ids=args.sibling_ids,
             scheduled=getattr(args, "scheduled", False),
+            repo_slug=getattr(args, "repo_slug", ""),
+            workdir=getattr(args, "workdir", "") or None,
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("acquired") else 1
 
     if args.subcommand == "release-lock":
-        res = release_dev_pr_lock(reason=args.reason, summary=args.summary)
+        res = release_dev_pr_lock(
+            reason=args.reason,
+            summary=args.summary,
+            repo_slug=getattr(args, "repo_slug", ""),
+            workdir=getattr(args, "workdir", "") or None,
+            branch_name=getattr(args, "branch", ""),
+            release_all=bool(getattr(args, "release_all", False)),
+        )
         print(json.dumps(res, indent=2, ensure_ascii=False))
-        return 0
+        return 0 if res.get("released") else 1
 
     if args.subcommand == "plan-developer":
         res = build_code_developer_subagent_plan(
@@ -3959,6 +4605,8 @@ def main(argv: list[str] | None = None) -> int:
             scheduled=args.scheduled,
             model=getattr(args, "model", ""),
             anchored_context=getattr(args, "anchored_context", ""),
+            workdir=getattr(args, "workdir", ""),
+            repo_slug=getattr(args, "repo_slug", ""),
         )
         print(json.dumps({"status": "ok", **res}, indent=2, ensure_ascii=False))
         return 0
@@ -4004,10 +4652,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res.get("status") == "ok" else 1
 
     if args.subcommand == "branch-diff":
-        lock_info = get_dev_pr_lock()
+        lock_info = get_dev_pr_lock(
+            repo_slug=getattr(args, "repo_slug", ""),
+            workdir=getattr(args, "workdir", "") or None,
+            branch_name=args.branch.strip(),
+        )
         resolved_branch = args.branch.strip() or str(lock_info.get("branch_name") or "").strip()
+        wd_str = str(getattr(args, "workdir", "") or "").strip()
         wt_str = str(lock_info.get("worktree_path") or "").strip()
-        repo_dir = Path(wt_str) if wt_str and Path(wt_str).exists() else None
+        cand_str = wd_str or wt_str
+        cand_path = Path(cand_str.replace("$HOME", str(Path.home()))).expanduser() if cand_str else None
+        repo_dir = (
+            cand_path.resolve()
+            if cand_path and cand_path.exists()
+            else _resolve_lock_target_repo_dir(lock_info)
+        )
         vcs = GitVcsIntegrationClient()
         res = vcs.get_branch_diff(head_branch=resolved_branch, base_branch=args.base, repo_dir=repo_dir)
         print(json.dumps(res, indent=2, ensure_ascii=False))
@@ -4023,6 +4682,8 @@ def main(argv: list[str] | None = None) -> int:
             branch_name=args.branch,
             reviewer_subagent_id=args.subagent_id,
             send_email=args.send_email,
+            workdir=getattr(args, "workdir", "") or None,
+            repo_slug=getattr(args, "repo_slug", ""),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
@@ -4049,6 +4710,8 @@ def main(argv: list[str] | None = None) -> int:
             comment=args.comment,
             branch_name=args.branch,
             pr_number=args.pr,
+            repo_slug=getattr(args, "repo_slug", ""),
+            workdir=getattr(args, "workdir", "") or None,
         )
         if res.get("status") == "ok" and getattr(args, "cleanup_conversations", False) and str(args.decision).lower() in ("approve", "merge"):
             prev_lock = (res.get("release_result") or {}).get("previous_lock") or {}
@@ -4103,7 +4766,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if q_res.get("status") == "ok" else 1
 
     if args.subcommand == "queue-next":
-        q_res = get_next_dev_queue_item(orchestrator_conversation_id=args.orchestrator_id)
+        q_res = get_next_dev_queue_item(
+            orchestrator_conversation_id=args.orchestrator_id,
+            skip_locked_repos=bool(getattr(args, "unlocked", False)),
+        )
         print(json.dumps(q_res, indent=2, ensure_ascii=False))
         return 0 if q_res.get("status") == "ok" else 1
 

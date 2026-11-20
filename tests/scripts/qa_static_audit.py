@@ -48,9 +48,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", default=str(REPO_ROOT), help="Repository directory to audit.")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--strict", action="store_true", help="Treat warnings as errors.")
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Compatibility flag for pr_remediator test-local gate (performs full fast AST/Zero-PII scan).",
+    )
     args = parser.parse_args(argv)
 
-    result = run_qa_audit(args.repo, strict=args.strict)
+    result = run_qa_audit(args.repo, strict=bool(args.strict or args.incremental))
     if args.format == "json":
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:

@@ -23,6 +23,18 @@ for _p in (CLIENTS_DIR, PR_REM_DIR, AUDIT_DIR, TESTS_SCRIPTS_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+# Prevent inherited git hook GIT_* variables from hijacking temp-repo subprocesses during commits.
+for _git_hook_var in (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+):
+    os.environ.pop(_git_hook_var, None)
+
 import dev_common  # noqa: E402
 import git_client  # noqa: E402
 import pr_remediator  # noqa: E402
@@ -140,40 +152,81 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
             )
             self.assertEqual(res_mise["decision"], "deny")
 
-            # Block live ~/.env write, allow .env.example
+            # Block live ~/.env write, allow .env.example (both toolName/arguments & toolCall/args schemas)
             res_env = evaluator.evaluate_pre_tool_use(
                 {"toolName": "write_file", "arguments": {"Path": str(home_dir / ".env"), "Content": "SECRET=1"}}
             )
             self.assertEqual(res_env["decision"], "deny")
+            res_toolcall_push = evaluator.evaluate_pre_tool_use(
+                {"toolCall": {"name": "run_command", "args": {"CommandLine": "git push origin main"}}}
+            )
+            self.assertEqual(res_toolcall_push["decision"], "deny")
+            res_toolcall_env = evaluator.evaluate_pre_tool_use(
+                {"toolCall": {"name": "write_file", "args": {"Path": str(home_dir / ".env"), "Content": "SECRET=1"}}}
+            )
+            self.assertEqual(res_toolcall_env["decision"], "deny")
             res_example = evaluator.evaluate_pre_tool_use(
-                {"toolName": "write_file", "arguments": {"Path": str(home_dir / ".env.example"), "Content": "KEY=<placeholder>"}}
+                {"toolCall": {"name": "write_file", "args": {"Path": str(home_dir / ".env.example"), "Content": "KEY=<placeholder>"}}}
             )
             self.assertEqual(res_example["decision"], "allow")
 
-    def test_session_start_injects_lock_context_by_owner(self) -> None:
+    def test_normalize_repo_slug_and_resolve_from_git_path(self) -> None:
+        self.assertEqual(dev_common.normalize_repo_slug("git@github.com:Acme-Org/Repo-A.git"), "acme-org/repo-a")
+        self.assertEqual(dev_common.normalize_repo_slug("https://github.com/Acme-Org/Repo-B.git"), "acme-org/repo-b")
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = pathlib.Path(tmp) / "proj"
+            repo_dir.mkdir(parents=True)
+            subprocess.run(["git", "init", "-b", "main", str(repo_dir)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_dir), "remote", "add", "origin", "git@github.com:acme-org/proj-one.git"], check=True, capture_output=True)
+            nested = repo_dir / "src" / "pkg"
+            nested.mkdir(parents=True)
+            self.assertEqual(dev_common.resolve_repo_slug_from_path(nested), "acme-org/proj-one")
+
+    def test_session_start_injects_lock_context_by_owner_and_repo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             troot = pathlib.Path(tmp)
             state_dir = troot / "state"
             state_dir.mkdir(parents=True)
+            repo_a = troot / "repo-a"
+            repo_b = troot / "repo-b"
+            for rdir, slug in ((repo_a, "acme-org/repo-a"), (repo_b, "acme-org/repo-b")):
+                rdir.mkdir(parents=True)
+                subprocess.run(["git", "init", "-b", "main", str(rdir)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(rdir), "remote", "add", "origin", f"git@github.com:{slug}.git"], check=True, capture_output=True)
+
             dev_common.atomic_write_json(
                 state_dir / "actions_state.json",
                 {
                     "actions_log_audit_state": {
-                        "dev_pr_lock": {
-                            "active": True,
-                            "conversation_id": "11111111-1111-4111-8111-111111111111",
-                            "branch_name": "fix/20261120-090000-acme-11111111",
+                        "dev_pr_locks": {
+                            "acme-org/repo-a": {
+                                "active": True,
+                                "repo_slug": "acme-org/repo-a",
+                                "conversation_id": "11111111-1111-4111-8111-111111111111",
+                                "branch_name": "fix/20261120-090000-acme-11111111",
+                            }
                         }
                     }
                 },
             )
             evaluator = dev_common.DevLifecycleGuardrailEvaluator(home_dir=troot, state_dir=state_dir)
 
-            owner_res = evaluator.evaluate_session_start({"conversationId": "11111111-1111-4111-8111-111111111111"})
+            owner_res = evaluator.evaluate_session_start(
+                {"conversationId": "11111111-1111-4111-8111-111111111111", "cwd": str(repo_a)}
+            )
             self.assertIn("Reuse this branch", owner_res["additionalContext"])
 
-            other_res = evaluator.evaluate_session_start({"conversationId": "22222222-2222-4222-8222-222222222222"})
-            self.assertIn("Do not start a new branch", other_res["additionalContext"])
+            other_same_repo = evaluator.evaluate_session_start(
+                {"conversationId": "22222222-2222-4222-8222-222222222222", "cwd": str(repo_a)}
+            )
+            self.assertIn("Do not start a new branch", other_same_repo["additionalContext"])
+
+            other_unlocked_repo = evaluator.evaluate_session_start(
+                {"conversationId": "22222222-2222-4222-8222-222222222222", "cwd": str(repo_b)}
+            )
+            self.assertIn("unlocked", other_unlocked_repo["additionalContext"].lower())
+            self.assertIn("acme-org/repo-a", other_unlocked_repo["additionalContext"])
+            self.assertNotIn("Do not start a new branch", other_unlocked_repo["additionalContext"])
 
 
 class TestGitClientAndRemediation(unittest.TestCase):
@@ -288,22 +341,93 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
             self.assertIn("sec:secret-pattern", rule_ids)
             self.assertIn("agy:markdown-size-limit", rule_ids)
 
+    def test_project_audit_validates_agents_hooks_wrapper_and_suggested_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_repo = pathlib.Path(tmp) / "bad-plugin"
+            (bad_repo / "agents").mkdir(parents=True)
+            (bad_repo / "agents" / "bad.md").write_text("---\nname: bad\ndescription: demo\n---\nbody\n", encoding="utf-8")
+            (bad_repo / "plugin.json").write_text(
+                json.dumps({"name": "bad-plugin", "suggestedPrompts": ["a", "b", "c", "d"]}),
+                encoding="utf-8",
+            )
+            (bad_repo / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": []}}), encoding="utf-8")
+
+            report = project_audit.audit_repository(bad_repo, strict=True)
+            self.assertFalse(report.passed)
+            error_ids = {f.rule_id for f in report.errors}
+            warn_ids = {f.rule_id for f in report.warnings}
+            self.assertIn("agy:hooks-invalid-root-wrapper", error_ids)
+            self.assertIn("agy:agent-tools-missing", warn_ids)
+            self.assertIn("agy:suggested-prompts-limit", warn_ids)
+
+    def test_qa_static_audit_incremental_and_selective_runner_plan(self) -> None:
+        inc_proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tests" / "scripts" / "qa_static_audit.py"), "--incremental"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(inc_proc.returncode, 0, msg=inc_proc.stdout + inc_proc.stderr)
+        plan_proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tests" / "scripts" / "selective_test_runner.py"), "--plan-only"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(plan_proc.returncode, 0, msg=plan_proc.stdout + plan_proc.stderr)
+        plan_json = json.loads(plan_proc.stdout)
+        self.assertIn("unittest_modules", plan_json)
+        self.assertIn("run_bats", plan_json)
+
+        import selective_test_runner
+
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/tmp/outer.git", "GIT_INDEX_FILE": "/tmp/idx", "KEEP_VAR": "ok"}):
+            cleaned = selective_test_runner._clean_git_env()
+            self.assertNotIn("GIT_DIR", cleaned)
+            self.assertNotIn("GIT_INDEX_FILE", cleaned)
+            self.assertEqual(cleaned.get("KEEP_VAR"), "ok")
+
     def test_current_repo_passes_strict_qa_static_audit_and_size_contracts(self) -> None:
         audit_res = qa_static_audit.run_qa_audit(REPO_ROOT, strict=True)
         self.assertTrue(audit_res["passed"], msg=json.dumps(audit_res, indent=2))
+        proj_rep = project_audit.audit_repository(REPO_ROOT, strict=True)
+        self.assertTrue(proj_rep.passed, msg=json.dumps([f.__dict__ for f in proj_rep.errors], indent=2))
 
         plugin_json = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(plugin_json["name"], "agy-dev-plugin")
+        self.assertLessEqual(len(plugin_json.get("suggestedPrompts", [])), 3)
 
         hooks_json = json.loads((REPO_ROOT / "hooks.json").read_text(encoding="utf-8"))
-        self.assertIn("PreToolUse", hooks_json["hooks"])
-        self.assertIn("SessionStart", hooks_json["hooks"])
+        self.assertNotIn("hooks", hooks_json)
+        guardrail = hooks_json["agy-dev-sdlc-guardrail"]
+        self.assertTrue(guardrail.get("enabled"))
+        self.assertIn("PreToolUse", guardrail)
+        self.assertIn("SessionStart", guardrail)
+
+        expected_agents = {
+            "agy-dev-orchestrator.md",
+            "agy-dev-planner.md",
+            "agy-dev-executor.md",
+            "agy-code-developer.md",
+            "agy-code-pr-reviewer.md",
+        }
+        actual_agents = {p.name for p in (REPO_ROOT / "agents").glob("*.md")}
+        self.assertTrue(expected_agents.issubset(actual_agents), msg=f"Missing agents: {expected_agents - actual_agents}")
 
         for md_file in [*(REPO_ROOT / "rules").glob("*.md"), *(REPO_ROOT / "skills").glob("*/SKILL.md"), *(REPO_ROOT / "agents").glob("*.md")]:
             self.assertLess(md_file.stat().st_size, 24000, msg=f"{md_file} exceeds 24 KB limit")
 
         for wf in (REPO_ROOT / ".github" / "workflows").glob("*.yml"):
-            self.assertIn("ubuntu-24.04", wf.read_text(encoding="utf-8"), msg=f"{wf} must pin ubuntu-24.04")
+            wf_text = wf.read_text(encoding="utf-8")
+            self.assertIn("ubuntu-24.04", wf_text, msg=f"{wf} must pin ubuntu-24.04")
+            self.assertIn("pull_request:", wf_text, msg=f"{wf} should trigger on pull_request")
+            self.assertNotRegex(
+                wf_text,
+                r"(?m)^[ \t]+push\s*:",
+                msg=f"{wf} must not trigger on push to avoid duplicate PR runs",
+            )
+            if wf.name == "pre-commit.yml":
+                self.assertIn("bats", wf_text, msg="pre-commit.yml must install bats before running bats-suite")
 
 
 if __name__ == "__main__":

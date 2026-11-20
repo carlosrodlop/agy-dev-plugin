@@ -19,6 +19,18 @@ for _p in (CLIENTS_DIR, PR_REM_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+# Prevent inherited git hook GIT_* variables from hijacking temp-repo subprocesses during commits.
+for _git_hook_var in (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+):
+    os.environ.pop(_git_hook_var, None)
+
 import git_client  # noqa: E402
 import pr_remediator as prs  # noqa: E402
 
@@ -415,6 +427,177 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertTrue(full_check["all_merged"])
             by_branch = {row["branch_name"]: pathlib.Path(row["repo_dir"]).name for row in full_check["branches"]}
             self.assertEqual(by_branch, {br_plugin: "acme-plugin", br_tower: "acme-tower"})
+
+    def test_three_concurrent_repo_locks_preserve_foreign_legacy_lock_and_isolate_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            _, repo_plugin = _init_bare_and_clone_repo(troot, name="acme-plugin")
+            _, repo_cli = _init_bare_and_clone_repo(troot, name="acme-cli")
+            _, repo_tower = _init_bare_and_clone_repo(troot, name="acme-tower")
+            subprocess.run(["git", "-C", str(repo_plugin), "remote", "set-url", "origin", f"git@github.com:acme-org/acme-plugin.git"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_cli), "remote", "set-url", "origin", f"git@github.com:acme-org/acme-cli.git"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_tower), "remote", "set-url", "origin", f"git@github.com:acme-org/acme-tower.git"], check=True, capture_output=True)
+
+            legacy_cid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+            plugin_cid = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+            cli_cid = "cccccccc-3333-4333-8333-cccccccccccc"
+            other_plugin_cid = "dddddddd-4444-4444-8444-dddddddddddd"
+
+            # Seed foreign active legacy `dev_pr_lock` for acme-org/acme-tower
+            (pdir / "actions_state.json").write_text(
+                json.dumps(
+                    {
+                        "actions_log_audit_state": {
+                            "dev_pr_lock": {
+                                "active": True,
+                                "conversation_id": legacy_cid,
+                                "action_id": "legacy-tower",
+                                "branch_name": "fix/20261120-010000-legacy-tower-aaaaaaaa",
+                                "target_repo_dir": str(repo_tower),
+                                "repo_slug": "acme-org/acme-tower",
+                            }
+                        }
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            vcs_plugin = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_plugin)})
+            res_plugin = prs.start_remediation_branch_and_lock(
+                conversation_id=plugin_cid,
+                action_id="acme-fix",
+                rca_summary="Plugin fix",
+                proposed_fix="Patch plugin",
+                create_worktree=True,
+                branch_timestamp="20261120-092000",
+                portfolio_dir=pdir,
+                workdir=repo_plugin,
+                git_client=vcs_plugin,
+            )
+            self.assertEqual(res_plugin["status"], "ok")
+            self.assertEqual(res_plugin["repo_slug"], "acme-org/acme-plugin")
+            self.assertIn("acme-plugin", pathlib.Path(res_plugin["worktree_path"]).name)
+
+            vcs_cli = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_cli)})
+            res_cli = prs.start_remediation_branch_and_lock(
+                conversation_id=cli_cid,
+                action_id="acme-fix",
+                rca_summary="CLI fix",
+                proposed_fix="Patch cli",
+                create_worktree=True,
+                branch_timestamp="20261120-092000",
+                portfolio_dir=pdir,
+                workdir=repo_cli,
+                git_client=vcs_cli,
+            )
+            self.assertEqual(res_cli["status"], "ok")
+            self.assertEqual(res_cli["repo_slug"], "acme-org/acme-cli")
+            self.assertIn("acme-cli", pathlib.Path(res_cli["worktree_path"]).name)
+            self.assertNotEqual(res_plugin["worktree_path"], res_cli["worktree_path"])
+
+            all_locks = prs.get_all_dev_pr_locks(portfolio_dir=pdir)
+            self.assertEqual(set(all_locks.keys()), {"acme-org/acme-tower", "acme-org/acme-plugin", "acme-org/acme-cli"})
+
+            # Competing conversation targeting acme-plugin is blocked & auto-enqueued on that repo only
+            blocked = prs.start_remediation_branch_and_lock(
+                conversation_id=other_plugin_cid,
+                action_id="competing",
+                rca_summary="Should block",
+                proposed_fix="Wait",
+                portfolio_dir=pdir,
+                workdir=repo_plugin,
+                git_client=vcs_plugin,
+            )
+            self.assertEqual(blocked["status"], "locked")
+            self.assertFalse(blocked["acquired"])
+            self.assertTrue(blocked["queued"])
+            q_items = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+            self.assertEqual(q_items[other_plugin_cid]["repo_slugs"], ["acme-org/acme-plugin"])
+
+            # Verify foreign legacy lock remained untouched in raw state JSON
+            raw_state = json.loads((pdir / "actions_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw_state["actions_log_audit_state"]["dev_pr_lock"]["conversation_id"], legacy_cid)
+            self.assertTrue(raw_state["actions_log_audit_state"]["dev_pr_lock"]["active"])
+
+            # Releasing only acme-org/acme-plugin keeps cli & legacy tower locks intact
+            prs.cleanup_worktree(res_plugin["worktree_path"], repo_dir=repo_plugin)
+            prs.cleanup_worktree(res_cli["worktree_path"], repo_dir=repo_cli)
+            prs.release_dev_pr_lock(
+                reason="TEST_RELEASE",
+                portfolio_dir=pdir,
+                repo_slug="acme-org/acme-plugin",
+            )
+            remaining = prs.get_all_dev_pr_locks(portfolio_dir=pdir)
+            self.assertEqual(set(remaining.keys()), {"acme-org/acme-tower", "acme-org/acme-cli"})
+
+    def test_queue_next_unlocked_and_progressive_multi_repo_merged_repos(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            _, repo_plugin = _init_bare_and_clone_repo(troot, name="acme-plugin")
+            _, repo_tower = _init_bare_and_clone_repo(troot, name="acme-tower")
+
+            orch_cid = "11111111-aaaa-4111-8111-111111111111"
+            locked_holder = "22222222-aaaa-4222-8222-222222222222"
+            cid_high_locked = "33333333-aaaa-4333-8333-333333333333"
+            cid_low_unlocked = "44444444-aaaa-4444-8444-444444444444"
+
+            prs.acquire_dev_pr_lock(
+                conversation_id=locked_holder,
+                action_id="hold-plugin",
+                branch_name="fix/20261120-080000-hold-22222222",
+                summary="Busy",
+                proposed_fix="Hold",
+                target_repo_dir=str(repo_plugin),
+                repo_slug="acme-org/acme-plugin",
+                portfolio_dir=pdir,
+            )
+            prs.set_dev_queue_orchestrator(orch_cid, portfolio_dir=pdir)
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_high_locked,
+                title="High priority blocked on acme-plugin",
+                priority=10,
+                repo_slugs=["acme-org/acme-plugin", "acme-org/acme-tower"],
+                status="pending",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_low_unlocked,
+                title="Lower priority on unlocked acme-cli",
+                priority=50,
+                repo_slugs=["acme-org/acme-cli"],
+                status="pending",
+                portfolio_dir=pdir,
+            )
+
+            picked = prs.get_next_dev_queue_item(orch_cid, portfolio_dir=pdir, skip_locked_repos=True)
+            self.assertEqual(picked["next_unlocked_item"]["conversation_id"], cid_low_unlocked)
+            self.assertEqual(picked["next_item"]["conversation_id"], cid_low_unlocked)
+            self.assertTrue(picked["blocked_by_repo_locks"])
+
+            # Verify partial multi-repo merge progression (`merged_repos`)
+            prs.update_dev_queue_item_status(cid_high_locked, status="pr_open", portfolio_dir=pdir)
+            partial = prs._mark_queue_item_repo_merged(
+                conversation_id=cid_high_locked,
+                released_repo_slug="acme-org/acme-plugin",
+                branch_names=["fix/plugin"],
+                portfolio_dir=pdir,
+            )["item"]
+            self.assertEqual(partial["merged_repos"], ["acme-org/acme-plugin"])
+            self.assertEqual(partial["status"], "pr_open")
+
+            completed = prs._mark_queue_item_repo_merged(
+                conversation_id=cid_high_locked,
+                released_repo_slug="acme-org/acme-tower",
+                branch_names=["fix/tower"],
+                portfolio_dir=pdir,
+            )["item"]
+            self.assertEqual(completed["merged_repos"], ["acme-org/acme-plugin", "acme-org/acme-tower"])
+            self.assertEqual(completed["status"], "merged")
 
 
 if __name__ == "__main__":

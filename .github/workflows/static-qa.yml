@@ -3,9 +3,11 @@ name: Static QA & Zero-PII Audit
 on:
   pull_request:
     branches: ["main"]
-  push:
-    branches: ["main"]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   static-qa:
@@ -18,3 +20,5 @@ jobs:
           python-version: "3.13"
       - name: Run Static Engineering & Zero-PII Audit
         run: python3 ./tests/scripts/qa_static_audit.py --strict
+      - name: Run Project Standards Audit
+        run: python3 ./skills/agy-project-standards/scripts/project_audit.py --repo . --strict
