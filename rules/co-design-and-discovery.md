@@ -63,6 +63,10 @@ When co-design converges, synthesize a concise **Design Contract** before mutati
 2. **Scoped Changes & Verification**: Impacted repositories, anchored target files, and required hermetic tests.
 3. **Explicit Non-Goals & Guardrails**: What is intentionally out of scope (preventing scope creep).
 
-Then offer a fast exit handoff calibrated to current per-repository `dev_pr_locks`:
+Then execute the exit handoff calibrated to current per-repository `dev_pr_locks`:
 - **Target Repo(s) Unlocked**: Ask whether to **implement immediately** on a timestamped `fix/*` worktree branch (`agy-code-remediation-pr`) OR **enqueue as `pending`** in `dev_queue.json` (`pr_remediator.py queue-add`).
-- **Target Repo(s) Locked**: Recommend **enqueueing directly as `pending`** in `dev_queue.json` with all confirmed decisions and `target_files` embedded in `--proposed-fix` / `--notes` — avoiding `hitl_blocked` buildup so `agy-dev-orchestrator` executes cleanly as soon as the active lock clears.
+- **Target Repo(s) Locked (Mandatory Auto-Enqueue — Zero Confirmation Prompt)**:
+  - When one or more target repositories currently hold an active `dev_pr_lock`, **DO NOT ask the user for confirmation or priority** (never prompt *"Do you want me to enqueue this?"* or *"What priority should I assign?"*).
+  - Immediately inspect `dev_queue.json` (`pr_remediator.py queue-list`), active `dev_pr_locks` (`pr_remediator.py lock-status --all`), application architecture, dependencies (`depends_on`), and user urgency to **assign a calibrated numeric priority automatically** relative to existing queued tasks.
+  - Immediately run `pr_remediator.py queue-add --status pending` with full `rca_summary`, `proposed_fix`, `target_files`, `depends_on`, `repo_slugs` (`--repos`), and `--notes` (all confirmed Design Contract decisions and non-goals) — avoiding `hitl_blocked` buildup so `agy-dev-orchestrator` executes cleanly as soon as the blocking lock clears.
+  - Render a **concise visual confirmation** of the newly queued item and active queue state (compact Markdown table showing queue position, calibrated priority, target repo(s), active blocker lock, and next-up sequence).

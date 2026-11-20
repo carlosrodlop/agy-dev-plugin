@@ -13,14 +13,15 @@ All code, script, skill, rule, agent, hook, and configuration changes MUST flow 
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py lock-status --all --sync-git
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py lock-status --workdir <TARGET_REPO_DIR> --sync-git
    ```
-   - Locks are isolated per repository slug (`owner/repo`). Only pause or enqueue via `queue-add` if the **target repository's** lock is held by an unrelated conversation; distinct repositories can run in parallel.
+   - Locks are isolated per repository slug (`owner/repo`); distinct unlocked repositories progress in parallel.
+   - **Locked-Repo Auto-Enqueue (Zero Confirmation Prompt)**: If a converged **Design Contract** or approved task targets one or more repositories currently holding an active `dev_pr_lock` owned by an unrelated conversation, **DO NOT ask the user for confirmation or priority** (never prompt *"Do you want me to enqueue this?"* or *"What priority should I assign?"*). Immediately inspect `dev_queue.json` (`queue-list`), active `dev_pr_locks`, application architecture, dependencies (`depends_on`), and user urgency to assign a calibrated numeric priority automatically relative to existing queued tasks, execute `pr_remediator.py queue-add --status pending` immediately (populating full `rca_summary`, `proposed_fix`, `target_files`, `depends_on`, and `repo_slugs` via `--repos`), and render a concise visual confirmation (compact Markdown table showing queue position, calibrated priority, target repo(s), active blocker lock, and next-up sequence).
 2. **Acquire Per-Repo Lock & Isolated Timestamped Worktree Branch**:
    ```bash
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation \
      --id <CONVERSATION_ID> --action-id <SCOPE> --workdir <TARGET_REPO_DIR> \
      --rca-summary "<Why>" --proposed-fix "<What>" --worktree
    ```
-   - Use `--reuse-active` when iterating on follow-up commits from the same active conversation (`--workdir` or `--repo <owner/repo>` selects the target repository cleanly across `agy-dev-plugin`, `agy-tam-plugin`, `g-control-tower`, etc.).
+   - Use `--reuse-active` when iterating on follow-up commits from the same active conversation (`--workdir` or `--repo <owner/repo>` selects any managed target repository cleanly).
 3. **Implement, Test & Persist Deterministic Verification Checks in `<WORKTREE_PATH>`**:
    - Delegate or execute via `agy-dev-executor` / `agy-code-developer` inside `<WORKTREE_PATH>` (never leave dirty feature edits on `main`).
    - Iterate quickly on targeted `python3 -m unittest <module>`, then run the full local gate (which persists structured `verification_results` bound to `head_sha` inside `dev_pr_lock`):
