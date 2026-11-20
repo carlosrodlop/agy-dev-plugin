@@ -16,10 +16,10 @@ All code, script, skill, rule, hook, and configuration changes MUST flow through
 2. **Acquire Lock & Isolated Timestamped Worktree Branch**:
    ```bash
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation \
-     --id <CONVERSATION_ID> --action-id <SCOPE> --repo-dir <TARGET_REPO_DIR> \
+     --id <CONVERSATION_ID> --action-id <SCOPE> --workdir <TARGET_REPO_DIR> \
      --rca-summary "<Why>" --proposed-fix "<What>" --worktree
    ```
-   - Use `--reuse-active` when iterating on follow-up commits from the same active conversation (`--repo-dir` supports multi-repo branches across `agy-dev-plugin`, `agy-tam-plugin`, `g-control-tower`, etc.).
+   - Use `--reuse-active` when iterating on follow-up commits from the same active conversation (`--workdir` supports multi-repo branches across `agy-dev-plugin`, `agy-tam-plugin`, `g-control-tower`, etc.).
 3. **Implement, Test & Gate in Isolated Worktree (`<WORKTREE_PATH>`)**:
    - Edit files ONLY inside `<WORKTREE_PATH>` (never leave dirty feature edits on `main`).
    - Iterate quickly on targeted `python3 -m unittest <module>`, then run the full local gate:
