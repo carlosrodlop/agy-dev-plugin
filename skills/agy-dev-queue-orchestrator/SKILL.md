@@ -12,6 +12,7 @@ All operations run deterministically via [`pr_remediator.py`]($HOME/.gemini/conf
 - **Inspect queue & active repo locks**: `pr_remediator.py lock-status --all --sync-git` and `pr_remediator.py queue-list`
 - **Enqueue / update item**: `pr_remediator.py queue-add --id <CID> --title "..." --priority <10-90> --repos <repo1> <repo2> --target-files <f1> <f2> --orchestrator-id <ORCH_CID>`
 - **Pick next unblocked item (skipping locked repos)**: `pr_remediator.py queue-next --unlocked --orchestrator-id <ORCH_CID>`
+- **Reconcile merged `pr_open` items & prune stale compare `pr_urls`**: `pr_remediator.py queue-sync [--repo <owner/repo>] [--workdir <DIR>] [--fetch]` (also executed automatically during `lock-status --sync-git`)
 - **Transition item state**: `pr_remediator.py queue-set-status --id <CID> --status <pending|in_progress|pr_open|merged|blocked|cancelled> --branches ... --pr-urls ...`
 
 ## Orchestration Loop (`agy-dev-orchestrator` -> `agy-dev-planner` -> `agy-dev-executor`)
