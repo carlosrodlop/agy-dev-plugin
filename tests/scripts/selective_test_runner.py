@@ -14,6 +14,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ALL_TEST_MODULES = [
     "tests.test_agy_dev_plugin",
+    "tests.test_dev_queue_doctor",
     "tests.test_dev_queue_tui",
     "tests.test_pr_remediator_queue_and_cleanup",
 ]
@@ -59,13 +60,19 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
     for rel in changed_files:
         norm = rel.replace("\\", "/")
         if (
-            norm.endswith(("pr_remediator.py", "dev_flow_optimizer.py", "test_pr_remediator_queue_and_cleanup.py", "dev_common.py"))
+            norm.endswith(("pr_remediator.py", "dev_flow_optimizer.py", "dev_queue_doctor.py", "test_pr_remediator_queue_and_cleanup.py", "dev_common.py"))
             or norm.startswith("agents/")
         ):
             if "tests.test_pr_remediator_queue_and_cleanup" not in selected:
                 selected.append("tests.test_pr_remediator_queue_and_cleanup")
         if (
-            norm.endswith(("dev_queue_tui.py", "dev_flow_optimizer.py", "test_dev_queue_tui.py", "agy_dev_queue.sh", "dev_common.py", "git_client.py"))
+            norm.endswith(("dev_queue_doctor.py", "test_dev_queue_doctor.py", "pr_remediator.py", "dev_flow_optimizer.py", "dev_queue_tui.py", "agy_dev_queue.sh", "dev_common.py"))
+            or norm.startswith(("skills/agy-dev-queue-orchestrator/", "shell/"))
+        ):
+            if "tests.test_dev_queue_doctor" not in selected:
+                selected.append("tests.test_dev_queue_doctor")
+        if (
+            norm.endswith(("dev_queue_tui.py", "dev_flow_optimizer.py", "dev_queue_doctor.py", "test_dev_queue_tui.py", "agy_dev_queue.sh", "dev_common.py", "git_client.py"))
             or norm.startswith("skills/agy-dev-queue-orchestrator/")
             or norm.startswith("shell/")
         ):

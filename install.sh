@@ -84,6 +84,7 @@ chmod 755 "${PLUGIN_DEST}/shell"/*.sh 2>/dev/null || true
 if [[ -x "${PLUGIN_DEST}/shell/agy_dev_queue.sh" ]]; then
   mkdir -p "${HOME}/.local/bin"
   ln -sfn "${PLUGIN_DEST}/shell/agy_dev_queue.sh" "${HOME}/.local/bin/agy-queue"
+  ln -sfn "${PLUGIN_DEST}/shell/agy_dev_queue.sh" "${HOME}/.local/bin/agy-doctor"
 fi
 
 if [[ -f "${HOME}/.env" ]]; then

@@ -78,6 +78,11 @@ try:
 except Exception:
     _flow_opt = None
 
+try:
+    import dev_queue_doctor as _queue_doctor  # type: ignore[import-not-found]
+except Exception:
+    _queue_doctor = None
+
 ANSI_RE = re.compile(r"\x1b\]8;;[^\x1b\x07]*(?:\x1b\\|\x07)|\x1b\[[0-9;?]*[A-Za-z]")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _CREATED_PR_PATH_RE = re.compile(r"/(?:pull|pulls|pull-requests|merge_requests)/\d+(?:/|$)")
@@ -680,12 +685,13 @@ def _collect_watched_script_paths() -> list[Path]:
                 collected.append(p)
 
     _add(Path(__file__))
-    for mod in (_flow_opt, _dev_common, _git_client):
+    for mod in (_flow_opt, _queue_doctor, _dev_common, _git_client):
         mod_file = getattr(mod, "__file__", None) if mod is not None else None
         if mod_file:
             _add(mod_file)
     for root in (_SCRIPT_PLUGIN_ROOT, _INSTALLED_PLUGIN_ROOT):
         _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "dev_flow_optimizer.py")
+        _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "dev_queue_doctor.py")
         _add(root / "clients" / "dev_common.py")
         _add(root / "clients" / "git_client.py")
     return collected
@@ -2802,6 +2808,148 @@ def _handle_board_hotkey(args: argparse.Namespace, state_dir: Path) -> str:
     return f"✓ Board synced ({board_path.name}) · Antigravity focused"
 
 
+def _invoke_queue_doctor(
+    state_dir: Path,
+    *,
+    repos_dir: str = "",
+    fix: bool = False,
+    wake: bool = False,
+    sync_git: bool = False,
+) -> dict[str, Any]:
+    """Execute `queue-doctor` in-process (or via `pr_remediator.py` subprocess fallback)."""
+    if _queue_doctor is not None and hasattr(_queue_doctor, "run_queue_doctor"):
+        return dict(
+            _queue_doctor.run_queue_doctor(
+                state_dir=state_dir,
+                repos_dir=repos_dir or None,
+                sync_git=sync_git,
+                fix=fix,
+                wake=wake,
+            )
+        )
+    pr_rem = _resolve_pr_remediator_script()
+    cmd = [sys.executable, str(pr_rem), "queue-doctor", "--json", "--state-dir", str(state_dir)]
+    if repos_dir:
+        cmd.extend(["--repos-dir", repos_dir])
+    if sync_git:
+        cmd.append("--sync-git")
+    if fix:
+        cmd.append("--fix")
+    if wake:
+        cmd.append("--wake")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20.0, check=False)
+    with contextlib.suppress(json.JSONDecodeError):
+        parsed = json.loads(proc.stdout or "{}")
+        if isinstance(parsed, dict):
+            return parsed
+    return {"status": "error", "overall_status": "degraded", "anomalies": [], "improvements": []}
+
+
+def _format_doctor_report_text(report: dict[str, Any], *, color: bool) -> str:
+    """Format `queue-doctor` report dictionary for terminal display."""
+    if _queue_doctor is not None and hasattr(_queue_doctor, "render_doctor_report"):
+        return str(_queue_doctor.render_doctor_report(report, color=color))
+    return json.dumps(report, indent=2, ensure_ascii=False)
+
+
+def _handle_doctor_hotkey(
+    args: argparse.Namespace,
+    state_dir: Path,
+    *,
+    out_stream: TextIO,
+    use_tty: bool,
+    tty_fd: int | None,
+    orig_termios: Any = None,
+    doctor_fn: Callable[..., dict[str, Any]] | None = None,
+    prompt_timeout_seconds: float = 300.0,
+) -> str:
+    """Suspend alt-screen/cbreak, render full `agy-doctor` report, offer `[w] wake / [f] fix / [Enter]`, and restore TUI."""
+    runner = doctor_fn if doctor_fn is not None else _invoke_queue_doctor
+    color_on = (not bool(getattr(args, "no_color", False))) and not bool(os.environ.get("NO_COLOR"))
+    repos_dir = str(getattr(args, "repos_dir", "") or "")
+
+    try:
+        if tty_fd is not None and orig_termios is not None:
+            with contextlib.suppress(Exception):
+                termios.tcsetattr(tty_fd, termios.TCSADRAIN, orig_termios)
+        if use_tty:
+            out_stream.write(ALT_SCREEN_EXIT)
+            out_stream.flush()
+
+        report = runner(state_dir, repos_dir=repos_dir, fix=False, wake=False, sync_git=False)
+        rendered = _format_doctor_report_text(report, color=color_on)
+        prompt_line = _color(
+            "\n[agy-doctor] Press [w] wake · [f] fix · [Enter] return to TUI: ",
+            "1;36",
+            color_on,
+        )
+        out_stream.write(f"\n{rendered}\n{prompt_line}")
+        out_stream.flush()
+
+        choice = ""
+        if tty_fd is not None:
+            if orig_termios is not None:
+                with contextlib.suppress(Exception):
+                    tty.setcbreak(tty_fd)
+            try:
+                ready, _, _ = select.select([tty_fd], [], [], max(0.05, float(prompt_timeout_seconds)))
+                if ready:
+                    choice = _read_watch_key(tty_fd)
+            except (InterruptedError, OSError):
+                choice = ""
+            finally:
+                if orig_termios is not None:
+                    with contextlib.suppress(Exception):
+                        termios.tcsetattr(tty_fd, termios.TCSADRAIN, orig_termios)
+
+        out_stream.write("\n")
+        out_stream.flush()
+
+        if choice == "w":
+            wake_rep = runner(state_dir, repos_dir=repos_dir, fix=False, wake=True, sync_git=False)
+            w_info = wake_rep.get("wake") if isinstance(wake_rep.get("wake"), dict) else {}
+            w_st = str(w_info.get("status") or "not_requested")
+            if w_st == "woke":
+                return f"✓ Doctor: woke orchestrator (pid {w_info.get('pid')})"
+            if w_st == "skipped_cooldown":
+                return f"⚠ Doctor: wake cooldown ({w_info.get('remaining_seconds', 0)}s left)"
+            if w_st == "skipped_wake_in_flight":
+                return f"⚠ Doctor: wake already running (pid {w_info.get('pid')})"
+            if w_st == "skipped_healthy":
+                return "✓ Doctor: healthy (wake skipped, 0 tokens)"
+            return f"⚠ Doctor wake: {w_st}"
+
+        if choice == "f":
+            is_offline = os.environ.get("AGY_OFFLINE_ONLY") == "1"
+            fix_rep = runner(
+                state_dir,
+                repos_dir=repos_dir,
+                fix=True,
+                wake=False,
+                sync_git=not is_offline,
+            )
+            rem_acts = fix_rep.get("remediation_actions") or []
+            rec_cnt = sum(
+                int(a.get("reconciled_count") or 0)
+                for a in rem_acts
+                if isinstance(a, dict)
+            )
+            return f"✓ Doctor: safe fixes applied ({rec_cnt} reconciled)"
+
+        overall = str(report.get("overall_status") or "healthy")
+        anom_cnt = len(report.get("anomalies") or [])
+        if overall == "healthy":
+            return f"✓ Doctor: healthy ({report.get('health_score', 100)}/100)"
+        return f"⚠ Doctor: {overall} ({anom_cnt} anomaly)"
+    finally:
+        if tty_fd is not None and orig_termios is not None:
+            with contextlib.suppress(Exception):
+                tty.setcbreak(tty_fd)
+        if use_tty:
+            out_stream.write(ALT_SCREEN_ENTER)
+            out_stream.flush()
+
+
 def _build_watch_frame(
     body_lines: list[str],
     term_w: int,
@@ -3104,16 +3252,16 @@ def run_watch_loop(
             if awaiting_hitl_digit:
                 footer = "Press HITL number [1-9] -> copy exact title & focus Antigravity App (Esc cancels)…"
             elif sync_ctrl.is_in_flight() and (not status_msg or status_msg == "↻ Syncing…"):
-                footer = "↻ Syncing…  |  [o/O] PR(s) · [1-9] open · [h+#] Agy · [j/k] scroll · [p] compact · [R] reload · [q] quit"
+                footer = "↻ Syncing…  |  [o/O] PR(s) · [1-9] open · [h+#] Agy · [d] doctor · [j/k] scroll · [p] compact · [R] reload · [q] quit"
             elif status_msg and now_mono < status_until:
                 footer = (
-                    f"{status_msg}  |  [o/O] PR · [1-9] open · [h+#] Agy · "
+                    f"{status_msg}  |  [o/O] PR · [1-9] open · [h+#] Agy · [d] doctor · "
                     f"[j/k] scroll · [p] compact · [s] sync · [R] reload · [q] quit"
                 )
             else:
                 status_msg = ""
                 footer = (
-                    f"[o/O] PR(s) · [1-9] open · [h+#] Agy · [j/k] scroll · [p] compact · "
+                    f"[o/O] PR(s) · [1-9] open · [h+#] Agy · [d] doctor · [j/k] scroll · [p] compact · "
                     f"[b] board · [s] sync · [a] all · [R] reload · [q] quit ({interval:g}s)"
                 )
 
@@ -3248,6 +3396,17 @@ def run_watch_loop(
                     status_msg = _handle_board_hotkey(args, st_dir)
                     status_until = time.monotonic() + 3.5
                     break
+                if key == "d":
+                    status_msg = _handle_doctor_hotkey(
+                        args,
+                        st_dir,
+                        out_stream=out_stream,
+                        use_tty=use_tty,
+                        tty_fd=tty_fd,
+                        orig_termios=orig_termios,
+                    )
+                    status_until = time.monotonic() + 4.5
+                    break
                 if key == "r":
                     status_msg = "↻ Refreshed"
                     status_until = time.monotonic() + 2.0
@@ -3328,6 +3487,13 @@ def run_watch_loop(
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for `dev_queue_tui.py` / `agy-queue`."""
     raw_cli_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_cli_argv and raw_cli_argv[0] == "doctor":
+        if _dev_common is not None and hasattr(_dev_common, "run_dev_queue_doctor_cli"):
+            return int(_dev_common.run_dev_queue_doctor_cli(raw_cli_argv[1:]))
+        pr_rem = _resolve_pr_remediator_script()
+        proc = subprocess.run([sys.executable, str(pr_rem), "queue-doctor", *raw_cli_argv[1:]], check=False)
+        return int(proc.returncode)
+
     parser = _build_parser()
     args = parser.parse_args(argv)
     args._raw_argv = raw_cli_argv
