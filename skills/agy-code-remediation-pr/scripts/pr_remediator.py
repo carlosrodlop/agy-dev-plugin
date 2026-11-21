@@ -59,6 +59,19 @@ import dev_common  # noqa: E402
 import git_client as _git_client  # noqa: E402
 from git_client import GitVcsIntegrationClient, stamp_repo_version_manifests  # noqa: E402
 
+_SCRIPT_DIR_STR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR_STR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR_STR)
+import dev_flow_optimizer as _flow_opt  # noqa: E402
+from dev_flow_optimizer import (  # noqa: E402
+    DEFAULT_STALL_THRESHOLD_SECONDS,
+    analyze_dev_flow_optimizations,
+    build_branch_diff_verification_gate,
+    detect_stalled_lock,
+    format_compact_opt_hint,
+    normalize_pre_commit_status,
+)
+
 build_pro_dashboard_ui_url = dev_common.try_build_control_tower_ui_url
 restart_pro_api_server = dev_common.try_restart_control_tower_api
 stop_dev_api_server = dev_common.try_stop_dev_api_server
@@ -597,6 +610,7 @@ def acquire_dev_pr_lock(
     target_repo_dir: str = "",
     repo_slug: str = "",
     workdir: Path | str | None = None,
+    worker_cid: str = "",
 ) -> dict[str, Any]:
     """Acquire the exclusive cross-conversation pending-branch lock scoped to a single repository (`dev_pr_locks[repo_slug]`).
 
@@ -747,6 +761,11 @@ def acquire_dev_pr_lock(
                 if same_prev and existing_lock.get("acquired_at")
                 else now_iso
             ),
+            "worker_cid": (
+                str(worker_cid or "").strip()
+                or (str(existing_lock.get("worker_cid") or "").strip() if same_prev else "")
+            ),
+            "last_activity_at": now_iso,
             "updated_at": now_iso,
         }
         locks_map[resolved_slug] = new_lock
@@ -831,6 +850,7 @@ def update_dev_pr_lock(
                     current_lock[k] = v
         current_lock["repo_slug"] = target_slug
         current_lock["repo"] = target_slug
+        current_lock["last_activity_at"] = str(updates.get("last_activity_at") or now_iso)
         current_lock["updated_at"] = now_iso
         locks_map[target_slug] = current_lock
         _write_locks_state(audit_state, locks_map, touched_repo_slug=target_slug)
@@ -841,6 +861,34 @@ def update_dev_pr_lock(
             os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, state_path)
     return {"status": "ok", "repo_slug": target_slug, "lock": current_lock}
+
+
+def record_dev_pr_lock_heartbeat(
+    *,
+    workdir: Path | str | None = None,
+    repo_slug: str = "",
+    branch_name: str = "",
+    worker_cid: str = "",
+    stage_label: str = "",
+    portfolio_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Stamp `last_activity_at`, optional `worker_cid`, and optional `stage_label` on an active lock."""
+    now_iso = _utc_now_iso()
+    updates: dict[str, Any] = {"last_activity_at": now_iso}
+    if str(worker_cid or "").strip():
+        updates["worker_cid"] = str(worker_cid).strip()
+    if str(stage_label or "").strip():
+        updates["stage_label"] = str(stage_label).strip()[:32]
+    res = update_dev_pr_lock(
+        updates,
+        portfolio_dir=portfolio_dir,
+        repo_slug=repo_slug,
+        workdir=workdir,
+        branch_name=branch_name,
+    )
+    if res.get("status") == "ok":
+        res["last_activity_at"] = now_iso
+    return res
 
 
 def _resolve_lock_target_repo_dir(lock_info: dict[str, Any] | None) -> Path | None:
@@ -1849,6 +1897,7 @@ def start_remediation_branch_and_lock(
     workdir: Path | str | None = None,
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
+    worker_cid: str = "",
 ) -> dict[str, Any]:
     """Execute Steps 1–2: inspect/RCA, verify no pending branch is awaiting validation (or reuse active PR branch), create timestamped git branch, and acquire `dev_pr_lock`."""
     vcs = git_client or GitVcsIntegrationClient()
@@ -2083,6 +2132,7 @@ def start_remediation_branch_and_lock(
         portfolio_dir=portfolio_dir,
         target_repo_dir=str(target_repo_dir) if isinstance(target_repo_dir, Path) else "",
         repo_slug=repo_slug,
+        worker_cid=worker_cid,
     )
     if not lock_res.get("acquired"):
         return lock_res
@@ -2325,9 +2375,9 @@ def _format_verification_checks_markdown(verification_results: dict[str, Any] | 
 
     def _status_badge(status_str: str) -> str:
         norm = status_str.strip().lower()
-        if norm == "pass":
+        if norm in ("pass", "passed"):
             return "✅ PASS"
-        if norm == "fail":
+        if norm in ("fail", "failed"):
             return "❌ FAIL"
         if norm == "not_run":
             return "⏭️ NOT RUN"
@@ -2376,6 +2426,25 @@ def _format_verification_checks_markdown(verification_results: dict[str, Any] | 
     return lines
 
 
+def _build_single_pass_pre_commit_skip(target_dir: Path, base_skip: str = "") -> tuple[str, list[str]]:
+    """Build `SKIP` value for single-pass `test-local --with-pre-commit` avoiding duplicate audit/tests."""
+    hooks: list[str] = []
+    for raw_tok in (base_skip or "").split(","):
+        tok = raw_tok.strip()
+        if tok and tok not in hooks:
+            hooks.append(tok)
+    for required_skip in ("unit-tests", "qa-static-audit"):
+        if required_skip not in hooks:
+            hooks.append(required_skip)
+    pc_cfg = target_dir / ".pre-commit-config.yaml"
+    if pc_cfg.is_file():
+        with contextlib.suppress(OSError):
+            cfg_text = pc_cfg.read_text(encoding="utf-8", errors="ignore")
+            if re.search(r"(?m)^\s*-\s*id:\s*unit-tests-fast\b", cfg_text) and "unit-tests-fast" not in hooks:
+                hooks.append("unit-tests-fast")
+    return (",".join(hooks), hooks)
+
+
 def run_local_validation_suite(
     workdir: Path | str | None = None,
     test_targets: list[str] | None = None,
@@ -2386,13 +2455,51 @@ def run_local_validation_suite(
     pre_commit_status: str = "",
     run_bats: bool = True,
 ) -> dict[str, Any]:
-    """Execute Step 6: Run local offline unit tests (`unittest`), `qa_static_audit.py`, optional BATS/pre-commit, and persist `verification_results` bound to `head_sha` into `dev_pr_lock`."""
+    """Execute Step 6: Optional single-pass `pre-commit` (`SKIP=unit-tests,qa-static-audit`), `qa_static_audit.py --incremental`, `selective_test_runner.py` / `unittest`, and BATS, persisting unified `verification_results` bound to `head_sha` into `dev_pr_lock`."""
     vcs = GitVcsIntegrationClient()
     target_dir = Path(workdir).expanduser().resolve() if workdir else vcs.resolve_repo_dir()
     if not target_dir.is_dir():
         return {"status": "error", "passed": False, "error": f"Workdir not found: {target_dir}"}
 
     clean_env = _clean_git_subprocess_env({"AGY_OFFLINE_ONLY": "1", "PRE_COMMIT_HOOK": "1"})
+
+    # Single-pass pre-commit execution FIRST (skipping duplicate test & static-audit hooks)
+    pre_commit_entry: dict[str, Any] = {"status": "not_run", "passed": None}
+    pre_commit_status_label = "NOT_RUN"
+    pre_commit_output = ""
+    if run_pre_commit:
+        if (target_dir / ".pre-commit-config.yaml").is_file():
+            pc_bin = shutil.which("pre-commit")
+            if pc_bin:
+                skip_val, skip_hooks = _build_single_pass_pre_commit_skip(target_dir, clean_env.get("SKIP", ""))
+                pc_env = {**clean_env, "SKIP": skip_val}
+                proc_pc = subprocess.run(
+                    [pc_bin, "run", "--all-files"],
+                    cwd=str(target_dir),
+                    env=pc_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+                pc_ok = proc_pc.returncode == 0
+                pre_commit_output = f"{proc_pc.stdout}\n{proc_pc.stderr}".strip()
+                pre_commit_status_label = "PASSED" if pc_ok else "FAILED"
+                pre_commit_entry = {
+                    "status": "pass" if pc_ok else "fail",
+                    "passed": pc_ok,
+                    "skipped_hooks": skip_hooks,
+                }
+            else:
+                pre_commit_status_label = "SKIPPED"
+                pre_commit_entry = {"status": "skipped", "passed": None}
+        else:
+            pre_commit_status_label = "SKIPPED"
+            pre_commit_entry = {"status": "skipped", "passed": None}
+    elif pre_commit_status.strip():
+        norm_short, norm_upper, norm_passed = normalize_pre_commit_status(pre_commit_status)
+        pre_commit_status_label = norm_upper
+        pre_commit_entry = {"status": norm_short, "passed": norm_passed}
 
     qa_script = target_dir / "tests" / "scripts" / "qa_static_audit.py"
     qa_ran = qa_script.is_file()
@@ -2465,33 +2572,6 @@ def run_local_validation_suite(
             bats_passed = proc_bats.returncode == 0
             bats_output = f"{proc_bats.stdout}\n{proc_bats.stderr}".strip()
 
-    # Optional pre-commit validation recording
-    pre_commit_entry: dict[str, Any] = {"status": "not_run", "passed": None}
-    pre_commit_output = ""
-    if run_pre_commit and (target_dir / ".pre-commit-config.yaml").is_file():
-        pc_bin = shutil.which("pre-commit")
-        if pc_bin:
-            proc_pc = subprocess.run(
-                [pc_bin, "run", "--all-files"],
-                cwd=str(target_dir),
-                env=clean_env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
-            pc_ok = proc_pc.returncode == 0
-            pre_commit_output = f"{proc_pc.stdout}\n{proc_pc.stderr}".strip()
-            pre_commit_entry = {"status": "pass" if pc_ok else "fail", "passed": pc_ok}
-        else:
-            pre_commit_entry = {"status": "skipped", "passed": None}
-    elif pre_commit_status.strip().lower() in ("pass", "fail", "skipped"):
-        norm_pc = pre_commit_status.strip().lower()
-        pre_commit_entry = {
-            "status": norm_pc,
-            "passed": True if norm_pc == "pass" else (False if norm_pc == "fail" else None),
-        }
-
     wt_state = _snapshot_worktree_state(target_dir)
     # Preserve previously recorded pre_commit pass/fail if same code fingerprint
     existing_lock = get_dev_pr_lock(portfolio_dir=portfolio_dir, workdir=target_dir)
@@ -2504,6 +2584,7 @@ def run_local_validation_suite(
             and prev_vr["pre_commit"].get("status") in ("pass", "fail")
         ):
             pre_commit_entry = dict(prev_vr["pre_commit"])
+            _, pre_commit_status_label, _ = normalize_pre_commit_status(str(pre_commit_entry.get("status") or ""))
 
     pre_commit_passed = pre_commit_entry.get("passed")
     overall_passed = bool(qa_passed and tests_passed and bats_passed and (pre_commit_passed is not False))
@@ -2515,6 +2596,7 @@ def run_local_validation_suite(
         "content_fingerprint": wt_state["content_fingerprint"],
         "verified_at_utc": _utc_now_iso(),
         "overall_passed": overall_passed,
+        "pre_commit_status": pre_commit_status_label,
         "qa_static_audit": _parse_qa_static_audit_summary(qa_output, qa_passed, qa_ran),
         "unittest": _parse_unittest_summary(test_output, tests_passed, unittest_ran),
         "bats": _parse_bats_summary(bats_output, bats_passed, bats_ran),
@@ -2536,13 +2618,14 @@ def run_local_validation_suite(
         "unit_tests_passed": tests_passed,
         "bats_passed": bats_passed,
         "pre_commit_passed": pre_commit_passed,
+        "pre_commit_status": pre_commit_status_label,
         "head_sha": wt_state["head_sha"],
         "workdir": str(target_dir),
         "test_targets": targets,
         "verification_results": verification_results,
         "qa_output": qa_output[-1500:],
         "test_output": test_output[-2500:],
-        "pre_commit_output": pre_commit_output[-1500:] if pre_commit_output else "",
+        "pre_commit_output": pre_commit_output[-2000:] if pre_commit_output else "",
     }
 
 
@@ -2597,7 +2680,7 @@ def build_code_developer_subagent_plan(
         f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation --id <CONVERSATION_ID> --action-id <ACTION_ID> --workdir <REPO_DIR> --rca-summary \"...\" --proposed-fix \"...\" --worktree`\n"
         f"   - If `status == \"locked\"` on this repository, `dev_queue.json` records the blocked item automatically; stop immediately and return the active lock status.\n"
         f"3. Implement modular Zero-PII code/skill fixes and hermetic unit test(s) in `tests/`, iterating quickly via targeted `python3 -m unittest <target>` checks.\n"
-        f"4. Once targeted tests pass, run the final local gate (`pre-commit run --all-files` + `pr_remediator.py test-local --workdir <WORKTREE_PATH>`) until `passed == true` so deterministic `verification_results` are persisted on `dev_pr_lock`.\n"
+        f"4. Once targeted tests pass, run the single-pass final local gate (`pr_remediator.py test-local --workdir <WORKTREE_PATH> --with-pre-commit`) until `passed == true` so deterministic `verification_results` are persisted on `dev_pr_lock`.\n"
         f"5. Stage the branch locally for independent review (Local-First Review — commits locally WITHOUT pushing to `origin` yet):\n"
         f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py prepare-review --workdir <WORKTREE_PATH> --title \"fix(<scope>): <summary>\" --executive-summary \"...\"`\n"
         f"6. Return the JSON output (including `branch_name`, `branch_timestamp`, `staged_head_sha`, `reviewer_subagent_definition`, and `reviewer_subagent_invocation`) so `{PR_REVIEWER_SUBAGENT_NAME}` (`Model=\"pro\"`) can audit locally and publish ONLY upon `PASS (>90/100)`."
@@ -2618,7 +2701,7 @@ def build_code_developer_subagent_plan(
         f"--id {cid_clean} --action-id \"{action_id or 'code-change'}\"{workdir_arg} "
         f"--rca-summary \"<RCA_SUMMARY>\" --proposed-fix \"<PROPOSED_FIX>\"{files_arg}{sib_arg} --worktree`.\n"
         f"   - If `status == \"locked\"`, abort immediately and return the lock status.\n"
-        f"2. Implement modular fixes and hermetic unit tests on the worktree branch, iterate with targeted `python3 -m unittest <target>`, then run `pre-commit run --all-files` and `pr_remediator.py test-local --workdir <WORKTREE_PATH>` until `passed == true`.\n"
+        f"2. Implement modular fixes and hermetic unit tests on the worktree branch, iterate with targeted `python3 -m unittest <target>`, then run single-pass `pr_remediator.py test-local --workdir <WORKTREE_PATH> --with-pre-commit` until `passed == true`.\n"
         f"3. Stage locally for review (without pushing to origin yet) via `pr_remediator.py prepare-review --workdir <WORKTREE_PATH> --title \"fix: remediate {action_id or cid_clean[:8]}\" --executive-summary \"...\"{sched_flag}`.\n"
         f"4. Return the full JSON result so `{PR_REVIEWER_SUBAGENT_NAME}` can immediately audit the local branch and publish only on `PASS (>90/100)`."
     )
@@ -2668,9 +2751,10 @@ def build_pr_reviewer_subagent_plan(
         f"(Maker-Checker pattern) for `agy-dev-plugin` and companion repositories (`agy-tam-plugin`, `g-control-tower`, etc.).\n"
         f"You run in a completely isolated conversation context right after a timestamped branch is staged locally (`AWAITING_AGENT_REVIEW`).\n"
         f"Hard PR Readiness Gate: ONLY `verdict == \"PASS\"` with `score > 90` (`>= {PR_REVIEW_PASS_MIN_SCORE}/100`) publishes `origin/<branch>` and exposes `manual_pr_url`.\n"
-        f"Your mandatory responsibilities:\n"
-        f"1. Inspect the local staged branch diff and changed files against `origin/main` using pure native `git` via:\n"
+        f"Your mandatory responsibilities (Lean Reviewer Protocol — Target 3-5 turns):\n"
+        f"1. Inspect the local staged branch diff, changed files, and embedded `verification_gate` against `origin/main` using pure native `git` via:\n"
         f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch <BRANCH_NAME>{wd_flag}`\n"
+        f"   - When `verification_gate.skip_redundant_test_rerun == true` (`matches_head == true` AND `passed == true`), DO NOT re-run `pre-commit` or the full `unittest` suite; focus directly on diff logic, security/Zero-PII, and test coverage quality.\n"
         f"2. Independently evaluate the proposed branch changes across 4 criteria (0-100 score) and determine your verdict (`PASS`, `WARN`, or `NEEDS_REVISION`):\n"
         f"   - Criterion A (40 pts): Root Cause / Requirement Resolution — Does the diff accurately implement the change without regressions?\n"
         f"   - Criterion B (25 pts): Unit Test Coverage — Are new or updated deterministic unit tests included in `tests/`?\n"
@@ -6445,6 +6529,38 @@ def cleanup_merged_conversations(
     }
 
 
+def get_branch_diff_with_verification_gate(
+    *,
+    branch: str = "",
+    base_branch: str = "main",
+    workdir: Path | str | None = None,
+    repo_slug: str = "",
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+) -> dict[str, Any]:
+    """Compute native git `branch-diff` and embed SHA-bound `verification_gate` for Lean Reviewer Protocol."""
+    lock_info = get_dev_pr_lock(
+        portfolio_dir=portfolio_dir,
+        repo_slug=repo_slug,
+        workdir=workdir,
+        branch_name=branch.strip(),
+    )
+    resolved_branch = branch.strip() or str(lock_info.get("branch_name") or "").strip()
+    wd_str = str(workdir or "").strip()
+    wt_str = str(lock_info.get("worktree_path") or "").strip()
+    cand_str = wd_str or wt_str
+    cand_path = Path(cand_str.replace("$HOME", str(Path.home()))).expanduser() if cand_str else None
+    repo_dir = (
+        cand_path.resolve()
+        if cand_path and cand_path.exists()
+        else _resolve_lock_target_repo_dir(lock_info)
+    )
+    vcs = git_client or GitVcsIntegrationClient()
+    res = vcs.get_branch_diff(head_branch=resolved_branch, base_branch=base_branch, repo_dir=repo_dir)
+    res["verification_gate"] = build_branch_diff_verification_gate(lock_info, repo_dir, resolved_branch)
+    return res
+
+
 # ==============================================================================
 # CLI Entrypoint (`pr_remediator.py`)
 # ==============================================================================
@@ -6491,6 +6607,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_rel.add_argument("--branch", default="", help="Optional branch name to match lock.")
     p_rel.add_argument("--all", dest="release_all", action="store_true", help="Release all active repository locks.")
 
+    p_hb = sub.add_parser("lock-heartbeat", help="Stamp last_activity_at, worker_cid, and optional stage label on an active dev_pr_lock.")
+    p_hb.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
+    p_hb.add_argument("--repo", "--repo-slug", dest="repo_slug", default="", help="Optional owner/repo slug.")
+    p_hb.add_argument("--branch", default="", help="Optional branch name to match lock.")
+    p_hb.add_argument("--worker-cid", dest="worker_cid", default="", help="Active worker subagent conversation ID.")
+    p_hb.add_argument("--stage", dest="stage_label", default="", help="Optional compact stage label (e.g., coding, tests).")
+
     p_plan_dev = sub.add_parser(
         "plan-developer",
         help="Build the subagent_definition and subagent_invocation for agy-code-developer when a code change is required.",
@@ -6522,6 +6645,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_start.add_argument("--worktree", action="store_true", help="Provision an isolated git worktree for the timestamped branch.")
     p_start.add_argument("--checkout", action="store_true", help="Checkout the timestamped branch directly in the local repository.")
     p_start.add_argument("--workdir", default="", help="Optional target repository directory (defaults to active cwd repo or AGY_CONF_REPO_DIR).")
+    p_start.add_argument("--worker-cid", dest="worker_cid", default="", help="Optional active worker subagent conversation ID for stall monitoring.")
     p_start.add_argument(
         "--reuse-active",
         "--continue-active",
@@ -6533,12 +6657,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_test = sub.add_parser("test-local", help="Run local offline unit tests, static QA auditor, and persist verification_results on dev_pr_lock.")
     p_test.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
     p_test.add_argument("--targets", nargs="*", default=[], help="Optional unittest target modules.")
-    p_test.add_argument("--pre-commit", dest="run_pre_commit", action="store_true", help="Also execute `pre-commit run --all-files` and record status.")
+    p_test.add_argument(
+        "--with-pre-commit",
+        "--run-pre-commit",
+        "--pre-commit",
+        dest="run_pre_commit",
+        action="store_true",
+        help="Single-pass mode: run `pre-commit run --all-files` with SKIP=unit-tests,qa-static-audit, then run qa_static_audit + tests once.",
+    )
     p_test.add_argument(
         "--pre-commit-status",
+        type=lambda v: normalize_pre_commit_status(v)[0] if str(v or "").strip() else "",
         choices=("", "pass", "fail", "skipped"),
         default="",
-        help="Optional recorded status from an external `pre-commit run --all-files` invocation.",
+        help="Optional recorded status from an external `pre-commit run --all-files` invocation (pass/PASSED, fail/FAILED, skipped).",
     )
 
     for push_cmd in ("push-branch", "prepare-review", "create-pr"):
@@ -6642,6 +6774,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_qsync.add_argument("--workdir", default="", help="Optional target repository directory or worktree path to scope reconciliation.")
     p_qsync.add_argument("--fetch", action="store_true", help="Fetch origin refs before checking Git merge state.")
 
+    p_qopt = sub.add_parser(
+        "queue-optimize",
+        help="Run deterministic 0-LLM self-diagnosing workflow optimization audit across locks, queue, managed repos, and bounded transcripts.",
+    )
+    p_qopt.add_argument("--json", dest="as_json", action="store_true", help="Emit structured JSON report (default output format).")
+    p_qopt.add_argument("--orchestrator-id", dest="orchestrator_id", default="", help="Active orchestrator conversation ID for bloat diagnostics.")
+    p_qopt.add_argument("--repos-dir", dest="repos_dir", default="", help="Optional parent directory of managed local git repositories.")
+    p_qopt.add_argument("--brain-dir", dest="brain_dir", default=None, help="Optional Antigravity brain directory override for read-only transcript telemetry.")
+    p_qopt.add_argument("--stall-seconds", dest="stall_seconds", type=int, default=None, help="Override stalled-worker idle threshold in seconds (default: 900).")
+
     p_clean = sub.add_parser(
         "cleanup-merged-conversations",
         help="Safely delete merged conversation directories/protobufs and spawned subagents after verifying git merge and protections.",
@@ -6708,6 +6850,17 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("released") else 1
 
+    if args.subcommand == "lock-heartbeat":
+        res = record_dev_pr_lock_heartbeat(
+            workdir=getattr(args, "workdir", "") or None,
+            repo_slug=getattr(args, "repo_slug", ""),
+            branch_name=getattr(args, "branch", ""),
+            worker_cid=getattr(args, "worker_cid", ""),
+            stage_label=getattr(args, "stage_label", ""),
+        )
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("status") == "ok" else 1
+
     if args.subcommand == "plan-developer":
         res = build_code_developer_subagent_plan(
             conversation_id=args.conversation_id,
@@ -6739,6 +6892,7 @@ def main(argv: list[str] | None = None) -> int:
             reuse_active_branch=getattr(args, "reuse_active_branch", False),
             scheduled=getattr(args, "scheduled", False),
             workdir=getattr(args, "workdir", "") or None,
+            worker_cid=getattr(args, "worker_cid", ""),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
@@ -6769,23 +6923,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res.get("status") == "ok" else 1
 
     if args.subcommand == "branch-diff":
-        lock_info = get_dev_pr_lock(
-            repo_slug=getattr(args, "repo_slug", ""),
+        res = get_branch_diff_with_verification_gate(
+            branch=args.branch.strip(),
+            base_branch=args.base,
             workdir=getattr(args, "workdir", "") or None,
-            branch_name=args.branch.strip(),
+            repo_slug=getattr(args, "repo_slug", ""),
         )
-        resolved_branch = args.branch.strip() or str(lock_info.get("branch_name") or "").strip()
-        wd_str = str(getattr(args, "workdir", "") or "").strip()
-        wt_str = str(lock_info.get("worktree_path") or "").strip()
-        cand_str = wd_str or wt_str
-        cand_path = Path(cand_str.replace("$HOME", str(Path.home()))).expanduser() if cand_str else None
-        repo_dir = (
-            cand_path.resolve()
-            if cand_path and cand_path.exists()
-            else _resolve_lock_target_repo_dir(lock_info)
-        )
-        vcs = GitVcsIntegrationClient()
-        res = vcs.get_branch_diff(head_branch=resolved_branch, base_branch=args.base, repo_dir=repo_dir)
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
 
@@ -6899,6 +7042,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(q_res, indent=2, ensure_ascii=False))
         return 0 if q_res.get("status") in ("ok", "skipped") else 1
+
+    if args.subcommand == "queue-optimize":
+        q_res = analyze_dev_flow_optimizations(
+            repos_dir=getattr(args, "repos_dir", "") or None,
+            brain_dir=getattr(args, "brain_dir", None),
+            orchestrator_cid=getattr(args, "orchestrator_id", ""),
+            stall_threshold_seconds=getattr(args, "stall_seconds", None),
+        )
+        print(json.dumps(q_res, indent=2, ensure_ascii=False))
+        return 0 if q_res.get("status") == "ok" else 1
 
     if args.subcommand == "cleanup-merged-conversations":
         c_res = cleanup_merged_conversations(

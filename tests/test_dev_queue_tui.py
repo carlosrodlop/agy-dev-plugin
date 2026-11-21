@@ -1165,6 +1165,148 @@ class TestDevQueueTui(unittest.TestCase):
             self.assertTrue(board_path_2.is_file())
             mock_focus.assert_called_once_with()
 
+    def test_stalled_worker_progress_bar_alert_and_compact_opt_footer_hint(self) -> None:
+        """Stalled DEVELOPING/NEEDS_REVISION_ITERATING locks render STALL alert (never 35% ~6m) and compact OPT: footer."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            stale_wt = root / "wt-stale"
+            stale_wt.mkdir(parents=True)
+            _git(stale_wt, "init", "-b", "main")
+            (stale_wt / "README.md").write_text("# Acme\n", encoding="utf-8")
+            _git(stale_wt, "add", "README.md")
+            _git(stale_wt, "commit", "-m", "init")
+            # Create a dirty uncommitted edit backdated by 1h42m (6120s)
+            (stale_wt / "dirty.py").write_text("PENDING = True\n", encoding="utf-8")
+
+            now_iso = "2027-01-15T10:00:00Z"
+            stale_iso = "2027-01-15T08:18:00Z"
+            now_ts = tui._flow_opt.parse_iso_timestamp(now_iso)
+            stale_ts = now_ts - 6120.0
+            for fn in ("README.md", "dirty.py"):
+                os.utime(stale_wt / fn, (stale_ts, stale_ts))
+
+            cid_stale = "abab1111-2222-4333-8444-555555555555"
+            _write_state(
+                state_dir,
+                items=[
+                    {
+                        "conversation_id": cid_stale,
+                        "priority": 10,
+                        "status": "in_progress",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "title": "Zombie worker task",
+                        "target_files": ["dirty.py"],
+                    },
+                    {
+                        "conversation_id": "cdcd1111-2222-4333-8444-555555555555",
+                        "priority": 30,
+                        "status": "pending",
+                        "repo_slugs": ["acme/repo-b"],
+                        "merged_repos": [],
+                        "title": "UI badge polish 1",
+                        "target_files": ["a.css"],
+                    },
+                    {
+                        "conversation_id": "cdcd2222-2222-4333-8444-555555555555",
+                        "priority": 31,
+                        "status": "pending",
+                        "repo_slugs": ["acme/repo-b"],
+                        "merged_repos": [],
+                        "title": "UI badge polish 2",
+                        "target_files": ["b.css"],
+                    },
+                    {
+                        "conversation_id": "cdcd3333-2222-4333-8444-555555555555",
+                        "priority": 32,
+                        "status": "pending",
+                        "repo_slugs": ["acme/repo-b"],
+                        "merged_repos": [],
+                        "title": "UI badge polish 3",
+                        "target_files": ["c.css"],
+                    },
+                ],
+                locks={
+                    "acme/repo-a": {
+                        "active": True,
+                        "status": "DEVELOPING",
+                        "pr_gate_ready": False,
+                        "conversation_id": cid_stale,
+                        "branch_name": "fix/20270115-081800-zombie-abab1111",
+                        "worktree_path": str(stale_wt),
+                        "acquired_at": stale_iso,
+                        "updated_at": stale_iso,
+                        "last_activity_at": stale_iso,
+                    }
+                },
+            )
+
+            # 1. Stalled DEVELOPING lock MUST NOT display misleading 35% ~6m
+            lp_stale = tui._compute_lock_progress(
+                {
+                    "active": True,
+                    "status": "DEVELOPING",
+                    "pr_gate_ready": False,
+                    "worktree_path": str(stale_wt),
+                    "updated_at": stale_iso,
+                },
+                now_ts=now_ts,
+                brain_dir="",
+            )
+            self.assertTrue(lp_stale["is_stalled"])
+            self.assertEqual(lp_stale["tag"], "STALL 1h42m")
+
+            # 2. Inline progress bar uses red/magenta alert ANSI styling (1;31 + 1;35)
+            prog_stalled = {"pct": 0, "tag": "STALL 1h42m", "mode": "stalled", "is_stalled": True}
+            cell_color = tui._render_inline_progress(prog_stalled, 20, color_on=True)
+            self.assertIn("\033[1;31m", cell_color)
+            self.assertIn("\033[1;35m", cell_color)
+            self.assertIn("STALL 1h42m", cell_color)
+            self.assertNotIn("35%", cell_color)
+            self.assertNotIn("~6m", cell_color)
+
+            # 3. Full render surfaces STALL progress cell, STALLED WORKER warning, and compact OPT: footer
+            out_txt, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, no_color=True, plain_urls=True),
+                brain_dir="",
+                is_tty_override=False,
+                term_width_override=124,
+                now_ts_override=now_ts,
+            )
+            self.assertIn("STALL 1h42m", out_txt)
+            self.assertIn("STALLED WORKER:", out_txt)
+            self.assertIn("OPT:", out_txt)
+            self.assertNotIn("35% ~6m", out_txt)
+
+            # 4. `--no-opt` hides OPT: footer hint while preserving STALLED WORKER alert
+            out_no_opt, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, no_color=True, plain_urls=True, no_opt=True),
+                brain_dir="",
+                is_tty_override=False,
+                term_width_override=124,
+                now_ts_override=now_ts,
+            )
+            self.assertIn("STALLED WORKER:", out_no_opt)
+            self.assertNotIn("OPT:", out_no_opt)
+
+            # 5. Fresh dirty DEVELOPING lock still reports 35% ~6m (not stalled)
+            fresh_iso = "2027-01-15T09:58:00Z"
+            lp_fresh = tui._compute_lock_progress(
+                {
+                    "active": True,
+                    "status": "DEVELOPING",
+                    "pr_gate_ready": False,
+                    "worktree_path": str(stale_wt),
+                    "last_activity_at": fresh_iso,
+                },
+                now_ts=now_ts,
+                brain_dir="",
+            )
+            self.assertFalse(lp_fresh["is_stalled"])
+            self.assertEqual(lp_fresh["pct"], 35)
+            self.assertEqual(lp_fresh["tag"], "~6m")
+
 
 if __name__ == "__main__":
     unittest.main()

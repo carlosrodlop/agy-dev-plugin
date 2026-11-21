@@ -1435,6 +1435,61 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
             for term in terms:
                 self.assertIn(term, text, msg=f"Skill {sname} missing expected contract term: {term}")
 
+    def test_dev_flow_optimizer_agent_and_skill_contracts(self) -> None:
+        """Verify all agent & skill docs stay <24KB and codify flow-optimizer, watchdog, flash routing, lean reviewer, and single-pass test-local."""
+        contracts: dict[pathlib.Path, tuple[str, ...]] = {
+            REPO_ROOT / "agents" / "agy-dev-orchestrator.md": (
+                "queue-optimize",
+                "DurationSeconds=1200",
+                "TimerCondition",
+                'Model="flash"',
+                'Model="pro"',
+                "bloated_orchestrator_session",
+                "test-local --workdir <WORKTREE_PATH> --with-pre-commit",
+            ),
+            REPO_ROOT / "agents" / "agy-code-pr-reviewer.md": (
+                "Lean Reviewer Protocol",
+                "verification_gate.skip_redundant_test_rerun",
+                "DO NOT re-run `pre-commit`",
+            ),
+            REPO_ROOT / "agents" / "agy-dev-executor.md": (
+                "test-local --workdir <WORKTREE_PATH> --with-pre-commit",
+                "lock-heartbeat",
+                "--worker-cid",
+            ),
+            REPO_ROOT / "agents" / "agy-code-developer.md": (
+                "test-local --workdir <WORKTREE_PATH> --with-pre-commit",
+                "lock-heartbeat",
+                "--worker-cid",
+            ),
+            REPO_ROOT / "agents" / "agy-dev-planner.md": (
+                "Micro-PR Batching",
+                "Contract-First Multi-Repo Parallelism",
+                "unanchored_pending_tasks",
+            ),
+            REPO_ROOT / "skills" / "agy-dev-queue-orchestrator" / "SKILL.md": (
+                "queue-optimize",
+                "DurationSeconds=1200",
+                "TimerCondition",
+                'Model="flash"',
+                "test-local --workdir <WORKTREE_PATH> --with-pre-commit",
+                "STALLED WORKER",
+                "OPT:",
+            ),
+            REPO_ROOT / "skills" / "agy-code-remediation-pr" / "SKILL.md": (
+                "lock-heartbeat",
+                "test-local --workdir <WORKTREE_PATH> --with-pre-commit",
+                "Lean Reviewer Protocol",
+                "verification_gate.skip_redundant_test_rerun",
+            ),
+        }
+        for md_path, expected_terms in contracts.items():
+            self.assertTrue(md_path.is_file(), msg=f"Missing contract doc: {md_path}")
+            self.assertLess(md_path.stat().st_size, 24000, msg=f"{md_path} exceeds 24,000-byte ceiling")
+            text = md_path.read_text(encoding="utf-8")
+            for term in expected_terms:
+                self.assertIn(term, text, msg=f"{md_path.name} missing required contract term: {term}")
+
 
 if __name__ == "__main__":
     unittest.main()
