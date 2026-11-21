@@ -1459,3 +1459,6 @@ def analyze_dev_flow_optimizations(
     }
     result["top_hint"] = format_compact_opt_hint(result)
     return result
+
+
+analyze_dev_flow = analyze_dev_flow_optimizations

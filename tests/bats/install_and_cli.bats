@@ -35,9 +35,17 @@ setup() {
   [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-dev-queue-orchestrator/scripts/dev_queue_tui.py" ]
   [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/shell/agy_dev_queue.sh" ]
   [ -L "${TMP_HOME}/.local/bin/agy-queue" ]
+  [ -L "${TMP_HOME}/.local/bin/agy-doctor" ]
   run env HOME="${TMP_HOME}" "${TMP_HOME}/.local/bin/agy-queue" --help
   [ "$status" -eq 0 ]
   [[ "$output" == *"agy-queue"* ]]
+  run env HOME="${TMP_HOME}" "${TMP_HOME}/.local/bin/agy-doctor" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"queue-doctor"* ]]
+  [[ "$output" == *"--check-only"* ]]
+  run env HOME="${TMP_HOME}" "${TMP_HOME}/.local/bin/agy-queue" doctor --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"queue-doctor"* ]]
   run grep -F "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/clients/dev_common.py" "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/hooks.json"
   [ "$status" -eq 0 ]
   rm -rf "${TMP_HOME}"
@@ -47,9 +55,13 @@ setup() {
   run "${REPO_ROOT}/shell/agy_dev_queue.sh" --help
   [ "$status" -eq 0 ]
   [[ "$output" == *"dev_queue.json"* ]]
-  run bash -c "source '${REPO_ROOT}/shell/agy_dev_queue.sh' && agy_queue --help"
+  run "${REPO_ROOT}/shell/agy_dev_queue.sh" doctor --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"queue-doctor"* ]]
+  run bash -c "source '${REPO_ROOT}/shell/agy_dev_queue.sh' && agy_queue --help && agy_doctor --help"
   [ "$status" -eq 0 ]
   [[ "$output" == *"dev_queue.json"* ]]
+  [[ "$output" == *"queue-doctor"* ]]
 }
 
 @test "core CLIs respond cleanly to --help" {

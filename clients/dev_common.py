@@ -1317,6 +1317,29 @@ def run_dev_queue_tui_cli(argv: list[str] | None = None) -> int:
     return 1
 
 
+def run_dev_queue_doctor_cli(argv: list[str] | None = None) -> int:
+    """Console entrypoint (`agy-doctor`) forwarding to `pr_remediator.py queue-doctor`."""
+    forwarded = list(sys.argv[1:] if argv is None else argv)
+    candidates = (
+        resolve_plugin_root() / "skills" / "agy-code-remediation-pr" / "scripts" / "pr_remediator.py",
+        Path.home()
+        / ".gemini"
+        / "config"
+        / "plugins"
+        / PLUGIN_NAME
+        / "skills"
+        / "agy-code-remediation-pr"
+        / "scripts"
+        / "pr_remediator.py",
+    )
+    for script_path in candidates:
+        mod = _load_optional_module(script_path, "pr_remediator")
+        if mod is not None and hasattr(mod, "main"):
+            return int(mod.main(["queue-doctor", *forwarded]))
+    sys.stderr.write("[agy-doctor] Error: pr_remediator.py not found. Run ./install.sh to deploy agy-dev-plugin.\n")
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for `dev_common.py`."""
     args = build_parser().parse_args(argv)

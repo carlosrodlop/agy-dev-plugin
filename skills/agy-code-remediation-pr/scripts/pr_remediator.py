@@ -71,6 +71,15 @@ from dev_flow_optimizer import (  # noqa: E402
     format_compact_opt_hint,
     normalize_pre_commit_status,
 )
+import dev_queue_doctor as _queue_doctor  # noqa: E402
+from dev_queue_doctor import (  # noqa: E402
+    DEFAULT_WAKE_COOLDOWN_SECONDS,
+    apply_safe_fixes,
+    diagnose_orchestrator,
+    render_doctor_report,
+    run_queue_doctor,
+    trigger_orchestrator_wake,
+)
 
 build_pro_dashboard_ui_url = dev_common.try_build_control_tower_ui_url
 restart_pro_api_server = dev_common.try_restart_control_tower_api
@@ -7119,6 +7128,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_qopt.add_argument("--brain-dir", dest="brain_dir", default=None, help="Optional Antigravity brain directory override for read-only transcript telemetry.")
     p_qopt.add_argument("--stall-seconds", dest="stall_seconds", type=int, default=None, help="Override stalled-worker idle threshold in seconds (default: 900).")
 
+    p_qdoc = sub.add_parser(
+        "queue-doctor",
+        help="0-LLM orchestrator diagnosis, safe runtime auto-heal (--fix), cooldown+PID-gated wake-up (--wake), and PR-only improvement advisor.",
+    )
+    p_qdoc.add_argument("--json", dest="as_json", action="store_true", help="Emit structured JSON diagnosis report.")
+    p_qdoc.add_argument("--sync-git", dest="sync_git", action="store_true", help="Sync per-repo locks and local main with git before diagnosing.")
+    p_qdoc.add_argument("--fix", action="store_true", help="Apply safe runtime-only reconciliations (sync locks & phantom pr_open items; never mutates tracked code).")
+    p_qdoc.add_argument("--wake", action="store_true", help="Launch detached native `agy --agent agy-dev-orchestrator` when needed (cooldown + live-PID gated).")
+    p_qdoc.add_argument("--heal", action="store_true", help="Shorthand for `--sync-git --fix --wake`.")
+    p_qdoc.add_argument("--check-only", dest="check_only", action="store_true", help="0-LLM sidecar/cron health gate: exit 0 when healthy, exit 2 when anomaly requires wake or fix.")
+    p_qdoc.add_argument("--dry-run", dest="dry_run", action="store_true", help="Preview safe fixes and exact wake command/prompt without spawning processes or mutating state.")
+    p_qdoc.add_argument("--force", action="store_true", help="Override wake cooldown or healthy skip check when `--wake` is passed.")
+    p_qdoc.add_argument("--cooldown-seconds", dest="cooldown_seconds", type=int, default=DEFAULT_WAKE_COOLDOWN_SECONDS, help=f"Minimum seconds between orchestrator wake-ups (default: {DEFAULT_WAKE_COOLDOWN_SECONDS}).")
+    p_qdoc.add_argument("--stall-seconds", dest="stall_seconds", type=int, default=None, help="Override stalled-worker/orchestrator idle threshold in seconds (default: 900).")
+    p_qdoc.add_argument("--repos-dir", dest="repos_dir", default="", help="Optional parent directory of managed local git repositories.")
+    p_qdoc.add_argument("--state-dir", dest="state_dir", default="", help="Optional state directory override.")
+    p_qdoc.add_argument("--brain-dir", dest="brain_dir", default=None, help="Optional Antigravity brain directory override.")
+    p_qdoc.add_argument("--orchestrator-id", dest="orchestrator_id", default="", help="Optional orchestrator conversation ID override.")
+    p_qdoc.add_argument("--print-prompt", dest="print_prompt", action="store_true", help="Print the pre-computed wake-up prompt to stdout.")
+    p_qdoc.add_argument("--no-color", dest="no_color", action="store_true", help="Disable ANSI color codes in terminal report.")
+
     p_clean = sub.add_parser(
         "cleanup-merged-conversations",
         help="Safely delete merged conversation directories/protobufs and spawned subagents after verifying git merge and protections.",
@@ -7399,6 +7429,33 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(q_res, indent=2, ensure_ascii=False))
         return 0 if q_res.get("status") == "ok" else 1
+
+    if args.subcommand == "queue-doctor":
+        doc_res = run_queue_doctor(
+            state_dir=getattr(args, "state_dir", "") or None,
+            repos_dir=getattr(args, "repos_dir", "") or None,
+            brain_dir=getattr(args, "brain_dir", None),
+            orchestrator_cid=getattr(args, "orchestrator_id", ""),
+            sync_git=bool(getattr(args, "sync_git", False)),
+            fix=bool(getattr(args, "fix", False)),
+            wake=bool(getattr(args, "wake", False)),
+            heal=bool(getattr(args, "heal", False)),
+            check_only=bool(getattr(args, "check_only", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            force=bool(getattr(args, "force", False)),
+            cooldown_seconds=int(getattr(args, "cooldown_seconds", DEFAULT_WAKE_COOLDOWN_SECONDS)),
+            stall_threshold_seconds=getattr(args, "stall_seconds", None),
+        )
+        if bool(getattr(args, "as_json", False)):
+            print(json.dumps(doc_res, indent=2, ensure_ascii=False))
+        elif bool(getattr(args, "print_prompt", False)):
+            print(str(doc_res.get("wake_prompt") or ""))
+        else:
+            color_on = (not bool(getattr(args, "no_color", False))) and bool(
+                getattr(sys.stdout, "isatty", lambda: False)()
+            ) and not bool(os.environ.get("NO_COLOR"))
+            print(render_doctor_report(doc_res, color=color_on))
+        return int(doc_res.get("exit_code", 0))
 
     if args.subcommand == "cleanup-merged-conversations":
         c_res = cleanup_merged_conversations(

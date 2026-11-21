@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Antigravity Multi-Repo Dev Queue TUI Wrapper (`agy-queue`)
-# Portable POSIX/Bash/Zsh thin wrapper for `dev_queue_tui.py`.
+# Antigravity Multi-Repo Dev Queue TUI & Orchestrator Doctor Wrapper
+# (`agy-queue` / `agy-doctor`)
+# Portable POSIX/Bash/Zsh thin wrapper for `dev_queue_tui.py` and
+# `pr_remediator.py queue-doctor`.
 #
 # Usage:
-#   1. Direct execution:
-#        ./shell/agy_dev_queue.sh [--watch [SECS]] [--sync] [--help]
+#   1. Direct execution / symlinks (`~/.local/bin/agy-queue` & `agy-doctor`):
+#        agy-queue [--watch [SECS]] [--sync] [--help]
+#        agy-queue doctor [--fix] [--wake] [--heal] [--check-only] [--json]
+#        agy-doctor [--fix] [--wake] [--heal] [--check-only] [--json]
 #   2. Shell profile sourcing (Bash or Zsh):
 #        source "$HOME/.gemini/config/plugins/agy-dev-plugin/shell/agy_dev_queue.sh"
-#        agy-queue [--watch [SECS]] [--sync] [--help]
+#        agy-queue [--watch [SECS]]
+#        agy-doctor [--heal]
 # ==============================================================================
 
 _agy_queue_src=""
@@ -69,10 +74,50 @@ _agy_queue_resolve_script() {
   return 1
 }
 
+_agy_doctor_resolve_remediator() {
+  local candidate=""
+
+  if [[ -n "${AGY_PR_REMEDIATOR_SCRIPT:-}" && -f "${AGY_PR_REMEDIATOR_SCRIPT}" ]]; then
+    printf '%s\n' "${AGY_PR_REMEDIATOR_SCRIPT}"
+    return 0
+  fi
+
+  if [[ -n "${_AGY_DEV_QUEUE_WRAPPER_DIR:-}" ]]; then
+    candidate="${_AGY_DEV_QUEUE_WRAPPER_DIR}/../skills/agy-code-remediation-pr/scripts/pr_remediator.py"
+    if [[ -f "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  fi
+
+  candidate="${HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py"
+  if [[ -f "${candidate}" ]]; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+
+  return 1
+}
+
+agy_doctor() {
+  local rem_script=""
+  rem_script="$(_agy_doctor_resolve_remediator)" || {
+    printf '%s\n' "[agy-doctor] Error: pr_remediator.py not found. Run ./install.sh to deploy agy-dev-plugin." >&2
+    return 1
+  }
+  python3 "${rem_script}" queue-doctor "$@"
+}
+
 agy_queue() {
+  if [[ "${1:-}" == "doctor" ]]; then
+    shift
+    agy_doctor "$@"
+    return $?
+  fi
+
   local tui_script=""
   tui_script="$(_agy_queue_resolve_script)" || {
-    echo "[agy-queue] Error: dev_queue_tui.py not found. Run ./install.sh to deploy agy-dev-plugin." >&2
+    printf '%s\n' "[agy-queue] Error: dev_queue_tui.py not found. Run ./install.sh to deploy agy-dev-plugin." >&2
     return 1
   }
   python3 "${tui_script}" "$@"
@@ -92,9 +137,14 @@ fi
 if [[ "${_agy_queue_is_sourced}" -eq 1 ]]; then
   alias agy-queue='agy_queue'
   alias agy-queue-watch='agy_queue --watch'
+  alias agy-doctor='agy_doctor'
   unset _agy_queue_is_sourced
 else
   unset _agy_queue_is_sourced
   set -euo pipefail
-  agy_queue "$@"
+  if [[ "$(basename "$0")" == "agy-doctor" ]]; then
+    agy_doctor "$@"
+  else
+    agy_queue "$@"
+  fi
 fi
