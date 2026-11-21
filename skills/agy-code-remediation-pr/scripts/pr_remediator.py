@@ -1117,6 +1117,34 @@ def release_dev_pr_lock(
                         remaining_active_locks=get_all_dev_pr_locks(portfolio_dir=portfolio_dir),
                         portfolio_dir=portfolio_dir,
                     )
+    elif reason == "HUMAN_REJECTED_BRANCH":
+        rem_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
+        for released_slug, released_lock in released_entries:
+            cid_clean = str(released_lock.get("conversation_id") or "").strip()
+            if not cid_clean:
+                continue
+            still_locked = any(
+                _matches_cid(str(al.get("conversation_id") or ""), cid_clean)
+                or any(_matches_cid(str(s), cid_clean) for s in (al.get("sibling_conversation_ids") or []))
+                for al in rem_locks.values()
+            )
+            if still_locked:
+                continue
+            with contextlib.suppress(Exception):
+                q_snap = load_dev_queue(portfolio_dir=portfolio_dir)
+                existing_it = next(
+                    (it for it in (q_snap.get("items") or []) if _matches_cid(str(it.get("conversation_id") or ""), cid_clean)),
+                    None,
+                )
+                if isinstance(existing_it, dict) and str(existing_it.get("source") or "") == "ad_hoc_lock":
+                    rel_br = str(released_lock.get("branch_name") or "").strip()
+                    update_dev_queue_item_status(
+                        conversation_id=cid_clean,
+                        status="rejected",
+                        strip_pr_urls_for_branches=[rel_br] if rel_br else None,
+                        strip_repo_slug=released_slug,
+                        portfolio_dir=portfolio_dir,
+                    )
 
     for _, released_lock in released_entries:
         wt_path = str(released_lock.get("worktree_path") or "").strip()
@@ -1677,6 +1705,119 @@ def spawn_pr_merge_watcher_daemon(
         }
 
 
+def wait_for_unlock_or_actionable_event(
+    poll_interval_seconds: float = 15.0,
+    max_duration_seconds: float = 3600.0,
+    max_iterations: int | None = None,
+    stall_threshold_seconds: int | float | None = None,
+    orchestrator_conversation_id: str = "",
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+    brain_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """0-LLM reactive watcher that polls `sync_dev_pr_lock_with_git()` and exits the moment a repo unlocks, runnable work appears, or a worker stalls."""
+    initial_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
+    initial_locked_repos = set(initial_locks.keys())
+    initial_lock_ids = {slug: str(lk.get("lock_id") or "") for slug, lk in initial_locks.items()}
+
+    effective_brain: Path | str | None = brain_dir
+    if effective_brain is None and portfolio_dir is not None:
+        # Keep isolated test/custom portfolio directories hermetic from ~/.gemini/antigravity/brain
+        effective_brain = ""
+
+    start_mono = time.monotonic()
+    iterations = 0
+
+    while True:
+        iterations += 1
+        sync_res = sync_dev_pr_lock_with_git(portfolio_dir=portfolio_dir, git_client=git_client)
+        current_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
+        current_locked_repos = set(current_locks.keys())
+
+        released_set: set[str] = set(initial_locked_repos - current_locked_repos)
+        for slug, prev_id in initial_lock_ids.items():
+            cur_lk = current_locks.get(slug)
+            if cur_lk is not None and prev_id and str(cur_lk.get("lock_id") or "") != prev_id:
+                released_set.add(slug)
+        rel_res_obj = sync_res.get("release_result")
+        if isinstance(rel_res_obj, dict):
+            for r_slug in rel_res_obj.get("released_repos") or []:
+                if str(r_slug).strip():
+                    released_set.add(dev_common.normalize_repo_slug(str(r_slug)))
+        by_repo_sync = sync_res.get("results_by_repo")
+        if isinstance(by_repo_sync, dict):
+            for r_slug, r_info in by_repo_sync.items():
+                if isinstance(r_info, dict) and bool(r_info.get("released")):
+                    released_set.add(dev_common.normalize_repo_slug(str(r_slug)))
+        released_repos = sorted(released_set)
+
+        q_next = get_next_dev_queue_item(
+            orchestrator_conversation_id=orchestrator_conversation_id,
+            portfolio_dir=portfolio_dir,
+            skip_locked_repos=True,
+        )
+        next_unlocked = q_next.get("next_unlocked_item")
+        runnable_by_repo = q_next.get("runnable_by_repo") or {}
+        summary = q_next.get("summary") or {}
+
+        stalled_locks: list[dict[str, Any]] = []
+        for slug, lk in sorted(current_locks.items()):
+            st_info = detect_stalled_lock(
+                lk,
+                threshold_seconds=stall_threshold_seconds,
+                brain_dir=effective_brain,
+            )
+            if st_info.get("stalled"):
+                stalled_locks.append(
+                    {
+                        "repo_slug": slug,
+                        "branch_name": str(lk.get("branch_name") or ""),
+                        "conversation_id": str(lk.get("conversation_id") or ""),
+                        "worker_cid": str(st_info.get("worker_cid") or ""),
+                        "idle_seconds": int(st_info.get("idle_seconds") or 0),
+                        "idle_label": str(st_info.get("idle_label") or ""),
+                    }
+                )
+
+        open_active_count = (
+            int(summary.get("pending") or 0)
+            + int(summary.get("in_progress") or 0)
+            + int(summary.get("pr_open") or 0)
+        )
+        elapsed_seconds = round(max(0.0, time.monotonic() - start_mono), 2)
+
+        def _payload(event_name: str, *, rearm: bool = False) -> dict[str, Any]:
+            return {
+                "status": "ok",
+                "event": event_name,
+                "released_repos": released_repos,
+                "active_lock_repos": sorted(current_locked_repos),
+                "active_lock_count": len(current_locks),
+                "stalled_locks": stalled_locks,
+                "next_unlocked_item": next_unlocked,
+                "runnable_by_repo": runnable_by_repo,
+                "summary": summary,
+                "iterations": iterations,
+                "elapsed_seconds": elapsed_seconds,
+                "rearm_recommended": rearm,
+            }
+
+        if released_repos:
+            return _payload("repo_unlocked", rearm=False)
+        if next_unlocked is not None:
+            return _payload("runnable_work_available", rearm=False)
+        if stalled_locks:
+            return _payload("stalled_worker", rearm=False)
+        if not current_locks and open_active_count == 0:
+            return _payload("queue_drained", rearm=False)
+        if max_iterations is not None and iterations >= max_iterations:
+            return _payload("max_iterations", rearm=bool(current_locks or open_active_count > 0))
+        if (time.monotonic() - start_mono) >= max_duration_seconds:
+            return _payload("timeout", rearm=bool(current_locks or open_active_count > 0))
+
+        time.sleep(max(0.05, float(poll_interval_seconds)))
+
+
 # ==============================================================================
 # Steps 1–4: RCA / Prompt Scope, Timestamped Branch Creation, Lock & Worktree
 # ==============================================================================
@@ -2136,6 +2277,21 @@ def start_remediation_branch_and_lock(
     )
     if not lock_res.get("acquired"):
         return lock_res
+
+    if cid_clean:
+        with contextlib.suppress(Exception):
+            _sync_active_lock_to_dev_queue(
+                conversation_id=cid_clean,
+                status="in_progress",
+                title=proposal_title,
+                action_id=action_id,
+                repo_slug=repo_slug,
+                branch_name=branch_name,
+                rca_summary=rca_summary,
+                proposed_fix=proposed_fix,
+                target_files=target_files,
+                portfolio_dir=portfolio_dir,
+            )
 
     return {
         "status": "ok",
@@ -3576,7 +3732,7 @@ def push_remediation_branch_and_build_reviewer_plan(
 
     if cid_clean:
         with contextlib.suppress(Exception):
-            update_dev_queue_item_status(
+            upd_q = update_dev_queue_item_status(
                 conversation_id=cid_clean,
                 status="in_progress",
                 branch_names=[resolved_head],
@@ -3584,6 +3740,18 @@ def push_remediation_branch_and_build_reviewer_plan(
                 strip_repo_slug=resolved_repo_slug,
                 portfolio_dir=portfolio_dir,
             )
+            if not upd_q.get("updated"):
+                _sync_active_lock_to_dev_queue(
+                    conversation_id=cid_clean,
+                    status="in_progress",
+                    title=commit_title,
+                    action_id=str(lock_info.get("action_id") or ""),
+                    repo_slug=resolved_repo_slug,
+                    branch_name=resolved_head,
+                    rca_summary=rca_summary,
+                    proposed_fix=preserved_exec_summary,
+                    portfolio_dir=portfolio_dir,
+                )
 
     reviewer_plan = build_pr_reviewer_subagent_plan(
         pr_number=None,
@@ -4294,7 +4462,7 @@ def record_pr_review_evaluation(
         )
         if cid_clean:
             with contextlib.suppress(Exception):
-                update_dev_queue_item_status(
+                upd_q = update_dev_queue_item_status(
                     conversation_id=cid_clean,
                     status="pr_open",
                     branch_names=[resolved_branch],
@@ -4302,6 +4470,20 @@ def record_pr_review_evaluation(
                     subagent_conversation_ids=recorded_subagents,
                     portfolio_dir=portfolio_dir,
                 )
+                if not upd_q.get("updated"):
+                    _sync_active_lock_to_dev_queue(
+                        conversation_id=cid_clean,
+                        status="pr_open",
+                        title=proposal_title,
+                        action_id=str(lock_info.get("action_id") or ""),
+                        repo_slug=resolved_repo_slug,
+                        branch_name=resolved_branch,
+                        pr_urls=[manual_pr_url],
+                        subagent_conversation_ids=recorded_subagents,
+                        rca_summary=str(lock_info.get("summary") or ""),
+                        proposed_fix=resolved_exec_summary,
+                        portfolio_dir=portfolio_dir,
+                    )
 
     if cid_clean:
         p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
@@ -4928,6 +5110,9 @@ def enqueue_dev_queue_item(
         if created:
             resolved_status = norm_status
             resolved_prio = norm_priority
+        elif source == "ad_hoc_lock":
+            resolved_status = existing_status if existing_status in ("merged", "cleaned") else norm_status
+            resolved_prio = int(existing.get("priority", norm_priority))
         elif source == "auto_lock" and existing_status in (*DEV_QUEUE_HOLD_STATUSES, "in_progress", "pr_open"):
             resolved_status = existing_status
             resolved_prio = int(existing.get("priority", norm_priority))
@@ -4938,9 +5123,15 @@ def enqueue_dev_queue_item(
             resolved_status = norm_status
             resolved_prio = norm_priority
 
+        existing_title = str(existing.get("title") or "").strip()
+        if source == "ad_hoc_lock" and existing_title:
+            resolved_title = existing_title
+        else:
+            resolved_title = title.strip() or existing_title or action_id.strip() or cid_clean[:8]
+
         item: dict[str, Any] = {
             "conversation_id": str(existing.get("conversation_id") or cid_clean),
-            "title": title.strip() or str(existing.get("title") or action_id.strip() or cid_clean[:8]),
+            "title": resolved_title,
             "action_id": action_id.strip() or str(existing.get("action_id") or ""),
             "priority": resolved_prio,
             "status": resolved_status,
@@ -4979,6 +5170,46 @@ def enqueue_dev_queue_item(
         "item": item,
         "summary": get_dev_queue_summary(data["items"]),
     }
+
+
+def _sync_active_lock_to_dev_queue(
+    *,
+    conversation_id: str,
+    status: str = "in_progress",
+    title: str = "",
+    action_id: str = "",
+    repo_slug: str = "",
+    branch_name: str = "",
+    pr_urls: list[str] | None = None,
+    subagent_conversation_ids: list[str] | None = None,
+    rca_summary: str = "",
+    proposed_fix: str = "",
+    target_files: list[str] | None = None,
+    portfolio_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Ensure every active `dev_pr_lock` (including ad-hoc runs) is tracked in `dev_queue.json`."""
+    cid_clean = str(conversation_id or "").strip()
+    if not cid_clean:
+        return {"status": "skipped", "reason": "missing_conversation_id"}
+    norm_slug = dev_common.normalize_repo_slug(repo_slug)
+    repo_list = [norm_slug] if (norm_slug and norm_slug != "default") else []
+    clean_title = str(title or "").strip() or str(action_id or "").strip() or str(rca_summary or "").strip()[:96]
+    return enqueue_dev_queue_item(
+        conversation_id=cid_clean,
+        title=clean_title,
+        action_id=action_id,
+        priority=15,
+        repo_slugs=repo_list,
+        status=status,
+        rca_summary=rca_summary,
+        proposed_fix=proposed_fix,
+        target_files=target_files,
+        branch_names=[branch_name] if str(branch_name or "").strip() else None,
+        pr_urls=pr_urls,
+        subagent_conversation_ids=subagent_conversation_ids,
+        source="ad_hoc_lock",
+        portfolio_dir=portfolio_dir,
+    )
 
 
 def update_dev_queue_item_status(
@@ -5280,12 +5511,22 @@ def _mark_queue_item_repo_merged(
             ]
         )
         still_locked_for_item = False
+        still_locked_human_ready = False
+        _human_ready_statuses = {
+            "PENDING_HUMAN_PR_VALIDATION",
+            "PR_OPEN",
+            "REVIEW_PASSED",
+            "REVIEW_APPROVED",
+            "NEEDS_HUMAN_REVIEW",
+        }
         for act_lock in (remaining_active_locks or {}).values():
             act_cid = str(act_lock.get("conversation_id") or "").strip()
             act_sibs = [str(s).strip() for s in (act_lock.get("sibling_conversation_ids") or [])]
             if _matches_cid(act_cid, cid_clean) or any(_matches_cid(s, cid_clean) for s in act_sibs):
                 still_locked_for_item = True
-                break
+                act_st_u = str(act_lock.get("status") or "").strip().upper()
+                if act_st_u in _human_ready_statuses and bool(act_lock.get("pr_gate_ready", True)):
+                    still_locked_human_ready = True
         all_target_repos_merged = (
             (not target_repos and not still_locked_for_item)
             or (clean_slug in ("", "default") and len(target_repos) <= 1 and not still_locked_for_item)
@@ -5305,9 +5546,12 @@ def _mark_queue_item_repo_merged(
         )
         if all_target_repos_merged:
             item["status"] = "merged"
+        elif still_locked_human_ready or bool(item["pr_urls"]):
+            item["status"] = "pr_open"
+        elif still_locked_for_item:
+            item["status"] = "in_progress"
         else:
-            cur_st = str(item.get("status") or "pr_open").lower()
-            item["status"] = cur_st if cur_st in ("in_progress", "pr_open") else "pr_open"
+            item["status"] = "pending"
         item["updated_at"] = now_iso
         items[idx] = item
         data["items"] = _sort_dev_queue_items(items)
@@ -5778,6 +6022,34 @@ def reconcile_dev_queue_with_git(
                     }
                 )
 
+        # Self-heal phantom `pr_open` items left with zero active locks and zero open PR URLs
+        cur_item_status = str(item.get("status") or "").strip().lower()
+        remaining_unmerged = [r for r in target_repos if r not in already_merged]
+        if cur_item_status == "pr_open" and remaining_unmerged and not _normalize_str_list(item.get("pr_urls")):
+            item_still_locked = any(
+                _matches_cid(str(al.get("conversation_id") or ""), item_cid)
+                or any(_matches_cid(str(s), item_cid) for s in (al.get("sibling_conversation_ids") or []))
+                for al in active_locks.values()
+            )
+            if not item_still_locked and (not is_scoped or scoped_slug in remaining_unmerged or scoped_slug in already_merged):
+                upd_ph = update_dev_queue_item_status(
+                    conversation_id=item_cid,
+                    status="pending",
+                    portfolio_dir=portfolio_dir,
+                )
+                if upd_ph.get("updated"):
+                    item = dict(upd_ph.get("item") or item)
+                    reconciled_items.append(
+                        {
+                            "conversation_id": item_cid,
+                            "repo_slug": remaining_unmerged[0],
+                            "evidence": "phantom_pr_open_reverted_to_pending",
+                            "status": str(item.get("status") or "pending"),
+                            "merged_repos": list(item.get("merged_repos") or []),
+                            "pr_urls_remaining": list(item.get("pr_urls") or []),
+                        }
+                    )
+
     result: dict[str, Any] = {
         "status": "ok",
         "checked_count": checked_count,
@@ -5848,23 +6120,52 @@ def get_next_dev_queue_item(
                 unmet.append(f"{dep_clean}({matched_st})")
         return unmet
 
-    def _item_repo_conflict(item: dict[str, Any]) -> list[str]:
-        item_repos = [
+    def _item_repo_schedule(item: dict[str, Any]) -> tuple[list[str], list[str], list[str], list[str]]:
+        """Compute `(remaining_repos, dispatch_repos, foreign_locked, self_locked)` using contract-first ordering and subtracting `merged_repos`."""
+        item_repos = _normalize_str_list(
+            [dev_common.normalize_repo_slug(str(r)) for r in (item.get("repo_slugs") or []) if str(r).strip()]
+        )
+        merged_set = {
             dev_common.normalize_repo_slug(str(r))
-            for r in (item.get("repo_slugs") or [])
+            for r in (item.get("merged_repos") or [])
             if str(r).strip()
-        ]
+        }
+        remaining_repos = [r for r in item_repos if r not in merged_set]
         item_cid = str(item.get("conversation_id") or "").strip()
-        conflicts: list[str] = []
-        for rslug in item_repos:
+        foreign_locked: list[str] = []
+        self_locked: list[str] = []
+        for rslug in remaining_repos:
             act = active_locks.get(rslug)
-            if act and not _matches_cid(str(act.get("conversation_id") or ""), item_cid):
-                conflicts.append(rslug)
-        return conflicts
+            if not act:
+                continue
+            act_cid = str(act.get("conversation_id") or "").strip()
+            act_sibs = [str(s).strip() for s in (act.get("sibling_conversation_ids") or [])]
+            is_owner = _matches_cid(act_cid, item_cid) or any(_matches_cid(s, item_cid) for s in act_sibs)
+            if is_owner:
+                self_locked.append(rslug)
+            else:
+                foreign_locked.append(rslug)
+
+        if not remaining_repos:
+            return ([], [], [], [])
+        next_contract_repo = remaining_repos[0]
+        if next_contract_repo in foreign_locked or next_contract_repo in self_locked:
+            return (remaining_repos, [], foreign_locked, self_locked)
+        if not foreign_locked:
+            dispatch_repos = [r for r in remaining_repos if r not in self_locked]
+        else:
+            # Contract-first partial multi-repo dispatch: advance unlocked prefix repo(s) ahead of downstream locked repo(s)
+            dispatch_repos = []
+            for r in remaining_repos:
+                if r in foreign_locked or r in self_locked:
+                    break
+                dispatch_repos.append(r)
+        return (remaining_repos, dispatch_repos, foreign_locked, self_locked)
 
     next_item: dict[str, Any] | None = None
     next_pending_item: dict[str, Any] | None = None
     next_unlocked_item: dict[str, Any] | None = None
+    runnable_by_repo: dict[str, dict[str, Any]] = {}
     blocked_deps: list[dict[str, Any]] = []
     blocked_repos: list[dict[str, Any]] = []
 
@@ -5882,20 +6183,42 @@ def get_next_dev_queue_item(
                 }
             )
             continue
-        repo_conflicts = _item_repo_conflict(it)
-        if repo_conflicts:
+        remaining_repos, dispatch_repos, foreign_locked, self_locked = _item_repo_schedule(it)
+        is_self_waiting = bool(remaining_repos and remaining_repos[0] in self_locked)
+        is_contract_blocked = bool(remaining_repos and not dispatch_repos and foreign_locked)
+
+        if is_contract_blocked:
             blocked_repos.append(
                 {
                     "conversation_id": it.get("conversation_id"),
                     "title": it.get("title"),
-                    "locked_repos": repo_conflicts,
+                    "locked_repos": foreign_locked,
                 }
             )
             if skip_locked_repos:
                 continue
+        elif is_self_waiting:
+            # Already actively developing or awaiting PR merge on its contract-first repo; do not re-dispatch as unlocked
+            if skip_locked_repos:
+                continue
         else:
+            annotated = dict(it)
+            if remaining_repos:
+                annotated["dispatch_repos"] = list(dispatch_repos)
+                annotated["partial_multi_repo_dispatch"] = bool(foreign_locked)
+                annotated["waiting_locked_repos"] = list(foreign_locked)
             if next_unlocked_item is None:
-                next_unlocked_item = it
+                next_unlocked_item = annotated
+            for free_repo in dispatch_repos:
+                if free_repo not in runnable_by_repo:
+                    runnable_by_repo[free_repo] = annotated
+            it_out = annotated
+            if next_item is None:
+                next_item = it_out
+            if st == "pending" and next_pending_item is None:
+                next_pending_item = it_out
+            continue
+
         if next_item is None:
             next_item = it
         if st == "pending" and next_pending_item is None:
@@ -5909,6 +6232,7 @@ def get_next_dev_queue_item(
         "next_item": next_item,
         "next_pending_item": next_pending_item,
         "next_unlocked_item": next_unlocked_item,
+        "runnable_by_repo": runnable_by_repo,
         "locked_repos": locked_repos,
         "blocked_by_dependencies": blocked_deps,
         "blocked_by_repo_locks": blocked_repos,
@@ -6718,6 +7042,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_watch.add_argument("--max-iterations", type=int, default=None, help="Optional maximum poll iterations before exiting.")
     p_watch.add_argument("--daemon", action="store_true", help="Spawn the watcher as a detached background daemon and return immediately.")
 
+    p_wait = sub.add_parser(
+        "wait-for-unlock",
+        help="0-LLM reactive background waiter for agy-dev-orchestrator: polls origin every N seconds and exits cleanly the moment any repo unlocks, runnable work appears, or a worker stalls.",
+    )
+    p_wait.add_argument("--interval", type=float, default=15.0, help="Polling interval in seconds (default: 15).")
+    p_wait.add_argument("--max-duration", type=float, default=3600.0, help="Maximum wait duration in seconds before returning timeout with rearm_recommended (default: 3600).")
+    p_wait.add_argument("--max-iterations", type=int, default=None, help="Optional maximum poll iterations before exiting.")
+    p_wait.add_argument("--stall-seconds", dest="stall_seconds", type=int, default=None, help="Override stalled-worker idle threshold in seconds (default: 900).")
+    p_wait.add_argument("--orchestrator-id", dest="orchestrator_id", default="", help="Active orchestrator conversation ID.")
+    p_wait.add_argument("--brain-dir", dest="brain_dir", default=None, help="Optional Antigravity brain directory override for worker transcript mtime checks.")
+
     for eval_cmd in ("evaluate-branch", "finalize-pr"):
         p_fin = sub.add_parser(
             eval_cmd,
@@ -6963,6 +7298,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") in ("ok", "skipped") else 1
+
+    if args.subcommand == "wait-for-unlock":
+        res = wait_for_unlock_or_actionable_event(
+            poll_interval_seconds=args.interval,
+            max_duration_seconds=args.max_duration,
+            max_iterations=args.max_iterations,
+            stall_threshold_seconds=getattr(args, "stall_seconds", None),
+            orchestrator_conversation_id=getattr(args, "orchestrator_id", ""),
+            brain_dir=getattr(args, "brain_dir", None),
+        )
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res.get("status") == "ok" else 1
 
     if args.subcommand in ("evaluate-branch", "finalize-pr"):
         res = evaluate_branch_and_release_lock(

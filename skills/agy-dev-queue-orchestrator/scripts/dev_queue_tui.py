@@ -1307,10 +1307,8 @@ def _resolve_item_human_pr_link(
         pu = _repo_pulls_url(target_slug, repo_web_bases) if target_slug else ""
         if saw_merged:
             return ("Sync", pu, False, "merged", target_slug)
-        if saw_missing:
+        if saw_missing or pu:
             return ("Stale", pu, False, "stale", target_slug)
-        if pu:
-            return ("PR", pu, True, "unknown", target_slug)
 
     return ("", "", False, "", "")
 
@@ -1496,6 +1494,91 @@ def _compute_lightweight_opt_hint(
         return ""
 
 
+def _cids_match(cid_a: str, cid_b: str) -> bool:
+    """Return True when two conversation IDs match exactly or share an 8-char prefix."""
+    a = str(cid_a or "").strip().lower()
+    b = str(cid_b or "").strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(a) >= 8 and len(b) >= 8 and a[:8] == b[:8]:
+        return a.startswith(b) or b.startswith(a)
+    return False
+
+
+def _synthesize_untracked_lock_items(
+    items: list[dict[str, Any]],
+    locks: dict[str, dict[str, Any]],
+    locks_by_cid: dict[str, list[tuple[str, dict[str, Any]]]],
+) -> list[dict[str, Any]]:
+    """Synthesize live table items for active `dev_pr_locks` not represented among active `dev_queue.json` rows."""
+    active_queue_cids = [
+        str(it.get("conversation_id") or "").strip()
+        for it in items
+        if str(it.get("status") or "pending").strip().lower() not in INACTIVE_STATUSES
+        and str(it.get("conversation_id") or "").strip()
+    ]
+    grouped: dict[str, dict[str, Any]] = {}
+    for slug, lk in sorted(locks.items()):
+        if not isinstance(lk, dict) or not bool(lk.get("active", True)):
+            continue
+        primary_cid = str(lk.get("conversation_id") or "").strip()
+        sibs = [str(s).strip() for s in (lk.get("sibling_conversation_ids") or []) if str(s).strip()]
+        lock_cids = [c for c in [primary_cid, *sibs] if c]
+        if any(_cids_match(lcid, qcid) for lcid in lock_cids for qcid in active_queue_cids):
+            continue
+
+        synth_cid = primary_cid or f"lock-{slug.split('/')[-1]}"
+        is_ready = is_lock_human_ready(lk)
+        raw_title = (
+            str(lk.get("proposal_title") or "").strip()
+            or str(lk.get("action_id") or "").strip()
+            or str(lk.get("summary") or "").strip()
+            or str(lk.get("branch_name") or "").strip()
+            or slug.split("/")[-1]
+        )
+        pr_candidates: list[str] = []
+        if is_ready:
+            for k in ("pr_url", "manual_pr_url"):
+                u = _sanitize_full_url(str(lk.get(k) or ""))
+                if u:
+                    pr_candidates.append(u)
+                    break
+
+        entry = grouped.get(synth_cid)
+        if entry is None:
+            grouped[synth_cid] = {
+                "conversation_id": synth_cid,
+                "priority": 10,
+                "status": "pr_open" if is_ready else "in_progress",
+                "repo_slugs": [slug],
+                "merged_repos": [],
+                "branch_names": [str(lk.get("branch_name") or "").strip()] if lk.get("branch_name") else [],
+                "pr_urls": pr_candidates,
+                "title": f"[ad-hoc] {raw_title}",
+                "source": "ad_hoc_lock",
+                "synthetic_live_lock": True,
+                "added_at": str(lk.get("acquired_at") or ""),
+            }
+        else:
+            if slug not in entry["repo_slugs"]:
+                entry["repo_slugs"].append(slug)
+            if is_ready:
+                entry["status"] = "pr_open"
+                for u in pr_candidates:
+                    if u not in entry["pr_urls"]:
+                        entry["pr_urls"].append(u)
+            br_n = str(lk.get("branch_name") or "").strip()
+            if br_n and br_n not in entry["branch_names"]:
+                entry["branch_names"].append(br_n)
+
+        if synth_cid not in locks_by_cid or all(s != slug for s, _ in locks_by_cid[synth_cid]):
+            locks_by_cid.setdefault(synth_cid, []).append((slug, lk))
+
+    return list(grouped.values())
+
+
 def render(
     args: argparse.Namespace,
     *,
@@ -1580,15 +1663,18 @@ def render(
                 seen_lock_cid_pairs.add(pair)
                 locks_by_cid.setdefault(lcid, []).append((slug, lk))
 
+    synthetic_lock_items = _synthesize_untracked_lock_items(items, locks, locks_by_cid)
+    effective_items = [*synthetic_lock_items, *items]
+
     counts: dict[str, int] = {}
-    for it in items:
+    for it in effective_items:
         st = str(it.get("status") or "pending")
         counts[st] = counts.get(st, 0) + 1
 
     filtered: list[dict[str, Any]] = []
     repo_filter = (args.repo or "").strip().lower()
     status_filter = (args.status or "").strip().lower()
-    for it in items:
+    for it in effective_items:
         st = str(it.get("status") or "pending")
         if not args.all and not status_filter and st in INACTIVE_STATUSES:
             continue

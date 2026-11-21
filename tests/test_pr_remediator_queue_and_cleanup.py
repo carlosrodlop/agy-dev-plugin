@@ -628,7 +628,8 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertEqual(picked["next_item"]["conversation_id"], cid_low_unlocked)
             self.assertTrue(picked["blocked_by_repo_locks"])
 
-            # Verify partial multi-repo merge progression (`merged_repos`)
+            # Verify partial multi-repo merge progression (`merged_repos`):
+            # without any open 2nd PR URL or active lock on acme-tower, item cleanly reverts to `pending` (never phantom `pr_open`)
             prs.update_dev_queue_item_status(cid_high_locked, status="pr_open", portfolio_dir=pdir)
             partial = prs._mark_queue_item_repo_merged(
                 conversation_id=cid_high_locked,
@@ -637,7 +638,7 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
                 portfolio_dir=pdir,
             )["item"]
             self.assertEqual(partial["merged_repos"], ["acme-org/acme-plugin"])
-            self.assertEqual(partial["status"], "pr_open")
+            self.assertEqual(partial["status"], "pending")
 
             completed = prs._mark_queue_item_repo_merged(
                 conversation_id=cid_high_locked,
@@ -2852,6 +2853,404 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             cli_payload = json.loads(buf.getvalue())
             self.assertEqual(cli_payload["status"], "ok")
             self.assertGreaterEqual(cli_payload["summary"]["total_findings"], 8)
+
+    def test_contract_first_partial_multi_repo_scheduling_and_merged_repos_subtraction(self) -> None:
+        """Verify `queue-next --unlocked` subtracts `merged_repos`, schedules contract-first unlocked prefixes, and populates `runnable_by_repo`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            _, repo_a = _init_bare_and_clone_repo(troot, name="acme-a")
+            _, repo_b = _init_bare_and_clone_repo(troot, name="acme-b")
+
+            orch_cid = "aaaa1111-aaaa-4aaa-8aaa-111111111111"
+            holder_b = "bbbb2222-bbbb-4bbb-8bbb-222222222222"
+            cid_multi_ab = "cccc3333-cccc-4ccc-8ccc-333333333333"
+            cid_single_a = "dddd4444-dddd-4ddd-8ddd-444444444444"
+            cid_single_c = "eeee5555-eeee-4eee-8eee-555555555555"
+
+            # Lock downstream repo-b; repo-a and repo-c are FREE
+            prs.acquire_dev_pr_lock(
+                conversation_id=holder_b,
+                action_id="hold-b",
+                branch_name="fix/20261121-080000-holdb-bbbb2222",
+                summary="PR waiting on repo-b",
+                proposed_fix="Hold",
+                target_repo_dir=str(repo_b),
+                repo_slug="acme/acme-b",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=holder_b,
+                title="Active PR on repo-b",
+                priority=10,
+                repo_slugs=["acme/acme-b"],
+                status="pr_open",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_multi_ab,
+                title="P18 contract-first multi-repo A -> B",
+                priority=18,
+                repo_slugs=["acme/acme-a", "acme/acme-b"],
+                status="pending",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_single_a,
+                title="P25 single-repo A",
+                priority=25,
+                repo_slugs=["acme/acme-a"],
+                status="pending",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_single_c,
+                title="P30 single-repo C",
+                priority=30,
+                repo_slugs=["acme/acme-c"],
+                status="pending",
+                portfolio_dir=pdir,
+            )
+
+            picked = prs.get_next_dev_queue_item(orch_cid, portfolio_dir=pdir, skip_locked_repos=True)
+            # Self-locked holder_b on repo-b must NOT be returned as next_unlocked_item;
+            # P18 contract-first multi-repo item MUST win for unlocked repo-a ahead of P25 single-repo A
+            self.assertIsNotNone(picked["next_unlocked_item"])
+            self.assertEqual(picked["next_unlocked_item"]["conversation_id"], cid_multi_ab)
+            self.assertEqual(picked["next_unlocked_item"]["dispatch_repos"], ["acme/acme-a"])
+            self.assertTrue(picked["next_unlocked_item"]["partial_multi_repo_dispatch"])
+            self.assertEqual(picked["next_unlocked_item"]["waiting_locked_repos"], ["acme/acme-b"])
+            # runnable_by_repo maps BOTH free repos simultaneously
+            self.assertEqual(picked["runnable_by_repo"]["acme/acme-a"]["conversation_id"], cid_multi_ab)
+            self.assertEqual(picked["runnable_by_repo"]["acme/acme-c"]["conversation_id"], cid_single_c)
+
+            # Now simulate repo-a merged on cid_multi_ab, repo-a locked by another task, and repo-b FREE:
+            # merged_repos subtraction ensures cid_multi_ab is NO LONGER falsely blocked by repo-a!
+            prs._mark_queue_item_repo_merged(
+                conversation_id=cid_multi_ab,
+                released_repo_slug="acme/acme-a",
+                branch_names=["fix/20261121-081000-multi-cccc3333"],
+                portfolio_dir=pdir,
+            )
+            with (
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+                mock.patch.object(prs, "restart_pro_api_server", return_value=False),
+            ):
+                prs.release_dev_pr_lock(reason="HUMAN_VALIDATED_MANUAL_PR", repo_slug="acme/acme-b", portfolio_dir=pdir)
+            prs.acquire_dev_pr_lock(
+                conversation_id="ffff6666-ffff-4fff-8fff-666666666666",
+                action_id="hold-a",
+                branch_name="fix/20261121-082000-holda-ffff6666",
+                summary="Busy on repo-a",
+                proposed_fix="Hold",
+                target_repo_dir=str(repo_a),
+                repo_slug="acme/acme-a",
+                portfolio_dir=pdir,
+            )
+            picked2 = prs.get_next_dev_queue_item(orch_cid, portfolio_dir=pdir, skip_locked_repos=True)
+            self.assertEqual(picked2["next_unlocked_item"]["conversation_id"], cid_multi_ab)
+            self.assertEqual(picked2["next_unlocked_item"]["dispatch_repos"], ["acme/acme-b"])
+            self.assertFalse(picked2["next_unlocked_item"]["partial_multi_repo_dispatch"])
+
+    def test_ad_hoc_lock_auto_upsert_reject_and_phantom_pr_open_self_heal(self) -> None:
+        """Verify `start-remediation` auto-tracks ad-hoc locks in `dev_queue.json`, rejects cleanly, and `queue-sync` self-heals phantom `pr_open`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            _, repo_a = _init_bare_and_clone_repo(troot, name="acme-adhoc")
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+
+            adhoc_cid = "1234abcd-1111-4222-8333-444444444444"
+            with (
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+                mock.patch.object(prs, "restart_pro_api_server", return_value=False),
+            ):
+                st_res = prs.start_remediation_branch_and_lock(
+                    conversation_id=adhoc_cid,
+                    action_id="adhoc-fix",
+                    rca_summary="Ad-hoc bug",
+                    proposed_fix="Fix ad-hoc bug",
+                    checkout_branch=True,
+                    branch_timestamp="20261121-090000",
+                    workdir=repo_a,
+                    portfolio_dir=pdir,
+                    git_client=vcs,
+                )
+                self.assertEqual(st_res["status"], "ok")
+                q_map = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+                self.assertIn(adhoc_cid, q_map)
+                self.assertEqual(q_map[adhoc_cid]["status"], "in_progress")
+                self.assertEqual(q_map[adhoc_cid]["source"], "ad_hoc_lock")
+
+                # Rejecting an ad-hoc lock transitions its dev_queue entry to rejected
+                prs.release_dev_pr_lock(
+                    reason="HUMAN_REJECTED_BRANCH",
+                    repo_slug=st_res["repo_slug"],
+                    portfolio_dir=pdir,
+                )
+                q_after_rej = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+                self.assertEqual(q_after_rej[adhoc_cid]["status"], "rejected")
+
+            # Seed a phantom `pr_open` item (0 active locks, 0 pr_urls, 1/2 repos already merged)
+            phantom_cid = "5678efab-1111-4222-8333-555555555555"
+            prs.enqueue_dev_queue_item(
+                conversation_id=phantom_cid,
+                title="Phantom PR after part 1 merge",
+                priority=18,
+                repo_slugs=["acme/repo-one", "acme/repo-two"],
+                status="pr_open",
+                branch_names=["fix/20261121-060000-part1-5678efab"],
+                pr_urls=[],
+                portfolio_dir=pdir,
+            )
+            # Mark repo-one already merged while leaving status=pr_open on disk directly
+            q_path = prs.get_dev_queue_path(portfolio_dir=pdir)
+            q_raw = json.loads(q_path.read_text(encoding="utf-8"))
+            for it in q_raw["items"]:
+                if it["conversation_id"] == phantom_cid:
+                    it["merged_repos"] = ["acme/repo-one"]
+                    it["status"] = "pr_open"
+            q_path.write_text(json.dumps(q_raw, indent=2), encoding="utf-8")
+
+            recon = prs.reconcile_dev_queue_with_git(portfolio_dir=pdir, fetch=False)
+            self.assertEqual(recon["status"], "ok")
+            self.assertTrue(
+                any(
+                    r["conversation_id"] == phantom_cid and r["evidence"] == "phantom_pr_open_reverted_to_pending"
+                    for r in recon["reconciled_items"]
+                )
+            )
+            q_healed = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+            self.assertEqual(q_healed[phantom_cid]["status"], "pending")
+            self.assertEqual(q_healed[phantom_cid]["merged_repos"], ["acme/repo-one"])
+
+    def test_wait_for_unlock_reactive_events_and_cli(self) -> None:
+        """Verify 0-LLM `wait-for-unlock` exits cleanly on runnable_work_available, repo_unlocked, stalled_worker, queue_drained, and max_iterations."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            orch_cid = "77770000-aaaa-4111-8111-000000000001"
+
+            # 1. Empty queue + zero locks -> queue_drained immediately
+            res_drained = prs.wait_for_unlock_or_actionable_event(
+                poll_interval_seconds=0.05,
+                max_iterations=2,
+                orchestrator_conversation_id=orch_cid,
+                portfolio_dir=pdir,
+            )
+            self.assertEqual(res_drained["event"], "queue_drained")
+            self.assertFalse(res_drained["rearm_recommended"])
+
+            # 2. Unlocked runnable work -> runnable_work_available immediately
+            prs.enqueue_dev_queue_item(
+                conversation_id="77770000-aaaa-4111-8111-000000000002",
+                title="Ready task on free repo",
+                priority=20,
+                repo_slugs=["acme/free-repo"],
+                status="pending",
+                portfolio_dir=pdir,
+            )
+            res_ready = prs.wait_for_unlock_or_actionable_event(
+                poll_interval_seconds=0.05,
+                max_iterations=2,
+                orchestrator_conversation_id=orch_cid,
+                portfolio_dir=pdir,
+            )
+            self.assertEqual(res_ready["event"], "runnable_work_available")
+            self.assertEqual(res_ready["next_unlocked_item"]["conversation_id"], "77770000-aaaa-4111-8111-000000000002")
+            self.assertIn("acme/free-repo", res_ready["runnable_by_repo"])
+
+            # 3. Lock acme/free-repo with fresh lock -> max_iterations with rearm_recommended=True
+            _, repo_free = _init_bare_and_clone_repo(troot, name="free-repo")
+            prs.acquire_dev_pr_lock(
+                conversation_id="77770000-aaaa-4111-8111-000000000003",
+                action_id="hold-free",
+                branch_name="fix/20261121-090000-hold-77770000",
+                summary="Waiting human PR",
+                proposed_fix="Hold",
+                target_repo_dir=str(repo_free),
+                repo_slug="acme/free-repo",
+                portfolio_dir=pdir,
+            )
+            prs.update_dev_pr_lock(
+                {"status": "PENDING_HUMAN_PR_VALIDATION", "pr_gate_ready": True},
+                repo_slug="acme/free-repo",
+                portfolio_dir=pdir,
+            )
+            with mock.patch.object(prs, "sync_dev_pr_lock_with_git", return_value={"status": "ok", "active": True}):
+                res_max = prs.wait_for_unlock_or_actionable_event(
+                    poll_interval_seconds=0.05,
+                    max_iterations=2,
+                    orchestrator_conversation_id=orch_cid,
+                    portfolio_dir=pdir,
+                )
+                self.assertEqual(res_max["event"], "max_iterations")
+                self.assertTrue(res_max["rearm_recommended"])
+                self.assertEqual(res_max["iterations"], 2)
+
+            # 4. Simulated merge releasing acme/free-repo on tick 2 -> repo_unlocked!
+            calls = {"n": 0}
+
+            def _fake_sync(**_kw: object) -> dict[str, object]:
+                calls["n"] += 1
+                if calls["n"] >= 2:
+                    with (
+                        mock.patch.object(prs, "stop_dev_api_server", return_value={"status": "skipped", "stopped": False}),
+                        mock.patch.object(prs, "restart_pro_api_server", return_value=False),
+                    ):
+                        prs.release_dev_pr_lock(
+                            reason="BRANCH_MERGED_INTO_MAIN",
+                            repo_slug="acme/free-repo",
+                            portfolio_dir=pdir,
+                        )
+                    return {"status": "ok", "active": False, "released": True, "release_result": {"released_repos": ["acme/free-repo"]}}
+                return {"status": "ok", "active": True, "released": False}
+
+            with mock.patch.object(prs, "sync_dev_pr_lock_with_git", side_effect=_fake_sync):
+                res_unlocked = prs.wait_for_unlock_or_actionable_event(
+                    poll_interval_seconds=0.05,
+                    max_iterations=4,
+                    orchestrator_conversation_id=orch_cid,
+                    portfolio_dir=pdir,
+                )
+            self.assertEqual(res_unlocked["event"], "repo_unlocked")
+            self.assertEqual(res_unlocked["released_repos"], ["acme/free-repo"])
+            self.assertEqual(res_unlocked["iterations"], 2)
+            self.assertEqual(res_unlocked["next_unlocked_item"]["conversation_id"], "77770000-aaaa-4111-8111-000000000002")
+
+            # 5. Stalled DEVELOPING lock -> stalled_worker event (backdate lock timestamps in actions_state.json)
+            prs.acquire_dev_pr_lock(
+                conversation_id="77770000-aaaa-4111-8111-000000000004",
+                action_id="stall-free",
+                branch_name="fix/20261121-070000-stall-77770000",
+                summary="Stalled",
+                proposed_fix="Stalled",
+                target_repo_dir=str(repo_free),
+                repo_slug="acme/free-repo",
+                portfolio_dir=pdir,
+            )
+            st_path = pdir / "actions_state.json"
+            st_raw = json.loads(st_path.read_text(encoding="utf-8"))
+            lk_raw = st_raw["actions_log_audit_state"]["dev_pr_locks"]["acme/free-repo"]
+            lk_raw["status"] = "DEVELOPING"
+            lk_raw["acquired_at"] = "2020-01-01T00:00:00Z"
+            lk_raw["updated_at"] = "2020-01-01T00:00:00Z"
+            lk_raw["last_activity_at"] = "2020-01-01T00:00:00Z"
+            st_path.write_text(json.dumps(st_raw, indent=2), encoding="utf-8")
+            with mock.patch.object(prs, "sync_dev_pr_lock_with_git", return_value={"status": "ok", "active": True}):
+                res_stall = prs.wait_for_unlock_or_actionable_event(
+                    poll_interval_seconds=0.05,
+                    max_iterations=2,
+                    stall_threshold_seconds=60,
+                    orchestrator_conversation_id=orch_cid,
+                    portfolio_dir=pdir,
+                )
+            self.assertEqual(res_stall["event"], "stalled_worker")
+            self.assertEqual(len(res_stall["stalled_locks"]), 1)
+            self.assertEqual(res_stall["stalled_locks"][0]["repo_slug"], "acme/free-repo")
+
+            # 6. CLI `wait-for-unlock` parses & runs cleanly
+            parsed = prs.parse_args(
+                ["wait-for-unlock", "--interval", "1", "--max-duration", "10", "--max-iterations", "1", "--orchestrator-id", orch_cid]
+            )
+            self.assertEqual(parsed.subcommand, "wait-for-unlock")
+            buf = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"AGY_DEV_STATE_DIR": str(pdir)}),
+                mock.patch.object(prs, "sync_dev_pr_lock_with_git", return_value={"status": "ok", "active": True}),
+                contextlib.redirect_stdout(buf),
+            ):
+                rc = prs.main(["wait-for-unlock", "--interval", "0.05", "--max-iterations", "1", "--stall-seconds", "60", "--orchestrator-id", orch_cid])
+            self.assertEqual(rc, 0)
+            cli_out = json.loads(buf.getvalue())
+            self.assertEqual(cli_out["event"], "stalled_worker")
+
+    def test_flow_optimizer_phantom_pr_untracked_lock_and_idle_orchestrator_detectors(self) -> None:
+        """Verify 0-LLM optimizer detects phantom_pr_open, untracked_active_lock, and idle_orchestrator_with_runnable_work."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            brain_dir = troot / "brain"
+            orch_cid = "88881111-aaaa-4111-8111-111111111111"
+            tpath = brain_dir / orch_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath.parent.mkdir(parents=True, exist_ok=True)
+            tpath.write_text('{"step_index": 1, "type": "PLANNER_RESPONSE"}\n', encoding="utf-8")
+
+            now_ts = prs._flow_opt.parse_iso_timestamp("2027-02-01T12:00:00Z")
+            idle_ts = now_ts - 2400.0  # 40m idle
+            os.utime(tpath, (idle_ts, idle_ts))
+
+            (pdir / "dev_queue.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "orchestrator_conversation_id": orch_cid,
+                        "items": [
+                            {
+                                "conversation_id": "88882222-aaaa-4222-8222-222222222222",
+                                "title": "Phantom PR item",
+                                "priority": 18,
+                                "status": "pr_open",
+                                "repo_slugs": ["acme/repo-a", "acme/repo-b"],
+                                "merged_repos": ["acme/repo-a"],
+                                "pr_urls": [],
+                                "target_files": ["a.py"],
+                            },
+                            {
+                                "conversation_id": "88883333-aaaa-4333-8333-333333333333",
+                                "title": "Runnable task on free repo",
+                                "priority": 20,
+                                "status": "pending",
+                                "repo_slugs": ["acme/repo-free"],
+                                "merged_repos": [],
+                                "target_files": ["b.py"],
+                            },
+                        ],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (pdir / "actions_state.json").write_text(
+                json.dumps(
+                    {
+                        "actions_log_audit_state": {
+                            "dev_pr_locks": {
+                                "acme/repo-adhoc": {
+                                    "active": True,
+                                    "conversation_id": "88884444-aaaa-4444-8444-444444444444",
+                                    "status": "PENDING_HUMAN_PR_VALIDATION",
+                                    "pr_gate_ready": True,
+                                    "branch_name": "fix/20270201-110000-adhoc-88884444",
+                                }
+                            }
+                        }
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            report = prs.analyze_dev_flow_optimizations(
+                portfolio_dir=pdir,
+                brain_dir=brain_dir,
+                orchestrator_cid=orch_cid,
+                now_ts=now_ts,
+                stall_threshold_seconds=900,
+            )
+            by_code = {f["code"]: f for f in report["findings"]}
+            self.assertIn("phantom_pr_open", by_code)
+            self.assertIn("untracked_active_lock", by_code)
+            self.assertIn("idle_orchestrator_with_runnable_work", by_code)
+            self.assertEqual(by_code["idle_orchestrator_with_runnable_work"]["evidence"]["runnable_count"], 1)
+            self.assertIn("acme/repo-free", by_code["idle_orchestrator_with_runnable_work"]["evidence"]["free_target_repos"])
+            hint = prs._flow_opt.format_compact_opt_hint(report)
+            self.assertTrue(hint.startswith("OPT:"))
+            self.assertTrue(any(tok in hint for tok in ("phantom PR", "untracked lock", "orch idle")))
 
 
 if __name__ == "__main__":

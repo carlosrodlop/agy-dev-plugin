@@ -358,6 +358,237 @@ def _make_finding(
     }
 
 
+def _cids_match(cid_a: str, cid_b: str) -> bool:
+    """Return True when two conversation IDs match exactly or share an 8-char UUID prefix."""
+    a = str(cid_a or "").strip().lower()
+    b = str(cid_b or "").strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if len(a) >= 8 and len(b) >= 8 and a[:8] == b[:8]:
+        return a.startswith(b) or b.startswith(a)
+    return False
+
+
+def _lock_matches_cid(lock_info: dict[str, Any], cid: str) -> bool:
+    """Return True when an active lock's primary or sibling conversation IDs match `cid`."""
+    if not isinstance(lock_info, dict) or not cid:
+        return False
+    if _cids_match(str(lock_info.get("conversation_id") or ""), cid):
+        return True
+    for sib in lock_info.get("sibling_conversation_ids") or []:
+        if _cids_match(str(sib or ""), cid):
+            return True
+    return False
+
+
+def _detect_phantom_pr_open(
+    items: list[dict[str, Any]],
+    active_locks: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Detect `pr_open` items with zero active locks and zero `pr_urls` (phantom PRs after partial merges)."""
+    phantoms: list[dict[str, Any]] = []
+    for it in items:
+        if str(it.get("status") or "").strip().lower() != "pr_open":
+            continue
+        cid = str(it.get("conversation_id") or "").strip()
+        if not cid:
+            continue
+        pr_urls = [str(u).strip() for u in (it.get("pr_urls") or []) if str(u).strip()]
+        if pr_urls:
+            continue
+        has_active_lock = any(_lock_matches_cid(lk, cid) for lk in active_locks.values())
+        if has_active_lock:
+            continue
+        phantoms.append(
+            {
+                "conversation_id": cid,
+                "title": str(it.get("title") or ""),
+                "repo_slugs": list(it.get("repo_slugs") or []),
+                "merged_repos": list(it.get("merged_repos") or []),
+            }
+        )
+    if not phantoms:
+        return []
+    cids = [p["conversation_id"] for p in phantoms]
+    return [
+        _make_finding(
+            code="phantom_pr_open",
+            severity="high",
+            category="reliability",
+            title=f"{len(phantoms)} phantom pr_open item(s) without active locks or PR URLs",
+            evidence={
+                "count": len(phantoms),
+                "conversation_ids": cids,
+                "items": phantoms,
+            },
+            recommendation=(
+                "Run `pr_remediator.py queue-sync` to auto-revert phantom `pr_open` items back to `pending` "
+                "(preserving `merged_repos`) so unlocked remaining repositories can execute cleanly."
+            ),
+            auto_action_hint="pr_remediator.py queue-sync",
+            estimated_savings_min=len(phantoms) * 15,
+        )
+    ]
+
+
+def _detect_untracked_active_locks(
+    items: list[dict[str, Any]],
+    active_locks: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Detect active `dev_pr_locks` whose conversation is absent from open `dev_queue.json` items."""
+    open_cids = [
+        str(it.get("conversation_id") or "").strip()
+        for it in items
+        if str(it.get("status") or "pending").strip().lower() in OPEN_QUEUE_STATUSES
+        and str(it.get("conversation_id") or "").strip()
+    ]
+    untracked: list[dict[str, Any]] = []
+    for repo_slug, lk in sorted(active_locks.items()):
+        if not isinstance(lk, dict) or not bool(lk.get("active", True)):
+            continue
+        l_cid = str(lk.get("conversation_id") or "").strip()
+        if any(_lock_matches_cid(lk, ocid) for ocid in open_cids):
+            continue
+        untracked.append(
+            {
+                "repo_slug": repo_slug,
+                "conversation_id": l_cid,
+                "branch_name": str(lk.get("branch_name") or ""),
+                "status": str(lk.get("status") or ""),
+                "pr_gate_ready": bool(lk.get("pr_gate_ready")),
+            }
+        )
+    if not untracked:
+        return []
+    repos_str = ", ".join(u["repo_slug"].split("/")[-1] for u in untracked)
+    return [
+        _make_finding(
+            code="untracked_active_lock",
+            severity="high",
+            category="visibility",
+            title=f"{len(untracked)} active ad-hoc lock(s) missing from dev_queue.json ({repos_str})",
+            evidence={
+                "count": len(untracked),
+                "locks": untracked,
+            },
+            recommendation=(
+                "Keep active ad-hoc locks tracked in `dev_queue.json` (auto-upserted by `start-remediation` / "
+                "`record-review`) and verify in `agy-queue` so human-ready PRs and running workers are never hidden."
+            ),
+            auto_action_hint="agy-queue --sync",
+            estimated_savings_min=len(untracked) * 10,
+        )
+    ]
+
+
+def _detect_idle_orchestrator_with_runnable_work(
+    items: list[dict[str, Any]],
+    active_locks: dict[str, dict[str, Any]],
+    brain_dir: Path | None,
+    *,
+    orchestrator_cid: str = "",
+    now_ts: float | None = None,
+    threshold_seconds: int | float | None = None,
+) -> list[dict[str, Any]]:
+    """Detect when runnable pending tasks exist for unlocked repos while the orchestrator session is idle."""
+    orch_clean = str(orchestrator_cid or "").strip()
+    if not orch_clean or brain_dir is None or not brain_dir.is_dir():
+        return []
+    tpath = brain_dir / orch_clean / ".system_generated" / "logs" / "transcript.jsonl"
+    if not tpath.is_file():
+        return []
+    try:
+        orch_mtime = float(tpath.stat().st_mtime)
+    except OSError:
+        return []
+
+    thresh = resolve_stall_threshold_seconds(threshold_seconds)
+    cur_ts = float(now_ts if now_ts is not None else time.time())
+    idle_seconds = max(0, int(cur_ts - orch_mtime))
+    if idle_seconds < thresh:
+        return []
+
+    status_by_cid = {
+        str(it.get("conversation_id") or "").strip(): str(it.get("status") or "").strip().lower()
+        for it in items
+        if str(it.get("conversation_id") or "").strip()
+    }
+    locked_slugs = {
+        str(k).strip().lower()
+        for k, v in active_locks.items()
+        if isinstance(v, dict) and bool(v.get("active", True))
+    }
+
+    runnable_ids: list[str] = []
+    free_repos: list[str] = []
+    for it in items:
+        if str(it.get("status") or "pending").strip().lower() != "pending":
+            continue
+        unmet = False
+        for dep in it.get("depends_on") or []:
+            dep_clean = str(dep or "").strip()
+            if not dep_clean:
+                continue
+            for cand_cid, cand_st in status_by_cid.items():
+                if _cids_match(cand_cid, dep_clean) and cand_st not in ("merged", "cleaned"):
+                    unmet = True
+                    break
+            if unmet:
+                break
+        if unmet:
+            continue
+
+        merged_set = {str(r).strip().lower() for r in (it.get("merged_repos") or []) if str(r).strip()}
+        remaining = [
+            str(r).strip()
+            for r in (it.get("repo_slugs") or [])
+            if str(r).strip() and str(r).strip().lower() not in merged_set
+        ]
+        if not remaining:
+            runnable_ids.append(str(it.get("conversation_id") or ""))
+            continue
+        next_repo = remaining[0]
+        if next_repo.lower() not in locked_slugs:
+            runnable_ids.append(str(it.get("conversation_id") or ""))
+            if next_repo not in free_repos:
+                free_repos.append(next_repo)
+
+    if not runnable_ids:
+        return []
+    idle_lbl = format_idle_duration(idle_seconds)
+    return [
+        _make_finding(
+            code="idle_orchestrator_with_runnable_work",
+            severity="high",
+            category="throughput",
+            title=(
+                f"Orchestrator {orch_clean[:8]} idle {idle_lbl} with {len(runnable_ids)} runnable task(s) "
+                f"on unlocked repo(s)"
+            ),
+            evidence={
+                "orchestrator_cid": orch_clean,
+                "idle_seconds": idle_seconds,
+                "idle_label": idle_lbl,
+                "threshold_seconds": thresh,
+                "runnable_count": len(runnable_ids),
+                "sample_runnable_ids": runnable_ids[:5],
+                "free_target_repos": free_repos,
+            },
+            recommendation=(
+                "Resume or rotate `agy-dev-orchestrator` and arm a 0-LLM background "
+                "`pr_remediator.py wait-for-unlock --orchestrator-id <CID>` task (+ safety watchdog timer) "
+                "so PR merges auto-wake the orchestrator in <15s."
+            ),
+            auto_action_hint=(
+                f"pr_remediator.py wait-for-unlock --orchestrator-id {orch_clean} --interval 15 --max-duration 3600"
+            ),
+            estimated_savings_min=max(15, idle_seconds // 60),
+        )
+    ]
+
+
 def _detect_stalled_workers(
     active_locks: dict[str, dict[str, Any]],
     *,
@@ -1051,6 +1282,12 @@ def format_compact_opt_hint(analysis: dict[str, Any], max_width: int = 120) -> s
         if code == "stalled_worker":
             repo_short = str(ev.get("repo_slug") or "").split("/")[-1]
             bits.append(f"stall {repo_short} ({ev.get('idle_label', '')})")
+        elif code == "phantom_pr_open":
+            bits.append(f"phantom PR ({ev.get('count', 1)})")
+        elif code == "untracked_active_lock":
+            bits.append(f"untracked lock ({ev.get('count', 1)})")
+        elif code == "idle_orchestrator_with_runnable_work":
+            bits.append(f"orch idle {ev.get('idle_label', '')} ({ev.get('runnable_count', 1)} ready)")
         elif code == "micro_pr_batch_candidates":
             repo_short = str(ev.get("repo_slug") or "").split("/")[-1]
             bits.append(f"batch {ev.get('count', 2)} PRs in {repo_short}")
@@ -1143,6 +1380,9 @@ def analyze_dev_flow_optimizations(
             brain_dir=resolved_brain if resolved_brain is not None else "",
         )
     )
+    # 1b. Phantom pr_open items (0 active locks & 0 pr_urls) and untracked ad-hoc active locks
+    findings.extend(_detect_phantom_pr_open(items, active_locks))
+    findings.extend(_detect_untracked_active_locks(items, active_locks))
     # 2. Micro-PR batch candidates
     findings.extend(_detect_micro_pr_batch_candidates(items))
     # 3. Repo contention hotspots
@@ -1165,13 +1405,23 @@ def analyze_dev_flow_optimizations(
                     line_threshold=max(1, int(god_file_line_threshold)),
                 )
             )
-        # 7. Telemetry efficiency anomalies
+        # 7. Telemetry efficiency anomalies + idle orchestrator with runnable work
         tel_findings, scanned_transcripts = _detect_telemetry_efficiency_anomalies(
             resolved_brain,
             orchestrator_cid=eff_orch_cid,
             max_recent_transcripts=max_recent_transcripts,
         )
         findings.extend(tel_findings)
+        findings.extend(
+            _detect_idle_orchestrator_with_runnable_work(
+                items,
+                active_locks,
+                resolved_brain,
+                orchestrator_cid=eff_orch_cid,
+                now_ts=now_ts,
+                threshold_seconds=stall_threshold_seconds,
+            )
+        )
 
     findings.sort(
         key=lambda f: (

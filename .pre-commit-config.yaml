@@ -30,7 +30,7 @@ repos:
     hooks:
       - id: qa-static-audit
         name: AGY Dev Static QA & Zero-PII Audit
-        entry: python3 ./tests/scripts/qa_static_audit.py --strict
+        entry: python3 ./tests/scripts/qa_static_audit.py --strict --incremental
         language: system
         pass_filenames: false
       - id: install-sh-syntax

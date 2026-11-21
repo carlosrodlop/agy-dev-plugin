@@ -867,7 +867,7 @@ class TestDevQueueTui(unittest.TestCase):
             self.assertIn("acme/repo-a", updated_item["merged_repos"])
             self.assertNotIn("acme/repo-b", updated_item["merged_repos"])
             self.assertNotEqual(updated_item["status"], "merged")
-            self.assertIn(updated_item["status"], ("pr_open", "in_progress"))
+            self.assertEqual(updated_item["status"], "pending")
 
             # Verify --fetch flag is passed to queue-sync ONLY when offline=False
             with mock.patch.object(tui.subprocess, "run") as mock_run:
@@ -1306,6 +1306,89 @@ class TestDevQueueTui(unittest.TestCase):
             self.assertFalse(lp_fresh["is_stalled"])
             self.assertEqual(lp_fresh["pct"], 35)
             self.assertEqual(lp_fresh["tag"], "~6m")
+
+    def test_untracked_ad_hoc_locks_synthesized_and_phantom_pr_open_never_hallucinates_pulls(self) -> None:
+        """Untracked active ad-hoc locks surface in table/counters/PR footer; phantom `pr_open` renders Stale (never fake `/pulls` PR)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            board_file = root / "board.md"
+
+            adhoc_pr_cid = "2770c9ef-1111-4222-8333-444444444444"
+            adhoc_dev_cid = "0305246e-1111-4222-8333-555555555555"
+            phantom_cid = "2170eff2-1111-4222-8333-666666666666"
+            real_pr_url = (
+                "https://github.com/acme/repo-ui/compare/main...fix/20261121-092514-adhoc-2770c9ef"
+                "?expand=1&title=fix%28ui%29%3A%20real%20ad-hoc%20PR&body=PASS%2099%2F100"
+            )
+            now_iso = "2027-01-15T10:00:00Z"
+            now_ts = tui._flow_opt.parse_iso_timestamp(now_iso)
+
+            _write_state(
+                state_dir,
+                items=[
+                    {
+                        "conversation_id": phantom_cid,
+                        "priority": 18,
+                        "status": "pr_open",
+                        "repo_slugs": ["acme/repo-api", "acme/repo-ui"],
+                        "merged_repos": ["acme/repo-api"],
+                        "pr_urls": [],
+                        "title": "Phantom partial multi-repo PR",
+                    }
+                ],
+                locks={
+                    "acme/repo-ui": {
+                        "active": True,
+                        "status": "PENDING_HUMAN_PR_VALIDATION",
+                        "pr_gate_ready": True,
+                        "conversation_id": adhoc_pr_cid,
+                        "proposal_title": "fix(ui): real ad-hoc PR",
+                        "branch_name": "fix/20261121-092514-adhoc-2770c9ef",
+                        "manual_pr_url": real_pr_url,
+                        "pr_url": real_pr_url,
+                        "acquired_at": now_iso,
+                        "updated_at": now_iso,
+                        "last_activity_at": now_iso,
+                    },
+                    "acme/repo-api": {
+                        "active": True,
+                        "status": "DEVELOPING",
+                        "pr_gate_ready": False,
+                        "conversation_id": adhoc_dev_cid,
+                        "action_id": "adhoc-api-worker",
+                        "branch_name": "fix/20261121-093401-adhoc-0305246e",
+                        "acquired_at": now_iso,
+                        "updated_at": now_iso,
+                        "last_activity_at": now_iso,
+                    },
+                },
+            )
+
+            out_txt, row_links, _, first_pr, _, _ = tui.render(
+                _make_args(state_dir, no_color=True, plain_urls=True, write_board=str(board_file)),
+                brain_dir="",
+                is_tty_override=False,
+                term_width_override=124,
+                now_ts_override=now_ts,
+            )
+            # Ad-hoc locks MUST be visible in counters (`run:1`) and table
+            self.assertIn("run:1", out_txt)
+            self.assertIn("[ad-hoc] fix(ui): real ad-hoc PR", out_txt)
+            self.assertIn("[ad-hoc] adhoc-api-worker", out_txt)
+            # First PR hotkey & footer MUST point to the real ad-hoc PR (never phantom `/pulls`!)
+            self.assertIsNotNone(first_pr)
+            assert first_pr is not None
+            self.assertEqual(first_pr[1], real_pr_url)
+            self.assertEqual(row_links[1][1], real_pr_url)
+            self.assertIn("[+verificaciones]", out_txt)
+            # Phantom pr_open row MUST render `[↻ Stale]` and NEVER `PR 2/2 listo` or `[commit fallback]`
+            self.assertIn("[↻ Stale]", out_txt)
+            self.assertNotIn("PR 2/2 listo", out_txt)
+            self.assertNotIn("[commit fallback]", out_txt)
+            # Board artifact includes the real ad-hoc PR link
+            board_md = board_file.read_text(encoding="utf-8")
+            self.assertIn("fix/20261121-092514-adhoc-2770c9ef", board_md)
 
 
 if __name__ == "__main__":
