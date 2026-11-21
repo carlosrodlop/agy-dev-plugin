@@ -8,10 +8,13 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -1389,6 +1392,783 @@ class TestDevQueueTui(unittest.TestCase):
             # Board artifact includes the real ad-hoc PR link
             board_md = board_file.read_text(encoding="utf-8")
             self.assertIn("fix/20261121-092514-adhoc-2770c9ef", board_md)
+
+
+    def test_auto_reload_fingerprints_syntax_guard_execv_banner_and_manual_R_hotkey(self) -> None:
+        """Auto-reload validates Python syntax with `ast.parse`, tears down alt-screen before `os.execv`, and supports `[R]`."""
+        watched = tui._collect_watched_script_paths()
+        self.assertGreaterEqual(len(watched), 1)
+        self.assertEqual(watched[0], Path(tui.__file__).resolve())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            _write_state(state_dir, items=[])
+            fake_script = root / "dev_queue_tui_copy.py"
+            fake_script.write_text("VALUE = 1\n", encoding="utf-8")
+
+            argv_built = tui._build_reload_exec_argv(fake_script, ["-w", "2", "--no-auto-sync"])
+            self.assertEqual(
+                argv_built,
+                [sys.executable, str(fake_script.resolve()), "-w", "2", "--no-auto-sync"],
+            )
+
+            # 1. Broken syntax on disk MUST NOT crash or call exec_fn; shows warning in watch footer
+            exec_calls: list[tuple[str, list[str]]] = []
+
+            def _fake_exec(exe: str, argv: list[str]) -> None:
+                exec_calls.append((exe, list(argv)))
+
+            def _corrupt_later() -> None:
+                time.sleep(0.04)
+                fake_script.write_text("def broken(:\n", encoding="utf-8")
+
+            corrupt_t = threading.Thread(target=_corrupt_later, daemon=True)
+            corrupt_t.start()
+            buf_bad = io.StringIO()
+            rc_bad = tui.run_watch_loop(
+                _make_args(state_dir, watch=0.4, no_color=True, no_auto_sync=True),
+                stream=buf_bad,
+                use_tty_override=True,
+                open_tty=False,
+                max_iterations=2,
+                term_size_override=(120, 22),
+                exec_fn=_fake_exec,
+                watched_paths_override=[fake_script],
+                reload_debounce_seconds=0.0,
+            )
+            corrupt_t.join(timeout=1.0)
+            self.assertEqual(rc_bad, 0)
+            self.assertEqual(exec_calls, [])
+            self.assertIn("Reload skipped (dev_queue_tui_copy.py: SyntaxError)", buf_bad.getvalue())
+
+            # 2. Valid script update triggers clean alt-screen exit, sets _AGY_QUEUE_RELOADED=1, and calls exec_fn
+            fake_script.write_text("VALUE = 2\n", encoding="utf-8")
+
+            def _update_valid_later() -> None:
+                time.sleep(0.04)
+                fake_script.write_text("VALUE = 300\n", encoding="utf-8")
+
+            valid_t = threading.Thread(target=_update_valid_later, daemon=True)
+            valid_t.start()
+            buf_ok = io.StringIO()
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("_AGY_QUEUE_RELOADED", None)
+                rc_ok = tui.run_watch_loop(
+                    _make_args(state_dir, watch=0.5, no_color=True, no_auto_sync=True),
+                    stream=buf_ok,
+                    use_tty_override=True,
+                    open_tty=False,
+                    max_iterations=5,
+                    term_size_override=(120, 22),
+                    exec_fn=_fake_exec,
+                    watched_paths_override=[fake_script],
+                    reload_debounce_seconds=0.0,
+                    raw_argv=["-w", "--no-auto-sync"],
+                )
+                valid_t.join(timeout=1.0)
+                self.assertEqual(rc_ok, 0)
+                self.assertEqual(len(exec_calls), 1)
+                self.assertEqual(exec_calls[0][0], sys.executable)
+                self.assertEqual(
+                    exec_calls[0][1],
+                    [sys.executable, str(fake_script.resolve()), "-w", "--no-auto-sync"],
+                )
+                self.assertEqual(os.environ.get("_AGY_QUEUE_RELOADED"), "1")
+                self.assertTrue(buf_ok.getvalue().endswith(tui.ALT_SCREEN_EXIT))
+
+                # 3. Startup after reload consumes _AGY_QUEUE_RELOADED=1 and displays reload banner
+                buf_reloaded = io.StringIO()
+                tui.run_watch_loop(
+                    _make_args(state_dir, watch=0.2, no_color=True, no_auto_sync=True),
+                    stream=buf_reloaded,
+                    use_tty_override=True,
+                    open_tty=False,
+                    max_iterations=1,
+                    term_size_override=(120, 22),
+                )
+                self.assertNotIn("_AGY_QUEUE_RELOADED", os.environ)
+                self.assertIn("Auto-reloaded after plugin update", buf_reloaded.getvalue())
+
+            # 4. Lowercase [r] repaints without exec_fn; uppercase [R] triggers safe exec_fn reload
+            exec_calls.clear()
+            r_fd, w_fd = os.pipe()
+            try:
+                os.write(w_fd, b"rR")
+                os.close(w_fd)
+                w_fd = -1
+                buf_keys = io.StringIO()
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    rc_keys = tui.run_watch_loop(
+                        _make_args(state_dir, watch=0.5, no_color=True, no_auto_sync=True),
+                        stream=buf_keys,
+                        use_tty_override=True,
+                        open_tty=False,
+                        tty_fd_override=r_fd,
+                        max_iterations=5,
+                        term_size_override=(120, 22),
+                        exec_fn=_fake_exec,
+                        watched_paths_override=[fake_script],
+                        raw_argv=["-w"],
+                    )
+                self.assertEqual(rc_keys, 0)
+                self.assertIn("Refreshed", buf_keys.getvalue())
+                self.assertEqual(len(exec_calls), 1)
+            finally:
+                os.close(r_fd)
+                if w_fd >= 0:
+                    os.close(w_fd)
+
+    def test_priority_viewport_keeps_pr_hitl_opt_footers_visible_and_scroll_compact_open_all_hotkeys(self) -> None:
+        """22 pending rows on a 26-row terminal never clip PR/HITL/STALLED/OPT footers; `[j]/[k]/↑/↓`, `[p]`, and `[O]` work."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            pr1_cid = "1111aaaa-2222-4333-8444-555555555555"
+            pr2_cid = "2222bbbb-2222-4333-8444-555555555555"
+            hitl_cid = "3333cccc-2222-4333-8444-555555555555"
+            url_1 = "https://github.com/acme/repo-a/pull/101"
+            url_2 = "https://github.com/acme/repo-b/pull/202"
+
+            pending_items = [
+                {
+                    "conversation_id": f"9999{i:04d}-2222-4333-8444-555555555555",
+                    "priority": 20 + i,
+                    "status": "pending",
+                    "repo_slugs": ["acme/repo-a"],
+                    "merged_repos": [],
+                    "title": f"Queued task item {i:02d}",
+                }
+                for i in range(1, 23)
+            ]
+            _write_state(
+                state_dir,
+                items=[
+                    {
+                        "conversation_id": pr1_cid,
+                        "priority": 5,
+                        "status": "pr_open",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "pr_urls": [url_1],
+                        "title": "Ready PR One",
+                    },
+                    {
+                        "conversation_id": pr2_cid,
+                        "priority": 6,
+                        "status": "pr_open",
+                        "repo_slugs": ["acme/repo-b"],
+                        "merged_repos": [],
+                        "pr_urls": [url_2],
+                        "title": "Ready PR Two",
+                    },
+                    {
+                        "conversation_id": hitl_cid,
+                        "priority": 12,
+                        "status": "hitl_blocked",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "title": "Approve Architecture Contract",
+                    },
+                    *pending_items,
+                ],
+                locks={
+                    "acme/repo-a": {
+                        "active": True,
+                        "status": "PENDING_HUMAN_PR_VALIDATION",
+                        "pr_gate_ready": True,
+                        "conversation_id": pr1_cid,
+                        "branch_name": "fix/20261121-pr1-1111aaaa",
+                        "pr_url": url_1,
+                    },
+                    "acme/repo-b": {
+                        "active": True,
+                        "status": "PENDING_HUMAN_PR_VALIDATION",
+                        "pr_gate_ready": True,
+                        "conversation_id": pr2_cid,
+                        "branch_name": "fix/20261121-pr2-2222bbbb",
+                        "pr_url": url_2,
+                    },
+                },
+            )
+
+            layout: dict[str, object] = {}
+            tui.render(
+                _make_args(state_dir, no_color=True, plain_urls=True),
+                brain_dir="",
+                is_tty_override=True,
+                term_width_override=124,
+                layout_out=layout,
+            )
+            self.assertEqual(len(layout["all_pr_links"]), 2)  # type: ignore[arg-type]
+            self.assertTrue(layout["has_active_work"])
+
+            vp_top = tui._compose_priority_viewport(
+                layout["header_lines"],  # type: ignore[arg-type]
+                layout["active_row_lines"],  # type: ignore[arg-type]
+                layout["middle_row_lines"],  # type: ignore[arg-type]
+                layout["sticky_footer_lines"],  # type: ignore[arg-type]
+                term_w=124,
+                term_h=26,
+                footer="[q] quit",
+                scroll_offset=0,
+                compact_pending=False,
+            )
+            self.assertLessEqual(len(vp_top), 26)
+            joined_top = "\n".join(vp_top)
+            self.assertIn("PRs READY FOR MERGE", joined_top)
+            self.assertIn(url_1, joined_top)
+            self.assertIn(url_2, joined_top)
+            self.assertIn("HITL — ANTIGRAVITY APP VALIDATION", joined_top)
+            self.assertIn("Queued task item 01", joined_top)
+            self.assertIn("[j/k] scroll", joined_top)
+
+            # Scrolling down reveals deeper pending items while keeping sticky PR/HITL footers intact
+            vp_scrolled = tui._compose_priority_viewport(
+                layout["header_lines"],  # type: ignore[arg-type]
+                layout["active_row_lines"],  # type: ignore[arg-type]
+                layout["middle_row_lines"],  # type: ignore[arg-type]
+                layout["sticky_footer_lines"],  # type: ignore[arg-type]
+                term_w=124,
+                term_h=26,
+                footer="[q] quit",
+                scroll_offset=18,
+                compact_pending=False,
+            )
+            joined_scrolled = "\n".join(vp_scrolled)
+            self.assertIn("PRs READY FOR MERGE", joined_scrolled)
+            self.assertIn("HITL — ANTIGRAVITY APP VALIDATION", joined_scrolled)
+            self.assertIn("Queued task item 22", joined_scrolled)
+
+            # Compact pending mode keeps at most 3 PENDING rows + all HITL_BLOCK rows
+            vp_compact = tui._compose_priority_viewport(
+                layout["header_lines"],  # type: ignore[arg-type]
+                layout["active_row_lines"],  # type: ignore[arg-type]
+                layout["middle_row_lines"],  # type: ignore[arg-type]
+                layout["sticky_footer_lines"],  # type: ignore[arg-type]
+                term_w=124,
+                term_h=26,
+                footer="[q] quit",
+                scroll_offset=0,
+                compact_pending=True,
+            )
+            joined_compact = "\n".join(vp_compact)
+            self.assertIn("Approve Architecture Contract", joined_compact)
+            self.assertIn("Queued task item 03", joined_compact)
+            self.assertNotIn("Queued task item 04", joined_compact)
+            self.assertIn("[p] full", joined_compact)
+
+            # Interactive watch hotkeys: [j], Down (\x1b[B), [k], Up (\x1b[A), [p], [o] (1 PR), [O] (all 2 PRs), [q]
+            r_fd, w_fd = os.pipe()
+            opened_urls: list[str] = []
+            try:
+                os.write(w_fd, b"j\x1b[Bk\x1b[ApoOq")
+                os.close(w_fd)
+                w_fd = -1
+                buf_watch = io.StringIO()
+                with mock.patch.object(
+                    tui,
+                    "_open_url_in_browser",
+                    side_effect=lambda u: opened_urls.append(u) or True,
+                ):
+                    rc = tui.run_watch_loop(
+                        _make_args(state_dir, watch=0.4, no_color=True, plain_urls=True, no_auto_sync=True),
+                        stream=buf_watch,
+                        use_tty_override=True,
+                        open_tty=False,
+                        tty_fd_override=r_fd,
+                        max_iterations=12,
+                        term_size_override=(124, 26),
+                    )
+                self.assertEqual(rc, 0)
+                watch_txt = buf_watch.getvalue()
+                self.assertIn("Pending view: COMPACT", watch_txt)
+                self.assertIn("Opening 2 ready PR(s)", watch_txt)
+                # [o] opened url_1 (1), then [O] opened url_1 + url_2 (2) -> total 3 browser calls
+                self.assertEqual(opened_urls, [url_1, url_1, url_2])
+            finally:
+                os.close(r_fd)
+                if w_fd >= 0:
+                    os.close(w_fd)
+
+    def test_async_background_auto_sync_gating_single_flight_async_s_and_deduplicated_fetch(self) -> None:
+        """`_run_live_sync` avoids triple-fetching; background auto-sync respects single-flight, locks/PRs, `--no-auto-sync`, and `AGY_OFFLINE_ONLY`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            repo_a = root / "repo-a"
+            repo_b = root / "repo-b"
+            repo_a.mkdir()
+            repo_b.mkdir()
+
+            # 1. Active lock + zero unlocked PRs -> ONLY `lock-status --all --sync-git` runs (no duplicate queue-sync or git fetch!)
+            _write_state(
+                state_dir,
+                items=[
+                    {
+                        "conversation_id": "aaaa1111-2222-4333-8444-555555555555",
+                        "priority": 10,
+                        "status": "pr_open",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "pr_urls": ["https://github.com/acme/repo-a/pull/1"],
+                        "title": "Locked repo PR",
+                    }
+                ],
+                locks={
+                    "acme/repo-a": {
+                        "active": True,
+                        "status": "PENDING_HUMAN_PR_VALIDATION",
+                        "pr_gate_ready": True,
+                        "conversation_id": "aaaa1111-2222-4333-8444-555555555555",
+                    }
+                },
+            )
+            with mock.patch.object(tui.subprocess, "run") as mock_run:
+                mock_run.return_value = mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"status": "ok", "queue_reconciliation": {"reconciled_count": 1}}),
+                    stderr="",
+                )
+                msg_dedup = tui._run_live_sync(
+                    state_dir,
+                    {"acme/repo-a": repo_a, "acme/repo-b": repo_b},
+                    offline=False,
+                )
+                self.assertIn("Sync OK (1 repos fetched, 1 PRs reconciled)", msg_dedup)
+                cmds = [c.args[0] for c in mock_run.call_args_list]
+                self.assertEqual(len(cmds), 1)
+                self.assertIn("lock-status", cmds[0])
+                self.assertIn("--sync-git", cmds[0])
+
+            # 2. Active lock on repo-a + unlocked pr_open on repo-b -> lock-status + scoped queue-sync --repo acme/repo-b --fetch
+            _write_state(
+                state_dir,
+                items=[
+                    {
+                        "conversation_id": "bbbb2222-2222-4333-8444-555555555555",
+                        "priority": 10,
+                        "status": "pr_open",
+                        "repo_slugs": ["acme/repo-b"],
+                        "merged_repos": [],
+                        "pr_urls": ["https://github.com/acme/repo-b/pull/2"],
+                        "title": "Unlocked repo PR",
+                    }
+                ],
+                locks={
+                    "acme/repo-a": {
+                        "active": True,
+                        "status": "DEVELOPING",
+                        "pr_gate_ready": False,
+                        "conversation_id": "aaaa1111-2222-4333-8444-555555555555",
+                    }
+                },
+            )
+            with mock.patch.object(tui.subprocess, "run") as mock_run:
+                mock_run.return_value = mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"status": "ok", "reconciled_count": 0}),
+                    stderr="",
+                )
+                msg_split = tui._run_live_sync(
+                    state_dir,
+                    {"acme/repo-a": repo_a, "acme/repo-b": repo_b},
+                    offline=False,
+                )
+                self.assertIn("Sync OK (2 repos fetched", msg_split)
+                cmds_split = [c.args[0] for c in mock_run.call_args_list]
+                self.assertEqual(len(cmds_split), 2)
+                self.assertIn("lock-status", cmds_split[0])
+                self.assertIn("queue-sync", cmds_split[1])
+                self.assertIn("acme/repo-b", cmds_split[1])
+
+            # 3. Single-flight controller never spawns overlapping threads and formats live sync badge
+            gate = threading.Event()
+            started = threading.Event()
+            sync_invocations = 0
+
+            def _slow_sync(_sd: Path, _dirs: dict[str, Path]) -> str:
+                nonlocal sync_invocations
+                sync_invocations += 1
+                started.set()
+                gate.wait(timeout=1.5)
+                return "↻ Sync OK (1 repos fetched, 1 PRs reconciled)"
+
+            ctrl = tui._AsyncSyncController(sync_fn=_slow_sync)
+            self.assertEqual(ctrl.format_badge(), "")
+            self.assertTrue(ctrl.trigger(state_dir, {}))
+            self.assertTrue(started.wait(timeout=1.0))
+            self.assertEqual(ctrl.format_badge(), "sync:syncing…")
+            self.assertFalse(ctrl.trigger(state_dir, {}))
+            gate.set()
+            deadline = time.monotonic() + 1.0
+            while ctrl.is_in_flight() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(sync_invocations, 1)
+            self.assertIn("Sync OK", ctrl.consume_result() or "")
+            self.assertTrue(ctrl.format_badge().startswith("sync:"))
+
+            # 4. Watch auto-sync gating: fires when active work exists; skipped when idle, --no-auto-sync, or AGY_OFFLINE_ONLY=1
+            auto_calls: list[int] = []
+
+            def _fast_sync(_sd: Path, _dirs: dict[str, Path]) -> str:
+                auto_calls.append(1)
+                return "↻ Sync OK (1 repos fetched, 0 PRs reconciled)"
+
+            with mock.patch.dict(os.environ, {"AGY_OFFLINE_ONLY": "0"}, clear=False):
+                buf_auto = io.StringIO()
+                tui.run_watch_loop(
+                    _make_args(state_dir, watch=0.25, sync_interval=10.0, no_auto_sync=False, no_color=True),
+                    stream=buf_auto,
+                    use_tty_override=True,
+                    open_tty=False,
+                    max_iterations=3,
+                    term_size_override=(120, 22),
+                    sync_fn=_fast_sync,
+                )
+            self.assertEqual(len(auto_calls), 1)
+            self.assertIn("sync:", buf_auto.getvalue())
+
+            # No auto-sync when `--no-auto-sync` or `AGY_OFFLINE_ONLY=1` or only pending items without locks
+            auto_calls.clear()
+            tui.run_watch_loop(
+                _make_args(state_dir, watch=0.06, sync_interval=0.01, no_auto_sync=True, no_color=True),
+                stream=io.StringIO(),
+                use_tty_override=True,
+                open_tty=False,
+                max_iterations=2,
+                sync_fn=_fast_sync,
+            )
+            self.assertEqual(auto_calls, [])
+
+            with mock.patch.dict(os.environ, {"AGY_OFFLINE_ONLY": "1"}, clear=False):
+                tui.run_watch_loop(
+                    _make_args(state_dir, watch=0.06, sync_interval=0.01, no_auto_sync=False, no_color=True),
+                    stream=io.StringIO(),
+                    use_tty_override=True,
+                    open_tty=False,
+                    max_iterations=2,
+                    sync_fn=_fast_sync,
+                )
+            self.assertEqual(auto_calls, [])
+
+            state_idle = root / "state_idle"
+            _write_state(
+                state_idle,
+                items=[
+                    {
+                        "conversation_id": "cccc3333-2222-4333-8444-555555555555",
+                        "priority": 20,
+                        "status": "pending",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "title": "Idle pending only",
+                    }
+                ],
+                locks={},
+            )
+            with mock.patch.dict(os.environ, {"AGY_OFFLINE_ONLY": "0"}, clear=False):
+                tui.run_watch_loop(
+                    _make_args(state_idle, watch=0.06, sync_interval=0.01, no_auto_sync=False, no_color=True),
+                    stream=io.StringIO(),
+                    use_tty_override=True,
+                    open_tty=False,
+                    max_iterations=2,
+                    sync_fn=_fast_sync,
+                )
+            self.assertEqual(auto_calls, [])
+
+            # Manual [s] hotkey triggers async sync even on idle queue without blocking input
+            r_fd, w_fd = os.pipe()
+            try:
+                os.write(w_fd, b"s")
+                os.close(w_fd)
+                w_fd = -1
+                buf_s = io.StringIO()
+                tui.run_watch_loop(
+                    _make_args(state_idle, watch=0.2, no_auto_sync=True, no_color=True),
+                    stream=buf_s,
+                    use_tty_override=True,
+                    open_tty=False,
+                    tty_fd_override=r_fd,
+                    max_iterations=3,
+                    term_size_override=(120, 22),
+                    sync_fn=_fast_sync,
+                )
+                self.assertEqual(len(auto_calls), 1)
+                self.assertIn("Sync OK", buf_s.getvalue())
+            finally:
+                os.close(r_fd)
+                if w_fd >= 0:
+                    os.close(w_fd)
+
+    def test_stat_dirty_check_immediate_wakeup_sigwinch_repo_cache_and_hash_guarded_board(self) -> None:
+        """`stat()` dirty-check wakes `<350ms` on state/worktree edits, `SIGWINCH` restores, `_discover_repos` caches 60s, and board skips no-op writes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            board_path = root / "board.md"
+            wt_dir = root / "worktree"
+            git_meta = root / "real_gitdir"
+            wt_dir.mkdir()
+            git_meta.mkdir()
+            (wt_dir / ".git").write_text(f"gitdir: {git_meta}\n", encoding="utf-8")
+            (git_meta / "HEAD").write_text("ref: refs/heads/fix/demo\n", encoding="utf-8")
+            (git_meta / "index").write_bytes(b"idx1")
+
+            _write_state(
+                state_dir,
+                items=[
+                    {
+                        "conversation_id": "11112222-3333-4444-8555-666666666666",
+                        "priority": 10,
+                        "status": "in_progress",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "title": "Initial title",
+                    }
+                ],
+                locks={
+                    "acme/repo-a": {
+                        "active": True,
+                        "status": "DEVELOPING",
+                        "pr_gate_ready": False,
+                        "conversation_id": "11112222-3333-4444-8555-666666666666",
+                        "worktree_path": str(wt_dir),
+                    }
+                },
+            )
+
+            # 1. Worktree gitdir pointer fingerprint changes when index updates
+            locks_loaded, _ = tui._load_locks(state_dir)
+            fp1 = tui._snapshot_state_fingerprint(state_dir, locks_loaded)
+            (git_meta / "index").write_bytes(b"idx2-updated")
+            fp2 = tui._snapshot_state_fingerprint(state_dir, locks_loaded)
+            self.assertNotEqual(fp1, fp2)
+
+            # 2. Immediate dirty-check wakeup: even with watch=5.0s, editing dev_queue.json wakes frame 2 in <0.6s
+            def _mutate_queue_soon() -> None:
+                time.sleep(0.06)
+                _write_state(
+                    state_dir,
+                    items=[
+                        {
+                            "conversation_id": "11112222-3333-4444-8555-666666666666",
+                            "priority": 10,
+                            "status": "in_progress",
+                            "repo_slugs": ["acme/repo-a"],
+                            "merged_repos": [],
+                            "title": "Mutated live title",
+                        }
+                    ],
+                )
+
+            mut_t = threading.Thread(target=_mutate_queue_soon, daemon=True)
+            t0 = time.monotonic()
+            mut_t.start()
+            buf_wake = io.StringIO()
+            tui.run_watch_loop(
+                _make_args(state_dir, watch=5.0, no_auto_sync=True, no_color=True),
+                stream=buf_wake,
+                use_tty_override=True,
+                open_tty=False,
+                max_iterations=2,
+                term_size_override=(120, 22),
+            )
+            elapsed = time.monotonic() - t0
+            mut_t.join(timeout=1.0)
+            self.assertLess(elapsed, 1.0)
+            self.assertIn("Mutated live title", buf_wake.getvalue())
+
+            # 3. SIGWINCH handler installed & restored cleanly
+            sigwinch = getattr(signal, "SIGWINCH", None)
+            if sigwinch is not None:
+                custom_winch = lambda _s, _f: None  # noqa: E731
+                orig_winch = signal.getsignal(sigwinch)
+                try:
+                    signal.signal(sigwinch, custom_winch)
+                    tui.run_watch_loop(
+                        _make_args(state_dir, watch=0.2, no_auto_sync=True, no_color=True),
+                        stream=io.StringIO(),
+                        use_tty_override=True,
+                        open_tty=False,
+                        max_iterations=1,
+                        term_size_override=(100, 20),
+                    )
+                    self.assertIs(signal.getsignal(sigwinch), custom_winch)
+                finally:
+                    signal.signal(sigwinch, orig_winch)
+
+            # 4. Repo discovery TTL cache skips duplicate _discover_repos calls until hints change or TTL expires
+            repo_cache: dict[str, object] = {"ttl": 60.0}
+            with mock.patch.object(
+                tui,
+                "_discover_repos",
+                wraps=tui._discover_repos,
+            ) as spy_discover:
+                tui.render(
+                    _make_args(state_dir, no_color=True),
+                    is_tty_override=False,
+                    repo_cache=repo_cache,  # type: ignore[arg-type]
+                )
+                tui.render(
+                    _make_args(state_dir, no_color=True),
+                    is_tty_override=False,
+                    repo_cache=repo_cache,  # type: ignore[arg-type]
+                )
+                self.assertEqual(spy_discover.call_count, 1)
+
+                # Adding a new repo slug invalidates cache immediately
+                _write_state(
+                    state_dir,
+                    items=[
+                        {
+                            "conversation_id": "11112222-3333-4444-8555-666666666666",
+                            "priority": 10,
+                            "status": "pending",
+                            "repo_slugs": ["acme/repo-a", "acme/repo-new"],
+                            "merged_repos": [],
+                            "title": "Added repo",
+                        }
+                    ],
+                )
+                tui.render(
+                    _make_args(state_dir, no_color=True),
+                    is_tty_override=False,
+                    repo_cache=repo_cache,  # type: ignore[arg-type]
+                )
+                self.assertEqual(spy_discover.call_count, 2)
+
+            # 5. Hash-guarded board write skips redundant disk writes unless content changes or force_board_write=True
+            tui.render(
+                _make_args(state_dir, write_board=str(board_path), no_color=True),
+                is_tty_override=False,
+            )
+            self.assertTrue(board_path.is_file())
+            mtime_1 = board_path.stat().st_mtime_ns
+            with mock.patch.object(tui.os, "replace", wraps=os.replace) as spy_replace:
+                tui.render(
+                    _make_args(state_dir, write_board=str(board_path), no_color=True),
+                    is_tty_override=False,
+                )
+                self.assertEqual(spy_replace.call_count, 0)
+                self.assertEqual(board_path.stat().st_mtime_ns, mtime_1)
+
+                # [b] hotkey forces write even when content is unchanged
+                with mock.patch.object(tui, "_focus_antigravity_app", return_value=True):
+                    tui._handle_board_hotkey(_make_args(state_dir, write_board=str(board_path)), state_dir)
+                self.assertEqual(spy_replace.call_count, 1)
+
+    def test_orchestrator_liveness_badge_and_transient_io_recovery_preserving_runtime_errors(self) -> None:
+        """Header renders `orch:<id8> (idle ...)` from transcript mtime, and watch loop recovers from torn JSON/SQLite/OS errors."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            brain_dir = root / "brain"
+            orch_cid = "444cef60-2222-4333-8444-555555555555"
+            tpath = brain_dir / orch_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath.parent.mkdir(parents=True)
+            tpath.write_text("{}\n", encoding="utf-8")
+
+            now_ts = 1_800_000_000.0
+            stale_mtime = now_ts - (3 * 3600 + 18 * 60)
+            os.utime(tpath, (stale_mtime, stale_mtime))
+
+            _write_state(
+                state_dir,
+                orchestrator_id=orch_cid,
+                items=[
+                    {
+                        "conversation_id": "aaaa9999-2222-4333-8444-555555555555",
+                        "priority": 10,
+                        "status": "pending",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "title": "Waiting on orchestrator",
+                    }
+                ],
+            )
+
+            out_stale, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, no_color=False, plain_urls=True),
+                brain_dir=brain_dir,
+                is_tty_override=True,
+                term_width_override=140,
+                now_ts_override=now_ts,
+                sync_status_badge="sync:12s",
+            )
+            self.assertIn("444cef60", out_stale)
+            self.assertIn("(idle 3h18m)", out_stale)
+            self.assertIn("\033[1;33m(idle 3h18m)\033[0m", out_stale)
+            self.assertIn("sync:12s", out_stale)
+
+            # Active (<2m) orchestrator shows green `(active ...)`
+            os.utime(tpath, (now_ts - 25.0, now_ts - 25.0))
+            out_active, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, no_color=False, plain_urls=True),
+                brain_dir=brain_dir,
+                is_tty_override=True,
+                term_width_override=140,
+                now_ts_override=now_ts,
+            )
+            self.assertIn("(active 25s)", out_active)
+            self.assertIn("\033[0;32m(active 25s)\033[0m", out_active)
+
+            # Transient torn JSON on tick 1 -> recoverable warning frame -> valid state recovered on tick 2
+            (state_dir / "dev_queue.json").write_text("{truncated-json", encoding="utf-8")
+
+            def _heal_json() -> None:
+                time.sleep(0.05)
+                _write_state(
+                    state_dir,
+                    orchestrator_id=orch_cid,
+                    items=[
+                        {
+                            "conversation_id": "aaaa9999-2222-4333-8444-555555555555",
+                            "priority": 10,
+                            "status": "pending",
+                            "repo_slugs": ["acme/repo-a"],
+                            "merged_repos": [],
+                            "title": "Healed queue item",
+                        }
+                    ],
+                )
+
+            heal_t = threading.Thread(target=_heal_json, daemon=True)
+            heal_t.start()
+            buf_io = io.StringIO()
+            rc_io = tui.run_watch_loop(
+                _make_args(state_dir, watch=0.3, no_auto_sync=True, no_color=True),
+                stream=buf_io,
+                use_tty_override=True,
+                open_tty=False,
+                max_iterations=2,
+                term_size_override=(120, 22),
+            )
+            heal_t.join(timeout=1.0)
+            self.assertEqual(rc_io, 0)
+            io_frames = buf_io.getvalue()
+            self.assertIn("Transient read error (JSONDecodeError)", io_frames)
+            self.assertIn("Healed queue item", io_frames)
+
+            # Transient OSError and sqlite3.OperationalError also recover cleanly without crashing
+            with mock.patch.object(
+                tui,
+                "render",
+                side_effect=[OSError("resource busy"), sqlite3.OperationalError("database is locked")],
+            ):
+                buf_os_db = io.StringIO()
+                rc_os_db = tui.run_watch_loop(
+                    _make_args(state_dir, watch=0.05, no_auto_sync=True, no_color=True),
+                    stream=buf_os_db,
+                    use_tty_override=True,
+                    open_tty=False,
+                    max_iterations=2,
+                    term_size_override=(120, 22),
+                )
+                self.assertEqual(rc_os_db, 0)
+                self.assertIn("Transient read error (OSError)", buf_os_db.getvalue())
+                self.assertIn("Transient read error (OperationalError)", buf_os_db.getvalue())
 
 
 if __name__ == "__main__":
