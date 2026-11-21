@@ -1,6 +1,6 @@
 ---
 trigger: glob
-globs: "**/*.py, **/*.sh, **/*.bats, **/SKILL.md, **/agents/*.md, **/plugin.json, **/hooks.json, **/README.md, **/.agents/**"
+globs: "**/*.py, **/*.sh, **/*.bash, **/*.zsh, **/*.bats, **/*.js, **/*.mjs, **/*.html, **/*.css, **/Makefile, **/SKILL.md, **/agents/*.md, **/plugin.json, **/hooks.json, **/README.md, **/.agents/**"
 description: Mandatory Native Git timestamped branch workflow, per-repository dev_pr_locks concurrency gate, pre-commit output, and manual PR review rules.
 ---
 

@@ -10,12 +10,12 @@ Review pull requests against these mandatory engineering guardrails. Flag violat
 - **No Proprietary VCS CLIs or Forge Tokens**: NEVER suggest or introduce `gh`, `glab`, `hub`, or GitHub/GitLab REST API tokens (`PROPRIETARY_VCS_CLI_RE` in `clients/dev_common.py`). Use native `/usr/bin/git` and `/usr/bin/ssh` (`clients/git_client.py`) exclusively.
 
 ## 3. Santa Lockdown & Declarative Tooling
-- **Standard Languages Only**: Python 3 + POSIX/Bash only.
-- **No Unapproved Binaries**: Reject `curl | sh`, `wget | sh`, `mise`, or ad-hoc compiled binary downloads. Declare runtimes via `asdf` (`.tool-versions`) and dependencies in `pyproject.toml`.
+- **Primary Languages**: Python 3, POSIX/Bash Shell, and Vanilla-First Zero-Build Web (`ES2022+` JS/HTML5/CSS3; frameworks only if explicitly declared).
+- **No Unapproved Binaries**: Reject `curl|sh`, `curl|python*`, `releases/download` + `chmod +x`, `mise`, `uv tool install`, `cargo binstall`, and native binary bundlers. Pin runtimes in `.tool-versions` (`asdf`) and pure-Python deps in `pyproject.toml`.
 
 ## 4. CI, Portability & Code Hygiene
-- **Pinned CI**: GitHub Actions workflows MUST pin `runs-on: ubuntu-24.04` (never `ubuntu-latest`) and avoid duplicate `push:` triggers when `pull_request:` already runs.
-- **Python Safety & Portability**: Forbid bare `except:` clauses and mutable default arguments (`[]`, `{}`, `set()`). Keep code Unix-portable (`macOS` & `Linux`); gate macOS-only calls behind `platform.system() == "Darwin"`.
+- **Pinned CI**: Pin `runs-on: ubuntu-24.04` (never `ubuntu-latest`); avoid duplicate `push:` triggers alongside `pull_request:`.
+- **5-Language Safety & Portability**: Forbid bare `except:`, `eval`/`exec`, unsafe `yaml.load`, mutable defaults (`[]`, `{}`, `set()`), JS `eval`/`new Function`/`document.write`/`javascript:`, duplicate HTML IDs, and unbalanced CSS braces. Keep Unix-portable (`macOS`/`Linux`); gate Darwin calls behind `platform.system() == "Darwin"`.
 - **English Only**: Code, comments, docstrings, identifiers, and documentation must be in English.
 
 ## 5. Instruction Size Caps & Hermetic Testing

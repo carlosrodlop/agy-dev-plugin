@@ -23,8 +23,8 @@ You execute in an isolated conversation context (always `Model="pro"`) immediate
 2. **Score Across 4 Independent Criteria (0–100)**:
    - **Criterion A (40 pts) — Requirement & RCA Accuracy**: Does the diff cleanly resolve the root cause or user requirement without regressions or duplicated logic?
    - **Criterion B (25 pts) — Unit Test Coverage & Determinism**: Are hermetic zero-credential unit tests added/updated under `tests/` and passing cleanly?
-   - **Criterion C (20 pts) — Security & Zero-PII Compliance**: Zero hardcoded secrets, tokens, emails, customer identifiers, or machine-local `/Users/<user>/` paths; passes `qa_static_audit.py` / `project_audit.py`.
-   - **Criterion D (15 pts) — Style, Typing & Plugin Parity**: English-only code/docstrings, clean type hints, shallow helpers, and `$HOME` plugin compatibility.
+   - **Criterion C (20 pts) — Security, Santa Lockdown & Zero-PII Compliance**: Zero hardcoded secrets, tokens, emails, customer identifiers, or machine-local `/Users/<user>/` paths across Python/Shell/JS/HTML/CSS; zero Santa-blocked binary downloads/pipes or XSS sinks (`eval`/`new Function`/`document.write`/`javascript:`); passes `qa_static_audit.py` / `project_audit.py`.
+   - **Criterion D (15 pts) — Style, Typing, Portability & Plugin Parity**: English-only code/docstrings, clean Python type hints, strict-mode Shell portability, semantic HTML5/CSS3 tokens, shallow modular helpers, and `$HOME` plugin compatibility.
 3. **Record Verdict & Enforce Hard PR Readiness Gate**:
    ```bash
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review \

@@ -12,15 +12,18 @@ By decoupling generic SDLC automation from domain-specific plugins (such as [`ag
 - **`PreToolUse` Safety Gate (`agy-dev-sdlc-guardrail`)**:
   - `pretool:direct-main-push`: Blocks direct `git push` commands targeting `main` or `master`.
   - `pretool:proprietary-vcs-cli`: Blocks proprietary forge wrappers (`gh`, `glab`), enforcing native `/usr/bin/git` and `/usr/bin/ssh`.
-  - `pretool:santa-lockdown-binary`: Blocks unapproved remote script pipes (`curl | sh`, `wget | sh`) and `mise`.
+  - `pretool:santa-lockdown-binary`: Blocks unapproved remote script pipes (`curl | sh`, `wget | sh`, `curl | python*`), chained binary downloads (`releases/download` + `chmod +x`), and unapproved binary managers (`mise`, `uv tool/python install`, `cargo binstall`).
   - `pretool:dotenv-write-protection`: Blocks direct agent edits to live `~/.env` credentials.
+  - `pretool:unvalidated-branch-push`: Blocks raw `git push` to locked branches before `agy-code-pr-reviewer` passes (`PASS > 90/100`).
 - **`SessionStart` Lock Context Injector (`session:dev-pr-lock-context`)**:
   - Surfaces per-repository `dev_pr_locks` state for the active workspace repo alongside sibling repo locks so parallel multi-repo agents coordinate without cross-repo collisions.
 
 ### 2. Skills (`skills/`)
 | Skill | Purpose |
 | :--- | :--- |
-| **`agy-project-standards`** | Audits any repo or plugin for Python AST safety, Zero-PII, Santa compliance, `.tool-versions`, `hooks.json` / `agents/*.md` schemas, pinned CI workflows, shell/BATS hygiene, `<24 KB` rule/skill limits, and optional `<=4 KB` Copilot instructions hygiene (`project_audit.py`). |
+| **`agy-project-standards`** | Pure-Python stdlib 5-language auditor (`project_audit.py`) covering Python 3, POSIX/Bash/Zsh Shell, JavaScript, HTML5, CSS3, Zero-PII/secrets, Santa Lockdown binary/pre-commit safety, `.tool-versions`, `hooks.json` / `agents/*.md` schemas, pinned CI workflows, `<24 KB` rule/skill limits, and optional `<=4 KB` Copilot instructions hygiene. |
+| **`agy-web-ui-architecture`** | Actionable workflow for designing, modularizing, and auditing Vanilla-First Zero-Build web UIs (`ES2022+` JS, semantic `HTML5`, `CSS3` design tokens) under Santa Lockdown, bridging static `project_audit.py` checks cleanly to `chrome-devtools-plugin` for live browser/a11y/LCP verification. |
+| **`agy-code-design-refactor`** | Structured architecture review, structural smell triage, and characterization-first incremental refactoring workflow across Python 3, POSIX/Bash Shell, and Vanilla JS/HTML/CSS. |
 | **`git-commit-configuration`** | Enforces Conventional Commits, `pre-commit` verification, Zero-PII scans, version stamping, and `$HOME` plugin deployment (`git_client.py deploy-home`). |
 | **`agy-code-remediation-pr`** | Creates isolated worktree branches (`fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>`) behind per-repository `dev_pr_locks` (`--workdir`, `--repo`, `--all`), runs `test-local`, pushes to `origin/<branch>`, invokes `agy-code-pr-reviewer` (`Model="pro"`), and spawns `watch-pr-merge`. |
 | **`agy-dev-queue-orchestrator`** | Coordinates multi-repo engineering tasks in `dev_queue.json`, picks unblocked repos (`queue-next --unlocked`), tracks progressive `merged_repos`, provides the zero-hardcode `agy-queue` TUI & live `dev_queue_board.md` HITL artifact, supports in-app `/hitl-review`, and safely cleans up merged conversations. |
@@ -30,13 +33,15 @@ By decoupling generic SDLC automation from domain-specific plugins (such as [`ag
 - **`agy-dev-planner`** (`mainAgent` / `subagent`, read-only): Leads Phase 0 interactive co-design (`co-design-and-discovery.md`), scopes tasks, anchors target files/tests, identifies cross-repo dependencies, and produces prioritized Design Contracts + plans in `dev_queue.json`.
 - **`agy-dev-executor`** (`mainAgent` / `subagent`): Drives per-repo `dev_pr_locks` worktrees, runs `pre-commit` / `test-local` / `bats`, pushes feature branches, and enforces Maker-Checker review.
 - **`agy-code-developer`** (`subagent`): Isolated branch implementer consuming pre-anchored context and running targeted tests before pushing.
-- **`agy-code-pr-reviewer`** (`subagent`, `Model="pro"`): Independent Maker-Checker evaluator scoring diff accuracy, test coverage, Zero-PII compliance, and style.
+- **`agy-code-pr-reviewer`** (`subagent`, `Model="pro"`): Independent Maker-Checker evaluator scoring diff accuracy, test coverage, Zero-PII/Santa compliance, and style.
 
 ### 4. Rules (`rules/`)
-- `engineering-pillars.md` (`always_on`) — Foundational SDLC pillars (`Phase 0 Co-Design -> Planning -> Queue -> Execution -> Maker-Checker Review -> Manual PR`)
+- `engineering-pillars.md` (`always_on`) — Foundational SDLC pillars, 5 primary languages (`Python 3`, `Shell`, `Vanilla JS/HTML/CSS`), and Santa Lockdown binary rules
 - `co-design-and-discovery.md` (`model_decision`) — Default Phase 0 adaptive Grill-Me protocol, silent codebase-first discovery, demanding partner pushback, hybrid cadence, and Design Contract exit gate
-- `python-and-testing.md` (`glob`)
-- `git-and-pr-workflow.md` (`glob`)
+- `python-and-testing.md` (`glob`: `*.py`, `pyproject.toml`, `.pre-commit-config.yaml`, CI workflows) — Python 3 typing, AST safety, Santa pure-Python constraints, and hermetic offline testing
+- `shell-standards.md` (`glob`: `*.sh`, `*.bash`, `*.zsh`, `*.bats`, `Makefile`) — POSIX/Bash/Zsh portability, sourced-safe strict mode, quoting, Santa binary safety, and BATS
+- `web-frontend-standards.md` (`glob`: `*.js`, `*.mjs`, `*.html`, `*.css`) — Vanilla-First Zero-Build JS/HTML5/CSS3, XSS/CSP defense, WCAG accessibility, design tokens, and Santa Lockdown toolchain rules
+- `git-and-pr-workflow.md` (`glob`) — Native Git timestamped branches, per-repo `dev_pr_locks`, and hard `PASS > 90/100` PR readiness gate
 
 ---
 
