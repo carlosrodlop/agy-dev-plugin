@@ -1396,10 +1396,20 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
 
     def test_five_language_rules_skills_and_santa_contracts(self) -> None:
         expected_rules = {
-            "engineering-pillars.md": ("always_on", ("Santa Lockdown", "Vanilla-First", "shell-standards.md", "web-frontend-standards.md")),
-            "python-and-testing.md": ("glob", ("Santa Lockdown", "py3-none-any", "yaml.safe_load")),
+            "engineering-pillars.md": (
+                "always_on",
+                ("Santa Lockdown", "Vanilla-First", "Don't Reinvent the Wheel", "allowed non-binary libraries", "shell-standards.md", "web-frontend-standards.md"),
+            ),
+            "co-design-and-discovery.md": (
+                "model_decision",
+                ("allowed non-binary library", "don't reinvent the wheel", "Santa Lockdown"),
+            ),
+            "python-and-testing.md": ("glob", ("Santa Lockdown", "Don't Reinvent the Wheel", "py3-none-any", "yaml.safe_load")),
             "shell-standards.md": ("glob", ("set -euo pipefail", "BASH_SOURCE", "Santa Lockdown", "bats")),
-            "web-frontend-standards.md": ("glob", ("Vanilla-First", "Santa Lockdown", "escapeHtml", "noopener noreferrer", "chrome-devtools-plugin")),
+            "web-frontend-standards.md": (
+                "glob",
+                ("Vanilla-First", "Santa Lockdown", "Don't Reinvent the Wheel", "Web Platform APIs", "escapeHtml", "noopener noreferrer", "chrome-devtools-plugin"),
+            ),
             "git-and-pr-workflow.md": ("glob", ("**/*.js", "**/*.html", "**/*.css")),
         }
         for fname, (trigger, terms) in expected_rules.items():
@@ -1413,7 +1423,7 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
 
         expected_skills = {
             "agy-web-ui-architecture": ("Vanilla-First", "Santa Lockdown", "project_audit.py", "chrome-devtools-plugin"),
-            "agy-code-design-refactor": ("Characterization", "Python 3", "Shell", "Vanilla JS", "project_audit.py"),
+            "agy-code-design-refactor": ("Characterization", "Reinvented Wheel", "allowed non-binary library", "Python 3", "Shell", "Vanilla JS", "project_audit.py"),
             "agy-project-standards": ("5-Language", "sec:santa-binary-download", "html:duplicate-id", "css:unbalanced-braces"),
         }
         for sname, terms in expected_skills.items():

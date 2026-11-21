@@ -23,8 +23,8 @@ description: Python 3 software engineering standards, static safety, Santa Lockd
   - Use `pathlib.Path` for filesystem paths, validate untrusted paths with `.resolve()` against allowed root directories to prevent path traversal, and enforce `0600` / `0700` permissions on sensitive local state (`os.chmod`).
   - Gate any optional macOS desktop/Keychain integration behind runtime `platform.system() == "Darwin"` checks so every script runs cleanly on macOS and Linux.
 
-## 3. Santa Lockdown Python & Pre-Commit Constraints
-- **Stdlib First, Pure-Python Wheels Second**: Prefer Python standard library (`pathlib`, `json`, `ast`, `html.parser`, `sqlite3`, `fcntl`, `urllib.request`, `unittest`) before adding third-party dependencies. When third-party packages are needed in `pyproject.toml`, prefer pure-Python wheels (`py3-none-any.whl`) executed inside the approved `python3` interpreter.
+## 3. Don't Reinvent the Wheel & Santa Lockdown Python Constraints
+- **Monitor for Allowed Non-Binary Libraries Before Coding**: Whenever implementing non-trivial parsing, validation, schemas, HTTP/auth, crypto, date/timezone math, or CLI formatting, first verify whether **Python 3 stdlib** (`pathlib`, `json`, `ast`, `html.parser`, `sqlite3`, `fcntl`, `urllib.request`, `zoneinfo`, `unittest`) or a well-maintained **pure-Python non-binary library** (`py3-none-any.whl` declared in `pyproject.toml`) already solves the need. If an allowed non-binary library fits cleanly, adopt it rather than hand-rolling fragile custom implementations.
 - **No Unapproved Standalone Binaries**: Avoid Python packages or local dev tools that download or execute standalone compiled `Mach-O` / `ELF` binaries at runtime (e.g., standalone `ruff`, `uv`, `pyright`, `playwright`, or `chromedriver` binary downloads) on Santa Lockdown workstations.
 - **Santa-Safe `.pre-commit-config.yaml`**: Use `language: system` (with stdlib Python / POSIX scripts) or pure-Python `language: python` hooks locally. Avoid `language: rust`, `language: golang`, `language: node`, `language: conda`, or `language: docker` hooks that fetch unapproved compiled binaries locally.
 

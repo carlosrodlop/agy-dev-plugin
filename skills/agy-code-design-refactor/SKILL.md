@@ -19,6 +19,7 @@ Before moving code, inspect the target module(s) and classify the actual structu
 | **Duplicated Logic** | Same parser, normalizer, validator, or formatter copied across 2+ files | Extract one shared pure helper in the owning layer (`clients/*_common.py`, shared JS formatter, sourced shell lib) |
 | **Mixed I/O & Logic** | Domain decision cannot be tested without real network, git remotes, or live `$HOME` | Inject `path` / `env` / transport callables or pass plain parsed data into pure functions |
 | **Hidden Coupling & Global State** | Implicit mutation of module globals, `os.environ`, or shared DOM globals | Return explicit typed dataclasses / plain state objects; pass dependencies explicitly |
+| **Reinvented Wheel** | Custom parser, validator, date/crypto/UI utility duplicating mature libraries | Replace with Python stdlib, native Web Platform APIs, or an allowed non-binary library (`py3-none-any.whl` / zero-build JS/CSS module — never Santa-blocked binaries) |
 | **Fragile Shell Logic** | Complex JSON, date math, or multi-file transforms written in nested `sed`/`awk` | Keep shell as a thin entrypoint and move non-trivial logic into stdlib Python 3 |
 
 ---
