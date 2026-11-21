@@ -42,7 +42,11 @@ PROPRIETARY_VCS_CLI_RE = re.compile(
     r"(?:^|[;&|]\s*|\$\(\s*)(?:gh\s+(?:pr|issue|repo|release|api)\b|glab\s+(?:mr|issue|repo|api)\b)"
 )
 SANTA_UNAPPROVED_BINARY_PIPE_RE = re.compile(
-    r"(?:\b(?:curl|wget)\b[^;\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b|(?:^|[;&|]\s*)mise\s+(?:install|use)\b)"
+    r"(?:"
+    r"\b(?:curl|wget)\b[^;\n|]*\|\s*(?:sudo\s+)?(?:(?:ba|z|da|k)?sh|python3?|perl|ruby)\b"
+    r"|(?:^|[;&|]\s*)(?:mise\s+(?:install|use)|uv\s+(?:tool|python)\s+install|cargo\s+binstall)\b"
+    r"|\b(?:curl|wget)\b[^\n]*(?:releases/download/|(?:-o|-O)\s+\S+)[^\n]*(?:&&|;)[^\n]*\bchmod\s+(?:[a-z]*\+x|[0-7]*[1357][0-7]{0,2})\b"
+    r")"
 )
 
 DETERMINISTIC_DEV_PRETOOL_CHECKS: tuple[dict[str, str], ...] = (
@@ -65,10 +69,10 @@ DETERMINISTIC_DEV_PRETOOL_CHECKS: tuple[dict[str, str], ...] = (
     {
         "check_id": "pretool:santa-lockdown-binary",
         "event": "PreToolUse",
-        "title": "Santa Lockdown Binary Pipe Blocker",
+        "title": "Santa Lockdown Binary Download & Pipe Blocker",
         "target": "run_command (SANTA_UNAPPROVED_BINARY_PIPE_RE)",
         "decision": "deny",
-        "description": "Blocks curl|sh, wget|sh, and 'mise install/use'; enforces declarative asdf (.tool-versions) and pyproject.toml.",
+        "description": "Blocks curl|sh, curl|python*, releases/download + chmod +x, mise, uv tool/python install, and cargo binstall; enforces declarative asdf (.tool-versions) and pure-Python pyproject.toml.",
     },
     {
         "check_id": "pretool:dotenv-write-protection",
@@ -825,8 +829,11 @@ class DevLifecycleGuardrailEvaluator:
                 return {
                     "decision": "deny",
                     "reason": (
-                        "Guardrail violation (Santa Lockdown): piping remote scripts to shell or invoking "
-                        "'mise' is blocked. Manage runtimes declaratively via 'asdf' (.tool-versions) and pyproject.toml."
+                        "Guardrail violation (Santa Lockdown): piping remote scripts to shell/interpreters, "
+                        "downloading standalone executable binaries (releases/download + chmod +x), or invoking "
+                        "unapproved binary managers ('mise', 'uv tool/python install', 'cargo binstall') is blocked. "
+                        "Manage runtimes declaratively via 'asdf' (.tool-versions), pure-Python pyproject.toml, "
+                        "and OS-signed utilities."
                     ),
                 }
 
