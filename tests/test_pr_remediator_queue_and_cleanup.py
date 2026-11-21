@@ -2293,6 +2293,566 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertEqual(rej_ok["status"], "ok")
             self.assertTrue(rej_ok["lock_released"])
 
+    def test_detect_stalled_lock_and_lock_heartbeat_cli(self) -> None:
+        """Verify stalled-worker detection across timestamps/worktree/transcript and `lock-heartbeat` CLI."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True)
+            brain_dir = troot / "brain"
+            convs_dir = troot / "convs"
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-a")
+            vcs_a = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+
+            cid = "71717171-1111-4111-8111-717171717171"
+            worker_cid = "82828282-2222-4222-8222-828282828282"
+            start_res = prs.start_remediation_branch_and_lock(
+                conversation_id=cid,
+                action_id="stall-check",
+                rca_summary="Test stall detection",
+                proposed_fix="Track worker activity",
+                create_worktree=True,
+                branch_timestamp="20261121-080000",
+                workdir=repo_a,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+                worker_cid=worker_cid,
+            )
+            self.assertEqual(start_res["status"], "ok")
+            wt_path = pathlib.Path(start_res["worktree_path"])
+            lock_obj = start_res["lock"]
+            self.assertEqual(lock_obj["worker_cid"], worker_cid)
+            self.assertTrue(lock_obj["last_activity_at"])
+
+            # Anchor deterministic clock and backdate worktree + lock timestamps by 1h42m (6120s)
+            stale_iso = "2027-01-15T06:18:00Z"  # exact 6120s before 2027-01-15T08:00:00Z
+            base_now = prs._flow_opt.parse_iso_timestamp("2027-01-15T08:00:00Z")
+            stale_ts = base_now - 6120.0
+            for root_d, dirnames, filenames in os.walk(wt_path):
+                dirnames[:] = [d for d in dirnames if d != ".git"]
+                for fn in filenames:
+                    os.utime(pathlib.Path(root_d) / fn, (stale_ts, stale_ts))
+
+            stale_lock = {
+                **lock_obj,
+                "status": "DEVELOPING",
+                "pr_gate_ready": False,
+                "acquired_at": stale_iso,
+                "updated_at": stale_iso,
+                "last_activity_at": stale_iso,
+            }
+            det_stale = prs.detect_stalled_lock(stale_lock, now_ts=base_now, brain_dir=brain_dir)
+            self.assertTrue(det_stale["stalled"])
+            self.assertEqual(det_stale["idle_seconds"], 6120)
+            self.assertEqual(det_stale["idle_label"], "1h42m")
+            self.assertEqual(det_stale["threshold_seconds"], 900)
+            self.assertEqual(det_stale["worker_cid"], worker_cid)
+
+            # NEEDS_REVISION_ITERATING is also eligible for stall detection
+            det_iter = prs.detect_stalled_lock(
+                {**stale_lock, "status": "NEEDS_REVISION_ITERATING"},
+                now_ts=base_now,
+                brain_dir=brain_dir,
+            )
+            self.assertTrue(det_iter["stalled"])
+
+            # Human-ready or non-developing locks are NEVER flagged as stalled
+            for exempt in (
+                {**stale_lock, "status": "PENDING_HUMAN_PR_VALIDATION", "pr_gate_ready": True},
+                {**stale_lock, "status": "AWAITING_AGENT_REVIEW"},
+                {**stale_lock, "status": "DEVELOPING", "pr_gate_ready": True},
+                {**stale_lock, "active": False},
+            ):
+                self.assertFalse(prs.detect_stalled_lock(exempt, now_ts=base_now, brain_dir=brain_dir)["stalled"])
+
+            # Fresh worker transcript mtime clears stall even when lock/worktree timestamps are stale
+            _write_fake_conversation(brain_dir, convs_dir, worker_cid, mtime=base_now - 120.0)
+            det_transcript_ok = prs.detect_stalled_lock(stale_lock, now_ts=base_now, brain_dir=brain_dir)
+            self.assertFalse(det_transcript_ok["stalled"])
+            self.assertEqual(det_transcript_ok["idle_label"], "2m")
+
+            # Backdate transcript too, then touch a worktree file -> worktree activity clears stall
+            _write_fake_conversation(brain_dir, convs_dir, worker_cid, mtime=stale_ts)
+            self.assertTrue(prs.detect_stalled_lock(stale_lock, now_ts=base_now, brain_dir=brain_dir)["stalled"])
+            (wt_path / "active_edit.py").write_text("X = 1\n", encoding="utf-8")
+            os.utime(wt_path / "active_edit.py", (base_now - 60.0, base_now - 60.0))
+            self.assertFalse(prs.detect_stalled_lock(stale_lock, now_ts=base_now, brain_dir=brain_dir)["stalled"])
+
+            # Env override AGY_DEV_STALL_THRESHOLD_SECONDS respected
+            with mock.patch.dict(os.environ, {"AGY_DEV_STALL_THRESHOLD_SECONDS": "30"}):
+                det_env = prs.detect_stalled_lock(stale_lock, now_ts=base_now, brain_dir=brain_dir)
+                self.assertTrue(det_env["stalled"])
+                self.assertEqual(det_env["threshold_seconds"], 30)
+
+            # CLI `lock-heartbeat` & `start-remediation --worker-cid` argument parsing + heartbeat stamping
+            parsed_start = prs.parse_args(
+                ["start-remediation", "--id", cid, "--worker-cid", worker_cid, "--worktree"]
+            )
+            self.assertEqual(parsed_start.worker_cid, worker_cid)
+            parsed_hb = prs.parse_args(
+                ["lock-heartbeat", "--workdir", str(wt_path), "--worker-cid", worker_cid, "--stage", "testing"]
+            )
+            self.assertEqual(parsed_hb.subcommand, "lock-heartbeat")
+            self.assertEqual(parsed_hb.stage_label, "testing")
+
+            hb_res = prs.record_dev_pr_lock_heartbeat(
+                workdir=wt_path,
+                worker_cid="93939393-3333-4333-8333-939393939393",
+                stage_label="testing",
+                portfolio_dir=pdir,
+            )
+            self.assertEqual(hb_res["status"], "ok")
+            self.assertEqual(hb_res["lock"]["worker_cid"], "93939393-3333-4333-8333-939393939393")
+            self.assertEqual(hb_res["lock"]["stage_label"], "testing")
+            self.assertTrue(hb_res["last_activity_at"])
+
+    def test_branch_diff_verification_gate_and_single_pass_test_local_with_pre_commit(self) -> None:
+        """Verify `test-local --with-pre-commit` single-pass SKIP & `branch-diff` embedded `verification_gate`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-a")
+            (repo_a / ".pre-commit-config.yaml").write_text(
+                "repos:\n  - repo: local\n    hooks:\n      - id: unit-tests\n        entry: python3 -m unittest\n",
+                encoding="utf-8",
+            )
+            (repo_a / "tests" / "scripts").mkdir(parents=True)
+            (repo_a / "tests" / "scripts" / "qa_static_audit.py").write_text(
+                "#!/usr/bin/env python3\nprint('[qa_static_audit] PASS: 2 files scanned (0 errors, 0 warnings)')\n",
+                encoding="utf-8",
+            )
+            (repo_a / "tests" / "test_acme_fast.py").write_text(
+                "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): self.assertEqual(2, 2)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo_a), "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "commit", "-m", "chore: seed suite"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "origin", "main"], check=True, capture_output=True)
+
+            vcs_a = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+            cid = "74747474-4444-4444-8444-747474747474"
+            start_res = prs.start_remediation_branch_and_lock(
+                conversation_id=cid,
+                action_id="single-pass",
+                rca_summary="Duplicate test runs",
+                proposed_fix="Single-pass test-local --with-pre-commit",
+                create_worktree=True,
+                branch_timestamp="20261121-081500",
+                workdir=repo_a,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            wt_path = pathlib.Path(start_res["worktree_path"])
+            branch_name = start_res["branch_name"]
+            (wt_path / "feature.py").write_text("ENABLED = True\n", encoding="utf-8")
+
+            # CLI flags `--with-pre-commit`, `--run-pre-commit`, and uppercase `--pre-commit-status PASSED`
+            self.assertTrue(prs.parse_args(["test-local", "--with-pre-commit"]).run_pre_commit)
+            self.assertTrue(prs.parse_args(["test-local", "--run-pre-commit"]).run_pre_commit)
+            self.assertEqual(prs.parse_args(["test-local", "--pre-commit-status", "PASSED"]).pre_commit_status, "pass")
+
+            # Single-pass run executes pre-commit FIRST with SKIP=unit-tests,qa-static-audit, then QA + unittest once
+            call_log: list[tuple[list[str], str]] = []
+            real_subproc_run = subprocess.run
+
+            def _intercept_run(cmd, *args, **kwargs):
+                cmd_list = [str(c) for c in cmd]
+                env_used = kwargs.get("env") or {}
+                call_log.append((cmd_list, str(env_used.get("SKIP") or "")))
+                if cmd_list and cmd_list[0].endswith("pre-commit"):
+                    return subprocess.CompletedProcess(cmd_list, 0, stdout="check-ast...Passed\n", stderr="")
+                return real_subproc_run(cmd, *args, **kwargs)
+
+            with (
+                mock.patch.object(prs.shutil, "which", side_effect=lambda b: "/usr/local/bin/pre-commit" if b == "pre-commit" else None),
+                mock.patch.object(prs.subprocess, "run", side_effect=_intercept_run),
+            ):
+                val_res = prs.run_local_validation_suite(
+                    workdir=wt_path,
+                    portfolio_dir=pdir,
+                    run_pre_commit=True,
+                    run_bats=False,
+                )
+
+            self.assertTrue(val_res["passed"])
+            self.assertEqual(val_res["pre_commit_status"], "PASSED")
+            self.assertIn("check-ast...Passed", val_res["pre_commit_output"])
+            self.assertEqual(val_res["verification_results"]["pre_commit"]["status"], "pass")
+            self.assertEqual(val_res["verification_results"]["pre_commit_status"], "PASSED")
+
+            pc_calls = [(c, sk) for c, sk in call_log if c and c[0].endswith("pre-commit")]
+            qa_calls = [c for c, _ in call_log if any("qa_static_audit.py" in tok for tok in c)]
+            ut_calls = [c for c, _ in call_log if "-m" in c and "unittest" in c]
+            self.assertEqual(len(pc_calls), 1)
+            self.assertEqual(pc_calls[0][1], "unit-tests,qa-static-audit")
+            self.assertEqual(len(qa_calls), 1)
+            self.assertIn("--incremental", qa_calls[0])
+            self.assertEqual(len(ut_calls), 1)
+            # Pre-commit ran before qa_static_audit and unittest
+            pc_idx = next(i for i, (c, _) in enumerate(call_log) if c and c[0].endswith("pre-commit"))
+            qa_idx = next(i for i, (c, _) in enumerate(call_log) if any("qa_static_audit.py" in tok for tok in c))
+            self.assertLess(pc_idx, qa_idx)
+
+            # Stage locally via prepare-review so verification_results binds cleanly to staged commit SHA
+            staged = prs.push_remediation_branch_and_build_reviewer_plan(
+                title="feat(single-pass): add feature",
+                executive_summary="Add feature and verify single-pass gate.",
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(staged["status"], "ok")
+            staged_sha = staged["staged_head_sha"]
+
+            # `branch-diff` embeds `verification_gate` with `skip_redundant_test_rerun == True`
+            diff_res = prs.get_branch_diff_with_verification_gate(
+                branch=branch_name,
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(diff_res["status"], "ok")
+            vgate = diff_res["verification_gate"]
+            self.assertEqual(vgate["head_sha"], staged_sha)
+            self.assertEqual(vgate["verified_head_sha"], staged_sha)
+            self.assertTrue(vgate["matches_head"])
+            self.assertTrue(vgate["passed"])
+            self.assertEqual(vgate["pre_commit_status"], "PASSED")
+            self.assertTrue(vgate["qa_passed"])
+            self.assertTrue(vgate["tests_passed"])
+            self.assertTrue(vgate["bats_passed"])
+            self.assertTrue(vgate["skip_redundant_test_rerun"])
+
+            # A subsequent unverified commit invalidates `matches_head` and `skip_redundant_test_rerun`
+            (wt_path / "feature.py").write_text("ENABLED = False\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(wt_path), "add", "feature.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(wt_path), "commit", "-m", "chore: unverified edit"], check=True, capture_output=True)
+            diff_stale = prs.get_branch_diff_with_verification_gate(
+                branch=branch_name,
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertFalse(diff_stale["verification_gate"]["matches_head"])
+            self.assertFalse(diff_stale["verification_gate"]["skip_redundant_test_rerun"])
+
+            # Failed pre-commit marks `pre_commit_status == "FAILED"` and `passed == False`
+            def _intercept_fail(cmd, *args, **kwargs):
+                cmd_list = [str(c) for c in cmd]
+                if cmd_list and cmd_list[0].endswith("pre-commit"):
+                    return subprocess.CompletedProcess(cmd_list, 1, stdout="trailing-whitespace...Failed\n", stderr="")
+                return real_subproc_run(cmd, *args, **kwargs)
+
+            with (
+                mock.patch.object(prs.shutil, "which", side_effect=lambda b: "/usr/local/bin/pre-commit" if b == "pre-commit" else None),
+                mock.patch.object(prs.subprocess, "run", side_effect=_intercept_fail),
+            ):
+                fail_res = prs.run_local_validation_suite(
+                    workdir=wt_path,
+                    portfolio_dir=pdir,
+                    run_pre_commit=True,
+                    run_bats=False,
+                )
+            self.assertFalse(fail_res["passed"])
+            self.assertEqual(fail_res["pre_commit_status"], "FAILED")
+            self.assertIn("trailing-whitespace...Failed", fail_res["pre_commit_output"])
+
+    def test_analyze_dev_flow_optimizations_all_seven_detectors_and_cli(self) -> None:
+        """Verify all 7 deterministic 0-LLM detectors in `analyze_dev_flow_optimizations` and `queue-optimize` CLI."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True)
+            repos_root = troot / "repos"
+            repos_root.mkdir(parents=True)
+            brain_dir = troot / "brain"
+            convs_dir = troot / "convs"
+
+            # 0. Clean empty state -> health_score == 100, zero findings, missing brain_dir gracefully skipped
+            clean_rep = prs.analyze_dev_flow_optimizations(
+                portfolio_dir=pdir,
+                repos_dir=repos_root,
+                brain_dir=troot / "nonexistent-brain",
+            )
+            self.assertEqual(clean_rep["status"], "ok")
+            self.assertEqual(clean_rep["health_score"], 100)
+            self.assertEqual(clean_rep["findings"], [])
+            self.assertEqual(clean_rep["summary"]["scanned_transcripts"], 0)
+            self.assertEqual(clean_rep["top_hint"], "")
+
+            # Seed synthetic managed repo-a (monolithic god files + missing selective test runner)
+            repo_a = repos_root / "repo-a"
+            (repo_a / ".git").mkdir(parents=True)
+            (repo_a / ".pre-commit-config.yaml").write_text(
+                "repos:\n"
+                "  - repo: local\n"
+                "    hooks:\n"
+                "      - id: qa-static-audit\n"
+                "        entry: python3 ./tests/scripts/qa_static_audit.py --strict\n"
+                "      - id: unit-tests\n"
+                "        entry: python3 -m unittest discover -s tests -p 'test_*.py'\n",
+                encoding="utf-8",
+            )
+            (repo_a / "web").mkdir(parents=True)
+            (repo_a / "web" / "big_ui.js").write_text("const x = 1;\n" * 5100, encoding="utf-8")
+            (repo_a / "core_monolith.py").write_text("VALUE = 1\n" * 5050, encoding="utf-8")
+
+            # Seed stale worktree + active DEVELOPING lock (Detector 1: stalled_worker)
+            now_ts = prs._flow_opt.parse_iso_timestamp("2027-01-15T10:00:00Z")
+            stale_iso = "2027-01-15T08:18:00Z"  # 1h42m idle
+            stale_wt = troot / "wt-stale"
+            stale_wt.mkdir(parents=True)
+            (stale_wt / "patch.py").write_text("A = 1\n", encoding="utf-8")
+            os.utime(stale_wt / "patch.py", (now_ts - 6120.0, now_ts - 6120.0))
+
+            (pdir / "actions_state.json").write_text(
+                json.dumps(
+                    {
+                        "actions_log_audit_state": {
+                            "dev_pr_locks": {
+                                "acme/repo-a": {
+                                    "active": True,
+                                    "repo_slug": "acme/repo-a",
+                                    "status": "DEVELOPING",
+                                    "pr_gate_ready": False,
+                                    "conversation_id": "aaaa1111-1111-4111-8111-111111111111",
+                                    "branch_name": "fix/20270115-081800-stall-aaaa1111",
+                                    "worktree_path": str(stale_wt),
+                                    "target_repo_dir": str(repo_a),
+                                    "acquired_at": stale_iso,
+                                    "updated_at": stale_iso,
+                                    "last_activity_at": stale_iso,
+                                }
+                            }
+                        }
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            # Seed dev_queue.json triggering Detectors 2 (micro_pr_batch_candidates), 3 (repo_contention_hotspot), 4 (unanchored_pending_tasks)
+            orch_cid = "99990000-1111-4111-8111-999900000001"
+            (pdir / "dev_queue.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "orchestrator_conversation_id": orch_cid,
+                        "updated_at": stale_iso,
+                        "items": [
+                            {
+                                "conversation_id": "aaaa1111-1111-4111-8111-111111111111",
+                                "title": "Active stalled work",
+                                "priority": 10,
+                                "status": "in_progress",
+                                "repo_slugs": ["acme/repo-a"],
+                                "target_files": ["web/big_ui.js"],
+                            },
+                            {
+                                "conversation_id": "bbbb2222-1111-4111-8111-111111111111",
+                                "title": "UI badge alignment polish",
+                                "priority": 30,
+                                "status": "pending",
+                                "repo_slugs": ["acme/repo-a"],
+                                "target_files": ["web/big_ui.js"],
+                            },
+                            {
+                                "conversation_id": "cccc3333-1111-4111-8111-111111111111",
+                                "title": "Tooltip copy tweak",
+                                "priority": 32,
+                                "status": "pending",
+                                "repo_slugs": ["acme/repo-a"],
+                                "target_files": ["web/tooltip.css"],
+                            },
+                            {
+                                "conversation_id": "dddd4444-1111-4111-8111-111111111111",
+                                "title": "Minor icon spacing fix",
+                                "priority": 34,
+                                "status": "pending",
+                                "repo_slugs": ["acme/repo-a"],
+                                "target_files": ["web/icons.css"],
+                            },
+                            {
+                                "conversation_id": "eeee5555-1111-4111-8111-111111111111",
+                                "title": "Unanchored architecture task",
+                                "priority": 60,
+                                "status": "pending",
+                                "repo_slugs": ["acme/repo-a", "acme/repo-b"],
+                                "target_files": [],
+                            },
+                        ],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            # Seed Detector 7 telemetry transcripts (bloated orchestrator + heavy reviewer + 0% flash routing)
+            orch_steps: list[dict] = []
+            for idx in range(6):
+                orch_steps.append(
+                    {
+                        "step_index": idx + 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "tool_calls": [
+                            {
+                                "name": "invoke_subagent",
+                                "arguments": {"TypeName": "agy-code-developer", "Model": "pro"},
+                            }
+                        ],
+                    }
+                )
+            for idx in range(6, 305):
+                orch_steps.append({"step_index": idx + 1, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "tick"})
+            _write_fake_conversation(brain_dir, convs_dir, orch_cid, steps=orch_steps)
+
+            rev_cid = "88880000-1111-4111-8111-888800000002"
+            rev_steps: list[dict] = [
+                {
+                    "step_index": 1,
+                    "type": "RUN_COMMAND",
+                    "tool_calls": [
+                        {"name": "run_command", "arguments": {"CommandLine": "python3 pr_remediator.py branch-diff --branch fix/x"}}
+                    ],
+                },
+                {
+                    "step_index": 2,
+                    "type": "RUN_COMMAND",
+                    "tool_calls": [
+                        {"name": "run_command", "arguments": {"CommandLine": "pre-commit run --all-files"}}
+                    ],
+                },
+            ]
+            for idx in range(3, 12):
+                rev_steps.append(
+                    {
+                        "step_index": idx,
+                        "type": "RUN_COMMAND",
+                        "tool_calls": [{"name": "run_command", "arguments": {"CommandLine": "git status"}}],
+                    }
+                )
+            rev_steps.append(
+                {
+                    "step_index": 12,
+                    "type": "RUN_COMMAND",
+                    "tool_calls": [
+                        {"name": "run_command", "arguments": {"CommandLine": "python3 pr_remediator.py record-review --verdict PASS --score 96"}}
+                    ],
+                }
+            )
+            _write_fake_conversation(brain_dir, convs_dir, rev_cid, steps=rev_steps)
+
+            report = prs.analyze_dev_flow_optimizations(
+                portfolio_dir=pdir,
+                repos_dir=repos_root,
+                brain_dir=brain_dir,
+                orchestrator_cid=orch_cid,
+                now_ts=now_ts,
+            )
+            self.assertEqual(report["status"], "ok")
+            self.assertGreaterEqual(report["health_score"], 0)
+            self.assertLess(report["health_score"], 100)
+            by_code = {f["code"]: f for f in report["findings"]}
+
+            expected_codes = {
+                "stalled_worker",
+                "micro_pr_batch_candidates",
+                "repo_contention_hotspot",
+                "unanchored_pending_tasks",
+                "monolithic_god_files",
+                "missing_selective_test_runner",
+                "bloated_orchestrator_session",
+                "heavy_reviewer_overhead",
+                "missing_flash_routing",
+            }
+            self.assertEqual(set(by_code.keys()), expected_codes)
+
+            required_keys = {
+                "code",
+                "severity",
+                "category",
+                "title",
+                "evidence",
+                "recommendation",
+                "auto_action_hint",
+                "estimated_savings_min",
+            }
+            for finding in report["findings"]:
+                self.assertTrue(required_keys.issubset(finding.keys()))
+
+            self.assertEqual(by_code["stalled_worker"]["severity"], "critical")
+            self.assertEqual(by_code["stalled_worker"]["evidence"]["idle_label"], "1h42m")
+            self.assertEqual(by_code["micro_pr_batch_candidates"]["severity"], "high")
+            self.assertEqual(by_code["micro_pr_batch_candidates"]["estimated_savings_min"], 36)
+            self.assertEqual(by_code["micro_pr_batch_candidates"]["evidence"]["count"], 3)
+            self.assertEqual(by_code["repo_contention_hotspot"]["severity"], "high")
+            self.assertEqual(by_code["unanchored_pending_tasks"]["evidence"]["count"], 1)
+            god_files = by_code["monolithic_god_files"]["evidence"]["files"]
+            self.assertEqual(god_files[0]["path"], "web/big_ui.js")
+            self.assertTrue(god_files[0]["queued_reference"])
+            self.assertEqual(god_files[0]["suggested_skill"], "agy-web-ui-architecture")
+            self.assertEqual(god_files[1]["suggested_skill"], "agy-code-design-refactor")
+            self.assertEqual(by_code["missing_selective_test_runner"]["severity"], "high")
+            self.assertTrue(by_code["missing_selective_test_runner"]["evidence"]["repos"][0]["missing_selective_runner"])
+            self.assertTrue(by_code["missing_selective_test_runner"]["evidence"]["repos"][0]["non_incremental_qa_audit"])
+            self.assertEqual(by_code["bloated_orchestrator_session"]["evidence"]["step_count"], 305)
+            self.assertEqual(by_code["heavy_reviewer_overhead"]["evidence"]["redundant_test_reruns"], 1)
+            self.assertEqual(by_code["missing_flash_routing"]["evidence"]["developer_invocations"], 6)
+            self.assertTrue(report["top_hint"].startswith("OPT:"))
+
+            # Verify `queue-optimize` CLI subcommand parses & outputs valid JSON
+            parsed_opt = prs.parse_args(
+                [
+                    "queue-optimize",
+                    "--json",
+                    "--orchestrator-id",
+                    orch_cid,
+                    "--repos-dir",
+                    str(repos_root),
+                    "--brain-dir",
+                    str(brain_dir),
+                    "--stall-seconds",
+                    "900",
+                ]
+            )
+            self.assertEqual(parsed_opt.subcommand, "queue-optimize")
+            self.assertTrue(parsed_opt.as_json)
+            self.assertEqual(parsed_opt.stall_seconds, 900)
+
+            buf = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"AGY_DEV_STATE_DIR": str(pdir)}),
+                contextlib.redirect_stdout(buf),
+            ):
+                rc = prs.main(
+                    [
+                        "queue-optimize",
+                        "--json",
+                        "--orchestrator-id",
+                        orch_cid,
+                        "--repos-dir",
+                        str(repos_root),
+                        "--brain-dir",
+                        str(brain_dir),
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            cli_payload = json.loads(buf.getvalue())
+            self.assertEqual(cli_payload["status"], "ok")
+            self.assertGreaterEqual(cli_payload["summary"]["total_findings"], 8)
+
 
 if __name__ == "__main__":
     unittest.main()

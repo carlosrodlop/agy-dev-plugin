@@ -18,16 +18,16 @@ All code, script, skill, rule, agent, hook, and configuration changes MUST flow 
 2. **Acquire Per-Repo Lock & Isolated Timestamped Worktree Branch**:
    ```bash
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation \
-     --id <CONVERSATION_ID> --action-id <SCOPE> --workdir <TARGET_REPO_DIR> \
+     --id <CONVERSATION_ID> --action-id <SCOPE> --workdir <TARGET_REPO_DIR> --worker-cid <WORKER_CID> \
      --rca-summary "<Why>" --proposed-fix "<What>" --worktree
    ```
    - Use `--reuse-active` when iterating on follow-up commits from the same active conversation (`--workdir` or `--repo <owner/repo>` selects any managed target repository cleanly).
-3. **Implement, Test & Persist Deterministic Verification Checks in `<WORKTREE_PATH>`**:
+   - Stamp `pr_remediator.py lock-heartbeat --workdir <WORKTREE_PATH> --worker-cid <WORKER_CID> --stage <LABEL>` during long tasks so `detect_stalled_lock` and `agy-queue` accurately track worker liveness.
+3. **Implement, Test & Persist Unified Single-Pass Verification Checks in `<WORKTREE_PATH>`**:
    - Delegate or execute via `agy-dev-executor` / `agy-code-developer` inside `<WORKTREE_PATH>` (never leave dirty feature edits on `main`).
-   - Iterate quickly on targeted `python3 -m unittest <module>`, then run the full local gate (which persists structured `verification_results` bound to `head_sha` inside `dev_pr_lock`):
+   - Iterate quickly on targeted `python3 -m unittest <module>`, then run the single-pass local gate (runs `pre-commit run --all-files` with `SKIP=unit-tests,qa-static-audit` first, then `qa_static_audit.py --incremental` + `selective_test_runner.py` once, persisting unified `verification_results` bound to `head_sha` inside `dev_pr_lock`):
      ```bash
-     cd <WORKTREE_PATH> && pre-commit run --all-files
-     python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py test-local --workdir <WORKTREE_PATH>
+     python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py test-local --workdir <WORKTREE_PATH> --with-pre-commit
      ```
 4. **Stage Locally for Independent Review (Local-First Review — Zero Pre-Review Push)**:
    ```bash
@@ -35,8 +35,8 @@ All code, script, skill, rule, agent, hook, and configuration changes MUST flow 
      --workdir <WORKTREE_PATH> --title "fix(<scope>): <summary>" --executive-summary "..."
    ```
    - `prepare-review` (alias `push-branch`) commits locally, renders deterministic `## 🧪 Automated Verification Checks`, and sets `status="AWAITING_AGENT_REVIEW"`, `pr_gate_ready=False`, `branch_pushed=False`, `manual_pr_url=""` **without pushing to `origin`**. Any subsequent commit/rebase invalidates `reviewed_head_sha` and clears `manual_pr_url` until re-reviewed. Direct `git push` on an unvalidated locked branch is blocked by `PreToolUse` (`pretool:unvalidated-branch-push`).
-5. **Independent Maker-Checker Gate (`agy-code-pr-reviewer`, `Model="pro"`) & Auto-Iteration Loop**:
-   - Invoke `agy-code-pr-reviewer` (`Model="pro"`) with `--branch <BRANCH_NAME>` and `--workdir <WORKTREE_PATH>`. It runs `branch-diff` locally and executes:
+5. **Independent Lean Maker-Checker Gate (`agy-code-pr-reviewer`, `Model="pro"`) & Auto-Iteration Loop**:
+   - Invoke `agy-code-pr-reviewer` (`Model="pro"`) with `--branch <BRANCH_NAME>` and `--workdir <WORKTREE_PATH>`. It runs `branch-diff` locally — which embeds a SHA-bound `verification_gate` (`head_sha`, `verified_head_sha`, `matches_head`, `passed`, `skip_redundant_test_rerun`). Under the **Lean Reviewer Protocol (Target 3–5 turns)**, when `verification_gate.skip_redundant_test_rerun == true`, the reviewer skips redundant `pre-commit`/`unittest` reruns, audits diff logic, security/Zero-PII, and test quality directly, and executes:
      ```bash
      python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review \
        --branch <BRANCH_NAME> --workdir <WORKTREE_PATH> --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary "..." --send-email

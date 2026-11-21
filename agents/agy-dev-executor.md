@@ -28,22 +28,22 @@ You take well-scoped tasks from `agy-dev-planner` / `dev_queue.json` (or direct 
      ```bash
      python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-next --unlocked
      python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation \
-       --id <TASK_CID> --action-id <SCOPE> --workdir <TARGET_REPO_DIR> \
+       --id <TASK_CID> --action-id <SCOPE> --workdir <TARGET_REPO_DIR> --worker-cid <CONVERSATION_ID> \
        --rca-summary "..." --proposed-fix "..." --worktree
      ```
    - If `status == "locked"` on that specific `repo_slug`, STOP work on that repo immediately, verify its queued item status, and report the active lock collision cleanly (never force-override another conversation's active lock!).
 
 2. **Implement Clean Modular Changes Inside `<WORKTREE_PATH>` Only**:
    - Mark the queue item active (`pr_remediator.py queue-set-status --id <TASK_CID> --status in_progress`).
+   - During long implementations, stamp `pr_remediator.py lock-heartbeat --workdir <WORKTREE_PATH> --worker-cid <CONVERSATION_ID> --stage coding` so the stall detector and TUI know the worker is actively progressing.
    - Edit files ONLY inside `<WORKTREE_PATH>` (keeping primary `main` checkout clean).
    - Enforce engineering pillars: English-only code/comments, shallow stateless helpers, Unix portability, Santa Lockdown compliance, strict Zero-PII / zero secrets, and hermetic unit/BATS tests covering every new behavior.
 
-3. **Run Local Verification Gates Until Green**:
+3. **Run Single-Pass Local Verification Gate Until Green**:
    - Iterate fast with `python3 -m unittest <target_test_module>`.
-   - Run full validation before pushing:
+   - Run unified single-pass validation (executes `pre-commit run --all-files` with `SKIP=unit-tests,qa-static-audit`, then runs `qa_static_audit.py --incremental` + `selective_test_runner.py` / `unittest` once and persists SHA-bound `verification_results` on `dev_pr_lock`):
      ```bash
-     cd <WORKTREE_PATH> && pre-commit run --all-files
-     python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py test-local --workdir <WORKTREE_PATH>
+     python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py test-local --workdir <WORKTREE_PATH> --with-pre-commit
      ```
 
 4. **Stage Locally & Drive Maker-Checker Auto-Iteration Loop Until `PASS > 90/100`**:

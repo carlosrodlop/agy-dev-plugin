@@ -49,6 +49,16 @@ for _cand_clients in (_SCRIPT_PLUGIN_ROOT / "clients", _INSTALLED_PLUGIN_ROOT / 
             sys.path.insert(0, _clients_str)
         break
 
+for _cand_opt in (
+    _SCRIPT_PLUGIN_ROOT / "skills" / "agy-code-remediation-pr" / "scripts",
+    _INSTALLED_PLUGIN_ROOT / "skills" / "agy-code-remediation-pr" / "scripts",
+):
+    if (_cand_opt / "dev_flow_optimizer.py").is_file():
+        _opt_str = str(_cand_opt)
+        if _opt_str not in sys.path:
+            sys.path.insert(0, _opt_str)
+        break
+
 try:
     import dev_common as _dev_common  # type: ignore[import-not-found]
 except Exception:
@@ -58,6 +68,11 @@ try:
     import git_client as _git_client  # type: ignore[import-not-found]
 except Exception:
     _git_client = None
+
+try:
+    import dev_flow_optimizer as _flow_opt  # type: ignore[import-not-found]
+except Exception:
+    _flow_opt = None
 
 ANSI_RE = re.compile(r"\x1b\]8;;[^\x1b\x07]*(?:\x1b\\|\x07)|\x1b\[[0-9;?]*[A-Za-z]")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
@@ -770,8 +785,44 @@ def _inspect_worktree_progress(worktree_raw: str) -> tuple[bool, int]:
     return (has_dirty, commits_ahead)
 
 
-def _compute_lock_progress(lk: dict[str, Any]) -> dict[str, object]:
-    """Compute per-lock progress percentage, compact tag, and PR readiness flags."""
+def _detect_stalled_lock_info(
+    lk: dict[str, Any],
+    *,
+    now_ts: float | None = None,
+    threshold_seconds: int | float | None = None,
+    brain_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Delegate stalled-worker inspection to `dev_flow_optimizer.detect_stalled_lock` safely."""
+    if _flow_opt is not None and hasattr(_flow_opt, "detect_stalled_lock"):
+        try:
+            return dict(
+                _flow_opt.detect_stalled_lock(
+                    lk,
+                    now_ts=now_ts,
+                    threshold_seconds=threshold_seconds,
+                    brain_dir=brain_dir,
+                )
+            )
+        except Exception:
+            pass
+    return {
+        "stalled": False,
+        "idle_seconds": 0,
+        "idle_label": "0s",
+        "threshold_seconds": 900,
+        "last_activity_ts": 0.0,
+        "worker_cid": str(lk.get("worker_cid") or "").strip(),
+    }
+
+
+def _compute_lock_progress(
+    lk: dict[str, Any],
+    *,
+    now_ts: float | None = None,
+    threshold_seconds: int | float | None = None,
+    brain_dir: Path | str | None = None,
+) -> dict[str, object]:
+    """Compute per-lock progress percentage, compact tag, stalled state, and PR readiness flags."""
     st_u = str(lk.get("status") or "DEVELOPING").upper()
     branch_pushed = bool(lk.get("branch_pushed"))
     has_pr = bool(lk.get("pr_url"))
@@ -783,8 +834,21 @@ def _compute_lock_progress(lk: dict[str, Any]) -> dict[str, object]:
         st_u in AGENT_REVIEW_LOCK_STATUSES or branch_pushed or has_pr
     )
 
+    stall_info = _detect_stalled_lock_info(
+        lk,
+        now_ts=now_ts,
+        threshold_seconds=threshold_seconds,
+        brain_dir=brain_dir,
+    )
+    is_stalled = bool(stall_info.get("stalled"))
+    idle_seconds = int(stall_info.get("idle_seconds") or 0)
+    idle_label = str(stall_info.get("idle_label") or "")
+
     explicit_pct = lk.get("progress_pct")
-    if isinstance(explicit_pct, (int, float)):
+    if is_stalled:
+        pct = 0
+        tag = f"STALL {idle_label}".strip()
+    elif isinstance(explicit_pct, (int, float)):
         pct = max(0, min(100, int(round(explicit_pct))))
         eta_mins = lk.get("eta_minutes")
         tag = f"~{int(eta_mins)}m" if isinstance(eta_mins, (int, float)) else str(lk.get("stage_label") or "")[:5]
@@ -813,6 +877,10 @@ def _compute_lock_progress(lk: dict[str, Any]) -> dict[str, object]:
         "is_human_ready": is_human_ready,
         "is_agent_review": is_agent_review,
         "is_escalated": is_escalated,
+        "is_stalled": is_stalled,
+        "idle_seconds": idle_seconds,
+        "idle_label": idle_label,
+        "worker_cid": str(stall_info.get("worker_cid") or ""),
     }
 
 
@@ -846,6 +914,9 @@ def _compute_item_progress(
     per_repo_pct: dict[str, int] = {slug: (100 if slug in merged_set else 0) for slug in repo_slugs}
     tags: list[str] = []
     any_lock_human_ready = False
+    any_lock_stalled = False
+    stalled_tag = ""
+    stalled_idle_label = ""
 
     for slug, lk in linked_locks:
         lp = lock_progress_cache.get(slug)
@@ -858,6 +929,10 @@ def _compute_item_progress(
                 tags.append(str(lp["tag"]))
             if lp.get("is_human_ready"):
                 any_lock_human_ready = True
+            if lp.get("is_stalled"):
+                any_lock_stalled = True
+                stalled_tag = str(lp.get("tag") or "STALL")
+                stalled_idle_label = str(lp.get("idle_label") or "")
 
     if is_human_pr or any_lock_human_ready:
         active_idx = min(total_repos, done_repos + 1)
@@ -868,6 +943,15 @@ def _compute_item_progress(
             "mode": "pr_final" if is_final_repo else "pr_part",
             "part_idx": active_idx,
             "total_repos": total_repos,
+        }
+
+    if any_lock_stalled:
+        return {
+            "pct": 0,
+            "tag": stalled_tag or f"STALL {stalled_idle_label}".strip(),
+            "mode": "stalled",
+            "is_stalled": True,
+            "idle_label": stalled_idle_label,
         }
 
     if not linked_locks:
@@ -899,13 +983,21 @@ def _compute_item_progress(
 
 
 def _render_inline_progress(progress: dict[str, object] | None, col_w: int, color_on: bool) -> str:
-    """Render an inline progress bar cell using full yellow/green bars for PR-ready states."""
+    """Render an inline progress bar cell using full yellow/green bars for PR-ready and alert style for stalled locks."""
     if progress is None:
         return _pad_visible(_color("—", "2", color_on), col_w)
     pct = max(0, min(100, int(progress.get("pct") or 0)))  # type: ignore[arg-type]
     tag = str(progress.get("tag") or "").strip()
     mode = str(progress.get("mode") or "")
     bar_cells = 6 if col_w < 21 else 8
+
+    if mode == "stalled":
+        lbl = tag or "STALL"
+        stall_cells = 4 if (col_w - bar_cells - 1) < len(lbl) and col_w >= 12 else bar_cells
+        bar = _color("▓" * stall_cells, "1;31", color_on)
+        max_lbl = max(4, col_w - stall_cells - 1)
+        lbl_clean = _trunc(lbl, max_lbl)
+        return _pad_visible(f"{bar} {_color(lbl_clean, '1;35', color_on)}", col_w)
 
     if mode in ("pr_part", "pr_final"):
         bar_code = "1;32" if mode == "pr_final" else "1;33"
@@ -1325,8 +1417,11 @@ def _write_live_antigravity_board(
             if lk:
                 lp = lock_progress_cache.get(slug) or {}
                 is_pr = bool(lp.get("is_human_ready"))
+                is_stalled = bool(lp.get("is_stalled"))
                 if is_pr:
                     tag = "PR listo"
+                elif is_stalled:
+                    tag = str(lp.get("tag") or "STALL")
                 elif lp.get("is_escalated"):
                     tag = "escalated"
                 elif lp.get("is_agent_review"):
@@ -1346,7 +1441,8 @@ def _write_live_antigravity_board(
                     if (is_pr and lock_has_pr and u_md)
                     else (f" · [Pulls]({u_md})" if u_md else "")
                 )
-                md.append(f"- 🟡 **`{lbl}`** — `{tag}`{link_part}")
+                icon = "🔴" if is_stalled else "🟡"
+                md.append(f"- {icon} **`{lbl}`** — `{tag}`{link_part}")
             else:
                 pu = _repo_pulls_url(slug, repo_web_bases)
                 link_part = f" · [Pulls]({pu})" if pu else ""
@@ -1369,6 +1465,37 @@ def _write_live_antigravity_board(
         return False
 
 
+def _compute_lightweight_opt_hint(
+    *,
+    items: list[dict[str, Any]],
+    locks: dict[str, dict[str, Any]],
+    all_locks: dict[str, dict[str, Any]],
+    repo_local_dirs: dict[str, Path],
+    bar_w: int,
+    now_ts: float | None = None,
+    stall_threshold_seconds: int | float | None = None,
+    brain_dir: Path | str | None = None,
+    enabled: bool = True,
+) -> str:
+    """Compute a fast, compact 1-line `OPT:` footer hint using lightweight 0-LLM analysis."""
+    if not enabled or _flow_opt is None or not hasattr(_flow_opt, "analyze_dev_flow_optimizations"):
+        return ""
+    try:
+        analysis = _flow_opt.analyze_dev_flow_optimizations(
+            lightweight=True,
+            preloaded_items=items,
+            preloaded_active_locks=locks,
+            preloaded_all_locks=all_locks,
+            preloaded_repo_dirs=repo_local_dirs,
+            now_ts=now_ts,
+            stall_threshold_seconds=stall_threshold_seconds,
+            brain_dir=brain_dir if brain_dir is not None else "",
+        )
+        return str(_flow_opt.format_compact_opt_hint(analysis, max_width=bar_w) or "")
+    except Exception:
+        return ""
+
+
 def render(
     args: argparse.Namespace,
     *,
@@ -1376,6 +1503,8 @@ def render(
     brain_dir: Path | str | None = None,
     is_tty_override: bool | None = None,
     term_width_override: int | None = None,
+    now_ts_override: float | None = None,
+    stall_threshold_seconds: int | float | None = None,
 ) -> tuple[
     str,
     dict[int, tuple[str, str]],
@@ -1398,8 +1527,26 @@ def render(
     repo_web_bases, repo_local_dirs = _discover_repos(all_locks, items, args.repos_dir)
 
     lock_progress_cache: dict[str, dict[str, object]] = {
-        slug: _compute_lock_progress(lk) for slug, lk in locks.items()
+        slug: _compute_lock_progress(
+            lk,
+            now_ts=now_ts_override,
+            threshold_seconds=stall_threshold_seconds,
+            brain_dir=brain_dir,
+        )
+        for slug, lk in locks.items()
     }
+    opt_enabled = not bool(getattr(args, "no_opt", False))
+    opt_hint = _compute_lightweight_opt_hint(
+        items=items,
+        locks=locks,
+        all_locks=all_locks,
+        repo_local_dirs=repo_local_dirs,
+        bar_w=bar_w,
+        now_ts=now_ts_override,
+        stall_threshold_seconds=stall_threshold_seconds,
+        brain_dir=brain_dir,
+        enabled=opt_enabled,
+    )
 
     all_managed_slugs: set[str] = set(locks.keys()) | set(repo_web_bases.keys())
     item_urls_by_cid: dict[str, list[str]] = {}
@@ -1477,6 +1624,11 @@ def render(
             for slug, lk in locks.items()
             if not repo_filter or repo_filter in slug.lower()
         }
+        stalled_locks_payload = {
+            slug: lock_progress_cache[slug]
+            for slug in active_locks_payload
+            if bool((lock_progress_cache.get(slug) or {}).get("is_stalled"))
+        }
         payload = json.dumps(
             {
                 "state_dir": str(state_dir),
@@ -1486,6 +1638,8 @@ def render(
                 "managed_repos": managed_list,
                 "locks": active_locks_payload,
                 "active_locks": active_locks_payload,
+                "stalled_locks": stalled_locks_payload,
+                "opt_hint": opt_hint,
                 "items": enriched_items,
             },
             indent=2,
@@ -1520,6 +1674,16 @@ def render(
         lines.append(header_left)
         lines.append(summary_str)
 
+    stalled_alerts: list[tuple[str, str, str]] = []
+    for slug in managed_list:
+        lk = locks.get(slug)
+        lp = lock_progress_cache.get(slug) or {}
+        if lk and bool(lp.get("is_stalled")):
+            lbl = label_map.get(slug, slug)
+            stalled_alerts.append(
+                (lbl, str(lp.get("idle_label") or ""), str(lk.get("branch_name") or ""))
+            )
+
     if managed_list:
         repo_pills: list[str] = []
         for slug in managed_list:
@@ -1528,14 +1692,20 @@ def render(
             if lk:
                 lp = lock_progress_cache.get(slug) or {}
                 is_human_pr = bool(lp.get("is_human_ready"))
+                is_stalled = bool(lp.get("is_stalled"))
                 is_rev = bool(lp.get("is_agent_review"))
                 is_esc = bool(lp.get("is_escalated"))
-                tag = (
-                    "PR"
-                    if is_human_pr
-                    else ("esc" if is_esc else (str(lp.get("tag") or "rev") if is_rev else f"{int(lp.get('pct') or 0)}%"))  # type: ignore[arg-type]
-                )
-                dot_code = "1;33" if is_human_pr else ("1;35" if is_esc else "1;36")
+                if is_human_pr:
+                    tag = "PR"
+                elif is_stalled:
+                    tag = str(lp.get("tag") or "STALL")
+                elif is_esc:
+                    tag = "esc"
+                elif is_rev:
+                    tag = str(lp.get("tag") or "rev")
+                else:
+                    tag = f"{int(lp.get('pct') or 0)}%"  # type: ignore[arg-type]
+                dot_code = "1;33" if is_human_pr else ("1;31" if is_stalled else ("1;35" if is_esc else "1;36"))
                 dot = _color("●", dot_code, color_on)
                 _, repo_u, _, _ = _resolve_lock_human_pr_link(
                     slug,
@@ -1544,10 +1714,11 @@ def render(
                     repo_local_dirs,
                     extra_urls=_collect_lock_extra_urls(lk, item_urls_by_cid),
                 )
-                styled_name = _color(lbl, "1;33" if is_human_pr else "1", color_on)
+                styled_name = _color(lbl, "1;33" if is_human_pr else ("1;31" if is_stalled else "1"), color_on)
+                tag_code = "1;33" if is_human_pr else ("1;35" if is_stalled else "2")
                 repo_pills.append(
                     f"{dot} {_osc8_link(styled_name, repo_u, use_osc8)} "
-                    f"{_color(f'({tag})', '1;33' if is_human_pr else '2', color_on)}"
+                    f"{_color(f'({tag})', tag_code, color_on)}"
                 )
             else:
                 dot = _color("○", "0;32", color_on)
@@ -1560,6 +1731,14 @@ def render(
 
     if not filtered:
         lines.append(_color("No matching items in dev_queue.json.", "2", color_on))
+        if stalled_alerts:
+            lines.append(_color("─" * bar_w, "2", color_on))
+            summary_st = ", ".join(f"{r} idle {idle}" for r, idle, _ in stalled_alerts)
+            lines.append(
+                _color(_trunc(f"⚠ STALLED WORKER: {summary_st} — inspect worktree or re-dispatch", bar_w), "1;31", color_on)
+            )
+        if opt_hint:
+            lines.append(_color(_trunc(opt_hint, bar_w), "1;35", color_on))
         lines.append(_color("═" * bar_w, "2;36", color_on))
         board_path = _resolve_board_artifact_path(state_dir, getattr(args, "write_board", ""))
         if board_path is not None:
@@ -1632,6 +1811,8 @@ def render(
             total_r = int(prog.get("total_repos") or 1)  # type: ignore[arg-type]
             part_i = int(prog.get("part_idx") or 1)  # type: ignore[arg-type]
             prog_md = f"PR {part_i}/{total_r} listo" if total_r > 1 else "PR listo"
+        elif prog and str(prog.get("mode") or "") == "stalled":
+            prog_md = str(prog.get("tag") or "STALL")
         else:
             prog_md = f"{int(prog['pct'])}% {prog.get('tag', '')}".strip() if prog else "—"  # type: ignore[arg-type]
         action_md = "—"
@@ -1751,6 +1932,25 @@ def render(
                 f"{_trunc(ag_t, max(20, bar_w - 20))}"
             )
 
+    if stalled_alerts:
+        lines.append(_color("─" * bar_w, "2", color_on))
+        st_bits = [
+            f"{repo_lbl} idle {idle_lbl}" + (f" ({br})" if br else "")
+            for repo_lbl, idle_lbl, br in stalled_alerts
+        ]
+        lines.append(
+            _color(
+                _trunc(f"⚠ STALLED WORKER: {'; '.join(st_bits)} — inspect worktree or re-dispatch", bar_w),
+                "1;31",
+                color_on,
+            )
+        )
+
+    if opt_hint:
+        if not stalled_alerts and not ready_pr_footer and not hitl_footer:
+            lines.append(_color("─" * bar_w, "2", color_on))
+        lines.append(_color(_trunc(opt_hint, bar_w), "1;35", color_on))
+
     lines.append(_color("═" * bar_w, "2;36", color_on))
 
     board_path = _resolve_board_artifact_path(state_dir, getattr(args, "write_board", ""))
@@ -1864,6 +2064,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", default="", help="Override state directory containing dev_queue.json.")
     parser.add_argument("--repos-dir", default="", help="Optional local parent directory to scan for managed git repos.")
     parser.add_argument("--plain-urls", action="store_true", help="Disable OSC-8 hyperlink escape sequences.")
+    parser.add_argument("--no-opt", dest="no_opt", action="store_true", help="Hide compact OPT: flow-optimizer footer hint.")
     parser.add_argument("--json", action="store_true", help="Output raw JSON.")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI color sequences.")
     return parser

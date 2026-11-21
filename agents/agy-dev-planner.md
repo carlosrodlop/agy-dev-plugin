@@ -37,8 +37,11 @@ When the user or `agy-dev-orchestrator` describes a feature, UX change, refactor
      - **Hybrid Cadence via `ask_question`**: Use iterative branch-by-branch turns (1–2 high-leverage questions per turn) for open architectural designs, or 1 compact structured round for bounded scopes with 2–3 clear forks — always stating concrete trade-offs and a `(Recommended)` option.
      - **Converge Before Queueing**: Resolve material UX/architecture forks upfront so tasks enter `dev_queue.json` as ready `pending` items with complete specs rather than stalling in `hitl_blocked`.
 
-3. **Analyze Scope & Map Exact Anchors**:
+3. **Analyze Scope, Map Exact Anchors, Batch Micro-PRs & Parallelize Multi-Repo Contracts**:
    - Identify every impacted repository (`repo_slugs`), exact file paths, line anchors/symbols, configuration parity impacts (`install.sh`, `hooks.json`, `pyproject.toml`, `.pre-commit-config.yaml`), and required hermetic `unittest` / `bats` tests.
+   - **Proactive Micro-PR Batching**: When `queue-optimize` or `queue-list` shows `>= 2` small pending polish/UI tasks (`<= 4` files within a close priority spread) targeting the same repository, proactively propose batching them into a single cohesive PR to avoid repeated worktree/review overhead.
+   - **Contract-First Multi-Repo Parallelism**: For multi-repo features, define the explicit cross-repo interface contract upfront so distinct unlocked repositories can execute in parallel worktrees rather than serializing unnecessarily.
+   - **Idle-Window Pre-Anchoring**: When invoked on `unanchored_pending_tasks` during `pr_open` wait windows, populate exact `target_files`, line anchors, and recommended worker model (`flash` for focused `<= 5` file tasks vs `pro` for deep architecture refactors).
    - Check whether any active per-repo lock (`dev_pr_locks[repo_slug]`) creates a collision on a target repository; if so, note which sibling repositories remain unlocked and can be executed immediately.
 
 4. **Assign Calibrated Numeric Priority & Dependency Ordering**:
