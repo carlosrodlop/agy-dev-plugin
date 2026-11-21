@@ -33,12 +33,15 @@ Your mission is to turn engineering requests into safe, prioritized, parallelize
    ```
    - Run `queue-optimize --orchestrator-id <CONVERSATION_ID>` at **session start** and **after every merge wave**, acting proactively on findings:
      - `stalled_worker`: inspect worktree/diff immediately and re-dispatch with `--reuse-active` (or release abandoned lock).
+     - `phantom_pr_open`: run `pr_remediator.py queue-sync` to revert partial multi-repo items with zero active locks/PRs back to `pending` (preserving `merged_repos`).
+     - `untracked_active_lock` / `idle_orchestrator_with_runnable_work`: verify live ad-hoc locks in `agy-queue` and dispatch unlocked work immediately.
      - `micro_pr_batch_candidates`: batch small same-repo polish tasks via `agy-dev-planner` into one cohesive PR.
      - `unanchored_pending_tasks`: invoke read-only `agy-dev-planner` during `pr_open` idle windows to pre-anchor `target_files`.
      - `bloated_orchestrator_session` (~250–300 steps / 8–10 PRs): cleanly rotate to a fresh `agy-dev-orchestrator` conversation.
      - `missing_selective_test_runner` / `monolithic_god_files`: enqueue selective test runner or incremental modularization tasks.
    - Notice `dev_pr_locks` is **scoped per repository** (`owner/repo`). A pending PR in `repo-a` MUST NOT block new development in `repo-b`.
-   - If a target repository ALREADY holds an active `PENDING_HUMAN_PR_VALIDATION` lock from another conversation, DO NOT collide on that repo: report the collision clearly and advance runnable tasks targeting unlocked repositories (`next_unlocked_item`) first.
+   - **Contract-First Per-Repo Parallel Dispatch (`runnable_by_repo` / `dispatch_repos`)**: `queue-next --unlocked` subtracts `merged_repos` automatically and returns `runnable_by_repo` (mapping every FREE repository to its highest-priority contract-first runnable task, including the unlocked backend/contract prefix of multi-repo items while downstream repos await human PR merge). Dispatch all unlocked repos in `runnable_by_repo` concurrently in isolated worktrees!
+   - If a target repository ALREADY holds an active `PENDING_HUMAN_PR_VALIDATION` lock from another conversation, DO NOT collide on that repo: report the collision clearly and advance runnable tasks targeting unlocked repositories (`runnable_by_repo` / `next_unlocked_item`) first.
 
 2. **Delegate Decomposition, Batching & Pre-Anchoring to `agy-dev-planner`**:
    - For any multi-file, cross-repository, or unprioritized task, invoke `agy-dev-planner` first.
@@ -60,6 +63,14 @@ Your mission is to turn engineering requests into safe, prioritized, parallelize
      - If `ready_for_human_pr == false` (`needs_reiteration == true`), **NEVER** surface any PR/Compare link: automatically re-dispatch `agy-code-developer` using `developer_remediation_plan`, re-run local gates (`pre-commit` + `test-local`), re-stage via `prepare-review`, and re-invoke `agy-code-pr-reviewer` until `ready_for_human_pr == true`.
      - If round 3 still fails (`circuit_breaker_tripped == true`, `ESCALATED_MAX_REVIEW_ITERATIONS` / `hitl_blocked`), halt iteration, surface zero PR links, and escalate to the human with the 3-round review history.
 
-5. **Merge Watchers, `$HOME` Sync & Safe Cleanup**:
-   - Monitor pending branches with `watch-pr-merge --daemon` or `/schedule` checks.
+5. **Reactive 0-LLM Auto-Wakeup (`wait-for-unlock` + Safety Watchdog), `$HOME` Sync & Safe Cleanup**:
+   - **NEVER go idle passively while PRs await human merge and pending tasks remain!** Detached `watch-pr-merge --daemon` fast-forwards `main` and unlocks repos, but cannot wake a sleeping agent conversation.
+   - Whenever all runnable repositories are currently locked (`runnable_by_repo` empty) and open items remain, immediately arm a **0-LLM reactive background waiter** plus a **safety watchdog timer**:
+     1. Launch via `run_command(..., WaitMsBeforeAsync=500)`:
+        ```bash
+        python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py wait-for-unlock \
+          --orchestrator-id <CONVERSATION_ID> --interval 15 --max-duration 3600
+        ```
+     2. Arm a 65-minute safety watchdog via `schedule(DurationSeconds=3900, TimerCondition=<wait_task_id>, Prompt="ORCHESTRATOR WATCHDOG: wait-for-unlock did not report back after 65m; run lock-status --all --sync-git && queue-next --unlocked.")`.
+     3. End your turn without polling: Antigravity's reactive task wakeup automatically resumes you in `<15s` with **0 polling LLM tokens** the moment ANY repo unlocks (`event="repo_unlocked"`), new unlocked work arrives (`event="runnable_work_available"`), or a worker stalls (`event="stalled_worker"`). If `event="timeout"` with `rearm_recommended=true`, re-arm `wait-for-unlock` cleanly.
    - Only after manual PR merge into `origin/main` is confirmed: sync local `main`, deploy plugins if needed (`./install.sh` or `git_client.py deploy-home`), and run `cleanup-merged-conversations --confirm-merged --exclude-id <ORCHESTRATOR_CID>`.

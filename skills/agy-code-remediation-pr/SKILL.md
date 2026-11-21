@@ -22,6 +22,7 @@ All code, script, skill, rule, agent, hook, and configuration changes MUST flow 
      --rca-summary "<Why>" --proposed-fix "<What>" --worktree
    ```
    - Use `--reuse-active` when iterating on follow-up commits from the same active conversation (`--workdir` or `--repo <owner/repo>` selects any managed target repository cleanly).
+   - `start-remediation`, `prepare-review`, and `record-review` automatically upsert active locks (including ad-hoc sessions) into `dev_queue.json` (`source="ad_hoc_lock"`) so active workers and human-ready PRs are always visible in `agy-queue` and tracked across partial multi-repo merges (automatically reverting partially-merged items with zero remaining open PRs/locks back to `pending` while preserving `merged_repos`).
    - Stamp `pr_remediator.py lock-heartbeat --workdir <WORKTREE_PATH> --worker-cid <WORKER_CID> --stage <LABEL>` during long tasks so `detect_stalled_lock` and `agy-queue` accurately track worker liveness.
 3. **Implement, Test & Persist Unified Single-Pass Verification Checks in `<WORKTREE_PATH>`**:
    - Delegate or execute via `agy-dev-executor` / `agy-code-developer` inside `<WORKTREE_PATH>` (never leave dirty feature edits on `main`).

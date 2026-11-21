@@ -1440,6 +1440,10 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
         contracts: dict[pathlib.Path, tuple[str, ...]] = {
             REPO_ROOT / "agents" / "agy-dev-orchestrator.md": (
                 "queue-optimize",
+                "wait-for-unlock",
+                "runnable_by_repo",
+                "phantom_pr_open",
+                "rearm_recommended",
                 "DurationSeconds=1200",
                 "TimerCondition",
                 'Model="flash"',
@@ -1469,6 +1473,10 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
             ),
             REPO_ROOT / "skills" / "agy-dev-queue-orchestrator" / "SKILL.md": (
                 "queue-optimize",
+                "wait-for-unlock",
+                "runnable_by_repo",
+                "phantom_pr_open",
+                "untracked_active_lock",
                 "DurationSeconds=1200",
                 "TimerCondition",
                 'Model="flash"',
