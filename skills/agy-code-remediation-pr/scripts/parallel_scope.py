@@ -162,6 +162,169 @@ _CLEAN_GIT_ENV_STRIP: frozenset[str] = frozenset(
         "GIT_PREFIX",
     }
 )
+_NON_REPO_PREFIX_SUFFIXES: frozenset[str] = frozenset(
+    {
+        ".py",
+        ".pyi",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".html",
+        ".htm",
+        ".css",
+        ".scss",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".bats",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".md",
+        ".rst",
+        ".txt",
+        ".sql",
+        ".xml",
+        ".svg",
+        ".ini",
+        ".cfg",
+        ".lock",
+        ".env",
+    }
+)
+_REPO_PREFIX_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{2,}(?:/[A-Za-z0-9_.-]+)?$")
+_SINGLE_COLON_RE = re.compile(r"(?<!:):(?!:)")
+_GENERIC_FS_OWNER_SEGMENTS: frozenset[str] = frozenset(
+    {"tmp", "var", "repos", "remotes", "git", "bare", "scratch", "worktrees"}
+)
+
+
+def split_repo_prefixed_target(raw_spec: str) -> tuple[str, str]:
+    """Split an optional `<repo_name>:` or `<owner>/<repo_name>:` prefix from a target file/anchor string.
+
+    Returns `(repo_prefix, remainder)`. When no repository prefix is present (for example
+    `pkg/portfolio.py:15-42`, `pkg/portfolio.py::func`, `./pkg/cli.py`, or `#anchor`),
+    returns `("", stripped_raw_spec)`.
+    """
+    text = str(raw_spec or "").strip()
+    if not text or text.startswith((".", "/", "~", "#")):
+        return ("", text)
+
+    m_colon = _SINGLE_COLON_RE.search(text)
+    if not m_colon:
+        return ("", text)
+
+    cand_prefix = text[: m_colon.start()].strip()
+    rest = text[m_colon.end() :].strip()
+    if not cand_prefix or not rest or rest.startswith("//"):
+        return ("", text)
+    if _ANCHOR_LINE_RANGE_RE.match(rest):
+        return ("", text)
+    if not _REPO_PREFIX_TOKEN_RE.match(cand_prefix):
+        return ("", text)
+
+    parts = cand_prefix.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        return ("", text)
+    repo_tok = parts[-1].removesuffix(".git")
+    if len(repo_tok) < 2:
+        return ("", text)
+    lower_tok = repo_tok.lower()
+    if any(lower_tok.endswith(ext) for ext in _NON_REPO_PREFIX_SUFFIXES):
+        return ("", text)
+
+    norm_prefix = f"{parts[0]}/{repo_tok}" if len(parts) == 2 else repo_tok
+    return (norm_prefix, rest)
+
+
+def _repo_prefix_matches_slug(repo_prefix: str, target_repo_slug: str) -> bool:
+    """Return True when `repo_prefix` belongs to `target_repo_slug` (or when either is unscoped)."""
+    pref = str(repo_prefix or "").strip().strip("/").removesuffix(".git").lower()
+    targ = str(target_repo_slug or "").strip().strip("/").removesuffix(".git").lower()
+    if not pref or not targ or targ == "default":
+        return True
+    if "/" in pref and "/" in targ:
+        return pref == targ
+    return pref.rsplit("/", 1)[-1] == targ.rsplit("/", 1)[-1]
+
+
+def _infer_repo_slug_from_git_dir(repo_dir: Path | None) -> str:
+    """Infer `owner/repo` (or `repo`) from `remote.origin.url` when `repo_dir` is a Git repository."""
+    if repo_dir is None or not (repo_dir / ".git").exists():
+        return ""
+    clean_env = {k: v for k, v in os.environ.items() if k not in _CLEAN_GIT_ENV_STRIP}
+    proc = subprocess.run(
+        ["git", "-C", str(repo_dir), "config", "--get", "remote.origin.url"],
+        env=clean_env,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    raw_url = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+    if raw_url:
+        cleaned = raw_url.rstrip("/").removesuffix(".git")
+        # SSH form `git@github.com:owner/repo`
+        if ":" in cleaned and "://" not in cleaned:
+            tail = cleaned.split(":", 1)[1].strip("/")
+            segs = [s for s in tail.split("/") if s]
+            if len(segs) >= 2:
+                return f"{segs[-2]}/{segs[-1]}".lower()
+            if len(segs) == 1:
+                return segs[0].lower()
+        else:
+            segs = [s for s in re.sub(r"^[a-zA-Z0-9+.-]+://[^/]*/?", "", cleaned).split("/") if s]
+            if len(segs) >= 2:
+                owner_cand, repo_cand = segs[-2], segs[-1]
+                if owner_cand.lower() not in _GENERIC_FS_OWNER_SEGMENTS:
+                    return f"{owner_cand}/{repo_cand}".lower()
+                return repo_cand.lower()
+            if len(segs) == 1:
+                return segs[0].lower()
+    return repo_dir.name.lower()
+
+
+def normalize_target_files_for_repo(
+    target_files: Sequence[str],
+    *,
+    repo_slug: str = "",
+    repo_dir: Path | str | None = None,
+) -> list[str]:
+    """Normalize `<repo>:` / `<owner>/<repo>:` prefixes and filter out paths explicitly targeting other repositories."""
+    r_dir = Path(repo_dir).expanduser() if repo_dir else None
+    eff_slug = str(repo_slug or "").strip() or _infer_repo_slug_from_git_dir(r_dir)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_item in target_files or ():
+        raw_str = str(raw_item or "").strip()
+        if not raw_str:
+            continue
+        pref, rest = split_repo_prefixed_target(raw_str)
+        if pref and eff_slug and not _repo_prefix_matches_slug(pref, eff_slug):
+            continue
+        rel, lrange, sym = parse_target_anchor_string(
+            rest if pref else raw_str,
+            repo_dir=r_dir,
+            repo_slug=eff_slug,
+        )
+        if not rel and not sym:
+            continue
+        if lrange is not None:
+            rebuilt = f"{rel}#L{lrange[0]}-L{lrange[1]}" if lrange[0] != lrange[1] else f"{rel}#L{lrange[0]}"
+        elif sym and rel:
+            rebuilt = f"{rel}#{sym}"
+        elif sym:
+            rebuilt = f"#{sym}"
+        else:
+            rebuilt = rel
+        if rebuilt and rebuilt not in seen:
+            seen.add(rebuilt)
+            normalized.append(rebuilt)
+    return normalized
 
 
 def _normalize_rel_path(raw_path: str, repo_dir: Path | None = None) -> str:
@@ -253,6 +416,8 @@ class TaskAnchorSpec:
     section_anchors: tuple[str, ...] = ()
     symbol_hints: tuple[str, ...] = ()
     branch_name: str = ""
+    base_sha: str = ""
+    worktree_path: str = ""
     pr_gate_ready: bool = False
     prose_context: str = ""
 
@@ -308,6 +473,9 @@ class TaskAnchorSpec:
             if isinstance(bnames, (list, tuple)) and bnames:
                 branch = str(bnames[-1] or "").strip().split("::")[-1]
 
+        base_sha = str(data.get("base_sha") or "").strip()
+        worktree_path = str(data.get("worktree_path") or "").strip()
+
         prose_parts = [
             str(data.get("title") or ""),
             str(data.get("proposed_fix") or ""),
@@ -326,6 +494,8 @@ class TaskAnchorSpec:
             section_anchors=tuple(flat_anchors),
             symbol_hints=tuple(hints_list),
             branch_name=branch,
+            base_sha=base_sha,
+            worktree_path=worktree_path,
             pr_gate_ready=bool(data.get("pr_gate_ready", False)),
             prose_context=prose,
         )
@@ -432,19 +602,33 @@ def parse_target_anchor_string(
     raw_spec: str,
     *,
     repo_dir: Path | None = None,
+    repo_slug: str = "",
 ) -> tuple[str, tuple[int, int] | None, str]:
     """Parse a target file or section anchor string into `(rel_path, optional_line_range, symbol_or_section)`.
 
-    Supported forms:
+    Supported forms (including optional `<repo_name>:` or `<owner>/<repo_name>:` prefixes):
+      - `agy-dev-plugin:tests/test_agy_dev_plugin.py`
+      - `carlosrodlop/agy-dev-plugin:tests/test_agy_dev_plugin.py`
       - `web/dashboard.js#L120-L180` or `web/dashboard.js:120-180`
       - `skills/.../pr_remediator.py::record_pr_review_evaluation`
       - `web/dashboard.js#renderOverview`
       - `styles.css#root-tokens`
       - `clients/git_client.py`
+
+    When `repo_slug` is provided and `raw_spec` carries an explicit prefix for a *different*
+    repository, returns `("", None, "")` so cross-repo multi-repo entries never collide falsely.
     """
     text = str(raw_spec or "").strip()
     if not text:
         return ("", None, "")
+
+    repo_prefix, stripped_text = split_repo_prefixed_target(text)
+    if repo_prefix:
+        if repo_slug and not _repo_prefix_matches_slug(repo_prefix, repo_slug):
+            return ("", None, "")
+        text = stripped_text
+        if not text:
+            return ("", None, "")
 
     file_part = text
     anchor_part = ""
@@ -458,7 +642,7 @@ def parse_target_anchor_string(
             return ("", None, _normalize_anchor_token(right))
     elif ":" in text:
         left, right = text.rsplit(":", 1)
-        if _ANCHOR_LINE_RANGE_RE.match(right.strip()) and ("." in Path(left).name or "/" in left):
+        if _ANCHOR_LINE_RANGE_RE.match(right.strip()) and left.strip():
             file_part, anchor_part = left, right
 
     rel_path = _normalize_rel_path(file_part, repo_dir=repo_dir)
@@ -1484,21 +1668,86 @@ def build_repository_import_graph(
     return structures, forward_graph
 
 
-def _extract_git_branch_diff_line_ranges(
+def _resolve_branch_worktree_dir(
     repo_dir: Path | None,
-    branch_name: str,
-    base_branch: str = "main",
-) -> dict[str, list[tuple[int, int]]]:
-    """Extract modified file line ranges from `git diff -U0 <base>...<branch>` when `branch_name` exists locally."""
+    *,
+    branch_name: str = "",
+    worktree_path: str = "",
+    clean_env: dict[str, str] | None = None,
+) -> Path | None:
+    """Resolve an existing isolated/checked-out worktree directory for `(branch_name, worktree_path)`."""
+    wt_raw = str(worktree_path or "").strip()
+    if wt_raw:
+        wt_exp = Path(wt_raw.replace("$HOME", str(Path.home()))).expanduser()
+        if wt_exp.is_dir() and (wt_exp / ".git").exists():
+            return wt_exp.resolve()
+
     clean_br = str(branch_name or "").strip().removeprefix("refs/heads/")
-    if repo_dir is None or not clean_br or not (repo_dir / ".git").exists():
-        return {}
+    if not clean_br or clean_br in ("main", "master", "HEAD") or repo_dir is None or not (repo_dir / ".git").exists():
+        return None
+
+    env = clean_env if clean_env is not None else {k: v for k, v in os.environ.items() if k not in _CLEAN_GIT_ENV_STRIP}
+    wt_proc = subprocess.run(
+        ["git", "-C", str(repo_dir), "worktree", "list", "--porcelain"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if wt_proc.returncode == 0 and wt_proc.stdout:
+        target_ref = f"refs/heads/{clean_br}"
+        cur_wt = ""
+        for raw_ln in wt_proc.stdout.splitlines():
+            ln = raw_ln.strip()
+            if not ln:
+                cur_wt = ""
+            elif ln.startswith("worktree "):
+                cur_wt = ln[9:].strip()
+            elif ln.startswith("branch ") and cur_wt and ln[7:].strip() == target_ref:
+                cand_wt = Path(cur_wt)
+                if cand_wt.is_dir() and (cand_wt / ".git").exists():
+                    return cand_wt.resolve()
+    return None
+
+
+def collect_git_changed_files(
+    repo_dir: Path | None,
+    *,
+    branch_name: str = "",
+    base_sha: str = "",
+    worktree_path: str = "",
+    base_branch: str = "main",
+) -> list[str]:
+    """Collect deduplicated changed file paths via `git diff --name-only <base_sha>...HEAD` plus staged/unstaged/untracked changes.
+
+    Strictly scoped to active branch/worktree tasks (`branch_name` or `worktree_path` non-empty) so unbranched
+    `pending` queue candidates never inherit working-tree files from `main`.
+    """
+    clean_br = str(branch_name or "").strip().removeprefix("refs/heads/")
+    if clean_br in ("main", "master", "HEAD"):
+        clean_br = ""
 
     clean_env = {k: v for k, v in os.environ.items() if k not in _CLEAN_GIT_ENV_STRIP}
-    base_ref = base_branch
-    for cand_base in (f"origin/{base_branch}", base_branch):
+    wt_dir = _resolve_branch_worktree_dir(
+        repo_dir,
+        branch_name=clean_br,
+        worktree_path=worktree_path,
+        clean_env=clean_env,
+    )
+    if not clean_br and wt_dir is None:
+        return []
+
+    eff_git_dir = wt_dir if wt_dir is not None else repo_dir
+    if eff_git_dir is None or not (eff_git_dir / ".git").exists():
+        return []
+
+    base_ref = ""
+    clean_base_sha = str(base_sha or "").strip()
+    base_candidates = [c for c in (clean_base_sha, f"origin/{base_branch}", base_branch) if c]
+    for cand_base in base_candidates:
         chk = subprocess.run(
-            ["git", "-C", str(repo_dir), "rev-parse", "--verify", cand_base],
+            ["git", "-C", str(eff_git_dir), "rev-parse", "--verify", "--quiet", f"{cand_base}^{{commit}}"],
             env=clean_env,
             capture_output=True,
             text=True,
@@ -1509,50 +1758,171 @@ def _extract_git_branch_diff_line_ranges(
             base_ref = cand_base
             break
 
-    br_ref = ""
-    for cand_br in (clean_br, f"origin/{clean_br}"):
-        chk_br = subprocess.run(
-            ["git", "-C", str(repo_dir), "rev-parse", "--verify", cand_br],
+    head_ref = ""
+    if wt_dir is not None:
+        head_ref = "HEAD"
+    elif clean_br:
+        for cand_br in (clean_br, f"origin/{clean_br}"):
+            chk_br = subprocess.run(
+                ["git", "-C", str(eff_git_dir), "rev-parse", "--verify", "--quiet", f"{cand_br}^{{commit}}"],
+                env=clean_env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if chk_br.returncode == 0:
+                head_ref = cand_br
+                break
+
+    seen: set[str] = set()
+    changed: list[str] = []
+
+    def _collect_nul(git_dir: Path, args: list[str]) -> None:
+        proc = subprocess.run(
+            ["git", "-C", str(git_dir), *args],
+            env=clean_env,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return
+        for raw_entry in proc.stdout.split(b"\x00"):
+            if not raw_entry:
+                continue
+            rel = _normalize_rel_path(raw_entry.decode("utf-8", errors="surrogateescape"))
+            if not rel or "__pycache__/" in rel or rel.endswith((".pyc", ".pyo")):
+                continue
+            if rel not in seen:
+                seen.add(rel)
+                changed.append(rel)
+
+    if base_ref and head_ref:
+        _collect_nul(eff_git_dir, ["diff", "--name-only", "-z", f"{base_ref}...{head_ref}"])
+
+    if wt_dir is not None:
+        _collect_nul(wt_dir, ["diff", "--cached", "--name-only", "-z"])
+        _collect_nul(wt_dir, ["diff", "--name-only", "-z"])
+        _collect_nul(wt_dir, ["ls-files", "--others", "--exclude-standard", "-z"])
+    return changed
+
+
+def _extract_git_branch_diff_line_ranges(
+    repo_dir: Path | None,
+    branch_name: str,
+    base_branch: str = "main",
+    *,
+    base_sha: str = "",
+    worktree_path: str = "",
+) -> dict[str, list[tuple[int, int]]]:
+    """Extract modified file line ranges from `git diff -U0 <base>...<branch>` (plus uncommitted worktree changes)."""
+    clean_br = str(branch_name or "").strip().removeprefix("refs/heads/")
+    if clean_br in ("main", "master", "HEAD"):
+        clean_br = ""
+
+    clean_env = {k: v for k, v in os.environ.items() if k not in _CLEAN_GIT_ENV_STRIP}
+    wt_dir = _resolve_branch_worktree_dir(
+        repo_dir,
+        branch_name=clean_br,
+        worktree_path=worktree_path,
+        clean_env=clean_env,
+    )
+    eff_dir = wt_dir if wt_dir is not None else repo_dir
+    if eff_dir is None or (not clean_br and wt_dir is None) or not (eff_dir / ".git").exists():
+        return {}
+
+    base_ref = ""
+    clean_base_sha = str(base_sha or "").strip()
+    for cand_base in [c for c in (clean_base_sha, f"origin/{base_branch}", base_branch) if c]:
+        chk = subprocess.run(
+            ["git", "-C", str(eff_dir), "rev-parse", "--verify", "--quiet", f"{cand_base}^{{commit}}"],
             env=clean_env,
             capture_output=True,
             text=True,
             timeout=5,
             check=False,
         )
-        if chk_br.returncode == 0:
-            br_ref = cand_br
+        if chk.returncode == 0:
+            base_ref = cand_base
             break
-    if not br_ref:
-        return {}
 
-    proc = subprocess.run(
-        ["git", "-C", str(repo_dir), "diff", "--unified=0", f"{base_ref}...{br_ref}"],
-        env=clean_env,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    if proc.returncode != 0 or not proc.stdout:
-        return {}
+    br_ref = "HEAD" if wt_dir is not None else ""
+    if not br_ref and clean_br:
+        for cand_br in (clean_br, f"origin/{clean_br}"):
+            chk_br = subprocess.run(
+                ["git", "-C", str(eff_dir), "rev-parse", "--verify", "--quiet", f"{cand_br}^{{commit}}"],
+                env=clean_env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if chk_br.returncode == 0:
+                br_ref = cand_br
+                break
 
     ranges_by_file: dict[str, list[tuple[int, int]]] = {}
-    current_file = ""
     hunk_re = re.compile(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@")
-    for line in proc.stdout.splitlines():
-        if line.startswith("+++ b/"):
-            current_file = _normalize_rel_path(line[6:].strip())
-            ranges_by_file.setdefault(current_file, [])
-        elif line.startswith("@@ ") and current_file:
-            m = hunk_re.match(line)
-            if m:
-                old_start = max(1, int(m.group(1)))
-                old_cnt = int(m.group(2)) if m.group(2) is not None else 1
-                new_start = max(1, int(m.group(3)))
-                new_cnt = int(m.group(4)) if m.group(4) is not None else 1
-                start_ln = old_start if old_cnt > 0 else new_start
-                span_len = max(1, old_cnt if old_cnt > 0 else new_cnt)
-                ranges_by_file[current_file].append((start_ln, start_ln + span_len - 1))
+
+    def _parse_unified_zero(diff_stdout: str) -> None:
+        current_file = ""
+        for line in diff_stdout.splitlines():
+            if line.startswith("+++ b/"):
+                current_file = _normalize_rel_path(line[6:].strip())
+                if current_file:
+                    ranges_by_file.setdefault(current_file, [])
+            elif line.startswith("+++ /dev/null"):
+                current_file = ""
+            elif line.startswith("@@ ") and current_file:
+                m = hunk_re.match(line)
+                if m:
+                    old_start = max(1, int(m.group(1)))
+                    old_cnt = int(m.group(2)) if m.group(2) is not None else 1
+                    new_start = max(1, int(m.group(3)))
+                    new_cnt = int(m.group(4)) if m.group(4) is not None else 1
+                    start_ln = old_start if old_cnt > 0 else new_start
+                    span_len = max(1, old_cnt if old_cnt > 0 else new_cnt)
+                    ranges_by_file[current_file].append((start_ln, start_ln + span_len - 1))
+
+    if base_ref and br_ref:
+        proc = subprocess.run(
+            ["git", "-C", str(eff_dir), "diff", "--unified=0", f"{base_ref}...{br_ref}"],
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            _parse_unified_zero(proc.stdout)
+
+    if wt_dir is not None:
+        wt_diff = subprocess.run(
+            ["git", "-C", str(wt_dir), "diff", "--unified=0", "HEAD"],
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if wt_diff.returncode == 0 and wt_diff.stdout:
+            _parse_unified_zero(wt_diff.stdout)
+        untracked = subprocess.run(
+            ["git", "-C", str(wt_dir), "ls-files", "--others", "--exclude-standard", "-z"],
+            env=clean_env,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if untracked.returncode == 0 and untracked.stdout:
+            for raw_u in untracked.stdout.split(b"\x00"):
+                if not raw_u:
+                    continue
+                rel_u = _normalize_rel_path(raw_u.decode("utf-8", errors="surrogateescape"))
+                if rel_u and "__pycache__/" not in rel_u and not rel_u.endswith((".pyc", ".pyo")):
+                    ranges_by_file.setdefault(rel_u, [])
+
     return ranges_by_file
 
 
@@ -1595,17 +1965,19 @@ def resolve_task_touches(
     task: TaskAnchorSpec,
     *,
     repo_dir: Path | None = None,
+    repo_slug: str = "",
     structures: dict[str, FileStructure] | None = None,
     py_index: dict[str, list[str]] | None = None,
 ) -> dict[str, ResolvedFileTouch]:
     """Resolve every touched file and its concrete section/symbol/line spans for `task`."""
+    eff_repo_slug = str(repo_slug or "").strip() or _infer_repo_slug_from_git_dir(repo_dir)
     file_ranges: dict[str, list[tuple[int, int]]] = {}
     file_tokens: dict[str, list[str]] = {}
-    global_tokens: list[str] = [ _normalize_anchor_token(h) for h in task.symbol_hints if _normalize_anchor_token(h) ]
+    global_tokens: list[str] = [_normalize_anchor_token(h) for h in task.symbol_hints if _normalize_anchor_token(h)]
     explicit_whole_files: set[str] = set()
 
     for raw_tf in task.target_files:
-        rel, lrange, sym = parse_target_anchor_string(raw_tf, repo_dir=repo_dir)
+        rel, lrange, sym = parse_target_anchor_string(raw_tf, repo_dir=repo_dir, repo_slug=eff_repo_slug)
         if not rel:
             if sym:
                 global_tokens.append(sym)
@@ -1620,7 +1992,7 @@ def resolve_task_touches(
             explicit_whole_files.add(rel)
 
     for raw_sec in task.section_anchors:
-        rel, lrange, sym = parse_target_anchor_string(raw_sec, repo_dir=repo_dir)
+        rel, lrange, sym = parse_target_anchor_string(raw_sec, repo_dir=repo_dir, repo_slug=eff_repo_slug)
         if rel:
             file_ranges.setdefault(rel, [])
             file_tokens.setdefault(rel, [])
@@ -1632,7 +2004,25 @@ def resolve_task_touches(
         elif sym:
             global_tokens.append(sym)
 
-    diff_ranges = _extract_git_branch_diff_line_ranges(repo_dir, task.branch_name)
+    # Fall back to `git diff --name-only <base_sha>...HEAD` (+ staged/unstaged/untracked) when `target_files` is empty
+    # or supplement active branch/worktree changes so overlap detection never misses live Slot #1 edits.
+    if task.branch_name or task.worktree_path:
+        git_changed_files = collect_git_changed_files(
+            repo_dir,
+            branch_name=task.branch_name,
+            base_sha=task.base_sha,
+            worktree_path=task.worktree_path,
+        )
+        for rel_git in git_changed_files:
+            file_ranges.setdefault(rel_git, [])
+            file_tokens.setdefault(rel_git, [])
+
+    diff_ranges = _extract_git_branch_diff_line_ranges(
+        repo_dir,
+        task.branch_name,
+        base_sha=task.base_sha,
+        worktree_path=task.worktree_path,
+    )
     for rel_diff, d_ranges in diff_ranges.items():
         file_ranges.setdefault(rel_diff, [])
         file_tokens.setdefault(rel_diff, [])
@@ -1826,6 +2216,7 @@ def compute_landing_order(
     tasks: Sequence[TaskAnchorSpec | Mapping[str, Any]],
     *,
     repo_dir: Path | str | None = None,
+    repo_slug: str = "",
     structures: dict[str, FileStructure] | None = None,
     forward_graph: dict[str, tuple[str, ...]] | None = None,
 ) -> list[str]:
@@ -1861,7 +2252,7 @@ def compute_landing_order(
     for idx_pos, sp in enumerate(specs):
         cid = sp.conversation_id or f"task-{idx_pos}"
         spec_by_id[cid] = sp
-        touches = resolve_task_touches(sp, repo_dir=r_dir, structures=structures, py_index=py_index)
+        touches = resolve_task_touches(sp, repo_dir=r_dir, repo_slug=repo_slug, structures=structures, py_index=py_index)
         metrics = compute_blast_radius_metrics(touches, reverse_graph, structures)
         unanchored_penalty = 100000 if not touches else 0
         sort_keys[cid] = (
@@ -1915,6 +2306,7 @@ def analyze_pair_overlap(
     task_b: TaskAnchorSpec | Mapping[str, Any],
     *,
     repo_dir: Path | str | None = None,
+    repo_slug: str = "",
     structures: dict[str, FileStructure] | None = None,
     forward_graph: dict[str, tuple[str, ...]] | None = None,
 ) -> PairOverlapResult:
@@ -1929,7 +2321,15 @@ def analyze_pair_overlap(
         else:
             structures, forward_graph = {}, {}
 
-    order = tuple(compute_landing_order([spec_a, spec_b], repo_dir=r_dir, structures=structures, forward_graph=forward_graph))
+    order = tuple(
+        compute_landing_order(
+            [spec_a, spec_b],
+            repo_dir=r_dir,
+            repo_slug=repo_slug,
+            structures=structures,
+            forward_graph=forward_graph,
+        )
+    )
 
     # 1. Explicit dependency link -> DEEP_SHARED
     a_deps_b = any(_matches_cid(spec_b.conversation_id, d) for d in spec_a.depends_on)
@@ -1947,8 +2347,8 @@ def analyze_pair_overlap(
         )
 
     py_index = _build_repo_python_module_index(r_dir)
-    touches_a = resolve_task_touches(spec_a, repo_dir=r_dir, structures=structures, py_index=py_index)
-    touches_b = resolve_task_touches(spec_b, repo_dir=r_dir, structures=structures, py_index=py_index)
+    touches_a = resolve_task_touches(spec_a, repo_dir=r_dir, repo_slug=repo_slug, structures=structures, py_index=py_index)
+    touches_b = resolve_task_touches(spec_b, repo_dir=r_dir, repo_slug=repo_slug, structures=structures, py_index=py_index)
 
     # Unanchored task cannot prove disjointness safely
     if not touches_a or not touches_b:
@@ -2126,6 +2526,7 @@ def analyze_candidates_overlap(
     tasks: Sequence[TaskAnchorSpec | Mapping[str, Any]],
     *,
     repo_dir: Path | str | None = None,
+    repo_slug: str = "",
     primary_slot_id: str = "",
 ) -> BatchOverlapAnalysis:
     """Analyze overlap across 2+ candidate tasks, compute blast-radius metrics, and rank `landing_order`."""
@@ -2145,7 +2546,7 @@ def analyze_candidates_overlap(
     blast_by_task: dict[str, dict[str, Any]] = {}
     for idx_pos, sp in enumerate(specs):
         cid = sp.conversation_id or f"task-{idx_pos}"
-        touches = resolve_task_touches(sp, repo_dir=r_dir, structures=structures, py_index=py_index)
+        touches = resolve_task_touches(sp, repo_dir=r_dir, repo_slug=repo_slug, structures=structures, py_index=py_index)
         metrics = compute_blast_radius_metrics(touches, reverse_graph, structures)
         blast_by_task[cid] = {
             **metrics,
@@ -2153,7 +2554,13 @@ def analyze_candidates_overlap(
         }
 
     landing = tuple(
-        compute_landing_order(specs, repo_dir=r_dir, structures=structures, forward_graph=forward_graph)
+        compute_landing_order(
+            specs,
+            repo_dir=r_dir,
+            repo_slug=repo_slug,
+            structures=structures,
+            forward_graph=forward_graph,
+        )
     )
     pairwise: list[PairOverlapResult] = []
     for i in range(len(specs)):
@@ -2163,6 +2570,7 @@ def analyze_candidates_overlap(
                     specs[i],
                     specs[j],
                     repo_dir=r_dir,
+                    repo_slug=repo_slug,
                     structures=structures,
                     forward_graph=forward_graph,
                 )

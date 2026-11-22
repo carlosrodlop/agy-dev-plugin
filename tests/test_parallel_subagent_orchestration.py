@@ -469,6 +469,105 @@ class TestParallelScopeAnalyzer(unittest.TestCase):
                 ],
             )
 
+    def test_repo_prefixed_target_files_normalization_and_foreign_repo_filtering(self) -> None:
+        self.assertEqual(
+            pscope.split_repo_prefixed_target("agy-dev-plugin:tests/test_agy_dev_plugin.py"),
+            ("agy-dev-plugin", "tests/test_agy_dev_plugin.py"),
+        )
+        self.assertEqual(
+            pscope.split_repo_prefixed_target("acme-org/agy-dev-plugin:tests/test_agy_dev_plugin.py"),
+            ("acme-org/agy-dev-plugin", "tests/test_agy_dev_plugin.py"),
+        )
+        self.assertEqual(
+            pscope.split_repo_prefixed_target("pkg/portfolio.py:15-42"),
+            ("", "pkg/portfolio.py:15-42"),
+        )
+        self.assertEqual(
+            pscope.parse_target_anchor_string(
+                "acme-org/agy-dev-plugin:pkg/portfolio.py:15-42",
+                repo_slug="acme-org/agy-dev-plugin",
+            ),
+            ("pkg/portfolio.py", (15, 42), ""),
+        )
+        self.assertEqual(
+            pscope.parse_target_anchor_string(
+                "agy-dev-plugin:pkg/portfolio.py::compute_billing_rollup",
+                repo_slug="acme-org/agy-dev-plugin",
+            ),
+            ("pkg/portfolio.py", None, "compute_billing_rollup"),
+        )
+        self.assertEqual(
+            pscope.parse_target_anchor_string(
+                "g-control-tower:pkg/portfolio.py::compute_billing_rollup",
+                repo_slug="acme-org/agy-dev-plugin",
+            ),
+            ("", None, ""),
+        )
+        self.assertEqual(
+            pscope.normalize_target_files_for_repo(
+                [
+                    "agy-dev-plugin:tests/test_agy_dev_plugin.py",
+                    "acme-org/agy-dev-plugin:pkg/independent_cli.py",
+                    "g-control-tower:api/routes/dev.py",
+                    "other-org/agy-dev-plugin:tests/test_other.py",
+                ],
+                repo_slug="acme-org/agy-dev-plugin",
+            ),
+            ["tests/test_agy_dev_plugin.py", "pkg/independent_cli.py"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._build_polyglot_fixture_repo(pathlib.Path(tmp))
+            slug = "acme-org/agy-dev-plugin"
+
+            # Short prefix `agy-dev-plugin:path` vs unprefixed `path` MUST detect DEEP_SHARED collision
+            ov_short = pscope.analyze_pair_overlap(
+                {"id": "11111111-aaaa", "target_files": ["pkg/leaf_db.py"]},
+                {"id": "22222222-bbbb", "target_files": ["agy-dev-plugin:pkg/leaf_db.py"]},
+                repo_dir=repo,
+                repo_slug=slug,
+            )
+            self.assertEqual(ov_short.overlap_tier, pscope.OVERLAP_DEEP_SHARED)
+            self.assertFalse(ov_short.parallel_safe)
+            self.assertEqual(ov_short.colliding_files, ("pkg/leaf_db.py",))
+
+            # Full `owner/repo:path` vs unprefixed `path` MUST detect DEEP_SHARED collision
+            ov_full = pscope.analyze_pair_overlap(
+                {"id": "11111111-aaaa", "target_files": ["pkg/leaf_db.py"]},
+                {"id": "22222222-bbbb", "target_files": ["acme-org/agy-dev-plugin:pkg/leaf_db.py"]},
+                repo_dir=repo,
+                repo_slug=slug,
+            )
+            self.assertEqual(ov_full.overlap_tier, pscope.OVERLAP_DEEP_SHARED)
+            self.assertFalse(ov_full.parallel_safe)
+
+            # Foreign-repo prefixes (`g-control-tower:...` / `other-org/...`) MUST be ignored for `slug`
+            ov_foreign_ignored = pscope.analyze_pair_overlap(
+                {"id": "11111111-aaaa", "target_files": ["pkg/leaf_db.py"]},
+                {
+                    "id": "22222222-bbbb",
+                    "target_files": [
+                        "g-control-tower:pkg/leaf_db.py",
+                        "other-org/agy-dev-plugin:pkg/leaf_db.py",
+                        "agy-dev-plugin:pkg/independent_cli.py",
+                    ],
+                },
+                repo_dir=repo,
+                repo_slug=slug,
+            )
+            self.assertEqual(ov_foreign_ignored.overlap_tier, pscope.OVERLAP_NONE)
+            self.assertTrue(ov_foreign_ignored.parallel_safe)
+
+            # Candidate with ONLY foreign-repo paths has zero local touches -> conservative DEEP_SHARED
+            ov_only_foreign = pscope.analyze_pair_overlap(
+                {"id": "11111111-aaaa", "target_files": ["pkg/leaf_db.py"]},
+                {"id": "22222222-bbbb", "target_files": ["g-control-tower:api/main.py"]},
+                repo_dir=repo,
+                repo_slug=slug,
+            )
+            self.assertEqual(ov_only_foreign.overlap_tier, pscope.OVERLAP_DEEP_SHARED)
+            self.assertFalse(ov_only_foreign.parallel_safe)
+
 
 class TestRebaseGate(unittest.TestCase):
     """Test native git drift detection, `merge-tree` conflict probing, cross-impact union, and 3 rebase outcomes."""
@@ -1124,6 +1223,448 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
                 self.assertFalse(conf_res["promoted_to_human_pr"])
                 self.assertIn("src/beta.py", conf_res["conflicted_files"])
                 self.assertIn("developer_remediation_plan", conf_res)
+
+    def test_slot2_prepare_and_record_review_without_explicit_branch_preserves_slot1_intact(self) -> None:
+        """End-to-end regression test: `prepare-review` & `record-review` on Slot #2 (omitting `--branch`) never hijack or mutate Slot #1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            bare, clone = self._seed_two_module_repo(root)
+            slug = "acme-org/acme-service"
+
+            env_patch = {
+                "AGY_DEV_STATE_DIR": str(state_dir),
+                "AGY_CONF_REPO_DIR": str(clone),
+                "AGY_REPOS_ROOT": str(clone.parent),
+            }
+            with (
+                mock.patch.dict(os.environ, env_patch, clear=False),
+                mock.patch.object(prs, "spawn_pr_merge_watcher_daemon", return_value={"status": "ok", "spawned": False}),
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"stopped": False}),
+                mock.patch.object(prs, "restart_pro_api_server", return_value={"restarted": False}),
+            ):
+                vcs = git_client.GitVcsIntegrationClient(
+                    env_overrides={"AGY_CONF_REPO_DIR": str(clone), "AGY_DEV_STATE_DIR": str(state_dir)}
+                )
+
+                # --- Full Slot #1 Lifecycle (`start-remediation` -> commit -> `test-local` -> `prepare-review` -> `record-review` PASS) ---
+                cid_slot1 = "aaaa1111-1111-4111-8111-111111111111"
+                s1 = prs.start_remediation_branch_and_lock(
+                    conversation_id=cid_slot1,
+                    action_id="alpha-slot1",
+                    rca_summary="Slot 1 alpha update",
+                    proposed_fix="Update src/alpha.py to return 42",
+                    target_files=["src/alpha.py", "tests/test_alpha.py"],
+                    create_worktree=True,
+                    branch_timestamp="20261122-120000",
+                    portfolio_dir=state_dir,
+                    workdir=clone,
+                    git_client=vcs,
+                )
+                self.assertEqual(s1["status"], "ok")
+                self.assertEqual(s1["slot_id"], 1)
+                wt1 = pathlib.Path(s1["worktree_path"])
+                br1 = s1["branch_name"]
+
+                (wt1 / "src" / "alpha.py").write_text("def alpha_value() -> int:\n    return 42\n", encoding="utf-8")
+                (wt1 / "tests" / "test_alpha.py").write_text(
+                    "import sys, pathlib, unittest\n"
+                    "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'src'))\n"
+                    "import alpha\n\n"
+                    "class TestAlpha(unittest.TestCase):\n"
+                    "    def test_alpha(self) -> None:\n"
+                    "        self.assertEqual(alpha.alpha_value(), 42)\n",
+                    encoding="utf-8",
+                )
+                _git(wt1, "add", "-A")
+                _git(wt1, "commit", "-m", "fix(alpha): update alpha_value to 42")
+
+                tl1 = prs.run_local_validation_suite(workdir=wt1, portfolio_dir=state_dir)
+                self.assertTrue(tl1["passed"])
+
+                prep1 = prs.push_remediation_branch_and_build_reviewer_plan(
+                    title="fix(alpha): update alpha_value to 42",
+                    executive_summary="Set alpha_value to 42 with unit test.",
+                    workdir=wt1,
+                    portfolio_dir=state_dir,
+                    git_client=vcs,
+                )
+                self.assertEqual(prep1["status"], "ok")
+                self.assertEqual(prep1["slot_id"], 1)
+                self.assertEqual(prep1["branch_name"], br1)
+
+                rev1 = prs.record_pr_review_evaluation(
+                    verdict="PASS",
+                    score=96,
+                    summary="Slot 1 verified cleanly.",
+                    workdir=wt1,
+                    portfolio_dir=state_dir,
+                    git_client=vcs,
+                )
+                self.assertEqual(rev1["status"], "ok")
+                self.assertTrue(rev1["ready_for_human_pr"])
+                self.assertTrue(rev1["branch_pushed"])
+                self.assertTrue(bool(rev1["manual_pr_url"]))
+
+                # Snapshot Slot #1 lock, worktree git state, and remote `origin/<br1>` ref BEFORE Slot #2 starts
+                s1_lock_before = prs.get_dev_pr_lock(portfolio_dir=state_dir, repo_slug=slug)
+                s1_head_sha = s1_lock_before["head_sha"]
+                s1_reviewed_sha = s1_lock_before["reviewed_head_sha"]
+                s1_manual_url = s1_lock_before["manual_pr_url"]
+                s1_wt_recorded = s1_lock_before["worktree_path"]
+                s1_updated_at = s1_lock_before["updated_at"]
+                s1_wt_git_sha = _git(wt1, "rev-parse", "HEAD").stdout.strip()
+                s1_wt_subject = _git(wt1, "log", "-1", "--format=%s").stdout.strip()
+                s1_remote_sha = subprocess.run(
+                    ["git", "--git-dir", str(bare), "rev-parse", "--verify", f"refs/heads/{br1}"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                self.assertEqual(s1_head_sha, s1_wt_git_sha)
+                self.assertEqual(s1_head_sha, s1_remote_sha)
+                self.assertEqual(s1_lock_before["status"], "PENDING_HUMAN_PR_VALIDATION")
+                self.assertTrue(s1_lock_before["pr_gate_ready"])
+
+                def _assert_slot1_completely_untouched() -> dict[str, object]:
+                    raw_all = prs.get_all_dev_pr_locks(portfolio_dir=state_dir)
+                    repo_lk = raw_all[slug]
+                    self.assertEqual(repo_lk["conversation_id"], cid_slot1)
+                    self.assertEqual(repo_lk["branch_name"], br1)
+                    self.assertEqual(repo_lk["branch_timestamp"], "20261122-120000")
+                    self.assertEqual(repo_lk["head_sha"], s1_head_sha)
+                    self.assertEqual(repo_lk["reviewed_head_sha"], s1_reviewed_sha)
+                    self.assertEqual(repo_lk["worktree_path"], s1_wt_recorded)
+                    self.assertEqual(repo_lk["status"], "PENDING_HUMAN_PR_VALIDATION")
+                    self.assertTrue(repo_lk["pr_gate_ready"])
+                    self.assertTrue(repo_lk["branch_pushed"])
+                    self.assertEqual(repo_lk["manual_pr_url"], s1_manual_url)
+                    self.assertEqual(repo_lk["reviewer_verdict"], "PASS")
+                    self.assertEqual(repo_lk["reviewer_score"], 96)
+                    self.assertEqual(repo_lk["updated_at"], s1_updated_at)
+                    # Slot #1 `repo_branches[slug]` entry untouched
+                    rb_s1 = repo_lk["repo_branches"][slug]
+                    self.assertEqual(rb_s1["branch_name"], br1)
+                    self.assertEqual(rb_s1["head_sha"], s1_head_sha)
+                    self.assertEqual(rb_s1["manual_pr_url"], s1_manual_url)
+                    self.assertTrue(rb_s1["branch_pushed"])
+                    # Slot #1 git worktree & remote ref untouched
+                    self.assertEqual(_git(wt1, "rev-parse", "HEAD").stdout.strip(), s1_wt_git_sha)
+                    self.assertEqual(_git(wt1, "log", "-1", "--format=%s").stdout.strip(), s1_wt_subject)
+                    cur_rem_sha = subprocess.run(
+                        ["git", "--git-dir", str(bare), "rev-parse", "--verify", f"refs/heads/{br1}"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    self.assertEqual(cur_rem_sha, s1_remote_sha)
+                    return repo_lk
+
+                # --- Concurrent Slot #2 Lifecycle (`start-remediation --allow-slot2` -> commit -> `test-local` -> `prepare-review` [NO `--branch`] -> `record-review`) ---
+                cid_slot2 = "bbbb2222-2222-4222-8222-222222222222"
+                s2 = prs.start_remediation_branch_and_lock(
+                    conversation_id=cid_slot2,
+                    action_id="beta-slot2",
+                    rca_summary="Slot 2 beta feature",
+                    proposed_fix="Add beta_extra helper in src/beta.py",
+                    target_files=["acme-service:src/beta.py", "acme-org/acme-service:tests/test_beta.py"],
+                    allow_slot2=True,
+                    create_worktree=True,
+                    branch_timestamp="20261122-120500",
+                    portfolio_dir=state_dir,
+                    workdir=clone,
+                    git_client=vcs,
+                )
+                self.assertEqual(s2["status"], "ok")
+                self.assertEqual(s2["slot_id"], 2)
+                wt2 = pathlib.Path(s2["worktree_path"])
+                br2 = s2["branch_name"]
+                self.assertNotEqual(br1, br2)
+                self.assertNotEqual(wt1.resolve(), wt2.resolve())
+                _assert_slot1_completely_untouched()
+
+                # Projected Slot #2 view must NOT bleed Slot #1's `proposal_title`, `manual_pr_url`, or `reviewer_verdict`
+                s2_view_init = prs.get_dev_pr_lock(portfolio_dir=state_dir, workdir=wt2)
+                self.assertEqual(s2_view_init["slot_id"], 2)
+                self.assertEqual(s2_view_init["branch_name"], br2)
+                self.assertEqual(s2_view_init.get("manual_pr_url", ""), "")
+                self.assertFalse(s2_view_init.get("pr_gate_ready", False))
+                self.assertNotIn("proposal_title", s2_view_init)
+                self.assertNotIn("reviewer_verdict", s2_view_init)
+
+                (wt2 / "src" / "beta.py").write_text(
+                    "def beta_value() -> int:\n    return 20\n\ndef beta_extra() -> int:\n    return 7\n",
+                    encoding="utf-8",
+                )
+                (wt2 / "tests" / "test_beta.py").write_text(
+                    "import sys, pathlib, unittest\n"
+                    "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / 'src'))\n"
+                    "import beta\n\n"
+                    "class TestBeta(unittest.TestCase):\n"
+                    "    def test_beta(self) -> None:\n"
+                    "        self.assertEqual(beta.beta_value(), 20)\n"
+                    "        self.assertEqual(beta.beta_extra(), 7)\n",
+                    encoding="utf-8",
+                )
+                _git(wt2, "add", "-A")
+                _git(wt2, "commit", "-m", "fix(beta): add beta_extra helper")
+
+                tl2 = prs.run_local_validation_suite(workdir=wt2, portfolio_dir=state_dir)
+                self.assertTrue(tl2["passed"])
+                _assert_slot1_completely_untouched()
+
+                # CRITICAL: Invoke `prepare-review` via CLI WITHOUT `--branch` (passing ONLY `--workdir <wt2>`)
+                buf_prep2 = io.StringIO()
+                with contextlib.redirect_stdout(buf_prep2):
+                    rc_prep2 = prs.main(
+                        [
+                            "prepare-review",
+                            "--workdir",
+                            str(wt2),
+                            "--title",
+                            "fix(beta): add beta_extra helper",
+                            "--executive-summary",
+                            "Add beta_extra helper and unit test.",
+                        ]
+                    )
+                self.assertEqual(rc_prep2, 0)
+                prep2 = json.loads(buf_prep2.getvalue())
+                self.assertEqual(prep2["status"], "ok")
+                self.assertEqual(prep2["slot_id"], 2)
+                self.assertEqual(prep2["branch_name"], br2)
+                self.assertEqual(prep2["branch_timestamp"], "20261122-120500")
+                self.assertFalse(prep2["branch_pushed"])
+                self.assertEqual(prep2["manual_pr_url"], "")
+                _assert_slot1_completely_untouched()
+
+                # Exercise non-PASS `record-review` on Slot #2 first to ensure Path A also isolates `repo_branches` & `slots['2']`
+                rev2_warn = prs.record_pr_review_evaluation(
+                    verdict="WARN",
+                    score=85,
+                    summary="Minor docstring nitpick on beta_extra.",
+                    workdir=wt2,
+                    portfolio_dir=state_dir,
+                    git_client=vcs,
+                )
+                self.assertEqual(rev2_warn["status"], "ok")
+                self.assertEqual(rev2_warn["slot_id"], 2)
+                self.assertEqual(rev2_warn["branch_name"], br2)
+                self.assertEqual(rev2_warn["branch_action"], "NEEDS_REVISION_ITERATING")
+                _assert_slot1_completely_untouched()
+
+                # Re-stage and PASS `record-review` (`97/100`) on Slot #2 -> `READY_AWAITING_BASE_MERGE`
+                prep2_r2 = prs.push_remediation_branch_and_build_reviewer_plan(
+                    title="fix(beta): add beta_extra helper",
+                    executive_summary="Add beta_extra helper and unit test.",
+                    workdir=wt2,
+                    portfolio_dir=state_dir,
+                    git_client=vcs,
+                )
+                self.assertEqual(prep2_r2["status"], "ok")
+                self.assertEqual(prep2_r2["slot_id"], 2)
+                self.assertEqual(prep2_r2["branch_name"], br2)
+
+                rev2_pass = prs.record_pr_review_evaluation(
+                    verdict="PASS",
+                    score=97,
+                    summary="Clean disjoint Slot #2 implementation.",
+                    workdir=wt2,
+                    portfolio_dir=state_dir,
+                    git_client=vcs,
+                )
+                self.assertEqual(rev2_pass["status"], "ok")
+                self.assertEqual(rev2_pass["slot_id"], 2)
+                self.assertEqual(rev2_pass["branch_name"], br2)
+                self.assertEqual(rev2_pass["lock_status"], prs.SLOT_STATUS_READY_AWAITING_BASE_MERGE)
+                self.assertTrue(rev2_pass["awaiting_base_merge"])
+                self.assertFalse(rev2_pass["ready_for_human_pr"])
+                self.assertFalse(rev2_pass["branch_pushed"])
+                self.assertEqual(rev2_pass["manual_pr_url"], "")
+
+                repo_lk_final = _assert_slot1_completely_untouched()
+                s2_slot = repo_lk_final["slots"]["2"]  # type: ignore[index]
+                self.assertEqual(s2_slot["slot_id"], 2)
+                self.assertEqual(s2_slot["conversation_id"], cid_slot2)
+                self.assertEqual(s2_slot["branch_name"], br2)
+                self.assertEqual(s2_slot["branch_timestamp"], "20261122-120500")
+                self.assertEqual(s2_slot["status"], prs.SLOT_STATUS_READY_AWAITING_BASE_MERGE)
+                self.assertTrue(s2_slot["review_approved"])
+                self.assertEqual(s2_slot["head_sha"], rev2_pass["head_sha"])
+                self.assertEqual(s2_slot["reviewed_head_sha"], rev2_pass["head_sha"])
+                self.assertFalse(s2_slot["pr_gate_ready"])
+                self.assertFalse(s2_slot["branch_pushed"])
+                self.assertEqual(s2_slot["manual_pr_url"], "")
+
+                rb_s2 = repo_lk_final["repo_branches"][f"{slug}#slot2"]  # type: ignore[index]
+                self.assertEqual(rb_s2["slot_id"], 2)
+                self.assertEqual(rb_s2["branch_name"], br2)
+                self.assertEqual(rb_s2["head_sha"], rev2_pass["head_sha"])
+                self.assertFalse(rb_s2["branch_pushed"])
+                self.assertEqual(rb_s2["manual_pr_url"], "")
+
+    def test_empty_slot1_target_files_git_diff_fallback_and_prefixed_queue_lookahead(self) -> None:
+        """Test `git diff --name-only <base_sha>...HEAD` (+ dirty/untracked) fallback when Slot #1 `target_files` is empty."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            bare, clone = _init_org_bare_and_clone(root, repo_name="agy-dev-plugin", org_name="acme-org")
+            slug = "acme-org/agy-dev-plugin"
+
+            (clone / "src").mkdir(parents=True, exist_ok=True)
+            (clone / "tests").mkdir(parents=True, exist_ok=True)
+            (clone / "src" / "alpha.py").write_text("ALPHA = 1\n", encoding="utf-8")
+            (clone / "src" / "beta.py").write_text("BETA = 2\n", encoding="utf-8")
+            (clone / "tests" / "test_agy_dev_plugin.py").write_text(
+                "import unittest\n\nclass TestPlugin(unittest.TestCase):\n    def test_ok(self) -> None:\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            _git(clone, "add", "src", "tests")
+            _git(clone, "commit", "-m", "feat: seed agy-dev-plugin layout")
+            _git(clone, "push", "origin", "main")
+
+            env_patch = {
+                "AGY_DEV_STATE_DIR": str(state_dir),
+                "AGY_CONF_REPO_DIR": str(clone),
+                "AGY_REPOS_ROOT": str(clone.parent),
+            }
+            with mock.patch.dict(os.environ, env_patch, clear=False):
+                vcs = git_client.GitVcsIntegrationClient(
+                    env_overrides={"AGY_CONF_REPO_DIR": str(clone), "AGY_DEV_STATE_DIR": str(state_dir)}
+                )
+
+                # 1. Start Slot #1 with EMPTY `target_files=[]`
+                cid_s1 = "10101010-1111-4111-8111-101010101010"
+                s1 = prs.start_remediation_branch_and_lock(
+                    conversation_id=cid_s1,
+                    action_id="unanchored-slot1",
+                    rca_summary="Slot 1 started without explicit --target-files",
+                    proposed_fix="Modify tests/test_agy_dev_plugin.py and src/alpha.py",
+                    target_files=[],
+                    create_worktree=True,
+                    branch_timestamp="20261122-130000",
+                    portfolio_dir=state_dir,
+                    workdir=clone,
+                    git_client=vcs,
+                )
+                self.assertEqual(s1["status"], "ok")
+                wt1 = pathlib.Path(s1["worktree_path"])
+                self.assertEqual(prs.get_dev_pr_lock(portfolio_dir=state_dir, repo_slug=slug)["target_files"], [])
+
+                # 2. Uncommitted & untracked edits in `wt1` BEFORE committing MUST already be detected by fallback!
+                (wt1 / "tests" / "test_agy_dev_plugin.py").write_text(
+                    "import unittest\n\nclass TestPlugin(unittest.TestCase):\n    def test_ok(self) -> None:\n        self.assertEqual(1, 1)\n",
+                    encoding="utf-8",
+                )
+                (wt1 / "src" / "untracked_helper.py").write_text("HELPER = True\n", encoding="utf-8")
+
+                blocked_dirty = prs.start_remediation_branch_and_lock(
+                    conversation_id="20202020-2222-4222-8222-202020202020",
+                    action_id="collide-dirty",
+                    target_files=["agy-dev-plugin:tests/test_agy_dev_plugin.py"],
+                    allow_slot2=True,
+                    portfolio_dir=state_dir,
+                    workdir=clone,
+                    git_client=vcs,
+                )
+                self.assertEqual(blocked_dirty["status"], "locked")
+                self.assertEqual(blocked_dirty["overlap_tier"], pscope.OVERLAP_DEEP_SHARED)
+
+                blocked_untracked = prs.start_remediation_branch_and_lock(
+                    conversation_id="21212121-2222-4222-8222-212121212121",
+                    action_id="collide-untracked",
+                    target_files=["acme-org/agy-dev-plugin:src/untracked_helper.py"],
+                    allow_slot2=True,
+                    portfolio_dir=state_dir,
+                    workdir=clone,
+                    git_client=vcs,
+                )
+                self.assertEqual(blocked_untracked["status"], "locked")
+                self.assertEqual(blocked_untracked["overlap_tier"], pscope.OVERLAP_DEEP_SHARED)
+
+                # 3. Commit changes in `wt1` (`git diff --name-only <base_sha>...HEAD` fallback)
+                (wt1 / "src" / "alpha.py").write_text("ALPHA = 99\n", encoding="utf-8")
+                _git(wt1, "add", "tests/test_agy_dev_plugin.py", "src/alpha.py", "src/untracked_helper.py")
+                _git(wt1, "commit", "-m", "feat: slot1 touches test_agy_dev_plugin and alpha")
+
+                # Enqueue:
+                #   (a) short repo-prefixed collision (`agy-dev-plugin:tests/test_agy_dev_plugin.py`)
+                #   (b) full owner/repo-prefixed collision (`acme-org/agy-dev-plugin:src/alpha.py`)
+                #   (c) multi-repo candidate with foreign collision (`g-control-tower:src/alpha.py`) + disjoint local (`acme-org/agy-dev-plugin:src/beta.py`)
+                cid_short_col = "30303030-3333-4333-8333-303030303030"
+                cid_full_col = "40404040-4444-4444-8444-404040404040"
+                cid_disjoint = "50505050-5555-4555-8555-505050505050"
+                prs.enqueue_dev_queue_item(
+                    conversation_id=cid_short_col,
+                    title="Short-prefixed test collision",
+                    priority=5,
+                    repo_slugs=[slug],
+                    target_files=["agy-dev-plugin:tests/test_agy_dev_plugin.py"],
+                    portfolio_dir=state_dir,
+                )
+                prs.enqueue_dev_queue_item(
+                    conversation_id=cid_full_col,
+                    title="Full-prefixed alpha collision",
+                    priority=8,
+                    repo_slugs=[slug],
+                    target_files=["acme-org/agy-dev-plugin:src/alpha.py"],
+                    portfolio_dir=state_dir,
+                )
+                prs.enqueue_dev_queue_item(
+                    conversation_id=cid_disjoint,
+                    title="Disjoint beta with foreign alpha prefix",
+                    priority=15,
+                    repo_slugs=[slug, "acme-org/g-control-tower"],
+                    target_files=[
+                        "g-control-tower:src/alpha.py",
+                        "acme-org/agy-dev-plugin:src/beta.py",
+                    ],
+                    portfolio_dir=state_dir,
+                )
+
+                qnext = prs.get_next_dev_queue_item(portfolio_dir=state_dir, skip_locked_repos=True)
+                self.assertIsNotNone(qnext["next_unlocked_item"])
+                self.assertEqual(qnext["next_unlocked_item"]["conversation_id"], cid_disjoint)
+                self.assertEqual(qnext["next_unlocked_item"]["target_slot"], 2)
+                self.assertEqual(qnext["next_unlocked_item"]["overlap_tier"], pscope.OVERLAP_NONE)
+
+                blocked_ids = {b["conversation_id"]: b for b in qnext["blocked_by_repo_locks"]}
+                self.assertIn(cid_short_col, blocked_ids)
+                self.assertEqual(blocked_ids[cid_short_col]["overlap_tier"], pscope.OVERLAP_DEEP_SHARED)
+                self.assertIn(cid_full_col, blocked_ids)
+                self.assertEqual(blocked_ids[cid_full_col]["overlap_tier"], pscope.OVERLAP_DEEP_SHARED)
+
+                # Confirm `start-remediation --allow-slot2` blocks the prefixed collision and allows the disjoint candidate
+                blk_short = prs.start_remediation_branch_and_lock(
+                    conversation_id=cid_short_col,
+                    action_id="short-collide",
+                    target_files=["agy-dev-plugin:tests/test_agy_dev_plugin.py"],
+                    allow_slot2=True,
+                    portfolio_dir=state_dir,
+                    workdir=clone,
+                    git_client=vcs,
+                )
+                self.assertEqual(blk_short["status"], "locked")
+                self.assertEqual(blk_short["overlap_tier"], pscope.OVERLAP_DEEP_SHARED)
+
+                ok_s2 = prs.start_remediation_branch_and_lock(
+                    conversation_id=cid_disjoint,
+                    action_id="disjoint-beta",
+                    target_files=[
+                        "g-control-tower:src/alpha.py",
+                        "acme-org/agy-dev-plugin:src/beta.py",
+                    ],
+                    allow_slot2=True,
+                    create_worktree=True,
+                    branch_timestamp="20261122-130500",
+                    portfolio_dir=state_dir,
+                    workdir=clone,
+                    git_client=vcs,
+                )
+                self.assertEqual(ok_s2["status"], "ok")
+                self.assertEqual(ok_s2["slot_id"], 2)
+                self.assertEqual(ok_s2["overlap_tier"], pscope.OVERLAP_NONE)
 
 
 if __name__ == "__main__":
