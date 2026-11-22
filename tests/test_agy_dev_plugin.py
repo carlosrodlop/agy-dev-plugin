@@ -1117,6 +1117,24 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
 
         bats_hooks = re.findall(r"(?m)^\s*-\s*id:\s*(bats[^\s]*)", active_pc)
         self.assertEqual(bats_hooks, ["bats-suite"])
+        bats_block_match = re.search(
+            r"(?ms)^\s*-\s*id:\s*bats-suite\b(.*?)(?=^\s*-\s*id:|\Z)",
+            active_pc,
+        )
+        self.assertIsNotNone(bats_block_match)
+        bats_files_m = re.search(r"(?m)^\s*files:\s*['\"]?([^'\"\n]+)['\"]?", bats_block_match.group(1) if bats_block_match else "")
+        self.assertIsNotNone(bats_files_m, msg="bats-suite hook must declare files: regex")
+        bats_files_re = re.compile(bats_files_m.group(1) if bats_files_m else "")
+        for cli_script in (
+            "skills/agy-code-remediation-pr/scripts/dev_flow_optimizer.py",
+            "skills/agy-code-remediation-pr/scripts/dev_queue_doctor.py",
+            "skills/agy-code-remediation-pr/scripts/parallel_scope.py",
+            "skills/agy-code-remediation-pr/scripts/rebase_gate.py",
+            "skills/agy-code-remediation-pr/scripts/pr_remediator.py",
+            "clients/dev_common.py",
+            "clients/git_client.py",
+        ):
+            self.assertRegex(cli_script, bats_files_re, msg=f"bats-suite files regex must match {cli_script}")
 
     def test_current_repo_passes_strict_qa_static_audit_and_size_contracts(self) -> None:
         audit_res = qa_static_audit.run_qa_audit(REPO_ROOT, strict=True)
@@ -1148,17 +1166,93 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
         for md_file in [*(REPO_ROOT / "rules").glob("*.md"), *(REPO_ROOT / "skills").glob("*/SKILL.md"), *(REPO_ROOT / "agents").glob("*.md")]:
             self.assertLess(md_file.stat().st_size, 24000, msg=f"{md_file} exceeds 24 KB limit")
 
-        for wf in (REPO_ROOT / ".github" / "workflows").glob("*.yml"):
+        workflows = sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+        self.assertEqual(
+            {wf.name for wf in workflows},
+            {
+                "coverage-report.yml",
+                "offline-unit-tests.yml",
+                "pre-commit.yml",
+                "static-qa.yml",
+                "sync-pr-verification.yml",
+            },
+        )
+        for wf in workflows:
             wf_text = wf.read_text(encoding="utf-8")
             self.assertIn("ubuntu-24.04", wf_text, msg=f"{wf} must pin ubuntu-24.04")
             self.assertIn("pull_request:", wf_text, msg=f"{wf} should trigger on pull_request")
+            self.assertIn("workflow_dispatch:", wf_text, msg=f"{wf} should support manual workflow_dispatch")
+            self.assertIn("permissions:", wf_text, msg=f"{wf} must declare explicit least-privilege permissions")
+            self.assertIn("contents: read", wf_text, msg=f"{wf} must declare contents: read")
+            if wf.name != "sync-pr-verification.yml":
+                self.assertNotIn("pull-requests: write", wf_text)
             self.assertNotRegex(
                 wf_text,
                 r"(?m)^[ \t]+push\s*:",
                 msg=f"{wf} must not trigger on push to avoid duplicate PR runs",
             )
+            for legacy_node20_ref in (
+                "actions/checkout@v4",
+                "actions/setup-python@v5",
+                "actions/cache@v4",
+                "pre-commit/action@",
+                "# v7.0.1",
+            ):
+                self.assertNotIn(legacy_node20_ref, wf_text, msg=f"{wf} must upgrade {legacy_node20_ref} to Node 24 actions")
+
             if wf.name == "pre-commit.yml":
-                self.assertIn("bats", wf_text, msg="pre-commit.yml must install bats before running bats-suite")
+                self.assertIn("actions/checkout@v6", wf_text)
+                self.assertIn("actions/setup-python@v6", wf_text)
+                self.assertIn("actions/cache@v5", wf_text)
+                self.assertIn("SKIP: qa-static-audit,unit-tests-fast,bats-suite", wf_text)
+                self.assertIn("pre-commit run --all-files --show-diff-on-failure", wf_text)
+            elif wf.name == "static-qa.yml":
+                self.assertIn("actions/checkout@v6", wf_text)
+                self.assertIn("actions/setup-python@v6", wf_text)
+                self.assertIn("ruff check --select E9,F63,F7,F82 clients skills sidecars tests", wf_text)
+                self.assertIn("qa_static_audit.py --strict", wf_text)
+                self.assertNotIn("project_audit.py", wf_text)
+            elif wf.name == "coverage-report.yml":
+                self.assertIn("actions/checkout@v6", wf_text)
+                self.assertIn("actions/setup-python@v6", wf_text)
+                self.assertIn('AGY_OFFLINE_ONLY: "1"', wf_text)
+                self.assertIn('PRE_COMMIT_HOOK: "1"', wf_text)
+                for cov_flag in (
+                    "--cov=clients",
+                    "--cov=skills",
+                    "--cov=sidecars",
+                    "--cov=tests/scripts",
+                    "--cov-fail-under=75",
+                    "GITHUB_STEP_SUMMARY",
+                ):
+                    self.assertIn(cov_flag, wf_text)
+            elif wf.name == "offline-unit-tests.yml":
+                self.assertIn("actions/checkout@v6", wf_text)
+                self.assertIn("actions/setup-python@v6", wf_text)
+                self.assertIn('AGY_OFFLINE_ONLY: "1"', wf_text)
+                self.assertIn('PRE_COMMIT_HOOK: "1"', wf_text)
+                self.assertIn('PYTHONDONTWRITEBYTECODE: "1"', wf_text)
+                self.assertIn('"3.11"', wf_text)
+                self.assertIn('"3.13"', wf_text)
+                self.assertIn("--no-deps -e .", wf_text)
+                self.assertIn("agy-queue --help", wf_text)
+                self.assertIn("agy-doctor --help", wf_text)
+                self.assertIn("bats tests/bats/*.bats", wf_text)
+                self.assertIn("selective_test_runner.py --plan-only", wf_text)
+
+        readme_ci = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        for ci_doc_term in (
+            "static-qa.yml",
+            "offline-unit-tests.yml",
+            "pre-commit.yml",
+            "coverage-report.yml",
+            "sync-pr-verification.yml",
+            "3.11",
+            "3.13",
+            "ruff",
+            "--cov-fail-under=75",
+        ):
+            self.assertIn(ci_doc_term, readme_ci)
 
     def test_phase0_co_design_grill_me_rule_and_planner_contract(self) -> None:
         co_design_rule = REPO_ROOT / "rules" / "co-design-and-discovery.md"
@@ -1659,6 +1753,621 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
             text = md_path.read_text(encoding="utf-8")
             for term in expected_terms:
                 self.assertIn(term, text, msg=f"{md_path.name} missing required contract term: {term}")
+
+
+class TestGitClientDevCommonAndRunnerCoverage(unittest.TestCase):
+    """Hermetic Zero-PII tests for `git_client`, `dev_common`, `qa_static_audit`, and `selective_test_runner`."""
+
+    def test_git_client_version_stamping_and_manifests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+
+            # 1. Non-git fallback chains: empty dir -> plugin.json -> api/__init__.py
+            empty_dir = troot / "empty"
+            empty_dir.mkdir()
+            self.assertEqual(
+                git_client.resolve_repo_version_stamp(empty_dir),
+                ("0000000-19700101", "19700101+g0000000"),
+            )
+            self.assertEqual(
+                git_client.stamp_repo_version_manifests(empty_dir),
+                {
+                    "status": "ok",
+                    "updated": False,
+                    "updated_files": [],
+                    "version": "",
+                    "pep440_version": "",
+                },
+            )
+
+            pjson_dir = troot / "pjson-only"
+            pjson_dir.mkdir()
+            (pjson_dir / "plugin.json").write_text('{"name": "acme-plugin", "version": "a1b2c3d-20261120"}\n', encoding="utf-8")
+            self.assertEqual(
+                git_client.resolve_repo_version_stamp(pjson_dir),
+                ("a1b2c3d-20261120", "20261120+ga1b2c3d"),
+            )
+
+            api_dir = troot / "api-only"
+            (api_dir / "api").mkdir(parents=True)
+            (api_dir / "api" / "__init__.py").write_text('_FALLBACK_VERSION = "b2c3d4e-20261121"\n', encoding="utf-8")
+            self.assertEqual(
+                git_client.resolve_repo_version_stamp(api_dir),
+                ("b2c3d4e-20261121", "20261121+gb2c3d4e"),
+            )
+
+            # 2. stamp_plugin_json_bytes edge cases
+            self.assertEqual(git_client.stamp_plugin_json_bytes(b'{"a":1}', "invalid"), b'{"a":1}')
+            self.assertEqual(git_client.stamp_plugin_json_bytes(b"[1, 2]", "a1b2c3d-20261120"), b"[1, 2]")
+            self.assertEqual(git_client.stamp_plugin_json_bytes(b"{not-json", "a1b2c3d-20261120"), b"{not-json")
+            stamped_bytes = git_client.stamp_plugin_json_bytes(b'{"name":"x"}', "a1b2c3d-20261120")
+            self.assertEqual(json.loads(stamped_bytes.decode("utf-8"))["version"], "a1b2c3d-20261120")
+
+            # 3. stamp_repo_version_manifests across plugin.json + api/__init__.py + pyproject.toml & fix/* branch
+            _, clone = _create_bare_and_clone(troot, name="stamp-repo")
+            (clone / "plugin.json").write_text('{"name": "acme-plugin", "version": "0.0.1"}\n', encoding="utf-8")
+            (clone / "api").mkdir()
+            (clone / "api" / "__init__.py").write_text('_FALLBACK_VERSION = "0.0.1"\n', encoding="utf-8")
+            (clone / "pyproject.toml").write_text('[project]\nname = "acme-plugin"\nversion = "0.0.1"\n', encoding="utf-8")
+
+            first_stamp = git_client.stamp_repo_version_manifests(clone)
+            self.assertTrue(first_stamp["updated"])
+            self.assertEqual(
+                set(first_stamp["updated_files"]),
+                {"plugin.json", "api/__init__.py", "pyproject.toml"},
+            )
+
+            # Idempotent second call without force returns updated=False via early-exit fast path
+            second_stamp = git_client.stamp_repo_version_manifests(clone, force=False)
+            self.assertFalse(second_stamp["updated"])
+            self.assertEqual(second_stamp["version"], first_stamp["version"])
+
+            # Also verify __version__ fallback in api/__init__.py & fix/<YYYYMMDD>-<HHMMSS>-* merge-base stamping
+            (clone / "plugin.json").unlink()
+            (clone / "api" / "__init__.py").write_text('__version__ = "0.0.1"\n', encoding="utf-8")
+            subprocess.run(["git", "-C", str(clone), "checkout", "-b", "fix/20261122-143000-acme-stamp"], check=True, capture_output=True)
+            fix_stamp = git_client.stamp_repo_version_manifests(clone)
+            self.assertTrue(fix_stamp["updated"])
+            self.assertTrue(fix_stamp["version"].endswith("-20261122"))
+            self.assertTrue(fix_stamp["pep440_version"].startswith("20261122+g"))
+            self.assertIn(f'__version__ = "{fix_stamp["version"]}"', (clone / "api" / "__init__.py").read_text(encoding="utf-8"))
+
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(clone)})
+            self.assertTrue(vcs.resolve_repo_version_stamp(repo_dir=clone, date_override="20261122").endswith("-20261122"))
+
+    def test_git_client_ssh_auth_status_and_cli_dispatch(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            _, clone = _create_bare_and_clone(troot, name="cli-repo")
+            vcs = git_client.GitVcsIntegrationClient(
+                repo="acme-org/cli-repo",
+                env_overrides={"AGY_CONF_REPO_DIR": str(clone)},
+            )
+            self.assertEqual(vcs.resolve_repo(), "acme-org/cli-repo")
+            self.assertEqual(vcs.resolve_ssh_host_from_remote("git@github.com:acme/repo.git"), "git@github.com")
+            self.assertEqual(vcs.resolve_ssh_host_from_remote("ssh://git@gitlab.example.com/acme/repo.git"), "git@gitlab.example.com")
+            self.assertEqual(vcs.resolve_ssh_host_from_remote("https://bitbucket.org/acme/repo.git"), "git@bitbucket.org")
+            self.assertEqual(vcs.resolve_ssh_host_from_remote("local-only-remote"), "git@github.com")
+
+            # Offline auth_status
+            offline_st = vcs.auth_status(live=False)
+            self.assertEqual(offline_st["status"], "ok")
+            self.assertTrue(offline_st["authenticated"])
+            self.assertEqual(offline_st["auth_mode"], "native_git_ssh_offline")
+
+            # check_ssh_git_auth + live auth_status (success, non-zero denial, and exception)
+            fake_ok_proc = subprocess.CompletedProcess(
+                args=["ssh"],
+                returncode=1,
+                stdout="",
+                stderr="Hi acme-bot! You've successfully authenticated, but GitHub does not provide shell access.",
+            )
+            with mock.patch("git_client.subprocess.run", return_value=fake_ok_proc):
+                ssh_ok = vcs.check_ssh_git_auth()
+                self.assertTrue(ssh_ok["authenticated"])
+                self.assertEqual(ssh_ok["username"], "acme-bot")
+                live_ok = vcs.auth_status(live=True)
+                self.assertEqual(live_ok["status"], "ok")
+                self.assertEqual(live_ok["account"], "acme-bot")
+
+            fake_fail_proc = subprocess.CompletedProcess(
+                args=["ssh"],
+                returncode=255,
+                stdout="",
+                stderr="git@github.com: Permission denied (publickey).",
+            )
+            with mock.patch("git_client.subprocess.run", return_value=fake_fail_proc):
+                ssh_fail = vcs.check_ssh_git_auth()
+                self.assertFalse(ssh_fail["authenticated"])
+                live_fail = vcs.auth_status(live=True)
+                self.assertEqual(live_fail["status"], "error")
+                self.assertFalse(live_fail["authenticated"])
+
+            with mock.patch("git_client.subprocess.run", side_effect=OSError("ssh binary missing")):
+                ssh_err = vcs.check_ssh_git_auth()
+                self.assertFalse(ssh_err["authenticated"])
+                self.assertIn("ssh binary missing", ssh_err["error"])
+
+            # Create a feature branch on clone & push to local bare remote to exercise CLI subcommands end-to-end
+            feat_branch = "fix/20261122-150000-cli-demo"
+            subprocess.run(["git", "-C", str(clone), "checkout", "-b", feat_branch], check=True, capture_output=True)
+            (clone / "feature.txt").write_text("hello\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(clone), "add", "feature.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(clone), "commit", "-m", "feat: add feature"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(clone), "checkout", "main"], check=True, capture_output=True)
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_CONF_REPO_DIR": str(clone)}, clear=False),
+                mock.patch("git_client.load_env_into_os", return_value={}),
+            ):
+                for cli_argv, expected_rc in (
+                    (["auth-status", "--offline"], 0),
+                    (["push-branch", "--branch", "main"], 1),
+                    (["push-branch", "--branch", feat_branch], 0),
+                    (["branch-diff", "--branch", feat_branch, "--base", "main"], 0),
+                    (["branch-state", "--branch", feat_branch, "--no-fetch"], 0),
+                    (["sync-repo", "--no-fetch", "--protect", feat_branch], 0),
+                    (["deploy-home", "--no-prune"], 0),
+                    (["delete-branch", "--branch", "main", "--local-only"], 1),
+                    (["delete-branch", "--branch", feat_branch, "--local-only"], 0),
+                ):
+                    out_buf = io.StringIO()
+                    with contextlib.redirect_stdout(out_buf):
+                        rc = git_client.main(cli_argv)
+                    self.assertEqual(rc, expected_rc, msg=f"CLI {cli_argv} returned {rc}: {out_buf.getvalue()}")
+                    parsed_out = json.loads(out_buf.getvalue())
+                    self.assertIn("status", parsed_out)
+
+                with self.assertRaises(SystemExit) as help_ctx, contextlib.redirect_stdout(io.StringIO()):
+                    git_client.main([])
+                self.assertEqual(help_ctx.exception.code, 0)
+
+    def test_git_client_sync_and_deploy_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            bare, clone = _create_bare_and_clone(troot, name="sync-repo")
+            fake_home = troot / "home"
+            fake_home.mkdir(parents=True)
+            state_dir = troot / "state"
+            state_dir.mkdir(parents=True)
+            vcs = git_client.GitVcsIntegrationClient(
+                env_overrides={"AGY_CONF_REPO_DIR": str(clone), "AGY_DEV_STATE_DIR": str(state_dir)}
+            )
+
+            # Error path on non-git directory & no_remote_base_ref on unpushed init repo
+            non_git = troot / "not-a-repo"
+            non_git.mkdir()
+            self.assertEqual(vcs.sync_and_clean_local_repo(repo_dir=non_git)["status"], "error")
+            self.assertEqual(vcs.get_branch_diff(branch_name="fix/x", repo_dir=non_git)["status"], "error")
+            self.assertEqual(vcs.inspect_remote_branch_state(branch_name="fix/x", repo_dir=non_git)["status"], "error")
+
+            no_remote_repo = troot / "local-init"
+            no_remote_repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main", str(no_remote_repo)], check=True, capture_output=True)
+            no_rem_res = vcs.sync_and_clean_local_repo(repo_dir=no_remote_repo, fetch=False)
+            self.assertEqual(no_rem_res["reason"], "no_remote_base_ref")
+
+            # Advance bare `origin/main` via a second clone so `clone` fast-forwards & prunes stale branches/worktrees
+            peer = troot / "peer"
+            subprocess.run(["git", "clone", str(bare), str(peer)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "config", "user.name", "Acme Bot"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "config", "user.email", "acme-bot@example.com"], check=True, capture_output=True)
+            (peer / "upstream.txt").write_text("from-peer\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(peer), "add", "upstream.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "commit", "-m", "feat: upstream change"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "push", "origin", "main"], check=True, capture_output=True)
+
+            # Create merged non-fix branch, orphan fix branch, and linked stale worktree on `clone`
+            subprocess.run(["git", "-C", str(clone), "branch", "feat/already-merged", "main"], check=True, capture_output=True)
+            stale_wt = troot / "stale-wt"
+            subprocess.run(
+                ["git", "-C", str(clone), "worktree", "add", "-b", "fix/20261120-010000-stale", str(stale_wt), "main"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "-C", str(clone), "checkout", "-b", "fix/20261120-020000-cur", "main"], check=True, capture_output=True)
+            (clone / "untracked_dirty.txt").write_text("autostash-me\n", encoding="utf-8")
+
+            # 1) Dirty unpushed current fix/* branch is protected while stale sibling branches/worktrees prune & main fast-forwards via branch -f
+            sync_dirty_unpushed = vcs.sync_and_clean_local_repo(
+                repo_dir=clone,
+                home_dir=fake_home,
+                state_dir=state_dir,
+                deploy_to_home=False,
+            )
+            self.assertEqual(sync_dirty_unpushed["status"], "ok")
+            self.assertEqual(sync_dirty_unpushed["current_branch"], "fix/20261120-020000-cur")
+            self.assertTrue(sync_dirty_unpushed["base_up_to_date"])
+            self.assertIn("feat/already-merged", sync_dirty_unpushed["deleted_local_branches"])
+            self.assertIn("fix/20261120-010000-stale", sync_dirty_unpushed["deleted_local_branches"])
+
+            # 2) Advance origin/main again and force-clean current branch -> exercises autostash + checkout main + ff-only + stash pop + branch -D
+            (peer / "upstream2.txt").write_text("from-peer-2\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(peer), "add", "upstream2.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "commit", "-m", "feat: upstream change 2"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "push", "origin", "main"], check=True, capture_output=True)
+
+            sync_res = vcs.sync_and_clean_local_repo(
+                repo_dir=clone,
+                home_dir=fake_home,
+                state_dir=state_dir,
+                force_clean_branches=["fix/20261120-020000-cur"],
+                deploy_to_home=False,
+            )
+            self.assertEqual(sync_res["status"], "ok")
+            self.assertTrue(sync_res["synced"])
+            self.assertEqual(sync_res["current_branch"], "main")
+            self.assertTrue(sync_res["base_up_to_date"])
+            self.assertTrue((clone / "upstream.txt").is_file())
+            self.assertTrue((clone / "upstream2.txt").is_file())
+            self.assertTrue((clone / "untracked_dirty.txt").is_file())
+            self.assertIn("fix/20261120-020000-cur", sync_res["deleted_local_branches"])
+
+            # Verify deploy_repo_to_home on src/home layout + permissions + orphan pruning + not_on_base_branch
+            self.assertEqual(vcs.deploy_repo_to_home(repo_dir=non_git, home_dir=fake_home)["reason"], "no_src_home_dir")
+            sh_home = clone / "src" / "home"
+            (sh_home / ".local" / "bin").mkdir(parents=True)
+            (sh_home / ".ssh").mkdir(parents=True)
+            (sh_home / ".gemini" / "config").mkdir(parents=True)
+            (sh_home / ".local" / "bin" / "acme-tool").write_text("#!/usr/bin/env sh\necho ok\n", encoding="utf-8")
+            (sh_home / ".ssh" / "acme_cfg").write_text("Host example.com\n", encoding="utf-8")
+            (sh_home / ".gemini" / "config" / "hooks.json").write_text('{"cmd": "$HOME/bin/run"}\n', encoding="utf-8")
+            subprocess.run(["git", "-C", str(clone), "add", "src/home"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(clone), "commit", "-m", "feat: add src/home"], check=True, capture_output=True)
+
+            # Seed obsolete files in fake_home to exercise orphan pruning
+            obs_rule = fake_home / ".gemini" / "config" / "rules" / "old.md"
+            obs_rule.parent.mkdir(parents=True, exist_ok=True)
+            obs_rule.write_text("stale\n", encoding="utf-8")
+
+            dep1 = vcs.deploy_repo_to_home(repo_dir=clone, home_dir=fake_home)
+            self.assertEqual(dep1["status"], "ok")
+            self.assertTrue(dep1["deployed"])
+            self.assertEqual(stat.S_IMODE((fake_home / ".local" / "bin" / "acme-tool").stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((fake_home / ".ssh" / "acme_cfg").stat().st_mode), 0o600)
+            self.assertIn(str(fake_home), (fake_home / ".gemini" / "config" / "hooks.json").read_text(encoding="utf-8"))
+            self.assertFalse(obs_rule.exists())
+
+            # Second deploy with drifted mode repairs mode via unchanged fast path
+            os.chmod(fake_home / ".local" / "bin" / "acme-tool", 0o644)
+            dep2 = vcs.deploy_repo_to_home(repo_dir=clone, home_dir=fake_home)
+            self.assertEqual(dep2["deployed_count"], 0)
+            self.assertEqual(stat.S_IMODE((fake_home / ".local" / "bin" / "acme-tool").stat().st_mode), 0o755)
+
+            # Refuses deploy when checked out on unmerged fix/* branch
+            subprocess.run(["git", "-C", str(clone), "checkout", "-b", "fix/20261122-999999-unmerged"], check=True, capture_output=True)
+            dep_skip = vcs.deploy_repo_to_home(repo_dir=clone, home_dir=fake_home, require_base_branch="main")
+            self.assertEqual(dep_skip["status"], "skipped")
+            self.assertEqual(dep_skip["reason"], "not_on_base_branch")
+
+            # _maybe_restart_control_tower_after_deploy guardrails
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"AGY_OFFLINE_ONLY": "0", "AGY_DISABLE_API_AUTOSTART": "0", "PRE_COMMIT_HOOK": "0"},
+                    clear=False,
+                ),
+                mock.patch("git_client.try_restart_control_tower_api", return_value=True) as mock_restart,
+            ):
+                self.assertFalse(
+                    git_client._maybe_restart_control_tower_after_deploy(
+                        ["README.md"], target_home=pathlib.Path.home(), _allow_in_tests=True
+                    )
+                )
+                self.assertFalse(
+                    git_client._maybe_restart_control_tower_after_deploy(
+                        ["clients/dev_common.py"], target_home=fake_home, _allow_in_tests=True
+                    )
+                )
+                self.assertTrue(
+                    git_client._maybe_restart_control_tower_after_deploy(
+                        ["clients/dev_common.py"], target_home=pathlib.Path.home(), _allow_in_tests=True
+                    )
+                )
+                mock_restart.assert_called_once()
+
+    def test_dev_common_cli_companion_and_ledger_helpers(self) -> None:
+        import contextlib
+        import fcntl
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            fake_home = troot / "home"
+            fake_home.mkdir(parents=True)
+            state_dir = troot / "state"
+            state_dir.mkdir(parents=True)
+
+            # 1. load_dotenv_dict & load_env_into_os + BaseIntegrationClient + HealthProbeResultDTO
+            env_file = fake_home / ".env"
+            env_file.write_text(
+                "# comment\nexport ACME_TEST_KEY=\"alpha\"\nACME_SINGLE='beta'\nINVALID_LINE\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("ACME_TEST_KEY", None)
+                os.environ.pop("ACME_SINGLE", None)
+                loaded = dev_common.load_env_into_os(env_file=env_file, home_dir=fake_home)
+                self.assertEqual(loaded["ACME_TEST_KEY"], "alpha")
+                self.assertEqual(os.environ.get("ACME_TEST_KEY"), "alpha")
+                self.assertEqual(os.environ.get("ACME_SINGLE"), "beta")
+
+            base_client = dev_common.BaseIntegrationClient(
+                env_file=env_file,
+                env_overrides={"ACME_OVERRIDE": "win"},
+            )
+            self.assertEqual(base_client.get_config("ACME_OVERRIDE"), "win")
+            self.assertEqual(base_client.get_config("ACME_SINGLE"), "beta")
+            self.assertEqual(base_client.get_config("ACME_MISSING", "fallback"), "fallback")
+
+            dto = dev_common.HealthProbeResultDTO(
+                system_id="git_client",
+                display_name="Git Client",
+                extra={"vcs_provider": "github"},
+            )
+            dto_dict = dto.to_dict()
+            self.assertEqual(dto_dict["vcs_provider"], "github")
+            self.assertNotIn("extra", dto_dict)
+
+            # 2. file_lock timeout when contended
+            lock_path = troot / "contended.lock"
+            held_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaises(TimeoutError), dev_common.file_lock(lock_path, timeout_seconds=0.5):
+                    pass
+            finally:
+                fcntl.flock(held_fd, fcntl.LOCK_UN)
+                os.close(held_fd)
+
+            # 3. Companion bridges (absent fallback + fake companion wiz_common.py)
+            with mock.patch.object(dev_common, "_resolve_companion_clients_dir", return_value=None), mock.patch.object(
+                dev_common, "_resolve_companion_control_tower_dir", return_value=None
+            ):
+                self.assertFalse(dev_common.try_restart_control_tower_api(home_dir=fake_home))
+                self.assertEqual(dev_common.try_stop_dev_api_server(home_dir=fake_home), {"status": "skipped", "stopped": False})
+                with mock.patch.dict(os.environ, {"AGY_PRO_HOST": "127.0.0.1", "AGY_PRO_PORT": "9000"}, clear=False):
+                    self.assertEqual(
+                        dev_common.try_build_control_tower_ui_url("#overview", home_dir=fake_home),
+                        "http://127.0.0.1:9000/ui#overview",
+                    )
+                    self.assertEqual(
+                        dev_common.try_build_control_tower_ui_url("", home_dir=fake_home),
+                        "http://127.0.0.1:9000/ui",
+                    )
+
+            comp_clients = fake_home / ".gemini" / "config" / "plugins" / "wiz-tam-plugin" / "clients"
+            comp_clients.mkdir(parents=True)
+            (comp_clients / "wiz_common.py").write_text(
+                "def restart_pro_api_server(portfolio_dir=None):\n"
+                "    return True\n"
+                "def stop_dev_api_server(portfolio_dir=None):\n"
+                "    return {'status': 'ok', 'stopped': True}\n"
+                "def build_pro_dashboard_ui_url(page='health', portfolio_dir=None, ensure_server=False):\n"
+                "    return f'http://127.0.0.1:8787/ui#{page}'\n"
+                "class ActionsLedgerStore:\n"
+                "    def __init__(self, portfolio_dir=None):\n"
+                "        self.portfolio_dir = portfolio_dir\n"
+                "    def sync_audit_verdicts(self, updates):\n"
+                "        return {'synced_keys': sorted(updates.keys())}\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(dev_common.try_restart_control_tower_api(portfolio_dir=state_dir, home_dir=fake_home))
+            self.assertEqual(
+                dev_common.try_stop_dev_api_server(portfolio_dir=state_dir, home_dir=fake_home),
+                {"status": "ok", "stopped": True},
+            )
+            self.assertEqual(
+                dev_common.try_build_control_tower_ui_url("queue", portfolio_dir=state_dir, home_dir=fake_home),
+                "http://127.0.0.1:8787/ui#queue",
+            )
+
+            # Ledger sync: without actions_ledger.db returns input dict; with actions_ledger.db calls store
+            passthrough = dev_common.try_sync_actions_ledger_verdicts(
+                {"cid-1": {"verdict": "PASS"}},
+                state_dir=state_dir,
+                home_dir=fake_home,
+            )
+            self.assertEqual(passthrough, {"cid-1": {"verdict": "PASS"}})
+            (state_dir / "actions_ledger.db").write_bytes(b"sqlite-placeholder")
+            synced = dev_common.try_sync_actions_ledger_verdicts(
+                {"cid-2": {"verdict": "PASS"}},
+                state_dir=state_dir,
+                legacy_audited={"cid-0": {"verdict": "PASS"}},
+                home_dir=fake_home,
+            )
+            self.assertEqual(synced, {"synced_keys": ["cid-2"]})
+
+            # 4. Antigravity brain transcript resolution & inspection
+            brain_root = troot / "brain"
+            conv_id = "77777777-7777-4777-8777-777777777777"
+            tpath = brain_root / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
+            tpath.parent.mkdir(parents=True)
+            tpath.write_text(
+                json.dumps({"type": "SYSTEM", "content": "init"}) + "\n"
+                + json.dumps({"type": "USER_INPUT", "content": "Audit AcmeCorp CI pipeline"}) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(dev_common.resolve_antigravity_brain_dirs([brain_root]), [brain_root])
+            self.assertEqual(dev_common.resolve_antigravity_brain_dirs(None, explicit_state_dir=True), [])
+            self.assertIsNone(dev_common.resolve_transcript_path("", brain_dir=brain_root))
+            inspected = dev_common.try_inspect_antigravity_conversation(conv_id, brain_dir=brain_root, home_dir=fake_home)
+            self.assertEqual(inspected["status"], "ok")
+            self.assertEqual(inspected["details"], "Audit AcmeCorp CI pipeline")
+            missing_conv = dev_common.try_inspect_antigravity_conversation("missing-cid", brain_dir=brain_root, home_dir=fake_home)
+            self.assertEqual(missing_conv["status"], "not_found")
+
+            # 5. Functional evaluators & CLI subcommands (`checks`, `guardrail-hook`, `run_dev_queue_*_cli`)
+            self.assertEqual(
+                dev_common.evaluate_pre_tool_use(
+                    {"toolName": "run_command", "arguments": {"CommandLine": "git status"}},
+                    home_dir=fake_home,
+                    state_dir=state_dir,
+                )["decision"],
+                "allow",
+            )
+            self.assertEqual(
+                dev_common.evaluate_session_start({"conversationId": conv_id}, home_dir=fake_home, state_dir=state_dir)["decision"],
+                "allow",
+            )
+            evaluator = dev_common.DevLifecycleGuardrailEvaluator(home_dir=fake_home, state_dir=state_dir)
+            self.assertEqual(evaluator.evaluate("PostToolUse", {}), {})
+            self.assertEqual(evaluator.evaluate("UnknownEvent", {}), {"decision": "allow"})
+
+            out_json = io.StringIO()
+            with contextlib.redirect_stdout(out_json):
+                self.assertEqual(dev_common.main(["checks", "--format", "json"]), 0)
+            self.assertEqual(json.loads(out_json.getvalue())["count"], 6)
+
+            out_txt = io.StringIO()
+            with contextlib.redirect_stdout(out_txt):
+                self.assertEqual(dev_common.main(["checks", "--event", "SessionStart", "--format", "text"]), 0)
+            self.assertIn("session:dev-pr-lock-context", out_txt.getvalue())
+
+            hook_out = io.StringIO()
+            fake_stdin = io.StringIO(json.dumps({"toolName": "run_command", "arguments": {"CommandLine": "git push origin main"}}))
+            with mock.patch.object(sys, "stdin", fake_stdin), contextlib.redirect_stdout(hook_out):
+                self.assertEqual(dev_common.main(["guardrail-hook", "--event", "PreToolUse"]), 0)
+            self.assertEqual(json.loads(hook_out.getvalue())["decision"], "deny")
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(dev_common.main([]), 0)
+
+            with self.assertRaises(SystemExit) as tui_help, contextlib.redirect_stdout(io.StringIO()):
+                dev_common.run_dev_queue_tui_cli(["--help"])
+            self.assertEqual(tui_help.exception.code, 0)
+
+            with self.assertRaises(SystemExit) as doc_help, contextlib.redirect_stdout(io.StringIO()):
+                dev_common.run_dev_queue_doctor_cli(["--help"])
+            self.assertEqual(doc_help.exception.code, 0)
+
+            with mock.patch.object(dev_common, "_load_optional_module", return_value=None), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(dev_common.run_dev_queue_tui_cli(["--help"]), 1)
+                self.assertEqual(dev_common.run_dev_queue_doctor_cli(["--help"]), 1)
+
+    def test_qa_static_audit_main_and_no_wiz_common_import(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+
+            # 1. Clean mini-repo with commented-out wiz_common mention passes
+            clean_repo = troot / "clean"
+            (clean_repo / "clients").mkdir(parents=True)
+            (clean_repo / "clients" / "dev_common.py").write_text(
+                "# Optional soft bridge; never import wiz_common at module load\nVALUE = 1\n",
+                encoding="utf-8",
+            )
+            out_clean = io.StringIO()
+            with contextlib.redirect_stdout(out_clean):
+                rc_clean = qa_static_audit.main(["--repo", str(clean_repo), "--format", "json", "--strict"])
+            self.assertEqual(rc_clean, 0)
+            self.assertTrue(json.loads(out_clean.getvalue())["passed"])
+
+            # 2. Hard `import wiz_common` inside clients/dev_common.py triggers dev:no-wiz-common-import
+            bad_repo = troot / "bad"
+            (bad_repo / "clients").mkdir(parents=True)
+            (bad_repo / "clients" / "dev_common.py").write_text("import wiz_common\n", encoding="utf-8")
+            (bad_repo / "clients" / "git_client.py").write_text("from wiz_common import foo\n", encoding="utf-8")
+            out_bad = io.StringIO()
+            with contextlib.redirect_stdout(out_bad):
+                rc_bad = qa_static_audit.main(["--repo", str(bad_repo), "--format", "text", "--incremental"])
+            self.assertEqual(rc_bad, 1)
+            self.assertIn("[qa_static_audit] FAIL", out_bad.getvalue())
+            self.assertIn("dev:no-wiz-common-import", out_bad.getvalue())
+
+    def test_selective_test_runner_detect_changed_files_and_main(self) -> None:
+        import contextlib
+        import io
+        import selective_test_runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            non_git = troot / "non-git"
+            non_git.mkdir()
+            self.assertEqual(selective_test_runner.detect_changed_files(non_git), [])
+
+            _, clone = _create_bare_and_clone(troot, name="sel-repo")
+            subprocess.run(["git", "-C", str(clone), "checkout", "-b", "fix/20261122-160000-sel"], check=True, capture_output=True)
+            (clone / "committed.py").write_text("X = 1\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(clone), "add", "committed.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(clone), "commit", "-m", "feat: committed file"], check=True, capture_output=True)
+
+            (clone / "staged.py").write_text("Y = 2\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(clone), "add", "staged.py"], check=True, capture_output=True)
+            (clone / "README.md").write_text("# Updated\n", encoding="utf-8")
+            (clone / "untracked.sh").write_text("#!/usr/bin/env bash\nset -euo pipefail\n", encoding="utf-8")
+            (clone / "__pycache__").mkdir()
+            (clone / "__pycache__" / "ignored.pyc").write_bytes(b"bytecode")
+
+            detected = selective_test_runner.detect_changed_files(clone)
+            self.assertEqual(set(detected), {"committed.py", "staged.py", "README.md", "untracked.sh"})
+
+            # Router integrity edge cases: duplicates, missing tests/ dir, missing registered file
+            dup_issues = selective_test_runner.audit_router_integrity(
+                REPO_ROOT,
+                registered_modules=[*selective_test_runner.ALL_TEST_MODULES, selective_test_runner.ALL_TEST_MODULES[0]],
+            )
+            self.assertTrue(any("duplicate" in i for i in dup_issues))
+            missing_dir_issues = selective_test_runner.audit_router_integrity(non_git)
+            self.assertTrue(any("missing tests/" in i for i in missing_dir_issues))
+            missing_mod_issues = selective_test_runner.audit_router_integrity(
+                REPO_ROOT,
+                registered_modules=[*selective_test_runner.ALL_TEST_MODULES, "tests.test_nonexistent_ghost"],
+            )
+            self.assertTrue(any("does not exist on disk" in i for i in missing_mod_issues))
+
+            # main() --audit-integrity, --plan-only --gha-outputs, clean skip, and unittest/bats execution
+            audit_out = io.StringIO()
+            with contextlib.redirect_stdout(audit_out):
+                self.assertEqual(selective_test_runner.main(["--audit-integrity"]), 0)
+            self.assertIn("Router integrity OK", audit_out.getvalue())
+
+            gha_file = troot / "github_output.txt"
+            plan_out = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(gha_file)}, clear=False),
+                contextlib.redirect_stdout(plan_out),
+            ):
+                self.assertEqual(
+                    selective_test_runner.main(["--plan-only", "--gha-outputs", "clients/git_client.py"]),
+                    0,
+                )
+            gha_text = gha_file.read_text(encoding="utf-8")
+            self.assertIn("mode=selective", gha_text)
+            self.assertIn("should_run_bats=true", gha_text)
+            self.assertIn("tests.test_agy_dev_plugin", gha_text)
+
+            skip_out = io.StringIO()
+            with (
+                mock.patch.object(selective_test_runner, "detect_changed_files", return_value=[]),
+                contextlib.redirect_stdout(skip_out),
+            ):
+                self.assertEqual(selective_test_runner.main([]), 0)
+            self.assertIn("SKIPPED", skip_out.getvalue())
+
+            # Mock subprocess execution for unittest + bats pass and non-zero failure propagation
+            ok_proc = subprocess.CompletedProcess(args=["cmd"], returncode=0)
+            fail_proc = subprocess.CompletedProcess(args=["cmd"], returncode=2)
+            with (
+                mock.patch("selective_test_runner.subprocess.run", return_value=ok_proc) as mock_run,
+                mock.patch("selective_test_runner.shutil.which", return_value="/usr/bin/bats"),
+            ):
+                self.assertEqual(selective_test_runner.main(["clients/git_client.py"]), 0)
+                self.assertEqual(mock_run.call_count, 2)
+
+            with mock.patch("selective_test_runner.subprocess.run", return_value=fail_proc):
+                self.assertEqual(selective_test_runner.main(["--no-bats", "clients/git_client.py"]), 2)
+
+            with (
+                mock.patch("selective_test_runner.subprocess.run", side_effect=[ok_proc, fail_proc]),
+                mock.patch("selective_test_runner.shutil.which", return_value="/usr/bin/bats"),
+            ):
+                self.assertEqual(selective_test_runner.main(["clients/git_client.py"]), 2)
 
 
 if __name__ == "__main__":

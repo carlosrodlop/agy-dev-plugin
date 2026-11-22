@@ -5,23 +5,44 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
   unit-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+    env:
+      AGY_OFFLINE_ONLY: "1"
+      PRE_COMMIT_HOOK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
       - name: Install bats-core (Debian package)
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats
+      - name: Install editable package & smoke-test CLI entrypoints
+        run: |
+          python3 -m pip install --upgrade pip setuptools pyyaml
+          python3 -m pip install --no-build-isolation --no-deps -e .
+          agy-queue --help
+          agy-doctor --help
       - name: Run Offline Unit Tests
         run: python3 -m unittest discover -s tests -p "test_*.py" -v
       - name: Run Shell BATS Tests

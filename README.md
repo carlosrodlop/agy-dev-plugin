@@ -68,11 +68,12 @@ make test
 - **`/hitl-review` workflow**: Inside Antigravity, reads `hitl_blocked` queue item transcripts and proposals, prompts structured decisions via `ask_question`, and auto-promotes approved items `hitl_blocked -> pending` (`skills/agy-dev-queue-orchestrator/SKILL.md`).
 
 ### 6. GitHub Actions CI (`ubuntu-24.04`)
-Because `carlosrodlop/agy-dev-plugin` is a public repository (unlimited GitHub Actions minutes) with protected `main` requiring Pull Requests, all 4 workflows trigger automatically on `pull_request` (`main`) — plus manual `workflow_dispatch`, with no duplicate `push` triggers:
-- `.github/workflows/static-qa.yml`: Runs `qa_static_audit.py --strict` and `project_audit.py --repo . --strict`.
-- `.github/workflows/offline-unit-tests.yml`: Runs `unittest` discovery, `bats tests/bats/*.bats`, and `selective_test_runner.py --plan-only`.
-- `.github/workflows/pre-commit.yml`: Installs `bats` and executes the full `.pre-commit-config.yaml` hook suite.
-- `.github/workflows/coverage-report.yml`: Runs `pytest --cov=clients --cov=skills` coverage reporting.
+Because `carlosrodlop/agy-dev-plugin` is a public repository (unlimited GitHub Actions minutes) with protected `main` requiring Pull Requests, all 5 workflows enforce explicit least-privilege `permissions:`, Node 24 compatible actions (`actions/checkout@v6`, `actions/setup-python@v6`, `actions/cache@v5`, SHA-pinned `actions/github-script` v8), and trigger exclusively on `pull_request` (`main`) plus manual `workflow_dispatch` (zero duplicate `push` triggers):
+- `.github/workflows/static-qa.yml`: Installs `pyyaml` + `ruff`, runs `ruff check --select E9,F63,F7,F82 clients skills sidecars tests`, and executes `qa_static_audit.py --strict` (which wraps `project_audit.py --strict` + independence checks).
+- `.github/workflows/offline-unit-tests.yml`: Runs across a Python `3.11` and `3.13` matrix with `AGY_OFFLINE_ONLY=1` and `PRE_COMMIT_HOOK=1`, smoke-tests editable CLI entrypoints (`pip install --no-deps -e .` -> `agy-queue --help`, `agy-doctor --help`), and executes `unittest` discovery, `bats tests/bats/*.bats`, and `selective_test_runner.py --plan-only`.
+- `.github/workflows/pre-commit.yml`: Caches `~/.cache/pre-commit` and executes `pre-commit run --all-files --show-diff-on-failure` with `SKIP=qa-static-audit,unit-tests-fast,bats-suite` so formatting, YAML/JSON/TOML, shebang, and secret hooks run without duplicating dedicated QA/test workflows.
+- `.github/workflows/coverage-report.yml`: Runs hermetic `pytest` across `--cov=clients --cov=skills --cov=sidecars --cov=tests/scripts` enforcing `--cov-fail-under=75` and publishing a Markdown coverage table to `GITHUB_STEP_SUMMARY`.
+- `.github/workflows/sync-pr-verification.yml`: Idempotently syncs SHA-bound `## 🧪 Automated Verification Checks` and `## 🤖 Independent PR Review` sections from `HEAD` commit messages into the PR description body (`contents: read`, `pull-requests: write`).
 
 ### 7. Optional GitHub Copilot Code Review (Credit-Safe Ruleset)
 To enable optional GitHub Copilot Code Review on Pull Requests targeting `main` without burning AI Credits on intermediate commits or drafts, configure the repository **GitHub Ruleset** for `main` as follows:

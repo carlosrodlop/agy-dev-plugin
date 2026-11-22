@@ -32,6 +32,11 @@ setup() {
   [ -f "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/clients/dev_common.py" ]
   [ -f "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/clients/git_client.py" ]
   [ -f "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-project-standards/scripts/project_audit.py" ]
+  [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py" ]
+  [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/dev_flow_optimizer.py" ]
+  [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/dev_queue_doctor.py" ]
+  [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/parallel_scope.py" ]
+  [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/rebase_gate.py" ]
   [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-dev-queue-orchestrator/scripts/dev_queue_tui.py" ]
   [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/shell/agy_dev_queue.sh" ]
   [ -f "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/sidecars/dev-queue-watchdog/sidecar.json" ]
@@ -75,6 +80,22 @@ setup() {
   run python3 "${REPO_ROOT}/clients/git_client.py" --help
   [ "$status" -eq 0 ]
   run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/pr_remediator.py" --help
+  [ "$status" -eq 0 ]
+  run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/dev_flow_optimizer.py" --help
+  [ "$status" -eq 0 ]
+  run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/dev_queue_doctor.py" --help
+  [ "$status" -eq 0 ]
+  run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/parallel_scope.py" --help
+  [ "$status" -eq 0 ]
+  run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/rebase_gate.py" --help
+  [ "$status" -eq 0 ]
+  run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/pr_remediator.py" queue-optimize --help
+  [ "$status" -eq 0 ]
+  run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/pr_remediator.py" queue-doctor --help
+  [ "$status" -eq 0 ]
+  run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/pr_remediator.py" analyze-overlap --help
+  [ "$status" -eq 0 ]
+  run python3 "${REPO_ROOT}/skills/agy-code-remediation-pr/scripts/pr_remediator.py" rebase-reverify --help
   [ "$status" -eq 0 ]
   run python3 "${REPO_ROOT}/skills/agy-dev-queue-orchestrator/scripts/dev_queue_tui.py" --help
   [ "$status" -eq 0 ]

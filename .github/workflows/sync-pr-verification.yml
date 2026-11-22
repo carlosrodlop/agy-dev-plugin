@@ -4,23 +4,24 @@ on:
   pull_request:
     types: [opened, synchronize]
     branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   contents: read
   pull-requests: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
   sync-pr-verification:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Sync Automated Verification Checks & Independent PR Review to PR Body
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1 pragma: allowlist secret
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0 pragma: allowlist secret
         with:
           script: |
             const pr = context.payload.pull_request;
