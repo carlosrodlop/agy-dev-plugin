@@ -67,7 +67,7 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
                 selected.append("tests.test_pr_remediator_queue_and_cleanup")
         if (
             norm.endswith(("dev_queue_doctor.py", "test_dev_queue_doctor.py", "pr_remediator.py", "dev_flow_optimizer.py", "dev_queue_tui.py", "agy_dev_queue.sh", "dev_common.py"))
-            or norm.startswith(("skills/agy-dev-queue-orchestrator/", "shell/"))
+            or norm.startswith(("skills/agy-dev-queue-orchestrator/", "shell/", "sidecars/"))
         ):
             if "tests.test_dev_queue_doctor" not in selected:
                 selected.append("tests.test_dev_queue_doctor")
@@ -88,7 +88,7 @@ def should_run_bats(changed_files: list[str], *, run_all: bool = False) -> bool:
     if run_all or not changed_files:
         return True
     markers = (".sh", ".bats", "hooks.json", "plugin.json", "dev_common.py", "git_client.py", "pr_remediator.py", "project_audit.py")
-    return any(rel.endswith(markers) for rel in changed_files)
+    return any(rel.endswith(markers) or rel.replace("\\", "/").startswith("sidecars/") for rel in changed_files)
 
 
 def _clean_git_env() -> dict[str, str]:

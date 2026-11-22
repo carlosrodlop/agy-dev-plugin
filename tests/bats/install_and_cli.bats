@@ -34,8 +34,13 @@ setup() {
   [ -f "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-project-standards/scripts/project_audit.py" ]
   [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/skills/agy-dev-queue-orchestrator/scripts/dev_queue_tui.py" ]
   [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/shell/agy_dev_queue.sh" ]
+  [ -f "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/sidecars/dev-queue-watchdog/sidecar.json" ]
+  [ -x "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/sidecars/dev-queue-watchdog/watchdog.py" ]
   [ -L "${TMP_HOME}/.local/bin/agy-queue" ]
   [ -L "${TMP_HOME}/.local/bin/agy-doctor" ]
+  run python3 "${TMP_HOME}/.gemini/config/plugins/agy-dev-plugin/sidecars/dev-queue-watchdog/watchdog.py" --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--interval"* ]]
   run env HOME="${TMP_HOME}" "${TMP_HOME}/.local/bin/agy-queue" --help
   [ "$status" -eq 0 ]
   [[ "$output" == *"agy-queue"* ]]

@@ -376,7 +376,28 @@ class TestGitClientAndRemediation(unittest.TestCase):
             (src_repo / "hooks.json").write_text('{"hooks": {"PreToolUse": [{"command": "python3 $HOME/.gemini/config/plugins/agy-dev-plugin/clients/dev_common.py"}]}}\n', encoding="utf-8")
             (src_repo / "clients").mkdir()
             (src_repo / "clients" / "dev_common.py").write_text('"""mock"""\n', encoding="utf-8")
-            subprocess.run(["git", "-C", str(src_repo), "add", "plugin.json", "hooks.json", "clients/dev_common.py"], check=True, capture_output=True)
+            sidecar_src = src_repo / "sidecars" / "dev-queue-watchdog"
+            sidecar_src.mkdir(parents=True)
+            (sidecar_src / "sidecar.json").write_text(
+                '{"command": "python3", "args": ["watchdog.py"], "restart_policy": "always", "description": "$HOME/sidecar"}\n',
+                encoding="utf-8",
+            )
+            (sidecar_src / "watchdog.py").write_text('#!/usr/bin/env python3\n"""watchdog"""\n', encoding="utf-8")
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(src_repo),
+                    "add",
+                    "plugin.json",
+                    "hooks.json",
+                    "clients/dev_common.py",
+                    "sidecars/dev-queue-watchdog/sidecar.json",
+                    "sidecars/dev-queue-watchdog/watchdog.py",
+                ],
+                check=True,
+                capture_output=True,
+            )
             subprocess.run(["git", "-C", str(src_repo), "commit", "-m", "feat: plugin files"], check=True, capture_output=True)
             (src_repo / ".env").write_text("PRIVATE_KEY=do_not_copy\n", encoding="utf-8")
 
@@ -386,6 +407,12 @@ class TestGitClientAndRemediation(unittest.TestCase):
             deployed_root = fake_home / ".gemini" / "config" / "plugins" / "agy-dev-plugin"
             self.assertTrue((deployed_root / "plugin.json").is_file())
             self.assertTrue((deployed_root / "clients" / "dev_common.py").is_file())
+            deployed_sidecar_json = deployed_root / "sidecars" / "dev-queue-watchdog" / "sidecar.json"
+            deployed_watchdog_py = deployed_root / "sidecars" / "dev-queue-watchdog" / "watchdog.py"
+            self.assertTrue(deployed_sidecar_json.is_file())
+            self.assertTrue(deployed_watchdog_py.is_file())
+            self.assertEqual(stat.S_IMODE(deployed_watchdog_py.stat().st_mode), 0o755)
+            self.assertIn(str(fake_home), deployed_sidecar_json.read_text(encoding="utf-8"))
             self.assertFalse((deployed_root / ".env").exists())
             self.assertFalse((fake_home / ".gemini" / "config" / "clients").exists())
             hooks_text = (deployed_root / "hooks.json").read_text(encoding="utf-8")

@@ -18,16 +18,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CLIENTS_DIR = REPO_ROOT / "clients"
 REM_SCRIPTS_DIR = REPO_ROOT / "skills" / "agy-code-remediation-pr" / "scripts"
 TUI_SCRIPTS_DIR = REPO_ROOT / "skills" / "agy-dev-queue-orchestrator" / "scripts"
+WATCHDOG_DIR = REPO_ROOT / "sidecars" / "dev-queue-watchdog"
 
-for _p in (CLIENTS_DIR, REM_SCRIPTS_DIR, TUI_SCRIPTS_DIR):
+for _p in (CLIENTS_DIR, REM_SCRIPTS_DIR, TUI_SCRIPTS_DIR, WATCHDOG_DIR):
     _s = str(_p)
     if _s not in sys.path:
         sys.path.insert(0, _s)
 
 import dev_common  # noqa: E402
+import dev_flow_optimizer as flow_opt  # noqa: E402
 import dev_queue_doctor as doctor  # noqa: E402
 import dev_queue_tui as tui  # noqa: E402
 import pr_remediator as prs  # noqa: E402
+import watchdog  # noqa: E402
 
 
 def _write_transcript(
@@ -430,6 +433,7 @@ class TestDevQueueDoctor(unittest.TestCase):
             mock_popen.return_value = mock_proc
 
             # 1. Dry-run never spawns and does not write state file
+            term_env = {"ANTIGRAVITY_LS_ADDRESS": ""}
             res_dry = doctor.run_queue_doctor(
                 state_dir=state_dir,
                 brain_dir=brain_dir,
@@ -438,14 +442,17 @@ class TestDevQueueDoctor(unittest.TestCase):
                 now_ts=now_ts,
                 ps_output="",
                 home_dir=home_dir,
+                env=term_env,
                 which_fn=lambda _name: None,
                 popen_fn=mock_popen,
             )
             self.assertEqual(res_dry["wake"]["status"], "dry_run")
+            self.assertEqual(res_dry["wake"]["transport"], "agy_cli")
             self.assertEqual(
-                res_dry["wake"]["command"][:4],
-                [str(agy_bin_path), "--agent", "agy-dev-orchestrator", "--mode"],
+                res_dry["wake"]["command"][:5],
+                [str(agy_bin_path), "--agent", "agy-dev-orchestrator", "--dangerously-skip-permissions", "-p"],
             )
+            self.assertNotIn("--mode", res_dry["wake"]["command"])
             mock_popen.assert_not_called()
             self.assertFalse((state_dir / doctor.DOCTOR_STATE_FILENAME).exists())
 
@@ -458,20 +465,22 @@ class TestDevQueueDoctor(unittest.TestCase):
                 now_ts=now_ts,
                 ps_output="",
                 home_dir=home_dir,
+                env=term_env,
                 which_fn=lambda _name: None,
                 popen_fn=mock_popen,
                 pid_alive_fn=lambda _pid: False,
             )
             self.assertEqual(res_first["wake"]["status"], "woke")
             self.assertTrue(res_first["wake"]["woke"])
+            self.assertEqual(res_first["wake"]["transport"], "agy_cli")
             self.assertEqual(res_first["wake"]["pid"], 43210)
             self.assertEqual(mock_popen.call_count, 1)
             called_cmd = mock_popen.call_args[0][0]
             self.assertEqual(
                 called_cmd[:5],
-                [str(agy_bin_path), "--agent", "agy-dev-orchestrator", "--mode", "auto"],
+                [str(agy_bin_path), "--agent", "agy-dev-orchestrator", "--dangerously-skip-permissions", "-p"],
             )
-            self.assertEqual(called_cmd[5], "-p")
+            self.assertNotIn("--mode", called_cmd)
             self.assertTrue(mock_popen.call_args[1]["start_new_session"])
 
             st_file = state_dir / doctor.DOCTOR_STATE_FILENAME
@@ -479,6 +488,8 @@ class TestDevQueueDoctor(unittest.TestCase):
             self.assertEqual(st_file.stat().st_mode & 0o777, 0o600)
             saved_state = json.loads(st_file.read_text(encoding="utf-8"))
             self.assertEqual(saved_state["last_wake_pid"], 43210)
+            self.assertEqual(saved_state["transport"], "agy_cli")
+            self.assertEqual(saved_state["last_command"][-1], "<prompt>")
             self.assertTrue(saved_state["last_wake_at"])
 
             # 3. Second wake within cooldown (PID exited) -> skipped_cooldown
@@ -490,6 +501,7 @@ class TestDevQueueDoctor(unittest.TestCase):
                 now_ts=now_ts + 120.0,
                 ps_output="",
                 home_dir=home_dir,
+                env=term_env,
                 which_fn=lambda _name: None,
                 popen_fn=mock_popen,
                 pid_alive_fn=lambda _pid: False,
@@ -508,6 +520,7 @@ class TestDevQueueDoctor(unittest.TestCase):
                 now_ts=now_ts + 2000.0,
                 ps_output="",
                 home_dir=home_dir,
+                env=term_env,
                 which_fn=lambda _name: None,
                 popen_fn=mock_popen,
                 pid_alive_fn=lambda pid: pid == 43210,
@@ -529,6 +542,7 @@ class TestDevQueueDoctor(unittest.TestCase):
                 now_ts=now_ts + 180.0,
                 ps_output="",
                 home_dir=home_dir,
+                env=term_env,
                 which_fn=lambda _name: None,
                 popen_fn=mock_popen,
                 pid_alive_fn=lambda _pid: False,
@@ -807,6 +821,409 @@ class TestDevQueueDoctor(unittest.TestCase):
                 self.assertTrue(doctor.is_pid_alive(12345))
             with mock.patch.object(doctor.os, "kill", side_effect=ProcessLookupError()):
                 self.assertFalse(doctor.is_pid_alive(12345))
+
+    def test_inspect_live_processes_strips_prompts_and_avoids_wait_for_unlock_false_positive(self) -> None:
+        """`agy -p "... wait-for-unlock ..."` and `agentapi` wakes never trigger `wait_for_unlock_running=True`."""
+        ps_false_pos = "\n".join(
+            [
+                "  PID ARGS",
+                '  401 /opt/bin/agy --agent agy-dev-orchestrator --dangerously-skip-permissions -p "[agy-doctor] run pr_remediator.py wait-for-unlock"',
+                "  402 /opt/bin/agy --agent agy-dev-orchestrator --dangerously-skip-permissions -p [agy-doctor] unquoted ps output pr_remediator.py wait-for-unlock",
+                '  403 agy -p "please inspect pr_remediator.py wait-for-unlock and watch-pr-merge"',
+                '  404 agy -p "unclosed truncated prompt mentioning pr_remediator.py wait-for-unlock',
+                "  405 /bin/zsh -c 'agy --prompt \"run pr_remediator.py wait-for-unlock\"'",
+                '  406 /opt/antigravity/bin/agentapi new-conversation "--title=[agy-doctor] Orchestrator Recovery" "arm pr_remediator.py wait-for-unlock"',
+            ]
+        )
+        res_clean = doctor.inspect_live_processes(ps_output=ps_false_pos, self_pid=99999)
+        self.assertFalse(res_clean["wait_for_unlock_running"])
+        self.assertEqual(res_clean["wait_for_unlock_pids"], [])
+        self.assertFalse(res_clean["watch_pr_merge_running"])
+        self.assertEqual(res_clean["watch_pr_merge_pids"], [])
+        self.assertTrue(res_clean["orchestrator_cli_running"])
+        self.assertEqual(res_clean["orchestrator_cli_pids"], [401, 402, 406])
+
+        # Genuine wait-for-unlock and watch-pr-merge daemons are detected accurately alongside wakes
+        ps_genuine = "\n".join(
+            [
+                "  PID ARGS",
+                "  501 python3 /opt/agy/pr_remediator.py wait-for-unlock --orchestrator-id 11112222 --interval 15",
+                "  502 /usr/bin/python3 /opt/agy/pr_remediator.py watch-pr-merge --interval 15",
+                "  503 /bin/zsh -c 'python3 /opt/agy/pr_remediator.py wait-for-unlock --max-duration 3600'",
+            ]
+        )
+        res_genuine = doctor.inspect_live_processes(ps_output=ps_genuine, self_pid=99999)
+        self.assertTrue(res_genuine["wait_for_unlock_running"])
+        self.assertEqual(res_genuine["wait_for_unlock_pids"], [501, 503])
+        self.assertTrue(res_genuine["watch_pr_merge_running"])
+        self.assertEqual(res_genuine["watch_pr_merge_pids"], [502])
+        self.assertFalse(res_genuine["orchestrator_cli_running"])
+
+    def test_hybrid_wake_agentapi_desktop_vs_agy_cli_terminal(self) -> None:
+        """Selects `agentapi new-conversation` when `ANTIGRAVITY_LS_ADDRESS` is set, else `agy --dangerously-skip-permissions`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            brain_dir = root / "brain"
+            home_dir = root / "fake_home"
+            agentapi_path = home_dir / ".gemini" / "antigravity" / "bin" / "agentapi"
+            agentapi_path.parent.mkdir(parents=True)
+            agentapi_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(agentapi_path, 0o755)
+
+            agy_path = home_dir / ".local" / "bin" / "agy"
+            agy_path.parent.mkdir(parents=True)
+            agy_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(agy_path, 0o755)
+
+            now_ts = 1_800_100_000.0
+            _write_state_files(
+                state_dir,
+                orchestrator_id="",
+                items=[
+                    {
+                        "conversation_id": "aaaa2222-bbbb-4222-8222-222222222222",
+                        "priority": 10,
+                        "status": "pending",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "target_files": ["mod.py"],
+                        "title": "Hybrid wake task",
+                    }
+                ],
+                locks={},
+            )
+
+            # Path A: ANTIGRAVITY_LS_ADDRESS set + agentapi present -> transport == "agentapi"
+            mock_popen = mock.MagicMock()
+            mock_proc = mock.MagicMock()
+            mock_proc.pid = 65432
+            mock_popen.return_value = mock_proc
+
+            desktop_env = {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:51234"}
+            res_desktop = doctor.run_queue_doctor(
+                state_dir=state_dir,
+                brain_dir=brain_dir,
+                wake=True,
+                now_ts=now_ts,
+                ps_output="",
+                home_dir=home_dir,
+                env=desktop_env,
+                which_fn=lambda _name: None,
+                popen_fn=mock_popen,
+                pid_alive_fn=lambda _pid: False,
+            )
+            self.assertEqual(res_desktop["wake"]["status"], "woke")
+            self.assertEqual(res_desktop["wake"]["transport"], "agentapi")
+            cmd_a = mock_popen.call_args[0][0]
+            self.assertEqual(
+                cmd_a[:3],
+                [str(agentapi_path), "new-conversation", "--title=[agy-doctor] Orchestrator Recovery"],
+            )
+            self.assertIn("agy-dev-orchestrator.md", cmd_a[3])
+            saved = json.loads((state_dir / doctor.DOCTOR_STATE_FILENAME).read_text(encoding="utf-8"))
+            self.assertEqual(saved["transport"], "agentapi")
+            self.assertEqual(saved["last_command"][-1], "<prompt>")
+            rendered_a = doctor.render_doctor_report(res_desktop, color=False)
+            self.assertIn("(agentapi)", rendered_a)
+
+            # ANTIGRAVITY_AGENTAPI_EXE override takes top precedence
+            custom_agentapi = root / "custom_agentapi"
+            custom_agentapi.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            self.assertEqual(
+                doctor.resolve_agentapi_cli(
+                    env={"ANTIGRAVITY_AGENTAPI_EXE": str(custom_agentapi)},
+                    home_dir=home_dir,
+                    which_fn=lambda _n: None,
+                ),
+                str(custom_agentapi),
+            )
+
+            # Path B fallback: ANTIGRAVITY_LS_ADDRESS set, but agentapi unavailable -> falls back to agy_cli
+            agentapi_path.unlink()
+            res_fallback = doctor.run_queue_doctor(
+                state_dir=state_dir,
+                brain_dir=brain_dir,
+                wake=True,
+                dry_run=True,
+                force=True,
+                now_ts=now_ts + 1000.0,
+                ps_output="",
+                home_dir=home_dir,
+                env=desktop_env,
+                which_fn=lambda _name: None,
+                popen_fn=mock_popen,
+                pid_alive_fn=lambda _pid: False,
+            )
+            self.assertEqual(res_fallback["wake"]["transport"], "agy_cli")
+            self.assertEqual(
+                res_fallback["wake"]["command"][:5],
+                [str(agy_path), "--agent", "agy-dev-orchestrator", "--dangerously-skip-permissions", "-p"],
+            )
+            self.assertNotIn("--mode", res_fallback["wake"]["command"])
+
+    def test_dual_desktop_and_cli_brain_transcript_lookup_and_hermetic_isolation(self) -> None:
+        """`dev_common` resolves transcripts across both `antigravity/brain` and `antigravity-cli/brain` while staying hermetic."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            fake_home = root / "home"
+            desktop_brain = fake_home / ".gemini" / "antigravity" / "brain"
+            cli_brain = fake_home / ".gemini" / "antigravity-cli" / "brain"
+            state_dir = root / "state"
+            now_ts = 1_800_200_000.0
+
+            with mock.patch.dict(os.environ, {"AGY_BRAIN_DIR": ""}, clear=False):
+                os.environ.pop("AGY_BRAIN_DIR", None)
+                # Empty string and explicit_state_dir=True return [] for 100% hermetic isolation
+                self.assertEqual(dev_common.resolve_antigravity_brain_dirs("", home_dir=fake_home), [])
+                self.assertEqual(
+                    dev_common.resolve_antigravity_brain_dirs(None, home_dir=fake_home, explicit_state_dir=True),
+                    [],
+                )
+                # Default returns [desktop_brain, cli_brain]
+                self.assertEqual(
+                    dev_common.resolve_antigravity_brain_dirs(None, home_dir=fake_home),
+                    [desktop_brain, cli_brain],
+                )
+
+                cli_orch_cid = "cccc1111-dddd-4111-8111-111111111111"
+                _write_transcript(
+                    cli_brain,
+                    cli_orch_cid,
+                    [
+                        {"step_index": 1, "type": "USER_INPUT", "content": "CLI orchestrator wake"},
+                        {"step_index": 2, "type": "RUN_COMMAND", "status": "RUNNING"},
+                    ],
+                    mtime=now_ts - 15.0,
+                )
+
+                # Resolved via dev_common helpers even though desktop_brain does not have this CID
+                resolved_tp = dev_common.resolve_transcript_path(cli_orch_cid, home_dir=fake_home)
+                self.assertIsNotNone(resolved_tp)
+                self.assertEqual(resolved_tp, cli_brain / cli_orch_cid / ".system_generated" / "logs" / "transcript.jsonl")
+
+                inspected = dev_common.try_inspect_antigravity_conversation(cli_orch_cid, home_dir=fake_home)
+                self.assertEqual(inspected["status"], "ok")
+                self.assertIn("CLI orchestrator wake", inspected["details"])
+
+                tail = doctor.inspect_transcript_tail(cli_orch_cid, [desktop_brain, cli_brain], now_ts=now_ts)
+                self.assertTrue(tail["exists"])
+                self.assertEqual(tail["idle_seconds"], 15)
+
+                # Active CLI-spawned orchestrator prevents false `idle_orchestrator_with_runnable_work`
+                _write_state_files(
+                    state_dir,
+                    orchestrator_id=cli_orch_cid,
+                    items=[
+                        {
+                            "conversation_id": "dddd2222-eeee-4222-8222-222222222222",
+                            "priority": 10,
+                            "status": "pending",
+                            "repo_slugs": ["acme/repo-a"],
+                            "merged_repos": [],
+                            "target_files": ["a.py"],
+                            "title": "Handled by active CLI orchestrator",
+                        }
+                    ],
+                    locks={},
+                )
+                diag = doctor.diagnose_orchestrator(
+                    state_dir=state_dir,
+                    brain_dir=[desktop_brain, cli_brain],
+                    now_ts=now_ts,
+                    ps_output="",
+                )
+                self.assertEqual(diag["overall_status"], "healthy")
+
+                # Active CLI worker transcript mtime prevents false `stalled_worker` in detect_stalled_lock
+                cli_worker_cid = "eeee3333-ffff-4333-8333-333333333333"
+                _write_transcript(
+                    cli_brain,
+                    cli_worker_cid,
+                    [{"step_index": 1, "type": "RUN_COMMAND", "status": "RUNNING"}],
+                    mtime=now_ts - 20.0,
+                )
+                st_check = flow_opt.detect_stalled_lock(
+                    {
+                        "active": True,
+                        "status": "DEVELOPING",
+                        "pr_gate_ready": False,
+                        "worker_cid": cli_worker_cid,
+                        "acquired_at": "2026-11-01T00:00:00Z",
+                    },
+                    now_ts=now_ts,
+                    home_dir=fake_home,
+                )
+                self.assertFalse(st_check["stalled"])
+                self.assertEqual(st_check["idle_seconds"], 20)
+
+    def test_watchdog_sidecar_schema_cycle_and_cli_modes(self) -> None:
+        """Validates `sidecar.json` schema and `watchdog.py` healthy 0-LLM no-op, degraded heal, wake, and cooldown."""
+        sidecar_manifest = json.loads((WATCHDOG_DIR / "sidecar.json").read_text(encoding="utf-8"))
+        self.assertEqual(sidecar_manifest["command"], "python3")
+        self.assertEqual(sidecar_manifest["args"], ["watchdog.py"])
+        self.assertEqual(sidecar_manifest["restart_policy"], "always")
+        self.assertIs(sidecar_manifest["has_web_ui"], False)
+        self.assertTrue(sidecar_manifest["display_name"])
+        self.assertTrue(sidecar_manifest["description"])
+
+        self.assertEqual(watchdog.resolve_watchdog_interval(None, env={}), 300)
+        self.assertEqual(watchdog.resolve_watchdog_interval(None, env={"AGY_WATCHDOG_INTERVAL_SECONDS": "120"}), 120)
+        self.assertEqual(watchdog.resolve_watchdog_interval(5, env={}), 30)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            brain_dir = root / "brain"
+            home_dir = root / "home"
+            agentapi_bin = home_dir / ".gemini" / "antigravity" / "bin" / "agentapi"
+            agentapi_bin.parent.mkdir(parents=True)
+            agentapi_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(agentapi_bin, 0o755)
+            now_ts = 1_800_300_000.0
+
+            # 1. Healthy queue: 0-LLM fast path, run_queue_doctor is never called
+            _write_state_files(state_dir, orchestrator_id="", items=[], locks={})
+            with mock.patch.object(doctor, "run_queue_doctor") as spy_run_doc:
+                healthy_res = watchdog.run_watchdog_cycle(
+                    state_dir=state_dir,
+                    brain_dir=brain_dir,
+                    sync_git=False,
+                    now_ts=now_ts,
+                    ps_output="",
+                )
+            self.assertEqual(healthy_res["status"], "healthy")
+            self.assertFalse(healthy_res["healed"])
+            self.assertFalse(healthy_res["woke"])
+            spy_run_doc.assert_not_called()
+
+            # Verify CLI `--once --json --no-sync-git`
+            cli_buf = io.StringIO()
+            with contextlib.redirect_stdout(cli_buf):
+                rc_once = watchdog.main(
+                    [
+                        "--once",
+                        "--json",
+                        "--no-sync-git",
+                        "--state-dir",
+                        str(state_dir),
+                        "--brain-dir",
+                        str(brain_dir),
+                    ]
+                )
+            self.assertEqual(rc_once, 0)
+            self.assertEqual(json.loads(cli_buf.getvalue())["status"], "healthy")
+
+            # 2. Degraded phantom_pr_open -> safe heal applied (`healed=True`, `woke=False`)
+            _write_state_files(
+                state_dir,
+                orchestrator_id="",
+                items=[
+                    {
+                        "conversation_id": "ffff1111-aaaa-4111-8111-111111111111",
+                        "priority": 10,
+                        "status": "pr_open",
+                        "repo_slugs": ["acme/repo-a", "acme/repo-b"],
+                        "merged_repos": ["acme/repo-a"],
+                        "pr_urls": [],
+                        "title": "Phantom multi-repo item",
+                    }
+                ],
+                locks={
+                    "acme/repo-b": {
+                        "active": True,
+                        "status": "PENDING_HUMAN_PR_VALIDATION",
+                        "pr_gate_ready": True,
+                        "conversation_id": "ffff2222-bbbb-4222-8222-222222222222",
+                        "branch_name": "fix/20261122-070000-other-ffff2222",
+                    }
+                },
+            )
+            with mock.patch.dict(os.environ, {"AGY_OFFLINE_ONLY": "1"}):
+                healed_res = watchdog.run_watchdog_cycle(
+                    state_dir=state_dir,
+                    brain_dir=brain_dir,
+                    sync_git=False,
+                    now_ts=now_ts,
+                    ps_output="  PID ARGS\n  901 python3 pr_remediator.py wait-for-unlock\n",
+                )
+            self.assertEqual(healed_res["status"], "healed")
+            self.assertTrue(healed_res["healed"])
+            self.assertFalse(healed_res["woke"])
+
+            # 3. Degraded runnable work -> wakes via agentapi on first cycle, then cooldown-gated on second cycle
+            _write_state_files(
+                state_dir,
+                orchestrator_id="",
+                items=[
+                    {
+                        "conversation_id": "ffff3333-cccc-4333-8333-333333333333",
+                        "priority": 10,
+                        "status": "pending",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "target_files": ["main.py"],
+                        "title": "Runnable pending item",
+                    }
+                ],
+                locks={},
+            )
+            mock_popen = mock.MagicMock()
+            mock_proc = mock.MagicMock()
+            mock_proc.pid = 88888
+            mock_popen.return_value = mock_proc
+            sidecar_env = {"ANTIGRAVITY_LS_ADDRESS": "127.0.0.1:59999"}
+
+            wake_cycle = watchdog.run_watchdog_cycle(
+                state_dir=state_dir,
+                brain_dir=brain_dir,
+                sync_git=False,
+                cooldown_seconds=900,
+                now_ts=now_ts,
+                home_dir=home_dir,
+                env=sidecar_env,
+                which_fn=lambda _n: None,
+                popen_fn=mock_popen,
+                pid_alive_fn=lambda _p: False,
+                ps_output="",
+            )
+            self.assertEqual(wake_cycle["status"], "woke")
+            self.assertTrue(wake_cycle["woke"])
+            self.assertEqual(wake_cycle["wake"]["transport"], "agentapi")
+            self.assertEqual(mock_popen.call_count, 1)
+
+            cooldown_cycle = watchdog.run_watchdog_cycle(
+                state_dir=state_dir,
+                brain_dir=brain_dir,
+                sync_git=False,
+                cooldown_seconds=900,
+                now_ts=now_ts + 300.0,
+                home_dir=home_dir,
+                env=sidecar_env,
+                which_fn=lambda _n: None,
+                popen_fn=mock_popen,
+                pid_alive_fn=lambda _p: False,
+                ps_output="",
+            )
+            self.assertEqual(cooldown_cycle["status"], "cooldown")
+            self.assertFalse(cooldown_cycle["woke"])
+            self.assertEqual(mock_popen.call_count, 1)
+
+            # 4. Continuous daemon loop survives transient exceptions and exits cleanly on stop_event
+            stop_ev = watchdog.threading.Event()
+            stop_ev.set()
+            err_buf = io.StringIO()
+            with (
+                mock.patch.object(watchdog, "run_watchdog_cycle", side_effect=RuntimeError("transient fs glitch")),
+                contextlib.redirect_stdout(err_buf),
+            ):
+                rc_daemon = watchdog.main(
+                    ["--interval", "30", "--no-sync-git", "--state-dir", str(state_dir)],
+                    stop_event=stop_ev,
+                )
+            self.assertEqual(rc_daemon, 0)
+            self.assertIn("status=error", err_buf.getvalue())
+            self.assertIn("RuntimeError: transient fs glitch", err_buf.getvalue())
 
 
 if __name__ == "__main__":

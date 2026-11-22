@@ -1774,7 +1774,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         clean_name = (plugin_name or "wiz-tam-plugin").strip().strip("/")
         if (
             rel_str in ("plugin.json", "hooks.json", "mcp_config.json")
-            or rel_str.startswith(("skills/", "clients/", "agents/", "rules/", "assets/", "shell/"))
+            or rel_str.startswith(("skills/", "clients/", "agents/", "rules/", "assets/", "shell/", "sidecars/"))
         ):
             return f".gemini/config/plugins/{clean_name}/{rel_str}"
         if clean_name == "wiz-tam-plugin" and rel_str in (".env.example", ".tool-versions", ".tool-plugins"):
@@ -1857,6 +1857,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     "clients",
                     "assets",
                     "shell",
+                    "sidecars",
                 ],
                 capture_output=True,
                 timeout=10,
@@ -1926,7 +1927,10 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                 )
                 or (
                     plugin_prefix
-                    and rel_str in (f"{plugin_prefix}/hooks.json", f"{plugin_prefix}/mcp_config.json")
+                    and (
+                        rel_str in (f"{plugin_prefix}/hooks.json", f"{plugin_prefix}/mcp_config.json")
+                        or (rel_str.startswith(f"{plugin_prefix}/sidecars/") and rel_str.endswith(".json"))
+                    )
                 )
                 or (rel_str.startswith(".gemini/config/sidecars/") and rel_str.endswith(".json"))
             ):
@@ -1951,6 +1955,13 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                 )
                 or (rel_str.startswith(".gemini/config/actions/") and "/scripts/" in rel_str and rel_str.endswith(".py"))
                 or (plugin_prefix and rel_str.startswith(f"{plugin_prefix}/shell/") and rel_str.endswith(".sh"))
+                or (
+                    (
+                        rel_str.startswith(".gemini/config/sidecars/")
+                        or (plugin_prefix and rel_str.startswith(f"{plugin_prefix}/sidecars/"))
+                    )
+                    and rel_str.endswith(".py")
+                )
             ):
                 mode = 0o755
             elif rel_str.startswith(".ssh/"):

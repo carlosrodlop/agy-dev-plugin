@@ -2170,6 +2170,82 @@ class TestDevQueueTui(unittest.TestCase):
                 self.assertIn("Transient read error (OSError)", buf_os_db.getvalue())
                 self.assertIn("Transient read error (OperationalError)", buf_os_db.getvalue())
 
+    def test_dual_desktop_and_cli_orchestrator_liveness_and_proposal_fallback(self) -> None:
+        """TUI resolves orchestrator liveness and HITL proposal `.md` files across both Desktop and CLI `brain/` dirs."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            fake_home = root / "home"
+            desktop_brain = fake_home / ".gemini" / "antigravity" / "brain"
+            cli_brain = fake_home / ".gemini" / "antigravity-cli" / "brain"
+            state_dir = root / "state"
+            board_path = root / "board.md"
+
+            orch_cid = "8888aaaa-2222-4333-8444-555555555555"
+            hitl_cid = "9999bbbb-2222-4333-8444-555555555555"
+            now_ts = 1_800_400_000.0
+
+            # Write orchestrator transcript ONLY under `antigravity-cli/brain`
+            cli_tpath = cli_brain / orch_cid / ".system_generated" / "logs" / "transcript.jsonl"
+            cli_tpath.parent.mkdir(parents=True)
+            cli_tpath.write_text("{}\n", encoding="utf-8")
+            os.utime(cli_tpath, (now_ts - 18.0, now_ts - 18.0))
+
+            # Write HITL proposal artifact ONLY under `antigravity-cli/brain`
+            cli_hitl_dir = cli_brain / hitl_cid
+            cli_hitl_dir.mkdir(parents=True)
+            (cli_hitl_dir / "cli_proposal.md").write_text("# CLI Proposal\n", encoding="utf-8")
+
+            _write_state(
+                state_dir,
+                orchestrator_id=orch_cid,
+                items=[
+                    {
+                        "conversation_id": hitl_cid,
+                        "priority": 10,
+                        "status": "hitl_blocked",
+                        "repo_slugs": ["acme/repo-a"],
+                        "merged_repos": [],
+                        "title": "CLI HITL item",
+                    }
+                ],
+            )
+
+            # Direct helper check with home_dir=fake_home and brain_dir=None
+            with mock.patch.dict(os.environ, {"AGY_BRAIN_DIR": ""}, clear=False):
+                os.environ.pop("AGY_BRAIN_DIR", None)
+                badge_txt, badge_col = tui._resolve_orchestrator_liveness(
+                    orch_cid,
+                    brain_dir=None,
+                    counts={"hitl_blocked": 1},
+                    now_ts=now_ts,
+                    home_dir=fake_home,
+                )
+                self.assertEqual(badge_txt, "(active 18s)")
+                self.assertEqual(badge_col, "0;32")
+
+                # Empty brain_dir stays 100% hermetic
+                self.assertEqual(
+                    tui._resolve_orchestrator_liveness(
+                        orch_cid,
+                        brain_dir="",
+                        counts={"hitl_blocked": 1},
+                        now_ts=now_ts,
+                        home_dir=fake_home,
+                    ),
+                    ("", ""),
+                )
+
+            # Render passing `[desktop_brain, cli_brain]` surfaces active CLI badge and `cli_proposal.md`
+            out_dual, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, write_board=str(board_path), no_color=True, plain_urls=True),
+                brain_dir=[desktop_brain, cli_brain],
+                is_tty_override=True,
+                term_width_override=140,
+                now_ts_override=now_ts,
+            )
+            self.assertIn("(active 18s)", out_dual)
+            self.assertIn("[cli_proposal.md](file://", board_path.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
