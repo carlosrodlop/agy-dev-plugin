@@ -40,7 +40,7 @@ if __name__ != "__main__":
 
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 import contextlib
 from datetime import datetime, timezone
 import fcntl
@@ -3211,7 +3211,16 @@ def _snapshot_worktree_state(target_dir: Path, branch_name: str = "") -> dict[st
                 continue
             u_path = target_dir / rel_clean
             if u_path.is_file():
-                hasher.update(b"\x00untracked\x00" + rel_clean.encode("utf-8") + b"\x00")
+                exec_mode = 0
+                with contextlib.suppress(OSError):
+                    exec_mode = u_path.stat().st_mode & 0o111
+                hasher.update(
+                    b"\x00untracked\x00"
+                    + rel_clean.encode("utf-8")
+                    + b"\x00"
+                    + f"{exec_mode:03o}".encode("ascii")
+                    + b"\x00"
+                )
                 with contextlib.suppress(OSError):
                     hasher.update(u_path.read_bytes())
 
@@ -3421,6 +3430,61 @@ def _build_single_pass_pre_commit_skip(target_dir: Path, base_skip: str = "") ->
     return (",".join(hooks), hooks)
 
 
+@contextlib.contextmanager
+def _temporarily_index_untracked_files(
+    target_dir: Path,
+    env: dict[str, str] | None = None,
+) -> Iterator[list[str]]:
+    """Temporarily register untracked non-ignored files with `git add -N` so `pre-commit` checks them."""
+    if not (target_dir / ".git").exists():
+        yield []
+        return
+    list_proc = subprocess.run(
+        ["git", "-C", str(target_dir), "ls-files", "--others", "--exclude-standard", "-z"],
+        env=env,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    if list_proc.returncode != 0 or not list_proc.stdout:
+        yield []
+        return
+    untracked = [
+        raw.decode("utf-8", errors="surrogateescape")
+        for raw in list_proc.stdout.split(b"\x00")
+        if raw
+    ]
+    if not untracked:
+        yield []
+        return
+
+    indexed: list[str] = []
+    batch_size = 200
+    try:
+        for start in range(0, len(untracked), batch_size):
+            batch = untracked[start : start + batch_size]
+            add_proc = subprocess.run(
+                ["git", "-C", str(target_dir), "add", "-N", "--", *batch],
+                env=env,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            if add_proc.returncode == 0:
+                indexed.extend(batch)
+        yield indexed
+    finally:
+        for start in range(0, len(indexed), batch_size):
+            batch = indexed[start : start + batch_size]
+            subprocess.run(
+                ["git", "-C", str(target_dir), "rm", "--cached", "--quiet", "--ignore-unmatch", "--", *batch],
+                env=env,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+
+
 def run_local_validation_suite(
     workdir: Path | str | None = None,
     test_targets: list[str] | None = None,
@@ -3455,15 +3519,16 @@ def run_local_validation_suite(
             if pc_bin:
                 skip_val, skip_hooks = _build_single_pass_pre_commit_skip(target_dir, clean_env.get("SKIP", ""))
                 pc_env = {**clean_env, "SKIP": skip_val}
-                proc_pc = subprocess.run(
-                    [pc_bin, "run", "--all-files"],
-                    cwd=str(target_dir),
-                    env=pc_env,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False,
-                )
+                with _temporarily_index_untracked_files(target_dir, env=clean_env):
+                    proc_pc = subprocess.run(
+                        [pc_bin, "run", "--all-files"],
+                        cwd=str(target_dir),
+                        env=pc_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
                 pc_ok = proc_pc.returncode == 0
                 pre_commit_output = f"{proc_pc.stdout}\n{proc_pc.stderr}".strip()
                 pre_commit_status_label = "PASSED" if pc_ok else "FAILED"

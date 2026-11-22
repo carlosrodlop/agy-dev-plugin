@@ -767,6 +767,9 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
         ):
             selected = srunner.select_test_modules(changed)
             self.assertIn("tests.test_parallel_subagent_orchestration", selected)
+            self.assertIn("tests.test_pr_remediator_queue_and_cleanup", selected)
+        tui_selected = srunner.select_test_modules(["skills/agy-code-remediation-pr/scripts/pr_remediator.py"])
+        self.assertIn("tests.test_dev_queue_tui", tui_selected)
 
     def test_two_slot_lock_serialization_queue_lookahead_and_zero_llm_promotion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
