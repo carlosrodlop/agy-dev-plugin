@@ -16,6 +16,7 @@ ALL_TEST_MODULES = [
     "tests.test_agy_dev_plugin",
     "tests.test_dev_queue_doctor",
     "tests.test_dev_queue_tui",
+    "tests.test_parallel_subagent_orchestration",
     "tests.test_pr_remediator_queue_and_cleanup",
 ]
 
@@ -59,6 +60,17 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
     selected: list[str] = []
     for rel in changed_files:
         norm = rel.replace("\\", "/")
+        if norm.endswith(
+            (
+                "parallel_scope.py",
+                "rebase_gate.py",
+                "pr_remediator.py",
+                "test_parallel_subagent_orchestration.py",
+                "selective_test_runner.py",
+            )
+        ):
+            if "tests.test_parallel_subagent_orchestration" not in selected:
+                selected.append("tests.test_parallel_subagent_orchestration")
         if (
             norm.endswith(("pr_remediator.py", "dev_flow_optimizer.py", "dev_queue_doctor.py", "test_pr_remediator_queue_and_cleanup.py", "dev_common.py"))
             or norm.startswith("agents/")

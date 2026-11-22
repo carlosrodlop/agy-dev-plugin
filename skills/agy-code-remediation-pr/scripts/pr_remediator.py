@@ -40,6 +40,7 @@ if __name__ != "__main__":
 
 
 import argparse
+from collections.abc import Mapping
 import contextlib
 from datetime import datetime, timezone
 import fcntl
@@ -80,6 +81,28 @@ from dev_queue_doctor import (  # noqa: E402
     run_queue_doctor,
     trigger_orchestrator_wake,
 )
+import parallel_scope as _parallel_scope  # noqa: E402
+from parallel_scope import (  # noqa: E402
+    OVERLAP_DEEP_SHARED,
+    OVERLAP_INTERFACE_SHARED,
+    OVERLAP_NONE,
+    OVERLAP_TRANSITIVE,
+    PARALLEL_SAFE_TIERS,
+    TaskAnchorSpec,
+    analyze_candidates_overlap,
+    analyze_pair_overlap,
+    compute_landing_order,
+)
+import rebase_gate as _rebase_gate  # noqa: E402
+from rebase_gate import (  # noqa: E402
+    OUTCOME_AUTO_PROMOTED,
+    OUTCOME_NEEDS_CONFLICT_RESOLUTION,
+    OUTCOME_NEEDS_SEMANTIC_FIX,
+    compute_cross_impact_files,
+    detect_base_sha_drift,
+    probe_merge_tree_conflicts,
+    rebase_and_reverify,
+)
 
 build_pro_dashboard_ui_url = dev_common.try_build_control_tower_ui_url
 restart_pro_api_server = dev_common.try_restart_control_tower_api
@@ -95,6 +118,11 @@ PR_REVIEWER_SUBAGENT_NAME = "agy-code-pr-reviewer"
 PR_SUBAGENT_MODEL = "pro"
 PR_REVIEW_PASS_MIN_SCORE = 91
 MAX_PR_REVIEW_ITERATIONS = 3
+DEFAULT_MAX_REPO_SLOTS = 2
+SLOT_STATUS_READY_AWAITING_BASE_MERGE = "READY_AWAITING_BASE_MERGE"
+SLOT_STATUS_NEEDS_REBASE_REVERIFY = "NEEDS_REBASE_REVERIFY"
+SLOT_STATUS_NEEDS_AGENT_SEMANTIC_FIX = "NEEDS_AGENT_SEMANTIC_FIX"
+SLOT_STATUS_NEEDS_AGENT_CONFLICT_RESOLUTION = "NEEDS_AGENT_CONFLICT_RESOLUTION"
 
 FRONTEND_PATH_MARKERS = (
     "api/ui.py",
@@ -280,6 +308,13 @@ def _infer_repo_slug_from_missing_path(
         for key in ("worktree_path", "target_repo_dir"):
             if _matches_path(str(entry.get(key) or "")):
                 return dev_common.normalize_repo_slug(slug) or slug
+        slots_obj = entry.get("slots")
+        if isinstance(slots_obj, dict):
+            for slot_item in slots_obj.values():
+                if isinstance(slot_item, dict):
+                    for key in ("worktree_path", "target_repo_dir"):
+                        if _matches_path(str(slot_item.get(key) or "")):
+                            return dev_common.normalize_repo_slug(slug) or slug
         for rb_key in ("repo_branches", "last_repo_branches"):
             rb_map = entry.get(rb_key)
             if not isinstance(rb_map, dict):
@@ -289,7 +324,8 @@ def _infer_repo_slug_from_missing_path(
                     continue
                 for key in ("worktree_path", "target_repo_dir"):
                     if _matches_path(str(rb_item.get(key) or "")):
-                        return dev_common.normalize_repo_slug(rb_slug) or dev_common.normalize_repo_slug(slug) or slug
+                        clean_rb = str(rb_slug).split("#", 1)[0]
+                        return dev_common.normalize_repo_slug(clean_rb) or dev_common.normalize_repo_slug(slug) or slug
 
     m_wt = re.match(r"^pr-worktree-([a-z0-9-]+)-fix-", cand_name.lower())
     if m_wt:
@@ -451,10 +487,16 @@ def _write_locks_state(
 
 
 def _entry_matches_branch(entry: dict[str, Any], clean_branch: str, *, include_inactive: bool = False) -> bool:
-    """Return True if a lock entry references `clean_branch` in active or (optionally) released metadata."""
+    """Return True if a lock entry references `clean_branch` in active slots or (optionally) released metadata."""
     if not isinstance(entry, dict) or not clean_branch:
         return False
     if str(entry.get("branch_name") or "").strip() == clean_branch:
+        return True
+    slots_map = entry.get("slots")
+    if isinstance(slots_map, dict) and any(
+        isinstance(s_v, dict) and str(s_v.get("branch_name") or "").strip() == clean_branch
+        for s_v in slots_map.values()
+    ):
         return True
     rb = entry.get("repo_branches")
     if isinstance(rb, dict) and any(
@@ -472,6 +514,272 @@ def _entry_matches_branch(entry: dict[str, Any], clean_branch: str, *, include_i
         ):
             return True
     return False
+
+
+_SLOT_SYNC_FIELDS: tuple[str, ...] = (
+    "lock_id",
+    "conversation_id",
+    "sibling_conversation_ids",
+    "action_id",
+    "notification_source",
+    "branch_timestamp",
+    "branch_name",
+    "base_sha",
+    "overlap_tier",
+    "landing_order",
+    "section_anchors",
+    "branch_pushed",
+    "pr_gate_ready",
+    "review_approved",
+    "approved_head_sha",
+    "deferred_send_email",
+    "reviewed_head_sha",
+    "staged_head_sha",
+    "head_sha",
+    "manual_pr_url",
+    "target_repo_dir",
+    "worktree_path",
+    "issue_number",
+    "issue_url",
+    "pr_number",
+    "pr_url",
+    "status",
+    "branch_action",
+    "created_by",
+    "summary",
+    "proposed_fix",
+    "executive_summary",
+    "proposal_title",
+    "proposal_body",
+    "target_files",
+    "frontend_changed",
+    "dev_preview_url",
+    "pro_url",
+    "review_iteration",
+    "review_history",
+    "reviewer_verdict",
+    "reviewer_score",
+    "reviewer_summary",
+    "reviewer_subagent_id",
+    "subagent_conversation_ids",
+    "review_markdown",
+    "verification_results",
+    "rebase_outcome",
+    "last_rebase_result",
+    "needs_base_rebase",
+    "promoted_from_slot",
+    "promoted_at",
+    "previous_slot1_branch",
+    "previous_slot1_release_reason",
+    "acquired_at",
+    "worker_cid",
+    "stage_label",
+    "last_activity_at",
+    "updated_at",
+)
+
+
+def _resolve_max_repo_slots(explicit_max_slots: int | None = None) -> int:
+    """Resolve `max_slots` per repository (default `2`, overrideable via `AGY_DEV_MAX_SLOTS_PER_REPO`)."""
+    if explicit_max_slots is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            val = int(explicit_max_slots)
+            if val >= 1:
+                return val
+    env_raw = str(os.environ.get("AGY_DEV_MAX_SLOTS_PER_REPO") or "").strip()
+    if env_raw:
+        with contextlib.suppress(TypeError, ValueError):
+            val = int(env_raw)
+            if val >= 1:
+                return val
+    return DEFAULT_MAX_REPO_SLOTS
+
+
+def _resolve_repo_base_sha(repo_dir: Path | None, base_branch: str = "main") -> str:
+    """Resolve the 40-char commit SHA of `origin/<base_branch>` (or `<base_branch>` / `HEAD`) inside `repo_dir`."""
+    if repo_dir is None or not (repo_dir / ".git").exists():
+        return ""
+    clean_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_PREFIX",
+        )
+    }
+    for cand_ref in (f"origin/{base_branch}", base_branch, "HEAD"):
+        proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "--verify", cand_ref],
+            env=clean_env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0 and (proc.stdout or "").strip():
+            return (proc.stdout or "").strip()
+    return ""
+
+
+def _build_slot_dict_from_mapping(source: Mapping[str, Any], slot_id: int) -> dict[str, Any]:
+    """Extract a normalized slot dictionary for `slot_id` (`1` or `2`)."""
+    slot_obj: dict[str, Any] = {
+        "slot_id": int(slot_id),
+        "active": bool(source.get("active", True)),
+    }
+    for key in _SLOT_SYNC_FIELDS:
+        if key in source:
+            val = source[key]
+            if isinstance(val, list):
+                slot_obj[key] = list(val)
+            elif isinstance(val, dict):
+                slot_obj[key] = dict(val)
+            else:
+                slot_obj[key] = val
+    slot_obj.setdefault("base_sha", "")
+    slot_obj.setdefault("overlap_tier", "")
+    slot_obj.setdefault("landing_order", [])
+    return slot_obj
+
+
+def _sync_lock_slots_structure(lock_obj: dict[str, Any], *, repo_slug: str = "") -> dict[str, Any]:
+    """Normalize `lock_obj` so top-level fields mirror Slot #1 while `slots` preserves multi-slot state."""
+    if not isinstance(lock_obj, dict) or not bool(lock_obj.get("active")):
+        return dict(lock_obj or {})
+
+    out = dict(lock_obj)
+    eff_slug = repo_slug or str(out.get("repo_slug") or out.get("repo") or "").strip()
+    max_slots = _resolve_max_repo_slots(out.get("max_slots"))
+    raw_slots = out.get("slots") if isinstance(out.get("slots"), dict) else {}
+
+    slot1 = _build_slot_dict_from_mapping(out, 1)
+    if isinstance(raw_slots.get("1"), dict):
+        # Preserve additive slot-1 keys (`base_sha`, `overlap_tier`, `landing_order`) when top-level omitted them
+        for add_k in ("base_sha", "overlap_tier", "landing_order", "section_anchors", "review_approved", "approved_head_sha", "deferred_send_email"):
+            if not slot1.get(add_k) and raw_slots["1"].get(add_k):
+                slot1[add_k] = raw_slots["1"][add_k]
+    slot1["slot_id"] = 1
+    slot1["active"] = True
+
+    slots_clean: dict[str, dict[str, Any]] = {"1": slot1}
+    raw_slot2 = raw_slots.get("2")
+    if isinstance(raw_slot2, dict) and bool(raw_slot2.get("active", True)):
+        s2 = _build_slot_dict_from_mapping(raw_slot2, 2)
+        s2["slot_id"] = 2
+        s2["active"] = True
+        slots_clean["2"] = s2
+
+    for k, v in slot1.items():
+        if k not in ("slot_id", "active"):
+            out[k] = v
+    out["active"] = True
+    out["slot_id"] = 1
+    out["max_slots"] = max_slots
+    out["active_slots_count"] = len(slots_clean)
+    out["slots"] = slots_clean
+
+    # Keep `repo_branches` synchronized so `dev_common.get_active_dev_pr_lock_protections()` protects Slot #2 worktrees too
+    raw_rb = out.get("repo_branches") if isinstance(out.get("repo_branches"), dict) else {}
+    clean_rb = {
+        str(k): dict(v)
+        for k, v in raw_rb.items()
+        if str(k).strip() and not str(k).endswith("#slot2") and isinstance(v, dict)
+    }
+    if eff_slug and "2" in slots_clean:
+        s2_entry = slots_clean["2"]
+        clean_rb[f"{eff_slug}#slot2"] = {
+            "repo_slug": eff_slug,
+            "slot_id": 2,
+            "branch_name": str(s2_entry.get("branch_name") or ""),
+            "branch_timestamp": str(s2_entry.get("branch_timestamp") or ""),
+            "target_repo_dir": str(s2_entry.get("target_repo_dir") or out.get("target_repo_dir") or ""),
+            "worktree_path": str(s2_entry.get("worktree_path") or ""),
+            "manual_pr_url": "",
+            "branch_pushed": False,
+            "head_sha": str(s2_entry.get("head_sha") or s2_entry.get("staged_head_sha") or ""),
+            "updated_at": str(s2_entry.get("updated_at") or out.get("updated_at") or ""),
+        }
+    out["repo_branches"] = clean_rb
+    return out
+
+
+def _path_matches_slot_worktree(raw_query: Path | str | None, recorded_wt: str) -> bool:
+    """Return True when `raw_query` resolves to or shares the isolated worktree basename of `recorded_wt`."""
+    if not raw_query or not recorded_wt:
+        return False
+    home_str = str(Path.home())
+    q_exp = str(Path(str(raw_query).replace("$HOME", home_str)).expanduser())
+    r_exp = str(Path(str(recorded_wt).replace("$HOME", home_str)).expanduser())
+    with contextlib.suppress(OSError):
+        q_exp = str(Path(q_exp).resolve())
+    with contextlib.suppress(OSError):
+        r_exp = str(Path(r_exp).resolve())
+    if q_exp == r_exp or _sanitize_home_paths(q_exp) == _sanitize_home_paths(r_exp):
+        return True
+    q_name = Path(q_exp).name
+    if q_name.startswith("pr-worktree-") and q_name == Path(r_exp).name:
+        return True
+    return False
+
+
+def _match_slot_key(
+    lock_obj: dict[str, Any],
+    *,
+    branch_name: str = "",
+    workdir: Path | str | None = None,
+    conversation_id: str = "",
+    slot_id: int | str | None = None,
+) -> str:
+    """Identify whether a selector targets Slot `'1'` or Slot `'2'` inside an active repository lock."""
+    if slot_id is not None and str(slot_id).strip() in ("1", "2"):
+        return str(slot_id).strip()
+    slots_map = lock_obj.get("slots") if isinstance(lock_obj.get("slots"), dict) else {}
+    slot2 = slots_map.get("2")
+    if not isinstance(slot2, dict) or not bool(slot2.get("active", True)):
+        return "1"
+
+    clean_br = (branch_name or "").strip().removeprefix("refs/heads/")
+    if clean_br:
+        if str(slot2.get("branch_name") or "").strip() == clean_br:
+            return "2"
+        if str(lock_obj.get("branch_name") or "").strip() == clean_br:
+            return "1"
+
+    if workdir and _path_matches_slot_worktree(workdir, str(slot2.get("worktree_path") or "")):
+        return "2"
+
+    clean_cid = (conversation_id or "").strip()
+    if clean_cid:
+        s2_cid = str(slot2.get("conversation_id") or "").strip()
+        s2_sibs = [str(s).strip() for s in (slot2.get("sibling_conversation_ids") or [])]
+        if _matches_cid(s2_cid, clean_cid) or any(_matches_cid(s, clean_cid) for s in s2_sibs):
+            return "2"
+
+    return "1"
+
+
+def _project_slot_view(lock_obj: dict[str, Any], slot_key: str) -> dict[str, Any]:
+    """Return a caller-facing lock dict representing `slot_key` (`'1'` or `'2'`) while preserving `slots`."""
+    norm = _sync_lock_slots_structure(lock_obj)
+    if slot_key != "2" or "2" not in norm.get("slots", {}):
+        return norm
+    slot2 = dict(norm["slots"]["2"])
+    slot1 = dict(norm["slots"]["1"])
+    projected = dict(norm)
+    for k, v in slot2.items():
+        projected[k] = v
+    projected["active"] = True
+    projected["slot_id"] = 2
+    projected["slot1_lock_id"] = str(slot1.get("lock_id") or "")
+    projected["slot1_branch_name"] = str(slot1.get("branch_name") or "")
+    projected["slot1_status"] = str(slot1.get("status") or "")
+    return projected
 
 
 def _match_lock_entry(
@@ -553,8 +861,11 @@ def get_all_dev_pr_locks(
     )
     locks_map = _read_locks_state(audit_state)
     if include_inactive:
-        return {k: dict(v) for k, v in locks_map.items()}
-    return {k: dict(v) for k, v in locks_map.items() if bool(v.get("active"))}
+        return {
+            k: (_sync_lock_slots_structure(v, repo_slug=k) if bool(v.get("active")) else dict(v))
+            for k, v in locks_map.items()
+        }
+    return {k: _sync_lock_slots_structure(v, repo_slug=k) for k, v in locks_map.items() if bool(v.get("active"))}
 
 
 def get_dev_pr_lock(
@@ -563,6 +874,8 @@ def get_dev_pr_lock(
     repo_slug: str = "",
     workdir: Path | str | None = None,
     branch_name: str = "",
+    conversation_id: str = "",
+    slot_id: int | str | None = None,
 ) -> dict[str, Any]:
     """Read the per-repository remediation branch lock matching `repo_slug`/`workdir`/`branch_name` (or active fallback)."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
@@ -582,7 +895,15 @@ def get_dev_pr_lock(
         portfolio_dir=portfolio_dir,
     )
     if isinstance(lock_obj, dict) and bool(lock_obj.get("active")):
-        return dict(lock_obj)
+        norm_lock = _sync_lock_slots_structure(lock_obj, repo_slug=matched_slug)
+        slot_key = _match_slot_key(
+            norm_lock,
+            branch_name=branch_name,
+            workdir=workdir,
+            conversation_id=conversation_id,
+            slot_id=slot_id,
+        )
+        return _project_slot_view(norm_lock, slot_key)
     has_selector = bool(repo_slug.strip() or workdir or branch_name.strip())
     legacy = audit_state.get("dev_pr_lock") if isinstance(audit_state.get("dev_pr_lock"), dict) else {}
     snap_source = lock_obj if lock_obj else ({} if has_selector else legacy)
@@ -620,11 +941,19 @@ def acquire_dev_pr_lock(
     repo_slug: str = "",
     workdir: Path | str | None = None,
     worker_cid: str = "",
+    *,
+    section_anchors: list[str] | None = None,
+    base_sha: str = "",
+    max_slots: int | None = None,
+    allow_slot2: bool = False,
+    force_slot2: bool = False,
+    overlap_tier: str = "",
+    landing_order: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Acquire the exclusive cross-conversation pending-branch lock scoped to a single repository (`dev_pr_locks[repo_slug]`).
+    """Acquire a 1-slot or 2-slot per-repository development lock (`dev_pr_locks[repo_slug]`).
 
-    While a timestamped branch is active or pending manual validation on `repo_slug`, no other conversation
-    can start a competing branch in that same repository; sibling repositories remain free to acquire their own locks.
+    Backward-compatibly preserves Slot #1 on top-level lock fields while supporting parallel Slot #2
+    acquisition in `slots["2"]` when `max_slots >= 2` and blast-radius overlap check passes (`NONE` or `TRANSITIVE`).
     """
     _ = scheduled
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
@@ -642,6 +971,8 @@ def acquire_dev_pr_lock(
         for s_val in [str(s).strip()]
         if s_val and s_val != cid_clean
     ]
+    clean_targets = [str(f).strip() for f in (target_files or []) if str(f).strip()]
+    clean_anchors = [str(a).strip() for a in (section_anchors or []) if str(a).strip()]
     default_branch = branch_name.strip() or format_timestamped_branch_name(
         branch_timestamp=resolved_ts,
         action_id=action_id,
@@ -655,6 +986,8 @@ def acquire_dev_pr_lock(
     )
     persistent_repo_dir = _resolve_main_git_repo_root(resolved_dir) if resolved_dir is not None else None
     clean_repo_dir = _sanitize_home_paths(str(persistent_repo_dir or target_repo_dir or "").strip())
+    resolved_base_sha = (base_sha or "").strip() or _resolve_repo_base_sha(persistent_repo_dir)
+    eff_max_slots = _resolve_max_repo_slots(max_slots)
 
     with dev_common.file_lock(lock_file):
         state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
@@ -666,46 +999,207 @@ def acquire_dev_pr_lock(
         locks_map = _read_locks_state(audit_state)
         existing_lock = locks_map.get(resolved_slug)
         repo_branches: dict[str, dict[str, Any]] = {}
+
         if isinstance(existing_lock, dict) and bool(existing_lock.get("active")):
-            holder_cid = str(existing_lock.get("conversation_id") or "").strip()
-            existing_siblings = [str(s).strip() for s in (existing_lock.get("sibling_conversation_ids") or [])]
-            same_conv = bool(
+            norm_existing = _sync_lock_slots_structure(existing_lock, repo_slug=resolved_slug)
+            eff_max_slots = int(max_slots if max_slots is not None else norm_existing.get("max_slots") or eff_max_slots)
+            slots_existing = dict(norm_existing.get("slots") or {})
+            holder_cid = str(norm_existing.get("conversation_id") or "").strip()
+            existing_siblings = [str(s).strip() for s in (norm_existing.get("sibling_conversation_ids") or [])]
+            same_conv_slot1 = bool(
                 not holder_cid
                 or holder_cid == cid_clean
                 or cid_clean.startswith(holder_cid[:8])
                 or holder_cid.startswith(cid_clean[:8])
                 or cid_clean in existing_siblings
             )
-            existing_status = str(existing_lock.get("status") or "")
-            raw_rb = existing_lock.get("repo_branches")
-            if same_conv and isinstance(raw_rb, dict):
+            slot2_existing = slots_existing.get("2")
+            same_conv_slot2 = False
+            if isinstance(slot2_existing, dict) and bool(slot2_existing.get("active", True)):
+                s2_holder = str(slot2_existing.get("conversation_id") or "").strip()
+                s2_sibs = [str(s).strip() for s in (slot2_existing.get("sibling_conversation_ids") or [])]
+                same_conv_slot2 = bool(
+                    s2_holder
+                    and (
+                        s2_holder == cid_clean
+                        or cid_clean.startswith(s2_holder[:8])
+                        or s2_holder.startswith(cid_clean[:8])
+                        or cid_clean in s2_sibs
+                    )
+                )
+
+            existing_status = str(norm_existing.get("status") or "")
+            # Case A: Re-acquiring or allocating Slot #2
+            if not same_conv_slot1:
+                can_try_slot2 = eff_max_slots >= 2 and (same_conv_slot2 or "2" not in slots_existing)
+                ov_tier_resolved = (overlap_tier or "").strip()
+                ov_order_resolved = list(landing_order or [])
+                ov_dict: dict[str, Any] = {}
+                slot2_allowed = False
+
+                if can_try_slot2:
+                    if same_conv_slot2:
+                        slot2_allowed = True
+                        ov_tier_resolved = ov_tier_resolved or str(slot2_existing.get("overlap_tier") or OVERLAP_NONE)
+                        ov_order_resolved = ov_order_resolved or list(slot2_existing.get("landing_order") or [])
+                    elif force_slot2:
+                        slot2_allowed = True
+                        ov_tier_resolved = ov_tier_resolved or OVERLAP_TRANSITIVE
+                    elif allow_slot2 or (bool(worktree_path) and bool(clean_targets) and bool(norm_existing.get("target_files"))):
+                        slot1_spec = TaskAnchorSpec.from_mapping(norm_existing)
+                        cand_spec = TaskAnchorSpec(
+                            conversation_id=cid_clean,
+                            title=str(summary or action_id or ""),
+                            status="pending",
+                            priority=50,
+                            target_files=tuple(clean_targets),
+                            section_anchors=tuple(clean_anchors),
+                            branch_name=default_branch,
+                            prose_context=f"{summary}\n{proposed_fix}",
+                        )
+                        ov_res = analyze_pair_overlap(slot1_spec, cand_spec, repo_dir=persistent_repo_dir)
+                        ov_dict = ov_res.to_dict()
+                        ov_tier_resolved = ov_res.overlap_tier
+                        ov_order_resolved = list(ov_res.landing_order)
+                        slot2_allowed = bool(ov_res.parallel_safe)
+
+                if slot2_allowed:
+                    prev_s2 = dict(slot2_existing) if isinstance(slot2_existing, dict) else {}
+                    s2_ts = (
+                        str(prev_s2.get("branch_timestamp") or resolved_ts)
+                        if (same_conv_slot2 and reuse_active_branch)
+                        else resolved_ts
+                    )
+                    s2_branch = (
+                        str(prev_s2.get("branch_name") or default_branch)
+                        if (same_conv_slot2 and (reuse_active_branch or not branch_name.strip()))
+                        else default_branch
+                    )
+                    slot2_obj: dict[str, Any] = {
+                        "slot_id": 2,
+                        "active": True,
+                        "lock_id": f"lock-{cid_clean[:8]}-{s2_ts}",
+                        "conversation_id": cid_clean,
+                        "sibling_conversation_ids": clean_siblings,
+                        "action_id": str(action_id or prev_s2.get("action_id") or "").strip(),
+                        "notification_source": "Ad-Hoc",
+                        "branch_timestamp": s2_ts,
+                        "branch_name": s2_branch,
+                        "base_sha": resolved_base_sha or str(prev_s2.get("base_sha") or ""),
+                        "overlap_tier": ov_tier_resolved or OVERLAP_NONE,
+                        "landing_order": ov_order_resolved or [holder_cid, cid_clean],
+                        "section_anchors": clean_anchors or list(prev_s2.get("section_anchors") or []),
+                        "branch_pushed": False,
+                        "pr_gate_ready": False,
+                        "review_approved": bool(prev_s2.get("review_approved")) if same_conv_slot2 else False,
+                        "approved_head_sha": str(prev_s2.get("approved_head_sha") or "") if same_conv_slot2 else "",
+                        "deferred_send_email": bool(prev_s2.get("deferred_send_email")) if same_conv_slot2 else False,
+                        "reviewed_head_sha": str(prev_s2.get("reviewed_head_sha") or "") if same_conv_slot2 else "",
+                        "staged_head_sha": str(prev_s2.get("staged_head_sha") or "") if same_conv_slot2 else "",
+                        "head_sha": str(prev_s2.get("head_sha") or "") if same_conv_slot2 else "",
+                        "manual_pr_url": "",
+                        "pr_url": "",
+                        "target_repo_dir": clean_repo_dir or str(norm_existing.get("target_repo_dir") or ""),
+                        "worktree_path": _sanitize_home_paths(str(worktree_path or "").strip())
+                        or (str(prev_s2.get("worktree_path") or "") if same_conv_slot2 else ""),
+                        "issue_number": int(issue_number) if issue_number is not None else None,
+                        "issue_url": str(issue_url or "").strip(),
+                        "pr_number": prev_s2.get("pr_number") if same_conv_slot2 else None,
+                        "status": str(prev_s2.get("status") or "DEVELOPING") if (same_conv_slot2 and reuse_active_branch) else "DEVELOPING",
+                        "summary": _sanitize_home_paths(str(summary or prev_s2.get("summary") or "").strip()),
+                        "proposed_fix": _sanitize_home_paths(str(proposed_fix or prev_s2.get("proposed_fix") or "").strip()),
+                        "executive_summary": (
+                            str(prev_s2.get("executive_summary") or "")
+                            if same_conv_slot2 and prev_s2.get("executive_summary")
+                            else _sanitize_home_paths(str(proposed_fix or summary or "").strip())
+                        ),
+                        "target_files": clean_targets or list(prev_s2.get("target_files") or []),
+                        "review_iteration": int(prev_s2.get("review_iteration") or 0) if same_conv_slot2 else 0,
+                        "review_history": list(prev_s2.get("review_history") or []) if same_conv_slot2 else [],
+                        "verification_results": (
+                            dict(prev_s2.get("verification_results") or {})
+                            if same_conv_slot2 and isinstance(prev_s2.get("verification_results"), dict)
+                            else {}
+                        ),
+                        "acquired_at": str(prev_s2.get("acquired_at") or now_iso) if same_conv_slot2 else now_iso,
+                        "worker_cid": str(worker_cid or prev_s2.get("worker_cid") or "").strip(),
+                        "last_activity_at": now_iso,
+                        "updated_at": now_iso,
+                    }
+                    slots_existing["2"] = slot2_obj
+                    norm_existing["slots"] = slots_existing
+                    norm_existing["max_slots"] = eff_max_slots
+                    norm_existing["updated_at"] = now_iso
+                    updated_repo_lock = _sync_lock_slots_structure(norm_existing, repo_slug=resolved_slug)
+                    locks_map[resolved_slug] = updated_repo_lock
+                    _write_locks_state(audit_state, locks_map, touched_repo_slug=resolved_slug)
+                    state_obj["actions_log_audit_state"] = audit_state
+                    tmp_path = state_path.with_suffix(".tmp")
+                    tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                    with contextlib.suppress(OSError):
+                        os.chmod(tmp_path, 0o600)
+                    os.replace(tmp_path, state_path)
+
+                    active_count = sum(1 for v in locks_map.values() if isinstance(v, dict) and bool(v.get("active")))
+                    return {
+                        "status": "ok",
+                        "acquired": True,
+                        "slot_id": 2,
+                        "overlap_tier": slot2_obj["overlap_tier"],
+                        "landing_order": slot2_obj["landing_order"],
+                        "repo_slug": resolved_slug,
+                        "active_locks_count": active_count,
+                        "lock": _project_slot_view(updated_repo_lock, "2"),
+                        "repo_lock": updated_repo_lock,
+                    }
+
+                blocked_payload: dict[str, Any] = {
+                    "status": "locked",
+                    "acquired": False,
+                    "repo_slug": resolved_slug,
+                    "error": (
+                        f"Repository `{resolved_slug}` is locked by branch `{norm_existing.get('branch_name')}` "
+                        f"(timestamp `{norm_existing.get('branch_timestamp')}`, Conversation ID `{holder_cid}`, "
+                        f"status={existing_status}) pending manual PR validation. Sibling repositories remain unlocked."
+                    ),
+                    "active_lock": norm_existing,
+                }
+                if ov_tier_resolved:
+                    blocked_payload["overlap_tier"] = ov_tier_resolved
+                if ov_dict:
+                    blocked_payload["overlap_analysis"] = ov_dict
+                return blocked_payload
+
+            # Case B: Same conversation as Slot #1
+            raw_rb = norm_existing.get("repo_branches")
+            if isinstance(raw_rb, dict):
                 repo_branches = {
                     str(k): dict(v)
                     for k, v in raw_rb.items()
-                    if str(k).strip() and isinstance(v, dict)
+                    if str(k).strip() and not str(k).endswith("#slot2") and isinstance(v, dict)
                 }
             existing_repo_entry = repo_branches.get(resolved_slug)
-            if same_conv and existing_repo_entry and existing_repo_entry.get("branch_name"):
+            if existing_repo_entry and existing_repo_entry.get("branch_name"):
                 default_branch = str(existing_repo_entry.get("branch_name") or default_branch)
                 resolved_ts = str(existing_repo_entry.get("branch_timestamp") or resolved_ts)
-            elif reuse_active_branch and same_conv:
-                resolved_ts = str(existing_lock.get("branch_timestamp") or resolved_ts)
-                default_branch = str(existing_lock.get("branch_name") or default_branch)
-            elif not same_conv or (
+            elif reuse_active_branch:
+                resolved_ts = str(norm_existing.get("branch_timestamp") or resolved_ts)
+                default_branch = str(norm_existing.get("branch_name") or default_branch)
+            elif (
                 existing_status == "PENDING_HUMAN_PR_VALIDATION"
                 and branch_timestamp
-                and branch_timestamp != existing_lock.get("branch_timestamp")
+                and branch_timestamp != norm_existing.get("branch_timestamp")
             ):
                 return {
                     "status": "locked",
                     "acquired": False,
                     "repo_slug": resolved_slug,
                     "error": (
-                        f"Repository `{resolved_slug}` is locked by branch `{existing_lock.get('branch_name')}` "
-                        f"(timestamp `{existing_lock.get('branch_timestamp')}`, Conversation ID `{holder_cid}`, "
+                        f"Repository `{resolved_slug}` is locked by branch `{norm_existing.get('branch_name')}` "
+                        f"(timestamp `{norm_existing.get('branch_timestamp')}`, Conversation ID `{holder_cid}`, "
                         f"status={existing_status}) pending manual PR validation. Sibling repositories remain unlocked."
                     ),
-                    "active_lock": existing_lock,
+                    "active_lock": norm_existing,
                 }
 
         prev_entry = repo_branches.get(resolved_slug, {})
@@ -723,11 +1217,22 @@ def acquire_dev_pr_lock(
 
         same_prev = isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
         prev_gate_ready = bool(existing_lock.get("pr_gate_ready")) if (same_prev and not reuse_active_branch) else False
-        new_lock: dict[str, Any] = {
+        preserved_slot2 = (
+            existing_lock.get("slots", {}).get("2")
+            if isinstance(existing_lock, dict) and isinstance(existing_lock.get("slots"), dict)
+            else None
+        )
+        new_lock_raw: dict[str, Any] = {
             "active": True,
             "vcs_mode": "native_git",
             "repo_slug": resolved_slug,
             "repo": resolved_slug,
+            "slot_id": 1,
+            "max_slots": eff_max_slots,
+            "base_sha": resolved_base_sha or (str(existing_lock.get("base_sha") or "") if same_prev else ""),
+            "overlap_tier": (overlap_tier or "").strip() or (str(existing_lock.get("overlap_tier") or "") if same_prev else ""),
+            "landing_order": list(landing_order or ([cid_clean] if not same_prev else (existing_lock.get("landing_order") or [cid_clean]))),
+            "section_anchors": clean_anchors or (list(existing_lock.get("section_anchors") or []) if same_prev else []),
             "lock_id": f"lock-{cid_clean[:8]}-{resolved_ts}",
             "conversation_id": cid_clean,
             "sibling_conversation_ids": clean_siblings,
@@ -757,7 +1262,7 @@ def acquire_dev_pr_lock(
                 if same_prev and existing_lock.get("executive_summary")
                 else _sanitize_home_paths(str(proposed_fix or summary or "").strip())
             ),
-            "target_files": [str(f).strip() for f in (target_files or []) if str(f).strip()],
+            "target_files": clean_targets,
             "review_iteration": int(existing_lock.get("review_iteration") or 0) if same_prev else 0,
             "review_history": list(existing_lock.get("review_history") or []) if same_prev else [],
             "verification_results": (
@@ -777,6 +1282,9 @@ def acquire_dev_pr_lock(
             "last_activity_at": now_iso,
             "updated_at": now_iso,
         }
+        if isinstance(preserved_slot2, dict) and bool(preserved_slot2.get("active", True)):
+            new_lock_raw["slots"] = {"2": dict(preserved_slot2)}
+        new_lock = _sync_lock_slots_structure(new_lock_raw, repo_slug=resolved_slug)
         locks_map[resolved_slug] = new_lock
         _write_locks_state(audit_state, locks_map, touched_repo_slug=resolved_slug)
         state_obj["actions_log_audit_state"] = audit_state
@@ -790,6 +1298,7 @@ def acquire_dev_pr_lock(
     return {
         "status": "ok",
         "acquired": True,
+        "slot_id": 1,
         "repo_slug": resolved_slug,
         "active_locks_count": active_count,
         "lock": new_lock,
@@ -803,12 +1312,22 @@ def update_dev_pr_lock(
     repo_slug: str = "",
     workdir: Path | str | None = None,
     branch_name: str = "",
+    slot_id: int | str | None = None,
 ) -> dict[str, Any]:
-    """Update fields on the matching active per-repository lock inside `actions_state.json`."""
+    """Update fields on the matching active per-repository lock (Slot #1 or Slot #2) inside `actions_state.json`."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
     state_path = p_dir / "actions_state.json"
     lock_file = state_path.with_suffix(".json.lock")
     now_iso = _utc_now_iso()
+    sanitize_str_keys = (
+        "summary",
+        "proposed_fix",
+        "executive_summary",
+        "proposal_title",
+        "proposal_body",
+        "target_repo_dir",
+        "worktree_path",
+    )
 
     with dev_common.file_lock(lock_file):
         state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
@@ -829,10 +1348,50 @@ def update_dev_pr_lock(
         )
         if not isinstance(cand_lock, dict) or not bool(cand_lock.get("active")):
             return {"status": "error", "error": f"No active dev_pr_lock to update for `{target_slug or 'default'}`."}
-        existing_branch = str(cand_lock.get("branch_name") or "").strip()
-        if req_branch and existing_branch and not _entry_matches_branch(cand_lock, req_branch):
+
+        norm_cand = _sync_lock_slots_structure(cand_lock, repo_slug=target_slug)
+        matched_slot = _match_slot_key(
+            norm_cand,
+            branch_name=req_branch,
+            workdir=workdir,
+            conversation_id=str(updates.get("conversation_id") or ""),
+            slot_id=slot_id,
+        )
+
+        if matched_slot == "2" and "2" in norm_cand.get("slots", {}):
+            slot2_cur = dict(norm_cand["slots"]["2"])
+            for k, v in updates.items():
+                if v is not None and k not in ("slots", "repo_branches"):
+                    if k in sanitize_str_keys and isinstance(v, str):
+                        slot2_cur[k] = _sanitize_home_paths(v)
+                    else:
+                        slot2_cur[k] = v
+            slot2_cur["slot_id"] = 2
+            slot2_cur["active"] = True
+            slot2_cur["last_activity_at"] = str(updates.get("last_activity_at") or now_iso)
+            slot2_cur["updated_at"] = now_iso
+            norm_cand["slots"]["2"] = slot2_cur
+            norm_cand["updated_at"] = now_iso
+            current_lock = _sync_lock_slots_structure(norm_cand, repo_slug=target_slug)
+            locks_map[target_slug] = current_lock
+            _write_locks_state(audit_state, locks_map, touched_repo_slug=target_slug)
+            state_obj["actions_log_audit_state"] = audit_state
+            tmp_path = state_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            with contextlib.suppress(OSError):
+                os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, state_path)
+            return {
+                "status": "ok",
+                "repo_slug": target_slug,
+                "slot_id": 2,
+                "lock": _project_slot_view(current_lock, "2"),
+            }
+
+        existing_branch = str(norm_cand.get("branch_name") or "").strip()
+        if req_branch and existing_branch and not _entry_matches_branch(norm_cand, req_branch):
             req_cid = str(updates.get("conversation_id") or "").strip()
-            holder_cid = str(cand_lock.get("conversation_id") or "").strip()
+            holder_cid = str(norm_cand.get("conversation_id") or "").strip()
             same_conv = bool(
                 req_cid
                 and holder_cid
@@ -850,10 +1409,10 @@ def update_dev_pr_lock(
                         f"active lock holds `{existing_branch}`, requested `{req_branch}`."
                     ),
                 }
-        current_lock = dict(cand_lock)
+        current_lock = dict(norm_cand)
         for k, v in updates.items():
             if v is not None:
-                if k in ("summary", "proposed_fix", "executive_summary", "proposal_title", "proposal_body", "target_repo_dir", "worktree_path") and isinstance(v, str):
+                if k in sanitize_str_keys and isinstance(v, str):
                     current_lock[k] = _sanitize_home_paths(v)
                 else:
                     current_lock[k] = v
@@ -861,6 +1420,7 @@ def update_dev_pr_lock(
         current_lock["repo"] = target_slug
         current_lock["last_activity_at"] = str(updates.get("last_activity_at") or now_iso)
         current_lock["updated_at"] = now_iso
+        current_lock = _sync_lock_slots_structure(current_lock, repo_slug=target_slug)
         locks_map[target_slug] = current_lock
         _write_locks_state(audit_state, locks_map, touched_repo_slug=target_slug)
         state_obj["actions_log_audit_state"] = audit_state
@@ -869,7 +1429,7 @@ def update_dev_pr_lock(
         with contextlib.suppress(OSError):
             os.chmod(tmp_path, 0o600)
         os.replace(tmp_path, state_path)
-    return {"status": "ok", "repo_slug": target_slug, "lock": current_lock}
+    return {"status": "ok", "repo_slug": target_slug, "slot_id": 1, "lock": current_lock}
 
 
 def record_dev_pr_lock_heartbeat(
@@ -1016,13 +1576,19 @@ def release_dev_pr_lock(
     branch_name: str = "",
     release_all: bool = False,
 ) -> dict[str, Any]:
-    """Release one repository's pending-branch lock (`repo_slug`/`workdir`/`branch_name`), or all locks when `release_all=True`."""
+    """Release one repository's pending-branch lock (`repo_slug`/`workdir`/`branch_name`), or all locks when `release_all=True`.
+
+    When two parallel slots (`slots['1']` and `slots['2']`) are active on the target repository and `release_all=False`:
+      - Releasing Slot #1 finalizes Slot #1 and promotes Slot #2 into Slot #1 (`READY_AWAITING_BASE_MERGE` -> `NEEDS_REBASE_REVERIFY`).
+      - Releasing Slot #2 finalizes Slot #2 while keeping Slot #1 untouched.
+    """
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
     state_path = p_dir / "actions_state.json"
     lock_file = state_path.with_suffix(".json.lock")
     now_iso = _utc_now_iso()
 
     released_entries: list[tuple[str, dict[str, Any]]] = []
+    promoted_slots: dict[str, dict[str, Any]] = {}
     remaining_active_slugs: list[str] = []
     with dev_common.file_lock(lock_file):
         state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
@@ -1067,7 +1633,101 @@ def release_dev_pr_lock(
         last_snap: dict[str, Any] = {}
         last_slug = ""
         for slug in target_slugs:
-            rel_lock = dict(locks_map.get(slug) or {})
+            raw_cur = dict(locks_map.get(slug) or {})
+            if not release_all and bool(raw_cur.get("active")):
+                norm_cur = _sync_lock_slots_structure(raw_cur, repo_slug=slug)
+                slots_cur = dict(norm_cur.get("slots") or {})
+                if "2" in slots_cur:
+                    rel_slot_key = _match_slot_key(norm_cur, branch_name=branch_name, workdir=workdir)
+                    if rel_slot_key == "2":
+                        slot2_rel = dict(slots_cur["2"])
+                        slot2_rel["repo_branches"] = {}
+                        released_entries.append((slug, slot2_rel))
+                        _finalize_single_released_lock(
+                            released_lock=slot2_rel,
+                            released_slug=slug,
+                            audit_state=audit_state,
+                            state_dir=state_path.parent,
+                            reason=reason,
+                            resolution=resolution,
+                            summary=summary,
+                            now_iso=now_iso,
+                        )
+                        slots_cur.pop("2", None)
+                        norm_cur["slots"] = slots_cur
+                        norm_cur["updated_at"] = now_iso
+                        locks_map[slug] = _sync_lock_slots_structure(norm_cur, repo_slug=slug)
+                        last_slug = slug
+                        continue
+
+                    # Releasing Slot #1 while Slot #2 is active -> finalize Slot #1 and promote Slot #2 -> Slot #1
+                    slot1_rel = dict(norm_cur)
+                    slot1_rb = {
+                        str(k): dict(v)
+                        for k, v in (norm_cur.get("repo_branches") or {}).items()
+                        if str(k).strip() and not str(k).endswith("#slot2") and isinstance(v, dict)
+                    }
+                    slot1_rel["repo_branches"] = slot1_rb
+                    slot1_rel.pop("slots", None)
+                    released_entries.append((slug, slot1_rel))
+                    snap1 = _finalize_single_released_lock(
+                        released_lock=slot1_rel,
+                        released_slug=slug,
+                        audit_state=audit_state,
+                        state_dir=state_path.parent,
+                        reason=reason,
+                        resolution=resolution,
+                        summary=summary,
+                        now_iso=now_iso,
+                    )
+                    slot2_prom = dict(slots_cur["2"])
+                    slot2_prom["slot_id"] = 1
+                    slot2_prom["active"] = True
+                    slot2_prom["promoted_from_slot"] = 2
+                    slot2_prom["promoted_at"] = now_iso
+                    slot2_prom["previous_slot1_branch"] = str(slot1_rel.get("branch_name") or "")
+                    slot2_prom["previous_slot1_release_reason"] = reason
+                    if str(slot2_prom.get("status") or "") == SLOT_STATUS_READY_AWAITING_BASE_MERGE:
+                        slot2_prom["status"] = SLOT_STATUS_NEEDS_REBASE_REVERIFY
+                        slot2_prom["branch_action"] = SLOT_STATUS_NEEDS_REBASE_REVERIFY
+                    elif reason in ("BRANCH_MERGED_INTO_MAIN", "HUMAN_VALIDATED_MANUAL_PR"):
+                        slot2_prom["needs_base_rebase"] = True
+                    slot2_prom["updated_at"] = now_iso
+
+                    promoted_raw: dict[str, Any] = {
+                        "active": True,
+                        "vcs_mode": str(norm_cur.get("vcs_mode") or "native_git"),
+                        "repo_slug": slug,
+                        "repo": slug,
+                        "max_slots": int(norm_cur.get("max_slots") or DEFAULT_MAX_REPO_SLOTS),
+                        **slot2_prom,
+                        "repo_branches": {
+                            slug: {
+                                "repo_slug": slug,
+                                "branch_name": str(slot2_prom.get("branch_name") or ""),
+                                "branch_timestamp": str(slot2_prom.get("branch_timestamp") or ""),
+                                "target_repo_dir": str(slot2_prom.get("target_repo_dir") or norm_cur.get("target_repo_dir") or ""),
+                                "worktree_path": str(slot2_prom.get("worktree_path") or ""),
+                                "manual_pr_url": "",
+                                "branch_pushed": False,
+                                "head_sha": str(slot2_prom.get("head_sha") or slot2_prom.get("staged_head_sha") or ""),
+                                "updated_at": now_iso,
+                            }
+                        },
+                        "last_released_slot1": snap1,
+                    }
+                    promoted_raw.pop("slots", None)
+                    promoted_norm = _sync_lock_slots_structure(promoted_raw, repo_slug=slug)
+                    locks_map[slug] = promoted_norm
+                    promoted_slots[slug] = promoted_norm
+                    last_slug = slug
+                    continue
+
+            rel_lock = raw_cur
+            if release_all and isinstance(rel_lock.get("slots"), dict) and isinstance(rel_lock["slots"].get("2"), dict):
+                s2_extra = dict(rel_lock["slots"]["2"])
+                s2_extra["repo_branches"] = {}
+                released_entries.append((slug, s2_extra))
             released_entries.append((slug, rel_lock))
             snap = _finalize_single_released_lock(
                 released_lock=rel_lock,
@@ -1114,8 +1774,8 @@ def release_dev_pr_lock(
                 rb_map = released_lock.get("repo_branches") if isinstance(released_lock.get("repo_branches"), dict) else {}
                 merged_branches = [
                     str(entry.get("branch_name") or "")
-                    for entry in rb_map.values()
-                    if isinstance(entry, dict) and entry.get("branch_name")
+                    for k_rb, entry in rb_map.items()
+                    if not str(k_rb).endswith("#slot2") and isinstance(entry, dict) and entry.get("branch_name")
                 ] or ([str(released_lock.get("branch_name") or "")] if released_lock.get("branch_name") else [])
                 for q_cid in [cid_clean, *siblings]:
                     _mark_queue_item_repo_merged(
@@ -1164,15 +1824,18 @@ def release_dev_pr_lock(
     restart_pro_api_server(portfolio_dir=portfolio_dir)
 
     primary_prev = released_entries[0][1] if released_entries else {}
-    return {
+    out_res: dict[str, Any] = {
         "status": "ok",
         "released": True,
-        "released_repos": [s for s, _ in released_entries],
+        "released_repos": list(dict.fromkeys(s for s, _ in released_entries)),
         "remaining_active_repos": remaining_active_slugs,
         "reason": reason,
         "resolution": resolution,
         "previous_lock": primary_prev,
     }
+    if promoted_slots:
+        out_res["promoted_slots"] = promoted_slots
+    return out_res
 
 
 def _sync_single_repo_lock_with_git(
@@ -1183,11 +1846,11 @@ def _sync_single_repo_lock_with_git(
     git_client: GitVcsIntegrationClient | None = None,
 ) -> dict[str, Any]:
     """Synchronize one repository's active lock against `origin` via native `git`."""
+    lock_repo_path = _resolve_lock_target_repo_dir(lock_info)
     if git_client is not None:
         vcs = git_client
     else:
         env_ov: dict[str, str] = {}
-        lock_repo_path = _resolve_lock_target_repo_dir(lock_info)
         if lock_repo_path and (lock_repo_path / ".git").exists():
             env_ov["AGY_CONF_REPO_DIR"] = str(lock_repo_path)
         if portfolio_dir is not None:
@@ -1196,11 +1859,20 @@ def _sync_single_repo_lock_with_git(
 
     branch_name = str(lock_info.get("branch_name") or "").strip()
     branch_pushed = bool(lock_info.get("branch_pushed"))
+    slot2_dict = (
+        lock_info.get("slots", {}).get("2")
+        if isinstance(lock_info.get("slots"), dict) and isinstance(lock_info["slots"].get("2"), dict)
+        else {}
+    )
+    slot2_branch = str(slot2_dict.get("branch_name") or "").strip() if slot2_dict else ""
+    extra_protected = [slot2_branch] if slot2_branch else []
+
     if not branch_name or not branch_pushed:
+        prot_list = [b for b in (branch_name, slot2_branch) if b]
         repo_sync = (
             vcs.sync_and_clean_local_repo(
                 base_branch="main",
-                protected_branches=[branch_name] if branch_name else [],
+                protected_branches=prot_list,
                 checkout_base_if_current_gone=False,
             )
             if hasattr(vcs, "sync_and_clean_local_repo")
@@ -1226,7 +1898,19 @@ def _sync_single_repo_lock_with_git(
             "git_sync_warning": branch_state.get("error", ""),
         }
 
-    if bool(branch_state.get("merged_into_base")):
+    is_merged_into_base = bool(branch_state.get("merged_into_base"))
+    if (
+        not is_merged_into_base
+        and not bool(branch_state.get("remote_exists"))
+        and isinstance(vcs, GitVcsIntegrationClient)
+        and lock_repo_path is not None
+        and (lock_repo_path / ".git").exists()
+    ):
+        loc_merged, _ = _inspect_local_branch_merged_readonly(lock_repo_path, branch_name, base_branch="main")
+        if loc_merged:
+            is_merged_into_base = True
+
+    if is_merged_into_base:
         if bool(branch_state.get("remote_exists")) and hasattr(vcs, "delete_branch_native"):
             vcs.delete_branch_native(
                 branch_name=branch_name,
@@ -1237,6 +1921,7 @@ def _sync_single_repo_lock_with_git(
         repo_sync = (
             vcs.sync_and_clean_local_repo(
                 base_branch="main",
+                protected_branches=extra_protected,
                 force_clean_branches=[branch_name],
                 fetch=bool(branch_state.get("remote_exists")),
             )
@@ -1251,6 +1936,20 @@ def _sync_single_repo_lock_with_git(
             repo_slug=repo_slug,
             branch_name=branch_name,
         )
+        promoted = (rel.get("promoted_slots") or {}).get(repo_slug)
+        if isinstance(promoted, dict):
+            return {
+                "status": "ok",
+                "repo_slug": repo_slug,
+                "active": True,
+                "released": True,
+                "slot1_merged": True,
+                "reason": "SLOT1_MERGED_SLOT2_PROMOTED",
+                "promoted_slot": promoted,
+                "lock": promoted,
+                "release_result": rel,
+                "repo_sync": repo_sync,
+            }
         return {
             "status": "ok",
             "repo_slug": repo_slug,
@@ -1265,6 +1964,7 @@ def _sync_single_repo_lock_with_git(
         repo_sync = (
             vcs.sync_and_clean_local_repo(
                 base_branch="main",
+                protected_branches=extra_protected,
                 force_clean_branches=[branch_name],
                 fetch=False,
             )
@@ -1279,6 +1979,20 @@ def _sync_single_repo_lock_with_git(
             repo_slug=repo_slug,
             branch_name=branch_name,
         )
+        promoted = (rel.get("promoted_slots") or {}).get(repo_slug)
+        if isinstance(promoted, dict):
+            return {
+                "status": "ok",
+                "repo_slug": repo_slug,
+                "active": True,
+                "released": True,
+                "slot1_released": True,
+                "reason": "SLOT1_DELETED_SLOT2_PROMOTED",
+                "promoted_slot": promoted,
+                "lock": promoted,
+                "release_result": rel,
+                "repo_sync": repo_sync,
+            }
         return {
             "status": "ok",
             "repo_slug": repo_slug,
@@ -1292,7 +2006,7 @@ def _sync_single_repo_lock_with_git(
     repo_sync = (
         vcs.sync_and_clean_local_repo(
             base_branch="main",
-            protected_branches=[branch_name],
+            protected_branches=[b for b in (branch_name, slot2_branch) if b],
             fetch=False,
         )
         if hasattr(vcs, "sync_and_clean_local_repo")
@@ -1770,23 +2484,41 @@ def wait_for_unlock_or_actionable_event(
         summary = q_next.get("summary") or {}
 
         stalled_locks: list[dict[str, Any]] = []
+        rebase_reverify_locks: list[dict[str, Any]] = []
         for slug, lk in sorted(current_locks.items()):
-            st_info = detect_stalled_lock(
-                lk,
-                threshold_seconds=stall_threshold_seconds,
-                brain_dir=effective_brain,
-            )
-            if st_info.get("stalled"):
-                stalled_locks.append(
+            if str(lk.get("status") or "").strip().upper() == SLOT_STATUS_NEEDS_REBASE_REVERIFY:
+                rebase_reverify_locks.append(
                     {
                         "repo_slug": slug,
+                        "slot_id": int(lk.get("slot_id") or 1),
                         "branch_name": str(lk.get("branch_name") or ""),
                         "conversation_id": str(lk.get("conversation_id") or ""),
-                        "worker_cid": str(st_info.get("worker_cid") or ""),
-                        "idle_seconds": int(st_info.get("idle_seconds") or 0),
-                        "idle_label": str(st_info.get("idle_label") or ""),
+                        "worktree_path": str(lk.get("worktree_path") or ""),
+                        "base_sha": str(lk.get("base_sha") or ""),
                     }
                 )
+            slot_candidates: list[tuple[int, dict[str, Any]]] = [(1, lk)]
+            s2_lk = lk.get("slots", {}).get("2") if isinstance(lk.get("slots"), dict) else None
+            if isinstance(s2_lk, dict) and bool(s2_lk.get("active", True)):
+                slot_candidates.append((2, s2_lk))
+            for s_num, slot_entry in slot_candidates:
+                st_info = detect_stalled_lock(
+                    slot_entry,
+                    threshold_seconds=stall_threshold_seconds,
+                    brain_dir=effective_brain,
+                )
+                if st_info.get("stalled"):
+                    stalled_locks.append(
+                        {
+                            "repo_slug": slug,
+                            "slot_id": s_num,
+                            "branch_name": str(slot_entry.get("branch_name") or ""),
+                            "conversation_id": str(slot_entry.get("conversation_id") or ""),
+                            "worker_cid": str(st_info.get("worker_cid") or ""),
+                            "idle_seconds": int(st_info.get("idle_seconds") or 0),
+                            "idle_label": str(st_info.get("idle_label") or ""),
+                        }
+                    )
 
         open_active_count = (
             int(summary.get("pending") or 0)
@@ -1800,6 +2532,7 @@ def wait_for_unlock_or_actionable_event(
                 "status": "ok",
                 "event": event_name,
                 "released_repos": released_repos,
+                "rebase_reverify_locks": rebase_reverify_locks,
                 "active_lock_repos": sorted(current_locked_repos),
                 "active_lock_count": len(current_locks),
                 "stalled_locks": stalled_locks,
@@ -1811,6 +2544,8 @@ def wait_for_unlock_or_actionable_event(
                 "rearm_recommended": rearm,
             }
 
+        if rebase_reverify_locks:
+            return _payload("slot2_needs_rebase_reverify", rearm=False)
         if released_repos:
             return _payload("repo_unlocked", rearm=False)
         if next_unlocked is not None:
@@ -2048,8 +2783,13 @@ def start_remediation_branch_and_lock(
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
     worker_cid: str = "",
+    *,
+    section_anchors: list[str] | None = None,
+    allow_slot2: bool = False,
+    force_slot2: bool = False,
+    max_slots: int | None = None,
 ) -> dict[str, Any]:
-    """Execute Steps 1–2: inspect/RCA, verify no pending branch is awaiting validation (or reuse active PR branch), create timestamped git branch, and acquire `dev_pr_lock`."""
+    """Execute Steps 1–2: inspect/RCA, verify lock/slot availability (1-slot or safe 2-slot parallel), create timestamped git branch, and acquire `dev_pr_lock`."""
     vcs = git_client or GitVcsIntegrationClient()
     resolved_slug, resolved_target_dir = _resolve_repo_slug_and_dir(
         workdir=workdir,
@@ -2082,8 +2822,63 @@ def start_remediation_branch_and_lock(
         or holder_cid.startswith(cid_clean[:8])
         or cid_clean in existing_siblings
     )
+    slots_existing = existing_lock.get("slots") if isinstance(existing_lock.get("slots"), dict) else {}
+    slot2_existing = slots_existing.get("2") if isinstance(slots_existing.get("2"), dict) else {}
+    same_conv_slot2 = False
+    if slot2_existing and bool(slot2_existing.get("active", True)):
+        s2_cid = str(slot2_existing.get("conversation_id") or "").strip()
+        s2_sibs = [str(s).strip() for s in (slot2_existing.get("sibling_conversation_ids") or [])]
+        same_conv_slot2 = bool(
+            s2_cid
+            and (
+                s2_cid == cid_clean
+                or cid_clean.startswith(s2_cid[:8])
+                or s2_cid.startswith(cid_clean[:8])
+                or cid_clean in s2_sibs
+            )
+        )
+
     existing_status = str(existing_lock.get("status") or "")
-    if existing_lock.get("active") and (
+    allocating_slot2 = False
+    slot2_overlap_tier = ""
+    slot2_landing_order: list[str] = []
+    slot2_overlap_dict: dict[str, Any] = {}
+
+    if existing_lock.get("active") and not same_conv:
+        eff_max_slots = int(
+            max_slots if max_slots is not None else existing_lock.get("max_slots") or _resolve_max_repo_slots()
+        )
+        slot2_free = eff_max_slots >= 2 and (same_conv_slot2 or "2" not in slots_existing)
+        clean_tfiles = [str(f).strip() for f in (target_files or []) if str(f).strip()]
+        clean_sanchors = [str(a).strip() for a in (section_anchors or []) if str(a).strip()]
+
+        if same_conv_slot2:
+            allocating_slot2 = True
+            slot2_overlap_tier = str(slot2_existing.get("overlap_tier") or OVERLAP_NONE)
+            slot2_landing_order = list(slot2_existing.get("landing_order") or [])
+        elif slot2_free and force_slot2:
+            allocating_slot2 = True
+            slot2_overlap_tier = OVERLAP_TRANSITIVE
+        elif slot2_free and (allow_slot2 or (create_worktree and bool(clean_tfiles) and bool(existing_lock.get("target_files")))):
+            main_git_root = _resolve_main_git_repo_root(target_repo_dir) if isinstance(target_repo_dir, Path) else None
+            slot1_spec = TaskAnchorSpec.from_mapping(existing_lock)
+            cand_spec = TaskAnchorSpec(
+                conversation_id=cid_clean,
+                title=str(rca_summary or action_id or ""),
+                status="pending",
+                priority=50,
+                target_files=tuple(clean_tfiles),
+                section_anchors=tuple(clean_sanchors),
+                prose_context=f"{rca_summary}\n{proposed_fix}",
+            )
+            ov_res = analyze_pair_overlap(slot1_spec, cand_spec, repo_dir=main_git_root)
+            slot2_overlap_dict = ov_res.to_dict()
+            slot2_overlap_tier = ov_res.overlap_tier
+            slot2_landing_order = list(ov_res.landing_order)
+            if ov_res.parallel_safe:
+                allocating_slot2 = True
+
+    if existing_lock.get("active") and not allocating_slot2 and (
         not same_conv
         or (not reuse_active_branch and existing_status == "PENDING_HUMAN_PR_VALIDATION")
     ):
@@ -2097,11 +2892,12 @@ def start_remediation_branch_and_lock(
                 rca_summary=rca_summary,
                 proposed_fix=proposed_fix,
                 target_files=target_files,
+                section_anchors=section_anchors,
                 repo_slugs=[repo_slug] if repo_slug else None,
                 blocked_by_lock_id=str(existing_lock.get("lock_id") or ""),
                 portfolio_dir=portfolio_dir,
             )
-        return {
+        locked_out: dict[str, Any] = {
             "status": "locked",
             "acquired": False,
             "repo_slug": repo_slug,
@@ -2114,11 +2910,17 @@ def start_remediation_branch_and_lock(
             ),
             "active_lock": existing_lock,
         }
+        if slot2_overlap_tier:
+            locked_out["overlap_tier"] = slot2_overlap_tier
+        if slot2_overlap_dict:
+            locked_out["overlap_analysis"] = slot2_overlap_dict
+        return locked_out
 
     evidence = ""
-    if existing_lock.get("active") and (reuse_active_branch or same_conv):
-        existing_sum = str(existing_lock.get("summary") or "").strip()
-        existing_fix = str(existing_lock.get("proposed_fix") or "").strip()
+    lock_for_reuse = slot2_existing if (allocating_slot2 and same_conv_slot2) else existing_lock
+    if existing_lock.get("active") and (reuse_active_branch or same_conv or same_conv_slot2):
+        existing_sum = str(lock_for_reuse.get("summary") or "").strip()
+        existing_fix = str(lock_for_reuse.get("proposed_fix") or "").strip()
         if not rca_summary.strip() and existing_sum and existing_sum != "Tool/step execution error":
             rca_summary = existing_sum
         if not proposed_fix.strip() and existing_fix and not existing_fix.startswith("Inspect the failing CLI command flags"):
@@ -2153,14 +2955,14 @@ def start_remediation_branch_and_lock(
     reused_repo_branch, reused_repo_ts = _find_existing_repo_branch_for_conversation(
         repo_dir=target_repo_dir,
         cid_clean=cid_clean,
-        existing_lock=existing_lock,
+        existing_lock=lock_for_reuse if (same_conv or same_conv_slot2) else {},
         repo_slug=repo_slug,
-        same_conv=same_conv,
+        same_conv=bool(same_conv or same_conv_slot2),
     )
     resolved_ts = (
         branch_timestamp.strip()
         or reused_repo_ts
-        or str(existing_lock.get("branch_timestamp") or "").strip()
+        or (str(lock_for_reuse.get("branch_timestamp") or "").strip() if (same_conv or same_conv_slot2) else "")
         or generate_branch_timestamp()
     )
     branch_name = (
@@ -2183,15 +2985,15 @@ def start_remediation_branch_and_lock(
     )
 
     wt_path = ""
-    if create_worktree:
+    if create_worktree or (allocating_slot2 and isinstance(target_repo_dir, Path) and (target_repo_dir / ".git").exists()):
         wt_res = prepare_isolated_worktree(
             branch_name=branch_name,
-            repo_dir=target_repo_dir if isinstance(target_repo_dir, Path) else None,
+            repo_dir=_resolve_main_git_repo_root(target_repo_dir) if isinstance(target_repo_dir, Path) else None,
             portfolio_dir=portfolio_dir,
         )
         if wt_res.get("status") == "ok":
             wt_path = str(wt_res.get("worktree_path") or "")
-            if wt_path:
+            if wt_path and not allocating_slot2:
                 stamp_repo_version_manifests(wt_path, branch_timestamp=resolved_ts)
         else:
             return {
@@ -2283,6 +3085,12 @@ def start_remediation_branch_and_lock(
         target_repo_dir=str(target_repo_dir) if isinstance(target_repo_dir, Path) else "",
         repo_slug=repo_slug,
         worker_cid=worker_cid,
+        section_anchors=section_anchors,
+        max_slots=max_slots,
+        allow_slot2=allocating_slot2 or allow_slot2,
+        force_slot2=force_slot2,
+        overlap_tier=slot2_overlap_tier,
+        landing_order=slot2_landing_order or None,
     )
     if not lock_res.get("acquired"):
         return lock_res
@@ -2299,12 +3107,15 @@ def start_remediation_branch_and_lock(
                 rca_summary=rca_summary,
                 proposed_fix=proposed_fix,
                 target_files=target_files,
+                section_anchors=section_anchors,
                 portfolio_dir=portfolio_dir,
             )
 
     return {
         "status": "ok",
         "acquired": True,
+        "slot_id": int(lock_res.get("slot_id") or 1),
+        "overlap_tier": str(lock_res.get("overlap_tier") or slot2_overlap_tier or ""),
         "vcs_mode": "native_git",
         "repo_slug": repo_slug,
         "target_repo_dir": _sanitize_home_paths(str(target_repo_dir)) if isinstance(target_repo_dir, Path) else "",
@@ -2626,7 +3437,13 @@ def run_local_validation_suite(
     if not target_dir.is_dir():
         return {"status": "error", "passed": False, "error": f"Workdir not found: {target_dir}"}
 
-    clean_env = _clean_git_subprocess_env({"AGY_OFFLINE_ONLY": "1", "PRE_COMMIT_HOOK": "1"})
+    clean_env = _clean_git_subprocess_env(
+        {
+            "AGY_OFFLINE_ONLY": "1",
+            "PRE_COMMIT_HOOK": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
 
     # Single-pass pre-commit execution FIRST (skipping duplicate test & static-audit hooks)
     pre_commit_entry: dict[str, Any] = {"status": "not_run", "passed": None}
@@ -3511,7 +4328,8 @@ def push_remediation_branch_and_build_reviewer_plan(
                     "error": (co_proc.stderr or co_proc.stdout or f"Failed to checkout {resolved_head}").strip(),
                 }
 
-        stamp_repo_version_manifests(target_repo_dir, branch_timestamp=resolved_ts)
+        if int(lock_info.get("slot_id") or 1) != 2:
+            stamp_repo_version_manifests(target_repo_dir, branch_timestamp=resolved_ts)
 
         status_proc = subprocess.run(
             ["git", "-C", str(target_repo_dir), "status", "--porcelain"],
@@ -4272,6 +5090,7 @@ def record_pr_review_evaluation(
     # ==========================================================================
     # HARD GATE PATH B: Review PASSED (`verdict == "PASS"` AND `score > 90`)
     # ==========================================================================
+    is_slot2_branch = bool(lock_info.get("active")) and int(lock_info.get("slot_id") or 1) == 2
     effective_repo_dir = target_repo_dir
     branch_published = False
     if lock_info.get("active"):
@@ -4320,6 +5139,104 @@ def record_pr_review_evaluation(
         amended_head_sha = str(amend_res.get("head_sha") or head_sha)
         if valid_vr and amended_head_sha:
             valid_vr = {**valid_vr, "head_sha": amended_head_sha, "dirty": False}
+
+        # MAX 1 OPEN GITHUB PR PER REPOSITORY INVARIANT:
+        # When Slot #2 passes review while Slot #1 is still active on the repo, DO NOT push to origin,
+        # DO NOT surface `manual_pr_url`, and DO NOT email until Slot #1 merges + rebase-reverify passes!
+        if is_slot2_branch:
+            head_sha = amended_head_sha
+            review_entry["head_sha"] = head_sha
+            updated_history[-1] = review_entry
+            slot1_br = str(lock_info.get("slot1_branch_name") or "")
+            slot2_md = (
+                f"### ⏳ Slot #2 Validated Locally — Awaiting Slot #1 Base Merge (`{PR_REVIEWER_SUBAGENT_NAME}` · `{PR_SUBAGENT_MODEL}`)\n\n"
+                f"- **Slot**: `2` (behind active Slot #1 `{slot1_br}`)\n"
+                f"- **Status**: `{SLOT_STATUS_READY_AWAITING_BASE_MERGE}` (`max 1 open GitHub PR per repo` enforced — NOT pushed to `origin` yet)\n"
+                f"- **Local Branch**: `{resolved_branch}` (Timestamp `{resolved_ts}`, SHA `{head_sha[:12]}`)\n"
+                f"- **Verdict**: **🟢 PASS** (`{score_int}/100` · Round `{current_iteration}/{MAX_PR_REVIEW_ITERATIONS}`)\n"
+                f"- **Evaluated At (UTC)**: `{now_iso}`\n\n"
+                f"{canonical_pr_body}\n"
+            )
+            update_dev_pr_lock(
+                {
+                    "status": SLOT_STATUS_READY_AWAITING_BASE_MERGE,
+                    "branch_action": SLOT_STATUS_READY_AWAITING_BASE_MERGE,
+                    "branch_pushed": False,
+                    "pr_gate_ready": False,
+                    "review_approved": True,
+                    "approved_head_sha": head_sha,
+                    "reviewed_head_sha": head_sha,
+                    "deferred_send_email": bool(send_email),
+                    "head_sha": head_sha,
+                    "manual_pr_url": "",
+                    "pr_url": "",
+                    "proposal_title": proposal_title,
+                    "proposal_body": canonical_pr_body,
+                    "executive_summary": resolved_exec_summary,
+                    "verification_results": valid_vr,
+                    "review_iteration": current_iteration,
+                    "review_history": updated_history,
+                    "reviewer_verdict": norm_verdict,
+                    "reviewer_score": score_int,
+                    "reviewer_summary": summary.strip(),
+                    "reviewer_subagent_id": reviewer_subagent_id.strip(),
+                    "subagent_conversation_ids": recorded_subagents,
+                    "review_markdown": slot2_md,
+                },
+                portfolio_dir=portfolio_dir,
+                repo_slug=resolved_repo_slug,
+                workdir=effective_repo_dir,
+                branch_name=resolved_branch,
+                slot_id=2,
+            )
+            if cid_clean:
+                with contextlib.suppress(Exception):
+                    update_dev_queue_item_status(
+                        conversation_id=cid_clean,
+                        status="in_progress",
+                        branch_names=[resolved_branch],
+                        strip_pr_urls_for_branches=[resolved_branch],
+                        strip_repo_slug=resolved_repo_slug,
+                        subagent_conversation_ids=recorded_subagents,
+                        notes=(
+                            f"Slot #2 passed {PR_REVIEWER_SUBAGENT_NAME} ({norm_verdict} {score_int}/100) locally; "
+                            f"{SLOT_STATUS_READY_AWAITING_BASE_MERGE} behind Slot #1 ({slot1_br})."
+                        ),
+                        portfolio_dir=portfolio_dir,
+                    )
+            return {
+                "status": "ok",
+                "vcs_mode": "native_git",
+                "repo_slug": resolved_repo_slug,
+                "slot_id": 2,
+                "branch_action": SLOT_STATUS_READY_AWAITING_BASE_MERGE,
+                "lock_status": SLOT_STATUS_READY_AWAITING_BASE_MERGE,
+                "awaiting_base_merge": True,
+                "notification_source": "Ad-Hoc",
+                "email_subject": "",
+                "created_by": created_by_label,
+                "branch_name": resolved_branch,
+                "branch_timestamp": resolved_ts,
+                "head_sha": head_sha,
+                "reviewed_head_sha": head_sha,
+                "branch_pushed": False,
+                "pr_gate_ready": False,
+                "ready_for_human_pr": False,
+                "needs_reiteration": False,
+                "circuit_breaker_tripped": False,
+                "review_iteration": current_iteration,
+                "max_review_iterations": MAX_PR_REVIEW_ITERATIONS,
+                "review_history": updated_history,
+                "manual_pr_url": "",
+                "pr_url": "",
+                "notification_target_url": "",
+                "pr_number": int(pr_number or 0),
+                "verdict": norm_verdict,
+                "score": score_int,
+                "review_markdown": slot2_md,
+                "notification_email_sent": False,
+                "pr_merge_watcher": {"status": "deferred_until_slot1_merge", "spawned": False},
+            }
 
         try:
             try:
@@ -5087,6 +6004,8 @@ def enqueue_dev_queue_item(
     source: str = "manual",
     blocked_by_lock_id: str = "",
     portfolio_dir: Path | str | None = None,
+    *,
+    section_anchors: list[str] | None = None,
 ) -> dict[str, Any]:
     """Upsert a development task entry into persistent `dev_queue.json` (`0600` + `file_lock`)."""
     cid_clean = str(conversation_id or "").strip()
@@ -5160,6 +6079,9 @@ def enqueue_dev_queue_item(
             "added_at": str(existing.get("added_at") or now_iso),
             "updated_at": now_iso,
         }
+        merged_anchors = _normalize_str_list([*(existing.get("section_anchors") or []), *(section_anchors or [])])
+        if merged_anchors:
+            item["section_anchors"] = merged_anchors
         if existing.get("merged_repos"):
             item["merged_repos"] = _normalize_str_list(
                 [dev_common.normalize_repo_slug(str(r)) for r in existing.get("merged_repos") or [] if str(r).strip()]
@@ -5194,6 +6116,7 @@ def _sync_active_lock_to_dev_queue(
     rca_summary: str = "",
     proposed_fix: str = "",
     target_files: list[str] | None = None,
+    section_anchors: list[str] | None = None,
     portfolio_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Ensure every active `dev_pr_lock` (including ad-hoc runs) is tracked in `dev_queue.json`."""
@@ -5213,6 +6136,7 @@ def _sync_active_lock_to_dev_queue(
         rca_summary=rca_summary,
         proposed_fix=proposed_fix,
         target_files=target_files,
+        section_anchors=section_anchors,
         branch_names=[branch_name] if str(branch_name or "").strip() else None,
         pr_urls=pr_urls,
         subagent_conversation_ids=subagent_conversation_ids,
@@ -6079,6 +7003,8 @@ def _auto_enqueue_blocked_task(
     repo_slugs: list[str] | None = None,
     blocked_by_lock_id: str = "",
     portfolio_dir: Path | str | None = None,
+    *,
+    section_anchors: list[str] | None = None,
 ) -> dict[str, Any]:
     """Best-effort deterministic enqueue when a repository lock blocks a concurrent remediation attempt."""
     try:
@@ -6091,6 +7017,7 @@ def _auto_enqueue_blocked_task(
             rca_summary=rca_summary,
             proposed_fix=proposed_fix,
             target_files=target_files,
+            section_anchors=section_anchors,
             source="auto_lock",
             blocked_by_lock_id=blocked_by_lock_id,
             portfolio_dir=portfolio_dir,
@@ -6105,7 +7032,7 @@ def get_next_dev_queue_item(
     *,
     skip_locked_repos: bool = False,
 ) -> dict[str, Any]:
-    """Return the highest-priority runnable item from `dev_queue.json`, skipping standby/HITL-blocked/unmet deps."""
+    """Return the highest-priority runnable item from `dev_queue.json`, including safe Slot #2 lookahead candidates."""
     if orchestrator_conversation_id.strip():
         set_dev_queue_orchestrator(orchestrator_conversation_id.strip(), portfolio_dir=portfolio_dir)
     data = load_dev_queue(portfolio_dir=portfolio_dir)
@@ -6129,6 +7056,19 @@ def get_next_dev_queue_item(
                 unmet.append(f"{dep_clean}({matched_st})")
         return unmet
 
+    def _lock_owns_cid(lock_obj: dict[str, Any], cid_val: str) -> bool:
+        act_cid = str(lock_obj.get("conversation_id") or "").strip()
+        act_sibs = [str(s).strip() for s in (lock_obj.get("sibling_conversation_ids") or [])]
+        if _matches_cid(act_cid, cid_val) or any(_matches_cid(s, cid_val) for s in act_sibs):
+            return True
+        s2 = lock_obj.get("slots", {}).get("2") if isinstance(lock_obj.get("slots"), dict) else None
+        if isinstance(s2, dict) and bool(s2.get("active", True)):
+            s2_cid = str(s2.get("conversation_id") or "").strip()
+            s2_sibs = [str(s).strip() for s in (s2.get("sibling_conversation_ids") or [])]
+            if _matches_cid(s2_cid, cid_val) or any(_matches_cid(s, cid_val) for s in s2_sibs):
+                return True
+        return False
+
     def _item_repo_schedule(item: dict[str, Any]) -> tuple[list[str], list[str], list[str], list[str]]:
         """Compute `(remaining_repos, dispatch_repos, foreign_locked, self_locked)` using contract-first ordering and subtracting `merged_repos`."""
         item_repos = _normalize_str_list(
@@ -6147,10 +7087,7 @@ def get_next_dev_queue_item(
             act = active_locks.get(rslug)
             if not act:
                 continue
-            act_cid = str(act.get("conversation_id") or "").strip()
-            act_sibs = [str(s).strip() for s in (act.get("sibling_conversation_ids") or [])]
-            is_owner = _matches_cid(act_cid, item_cid) or any(_matches_cid(s, item_cid) for s in act_sibs)
-            if is_owner:
+            if _lock_owns_cid(act, item_cid):
                 self_locked.append(rslug)
             else:
                 foreign_locked.append(rslug)
@@ -6171,10 +7108,52 @@ def get_next_dev_queue_item(
                 dispatch_repos.append(r)
         return (remaining_repos, dispatch_repos, foreign_locked, self_locked)
 
+    def _probe_slot2_lookahead(item: dict[str, Any], target_repo: str) -> tuple[bool, dict[str, Any], str]:
+        """Return `(eligible, slot2_annotation, blocked_reason)` for a pending item on a Slot-#1-locked repo."""
+        act = active_locks.get(target_repo)
+        if not isinstance(act, dict) or not bool(act.get("active")):
+            return (False, {}, "repo_not_locked")
+        max_slots = int(act.get("max_slots") or _resolve_max_repo_slots())
+        slots_map = act.get("slots") if isinstance(act.get("slots"), dict) else {}
+        if max_slots < 2 or ("2" in slots_map and bool(slots_map["2"].get("active", True))):
+            return (False, {}, "max_slots_occupied")
+        if str(item.get("status") or "pending").lower() != "pending":
+            return (False, {}, "item_not_pending")
+        if not (item.get("target_files") or item.get("section_anchors")):
+            return (False, {}, "candidate_unanchored")
+        if not (act.get("target_files") or act.get("section_anchors") or act.get("branch_name")):
+            return (False, {}, "slot1_unanchored")
+
+        r_dir = _resolve_lock_target_repo_dir(act) or _resolve_repo_dir_for_slug(target_repo, portfolio_dir=portfolio_dir)
+        slot1_spec = TaskAnchorSpec.from_mapping(act)
+        cand_spec = TaskAnchorSpec.from_mapping(item)
+        ov_res = analyze_pair_overlap(slot1_spec, cand_spec, repo_dir=r_dir)
+        if not ov_res.parallel_safe:
+            return (
+                False,
+                {"overlap_tier": ov_res.overlap_tier},
+                f"overlap_{ov_res.overlap_tier.lower()}",
+            )
+
+        annotated = dict(item)
+        annotated["target_slot"] = 2
+        annotated["slot_allocation"] = "slot_2_lookahead"
+        annotated["dispatch_repos"] = [target_repo]
+        annotated["overlap_tier"] = ov_res.overlap_tier
+        annotated["monolith_disjoint"] = ov_res.monolith_disjoint
+        annotated["requires_rebase_reverify"] = ov_res.requires_rebase_reverify
+        annotated["landing_order"] = list(ov_res.landing_order)
+        annotated["slot1_lock_id"] = str(act.get("lock_id") or "")
+        annotated["slot1_branch_name"] = str(act.get("branch_name") or "")
+        annotated["slot1_status"] = str(act.get("status") or "")
+        return (True, annotated, "")
+
     next_item: dict[str, Any] | None = None
     next_pending_item: dict[str, Any] | None = None
     next_unlocked_item: dict[str, Any] | None = None
     runnable_by_repo: dict[str, dict[str, Any]] = {}
+    slot2_candidates: list[dict[str, Any]] = []
+    slot2_by_repo: dict[str, dict[str, Any]] = {}
     blocked_deps: list[dict[str, Any]] = []
     blocked_repos: list[dict[str, Any]] = []
 
@@ -6197,13 +7176,35 @@ def get_next_dev_queue_item(
         is_contract_blocked = bool(remaining_repos and not dispatch_repos and foreign_locked)
 
         if is_contract_blocked:
-            blocked_repos.append(
-                {
-                    "conversation_id": it.get("conversation_id"),
-                    "title": it.get("title"),
-                    "locked_repos": foreign_locked,
-                }
+            first_repo = remaining_repos[0]
+            s2_ok, s2_annotated, s2_reason = (
+                _probe_slot2_lookahead(it, first_repo)
+                if first_repo not in slot2_by_repo
+                else (False, {}, "slot2_already_selected")
             )
+            if s2_ok:
+                slot2_candidates.append(s2_annotated)
+                slot2_by_repo[first_repo] = s2_annotated
+                if first_repo not in runnable_by_repo:
+                    runnable_by_repo[first_repo] = s2_annotated
+                if next_unlocked_item is None:
+                    next_unlocked_item = s2_annotated
+                if next_item is None:
+                    next_item = s2_annotated
+                if st == "pending" and next_pending_item is None:
+                    next_pending_item = s2_annotated
+                continue
+
+            blk_entry: dict[str, Any] = {
+                "conversation_id": it.get("conversation_id"),
+                "title": it.get("title"),
+                "locked_repos": foreign_locked,
+            }
+            if s2_annotated.get("overlap_tier"):
+                blk_entry["overlap_tier"] = s2_annotated["overlap_tier"]
+            if s2_reason:
+                blk_entry["slot2_blocked_reason"] = s2_reason
+            blocked_repos.append(blk_entry)
             if skip_locked_repos:
                 continue
         elif is_self_waiting:
@@ -6213,6 +7214,7 @@ def get_next_dev_queue_item(
         else:
             annotated = dict(it)
             if remaining_repos:
+                annotated["target_slot"] = 1
                 annotated["dispatch_repos"] = list(dispatch_repos)
                 annotated["partial_multi_repo_dispatch"] = bool(foreign_locked)
                 annotated["waiting_locked_repos"] = list(foreign_locked)
@@ -6242,6 +7244,8 @@ def get_next_dev_queue_item(
         "next_pending_item": next_pending_item,
         "next_unlocked_item": next_unlocked_item,
         "runnable_by_repo": runnable_by_repo,
+        "slot2_candidates": slot2_candidates,
+        "slot2_by_repo": slot2_by_repo,
         "locked_repos": locked_repos,
         "blocked_by_dependencies": blocked_deps,
         "blocked_by_repo_locks": blocked_repos,
@@ -6449,6 +7453,13 @@ def collect_protected_conversation_ids(
             for key in ("sibling_conversation_ids", "subagent_conversation_ids"):
                 for cid in active_lock.get(key) or []:
                     _protect(str(cid), "active_dev_pr_lock")
+            slots_prot = active_lock.get("slots") if isinstance(active_lock.get("slots"), dict) else {}
+            for s_obj in slots_prot.values():
+                if isinstance(s_obj, dict) and bool(s_obj.get("active", True)):
+                    _protect(str(s_obj.get("conversation_id") or ""), "active_dev_pr_lock")
+                    for key in ("sibling_conversation_ids", "subagent_conversation_ids"):
+                        for cid in s_obj.get(key) or []:
+                            _protect(str(cid), "active_dev_pr_lock")
     pending_t2 = audit_state.get("pending_tier2_proposals")
     if isinstance(pending_t2, dict):
         for cid in pending_t2:
@@ -6623,8 +7634,12 @@ def verify_branches_merged_into_base(
 
     for cand_lock in all_lock_entries:
         if cand_lock.get("active"):
-            lock_cid = str(cand_lock.get("conversation_id") or "")
-            if any(_matches_cid(c, lock_cid) for c in cids_clean):
+            lock_cids = [str(cand_lock.get("conversation_id") or "")]
+            s_map = cand_lock.get("slots") if isinstance(cand_lock.get("slots"), dict) else {}
+            for s_v in s_map.values():
+                if isinstance(s_v, dict) and bool(s_v.get("active", True)) and s_v.get("conversation_id"):
+                    lock_cids.append(str(s_v["conversation_id"]))
+            if any(_matches_cid(c, l_cid) for c in cids_clean for l_cid in lock_cids if l_cid):
                 return {
                     "all_merged": False,
                     "reason": "active_dev_pr_lock_still_held",
@@ -6895,6 +7910,532 @@ def get_branch_diff_with_verification_gate(
 
 
 # ==============================================================================
+# Parallel Subagents Phase 1: Overlap Analysis & 0-LLM Rebase-Reverify Gate
+# ==============================================================================
+
+
+def analyze_queue_or_tasks_overlap(
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    candidate_ids: list[str] | None = None,
+    files_a: list[str] | None = None,
+    files_b: list[str] | None = None,
+    anchors_a: list[str] | None = None,
+    anchors_b: list[str] | None = None,
+    tasks_json: str = "",
+    include_active_lock: bool = True,
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+) -> dict[str, Any]:
+    """Analyze 4-tier blast-radius overlap (`NONE`, `TRANSITIVE`, `INTERFACE_SHARED`, `DEEP_SHARED`) and `landing_order`."""
+    resolved_slug, resolved_dir = _resolve_repo_slug_and_dir(
+        repo_slug=repo_slug,
+        workdir=workdir,
+        git_client=git_client,
+        prefer_cwd=not bool(repo_slug or workdir),
+        portfolio_dir=portfolio_dir,
+    )
+    if resolved_dir is None and resolved_slug and resolved_slug != "default":
+        resolved_dir = _resolve_repo_dir_for_slug(resolved_slug, portfolio_dir=portfolio_dir, git_client=git_client)
+    main_repo_dir = _resolve_main_git_repo_root(resolved_dir) if resolved_dir is not None else None
+
+    if files_a or files_b:
+        spec_a = TaskAnchorSpec(
+            conversation_id="task-a",
+            title="Candidate A",
+            status="in_progress",
+            priority=10,
+            target_files=tuple(str(f).strip() for f in (files_a or []) if str(f).strip()),
+            section_anchors=tuple(str(a).strip() for a in (anchors_a or []) if str(a).strip()),
+        )
+        spec_b = TaskAnchorSpec(
+            conversation_id="task-b",
+            title="Candidate B",
+            status="pending",
+            priority=20,
+            target_files=tuple(str(f).strip() for f in (files_b or []) if str(f).strip()),
+            section_anchors=tuple(str(a).strip() for a in (anchors_b or []) if str(a).strip()),
+        )
+        pair_res = analyze_pair_overlap(spec_a, spec_b, repo_dir=main_repo_dir)
+        batch_res = analyze_candidates_overlap([spec_a, spec_b], repo_dir=main_repo_dir, primary_slot_id="task-a")
+        return {
+            "status": "ok",
+            "mode": "direct_pair",
+            "repo_slug": resolved_slug,
+            "overlap_tier": pair_res.overlap_tier,
+            "parallel_safe": pair_res.parallel_safe,
+            "monolith_disjoint": pair_res.monolith_disjoint,
+            "requires_rebase_reverify": pair_res.requires_rebase_reverify,
+            "landing_order": list(pair_res.landing_order),
+            "pair": pair_res.to_dict(),
+            "batch": batch_res.to_dict(),
+        }
+
+    if tasks_json.strip():
+        try:
+            parsed_tasks = json.loads(tasks_json)
+        except json.JSONDecodeError as exc:
+            return {"status": "error", "error": f"Invalid --tasks-json payload: {exc}"}
+        if not isinstance(parsed_tasks, list) or len(parsed_tasks) < 1:
+            return {"status": "error", "error": "--tasks-json must be a non-empty JSON array of task objects."}
+        batch_res = analyze_candidates_overlap(parsed_tasks, repo_dir=main_repo_dir)
+        out = batch_res.to_dict()
+        out["mode"] = "tasks_json"
+        out["repo_slug"] = resolved_slug
+        if len(batch_res.pairwise) == 1:
+            p0 = batch_res.pairwise[0]
+            out["overlap_tier"] = p0.overlap_tier
+            out["parallel_safe"] = p0.parallel_safe
+            out["monolith_disjoint"] = p0.monolith_disjoint
+        return out
+
+    tasks_list: list[TaskAnchorSpec] = []
+    primary_cid = ""
+    if include_active_lock:
+        act_lock = get_dev_pr_lock(portfolio_dir=portfolio_dir, repo_slug=resolved_slug, workdir=workdir)
+        if act_lock.get("active"):
+            primary_cid = str(act_lock.get("conversation_id") or "")
+            tasks_list.append(TaskAnchorSpec.from_mapping(act_lock))
+            s2_lk = act_lock.get("slots", {}).get("2") if isinstance(act_lock.get("slots"), dict) else None
+            if isinstance(s2_lk, dict) and bool(s2_lk.get("active", True)):
+                tasks_list.append(TaskAnchorSpec.from_mapping(s2_lk))
+
+    q_data = load_dev_queue(portfolio_dir=portfolio_dir)
+    filter_ids = [str(c).strip() for c in (candidate_ids or []) if str(c).strip()]
+    seen_cids = {t.conversation_id for t in tasks_list if t.conversation_id}
+    for it in q_data.get("items") or []:
+        cid_it = str(it.get("conversation_id") or "").strip()
+        if not cid_it or any(_matches_cid(cid_it, sc) for sc in seen_cids):
+            continue
+        if filter_ids:
+            if not any(_matches_cid(cid_it, fid) for fid in filter_ids):
+                continue
+        else:
+            st_it = str(it.get("status") or "").lower()
+            if st_it not in ("pending", "in_progress", "pr_open"):
+                continue
+            item_repos = [dev_common.normalize_repo_slug(str(r)) for r in (it.get("repo_slugs") or []) if str(r).strip()]
+            if resolved_slug and resolved_slug != "default" and item_repos and resolved_slug not in item_repos:
+                continue
+        seen_cids.add(cid_it)
+        tasks_list.append(TaskAnchorSpec.from_mapping(it))
+
+    batch_res = analyze_candidates_overlap(tasks_list, repo_dir=main_repo_dir, primary_slot_id=primary_cid)
+    out = batch_res.to_dict()
+    out["mode"] = "queue_and_locks"
+    out["repo_slug"] = resolved_slug
+    out["primary_slot_id"] = primary_cid
+    if len(batch_res.pairwise) == 1:
+        p0 = batch_res.pairwise[0]
+        out["overlap_tier"] = p0.overlap_tier
+        out["parallel_safe"] = p0.parallel_safe
+        out["monolith_disjoint"] = p0.monolith_disjoint
+    return out
+
+
+def run_slot_rebase_reverify(
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    branch_name: str = "",
+    base_branch: str = "main",
+    fetch: bool = False,
+    send_email: bool = False,
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+    verify_fn: Any | None = None,
+) -> dict[str, Any]:
+    """Invoke `rebase_gate.rebase_and_reverify` for an active slot and transition lock/queue state deterministically.
+
+    - `AUTO_PROMOTED_ZERO_LLM`: if Slot #1 already passed independent review (`review_approved` or `PASS >= 91`),
+      amends HEAD commit metadata, pushes `origin/<branch>`, publishes `manual_pr_url`, transitions lock to
+      `PENDING_HUMAN_PR_VALIDATION` and queue to `pr_open` with 0 LLM tokens!
+    - `NEEDS_AGENT_SEMANTIC_FIX`: records `NEEDS_AGENT_SEMANTIC_FIX` + `merged_a_diff` + `developer_remediation_plan`.
+    - `NEEDS_AGENT_CONFLICT_RESOLUTION`: clean `git rebase --abort`, records `NEEDS_AGENT_CONFLICT_RESOLUTION` + conflicted files.
+    """
+    vcs = git_client or GitVcsIntegrationClient()
+    lock_info = get_dev_pr_lock(
+        portfolio_dir=portfolio_dir,
+        repo_slug=repo_slug,
+        workdir=workdir,
+        branch_name=branch_name,
+    )
+    if not lock_info.get("active"):
+        return {
+            "status": "error",
+            "error": "No active dev_pr_lock found for rebase-reverify.",
+        }
+
+    slot_num = int(lock_info.get("slot_id") or 1)
+    resolved_branch = branch_name.strip() or str(lock_info.get("branch_name") or "").strip()
+    resolved_ts = str(lock_info.get("branch_timestamp") or "").strip() or generate_branch_timestamp()
+    resolved_slug = dev_common.normalize_repo_slug(
+        repo_slug or str(lock_info.get("repo_slug") or lock_info.get("repo") or "")
+    )
+    cid_clean = str(lock_info.get("conversation_id") or "").strip()
+    act_id = str(lock_info.get("action_id") or "").strip()
+    recorded_base_sha = str(lock_info.get("base_sha") or "").strip()
+
+    wt_raw = str(workdir or lock_info.get("worktree_path") or "").strip()
+    wt_cand = Path(wt_raw.replace("$HOME", str(Path.home()))).expanduser() if wt_raw else None
+    lock_main_dir = _resolve_lock_target_repo_dir(lock_info)
+    target_dir: Path | None = None
+    if wt_cand is not None and wt_cand.exists():
+        target_dir = _find_git_root_from_path(wt_cand) or wt_cand.resolve()
+    elif lock_main_dir is not None and (lock_main_dir / ".git").exists():
+        target_dir = lock_main_dir
+    elif resolved_slug and resolved_slug != "default":
+        target_dir = _resolve_repo_dir_for_slug(resolved_slug, portfolio_dir=portfolio_dir, git_client=git_client)
+
+    if target_dir is None or not (target_dir / ".git").exists():
+        return {
+            "status": "error",
+            "branch_name": resolved_branch,
+            "error": f"Git repository or worktree not found for `{resolved_branch}`.",
+        }
+
+    def _restamp_if_manifest_touched(eff_wt: Path, touched_b: list[str]) -> None:
+        manifest_names = {"plugin.json", "pyproject.toml", "api/__init__.py"}
+        if not (set(touched_b) & manifest_names):
+            return
+        stamp_res = stamp_repo_version_manifests(eff_wt, branch_timestamp=resolved_ts, force=True)
+        if stamp_res.get("updated"):
+            subprocess.run(
+                ["git", "-C", str(eff_wt), "add", *(stamp_res.get("updated_files") or [])],
+                env=_clean_git_subprocess_env(),
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            subprocess.run(
+                ["git", "-C", str(eff_wt), "commit", "--amend", "--no-edit", "--no-verify"],
+                env=_clean_git_subprocess_env(),
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+
+    rb_res = rebase_and_reverify(
+        target_dir,
+        branch_name=resolved_branch,
+        recorded_base_sha=recorded_base_sha,
+        base_branch=base_branch,
+        fetch=fetch,
+        verify_fn=verify_fn,
+        restamp_fn=_restamp_if_manifest_touched,
+    )
+    if rb_res.status != "ok":
+        return rb_res.to_dict()
+
+    outcome = rb_res.outcome
+    rca_summary = str(lock_info.get("summary") or "")
+    proposed_fix = str(lock_info.get("proposed_fix") or "")
+    exec_summary = str(lock_info.get("executive_summary") or proposed_fix or rca_summary)
+    proposal_title = str(lock_info.get("proposal_title") or "").strip() or format_remediation_commit_title(
+        f"update {act_id or resolved_branch}",
+        action_id=act_id,
+        conversation_id=cid_clean,
+        branch_timestamp=resolved_ts,
+    )
+
+    if outcome == OUTCOME_AUTO_PROMOTED:
+        was_review_approved = bool(lock_info.get("review_approved")) or (
+            str(lock_info.get("reviewer_verdict") or "").upper() == "PASS"
+            and int(lock_info.get("reviewer_score") or 0) >= PR_REVIEW_PASS_MIN_SCORE
+        )
+        # Promote directly to open human PR when this is Slot #1 and review already passed!
+        if slot_num == 1 and was_review_approved:
+            rev_score = int(lock_info.get("reviewer_score") or 95)
+            rev_summary = str(lock_info.get("reviewer_summary") or "Validated prior to 0-LLM base rebase-reverify.")
+            rev_sub_id = str(lock_info.get("reviewer_subagent_id") or "")
+            rev_iter = max(1, int(lock_info.get("review_iteration") or 1))
+            eff_wt_path = _resolve_worktree_for_branch(target_dir, resolved_branch) or target_dir
+            stamp_promo = stamp_repo_version_manifests(eff_wt_path, branch_timestamp=resolved_ts, force=True)
+            if stamp_promo.get("updated"):
+                subprocess.run(
+                    ["git", "-C", str(eff_wt_path), "add", *(stamp_promo.get("updated_files") or [])],
+                    env=_clean_git_subprocess_env(),
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+            diff_info = vcs.get_branch_diff(head_branch=resolved_branch, base_branch=base_branch, repo_dir=eff_wt_path)
+            files_changed = list(diff_info.get("files") or [])
+            canonical_body = build_canonical_pr_description(
+                commit_title=proposal_title,
+                executive_summary=exec_summary,
+                rca_summary=rca_summary,
+                proposed_fix=proposed_fix,
+                branch_name=resolved_branch,
+                branch_timestamp=resolved_ts,
+                conversation_id=cid_clean,
+                files_changed=files_changed,
+                verification_results=rb_res.verification_results,
+                reviewer_verdict="PASS",
+                reviewer_score=rev_score,
+                reviewer_summary=rev_summary,
+                reviewer_subagent_id=rev_sub_id,
+                review_iteration=rev_iter,
+                max_review_iterations=MAX_PR_REVIEW_ITERATIONS,
+            )
+            amend_res = _sync_branch_head_commit_message_detailed(
+                target_repo_dir=eff_wt_path,
+                branch_name=resolved_branch,
+                base_branch=base_branch,
+                commit_title=proposal_title,
+                commit_body=canonical_body,
+            )
+            if not amend_res.get("amended"):
+                return {
+                    "status": "error",
+                    "step": "amend_rebased_commit",
+                    "outcome": outcome,
+                    "error": str(amend_res.get("error") or "Failed to amend rebased commit message."),
+                }
+            final_head_sha = str(amend_res.get("head_sha") or rb_res.new_head_sha)
+            eff_push_dir = amend_res.get("effective_repo_dir") if isinstance(amend_res.get("effective_repo_dir"), Path) else eff_wt_path
+            updated_vr = {**rb_res.verification_results, "head_sha": final_head_sha, "dirty": False}
+
+            try:
+                push_res = vcs.push_branch(
+                    branch_name=resolved_branch,
+                    remote="origin",
+                    base_branch=base_branch,
+                    set_upstream=True,
+                    force_with_lease=True,
+                    title=proposal_title,
+                    body=canonical_body,
+                    repo_dir=eff_push_dir,
+                )
+            except TypeError:
+                push_res = vcs.push_branch(
+                    branch_name=resolved_branch,
+                    remote="origin",
+                    base_branch=base_branch,
+                    set_upstream=True,
+                    repo_dir=eff_push_dir,
+                )
+            if not isinstance(push_res, dict) or push_res.get("status") != "ok":
+                return {
+                    "status": "error",
+                    "step": "push_promoted_branch",
+                    "outcome": outcome,
+                    "error": str((push_res or {}).get("error") or f"Failed to push promoted branch '{resolved_branch}'."),
+                }
+
+            final_head_sha = str(push_res.get("head_sha") or final_head_sha)
+            try:
+                manual_pr_url = vcs.build_manual_pr_url(
+                    head_branch=resolved_branch,
+                    base_branch=base_branch,
+                    title=proposal_title,
+                    body=canonical_body,
+                    repo_dir=eff_push_dir,
+                )
+            except TypeError:
+                manual_pr_url = vcs.build_manual_pr_url(head_branch=resolved_branch, base_branch=base_branch)
+
+            now_iso = _utc_now_iso()
+            persistent_root = _resolve_main_git_repo_root(eff_push_dir)
+            raw_rb = lock_info.get("repo_branches") if isinstance(lock_info.get("repo_branches"), dict) else {}
+            upd_rb = {str(k): dict(v) for k, v in raw_rb.items() if str(k).strip() and isinstance(v, dict)}
+            if resolved_slug:
+                upd_rb[resolved_slug] = {
+                    "repo_slug": resolved_slug,
+                    "branch_name": resolved_branch,
+                    "branch_timestamp": resolved_ts,
+                    "target_repo_dir": _sanitize_home_paths(str(persistent_root)),
+                    "manual_pr_url": manual_pr_url,
+                    "branch_pushed": True,
+                    "head_sha": final_head_sha,
+                    "updated_at": now_iso,
+                }
+
+            update_dev_pr_lock(
+                {
+                    "status": "PENDING_HUMAN_PR_VALIDATION",
+                    "branch_action": OUTCOME_AUTO_PROMOTED,
+                    "base_sha": rb_res.new_base_sha,
+                    "head_sha": final_head_sha,
+                    "reviewed_head_sha": final_head_sha,
+                    "approved_head_sha": final_head_sha,
+                    "branch_pushed": True,
+                    "pr_gate_ready": True,
+                    "needs_base_rebase": False,
+                    "manual_pr_url": manual_pr_url,
+                    "pr_url": manual_pr_url,
+                    "repo_branches": upd_rb,
+                    "proposal_body": canonical_body,
+                    "verification_results": updated_vr,
+                    "rebase_outcome": OUTCOME_AUTO_PROMOTED,
+                    "last_rebase_result": rb_res.to_dict(),
+                },
+                portfolio_dir=portfolio_dir,
+                repo_slug=resolved_slug,
+                workdir=eff_push_dir,
+                branch_name=resolved_branch,
+                slot_id=1,
+            )
+            if cid_clean:
+                with contextlib.suppress(Exception):
+                    update_dev_queue_item_status(
+                        conversation_id=cid_clean,
+                        status="pr_open",
+                        branch_names=[resolved_branch],
+                        pr_urls=[manual_pr_url],
+                        notes=f"Auto-promoted via 0-LLM rebase-reverify onto {rb_res.new_base_sha[:8]}.",
+                        portfolio_dir=portfolio_dir,
+                    )
+
+            email_sent = False
+            if send_email or bool(lock_info.get("deferred_send_email")):
+                repo_name = resolved_slug.split("/")[-1] if resolved_slug and resolved_slug != "default" else eff_push_dir.name
+                subj_sum = _format_pr_notification_subject_summary(proposal_title, exec_summary, resolved_branch)
+                email_subj = f"PR Ready for Validation [{repo_name}]: {subj_sum} (PASS {rev_score}/100)"
+                notif_url = _git_client.build_vcs_pr_notification_url(
+                    branch_name=resolved_branch,
+                    base_branch=base_branch,
+                    pr_url=manual_pr_url,
+                    repo_slug=resolved_slug,
+                )
+                n_res = dev_common.try_send_branch_review_notification(
+                    status="OK",
+                    subject=email_subj,
+                    body=canonical_body,
+                    conversation_id=cid_clean or resolved_ts,
+                    validator=f"{PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL}) [PASS {rev_score}/100 · 0-LLM Rebase Promoted]",
+                    branch_name=resolved_branch,
+                    target_url=notif_url,
+                    errors_only_override=False,
+                )
+                email_sent = bool(n_res.get("sent"))
+
+            watcher_res = spawn_pr_merge_watcher_daemon(portfolio_dir=portfolio_dir)
+            return {
+                **rb_res.to_dict(),
+                "slot_id": 1,
+                "promoted_to_human_pr": True,
+                "ready_for_human_pr": True,
+                "pr_gate_ready": True,
+                "branch_pushed": True,
+                "head_sha": final_head_sha,
+                "manual_pr_url": manual_pr_url,
+                "pr_url": manual_pr_url,
+                "notification_email_sent": email_sent,
+                "pr_merge_watcher": watcher_res,
+            }
+
+        next_st = (
+            SLOT_STATUS_READY_AWAITING_BASE_MERGE
+            if (slot_num == 2 and was_review_approved)
+            else str(lock_info.get("status") or "DEVELOPING")
+        )
+        if next_st == SLOT_STATUS_NEEDS_REBASE_REVERIFY:
+            next_st = "DEVELOPING"
+        update_dev_pr_lock(
+            {
+                "status": next_st,
+                "base_sha": rb_res.new_base_sha,
+                "head_sha": rb_res.new_head_sha,
+                "needs_base_rebase": False,
+                "verification_results": rb_res.verification_results,
+                "rebase_outcome": OUTCOME_AUTO_PROMOTED,
+                "last_rebase_result": rb_res.to_dict(),
+            },
+            portfolio_dir=portfolio_dir,
+            repo_slug=resolved_slug,
+            workdir=target_dir,
+            branch_name=resolved_branch,
+            slot_id=slot_num,
+        )
+        return {
+            **rb_res.to_dict(),
+            "slot_id": slot_num,
+            "promoted_to_human_pr": False,
+            "ready_for_human_pr": False,
+            "pr_gate_ready": False,
+            "branch_pushed": False,
+            "manual_pr_url": "",
+        }
+
+    # Needs agent intervention (`NEEDS_AGENT_SEMANTIC_FIX` or `NEEDS_AGENT_CONFLICT_RESOLUTION`)
+    next_lock_status = (
+        SLOT_STATUS_NEEDS_AGENT_SEMANTIC_FIX
+        if outcome == OUTCOME_NEEDS_SEMANTIC_FIX
+        else SLOT_STATUS_NEEDS_AGENT_CONFLICT_RESOLUTION
+    )
+    feedback_ctx = (
+        f"Post-merge rebase-reverify returned `{outcome}`.\n"
+        + (f"- Conflicted Files: `{', '.join(rb_res.conflicted_files)}`\n" if rb_res.conflicted_files else "")
+        + f"- Cross-Impact Union Files (`files(B) ∪ files(merged_A)`): `{', '.join(rb_res.union_files)}`\n"
+        + (f"- Merged Slot #1 Commits:\n" + "\n".join(f"  * {c}" for c in rb_res.merged_a_commits) + "\n" if rb_res.merged_a_commits else "")
+        + (f"- Verification / Conflict Details:\n{rb_res.failure_details[:2000]}\n" if rb_res.failure_details else "")
+        + (f"- Merged Slot #1 Diff Excerpt:\n```diff\n{rb_res.merged_a_diff[:4000]}\n```\n" if rb_res.merged_a_diff else "")
+    )
+    dev_plan = _build_developer_remediation_plan(
+        conversation_id=cid_clean or resolved_ts,
+        action_id=act_id,
+        repo_slug=resolved_slug,
+        branch_name=resolved_branch,
+        workdir=str(target_dir),
+        review_iteration=max(1, int(lock_info.get("review_iteration") or 1)),
+        verdict="NEEDS_REVISION",
+        score=0,
+        reviewer_feedback=feedback_ctx,
+        rca_summary=rca_summary,
+        proposed_fix=proposed_fix,
+        target_files=list(rb_res.union_files or lock_info.get("target_files") or []),
+    )
+    upd_fields: dict[str, Any] = {
+        "status": next_lock_status,
+        "branch_action": next_lock_status,
+        "review_approved": False,
+        "pr_gate_ready": False,
+        "branch_pushed": False,
+        "manual_pr_url": "",
+        "pr_url": "",
+        "rebase_outcome": outcome,
+        "last_rebase_result": rb_res.to_dict(),
+    }
+    if outcome == OUTCOME_NEEDS_SEMANTIC_FIX:
+        upd_fields["base_sha"] = rb_res.new_base_sha
+        upd_fields["head_sha"] = rb_res.new_head_sha
+        upd_fields["verification_results"] = rb_res.verification_results
+    update_dev_pr_lock(
+        upd_fields,
+        portfolio_dir=portfolio_dir,
+        repo_slug=resolved_slug,
+        workdir=target_dir,
+        branch_name=resolved_branch,
+        slot_id=slot_num,
+    )
+    if cid_clean:
+        with contextlib.suppress(Exception):
+            update_dev_queue_item_status(
+                conversation_id=cid_clean,
+                status="in_progress",
+                branch_names=[resolved_branch],
+                strip_pr_urls_for_branches=[resolved_branch],
+                strip_repo_slug=resolved_slug,
+                notes=f"Rebase-reverify returned {outcome}; awaiting targeted developer remediation.",
+                portfolio_dir=portfolio_dir,
+            )
+
+    return {
+        **rb_res.to_dict(),
+        "slot_id": slot_num,
+        "lock_status": next_lock_status,
+        "promoted_to_human_pr": False,
+        "ready_for_human_pr": False,
+        "pr_gate_ready": False,
+        "branch_pushed": False,
+        "manual_pr_url": "",
+        "developer_remediation_plan": dev_plan,
+    }
+
+
+# ==============================================================================
 # CLI Entrypoint (`pr_remediator.py`)
 # ==============================================================================
 
@@ -6927,9 +8468,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_acq.add_argument("--timestamp", default="", help="Canonical branch timestamp (YYYYMMDD-HHMMSS).")
     p_acq.add_argument("--summary", default="", help="RCA / change summary.")
     p_acq.add_argument("--proposed-fix", default="", help="Proposed fix summary.")
+    p_acq.add_argument("--target-files", nargs="*", default=[], help="Optional target file paths.")
+    p_acq.add_argument("--section-anchors", nargs="*", default=[], help="Optional section/symbol/line anchors.")
     p_acq.add_argument("--sibling-ids", nargs="*", default=[], help="Optional sibling Conversation IDs.")
     p_acq.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
     p_acq.add_argument("--workdir", default="", help="Optional target repository directory.")
+    p_acq.add_argument("--allow-slot2", "--parallel-slot", dest="allow_slot2", action="store_true", help="Allow acquiring parallel Slot #2 when overlap check passes.")
     p_acq.add_argument("--scheduled", action="store_true", help="Mark as scheduled run.")
 
     p_rel = sub.add_parser("release-lock", help="Release/delete a per-repository branch development lock.")
@@ -6972,6 +8516,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_start.add_argument("--rca-summary", default="", help="Root Cause Analysis or prompt change rationale.")
     p_start.add_argument("--proposed-fix", default="", help="Proposed solution description.")
     p_start.add_argument("--target-files", nargs="*", default=[], help="Affected files.")
+    p_start.add_argument("--section-anchors", nargs="*", default=[], help="Optional section/symbol/line anchors for monolith disjointness.")
     p_start.add_argument("--sibling-ids", nargs="*", default=[], help="Grouped sibling Conversation IDs.")
     p_start.add_argument("--timestamp", default="", help="Optional explicit timestamp (YYYYMMDD-HHMMSS).")
     p_start.add_argument("--scheduled", action="store_true", help="Mark as scheduled run.")
@@ -6979,6 +8524,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_start.add_argument("--checkout", action="store_true", help="Checkout the timestamped branch directly in the local repository.")
     p_start.add_argument("--workdir", default="", help="Optional target repository directory (defaults to active cwd repo or AGY_CONF_REPO_DIR).")
     p_start.add_argument("--worker-cid", dest="worker_cid", default="", help="Optional active worker subagent conversation ID for stall monitoring.")
+    p_start.add_argument("--allow-slot2", "--parallel-slot", dest="allow_slot2", action="store_true", help="Allow allocating parallel Slot #2 when overlap check passes.")
     p_start.add_argument(
         "--reuse-active",
         "--continue-active",
@@ -7093,6 +8639,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_qadd.add_argument("--rca-summary", default="", help="RCA summary.")
     p_qadd.add_argument("--proposed-fix", default="", help="Proposed fix summary.")
     p_qadd.add_argument("--target-files", nargs="*", default=[], help="Target file paths.")
+    p_qadd.add_argument("--section-anchors", nargs="*", default=[], help="Optional section/symbol/line anchors.")
     p_qadd.add_argument("--branches", nargs="*", default=[], help="Associated branch names.")
     p_qadd.add_argument("--pr-urls", nargs="*", default=[], help="Associated PR or Compare URLs.")
     p_qadd.add_argument("--notes", default="", help="Orchestrator notes.")
@@ -7162,6 +8709,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_clean.add_argument("--skip-unaudited-check", action="store_true", help="Skip conversation_analyzer check-unaudited lookup (useful in isolated tests).")
     p_clean.add_argument("--dry-run", action="store_true", help="Preview candidates and freed MB without deleting files.")
 
+    p_ov = sub.add_parser(
+        "analyze-overlap",
+        help="0-LLM AST/section blast-radius overlap & landing-order analyzer across active Slot #1 and candidate tasks.",
+    )
+    p_ov.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
+    p_ov.add_argument("--workdir", default="", help="Optional target repository directory.")
+    p_ov.add_argument("--id", "--ids", dest="candidate_ids", nargs="*", default=[], help="Optional candidate queue conversation IDs.")
+    p_ov.add_argument("--files-a", nargs="*", default=[], help="Direct pair mode: target files for Task A.")
+    p_ov.add_argument("--anchors-a", nargs="*", default=[], help="Direct pair mode: section/symbol/line anchors for Task A.")
+    p_ov.add_argument("--files-b", nargs="*", default=[], help="Direct pair mode: target files for Task B.")
+    p_ov.add_argument("--anchors-b", nargs="*", default=[], help="Direct pair mode: section/symbol/line anchors for Task B.")
+    p_ov.add_argument("--tasks-json", default="", help="Optional JSON array of task objects for batch overlap analysis.")
+    p_ov.add_argument("--no-active-lock", dest="no_active_lock", action="store_true", help="Exclude active repository lock from queue overlap scan.")
+
+    p_rbr = sub.add_parser(
+        "rebase-reverify",
+        help="0-LLM post-merge rebase & cross-impact re-verification gate (`AUTO_PROMOTED_ZERO_LLM`, `NEEDS_AGENT_SEMANTIC_FIX`, `NEEDS_AGENT_CONFLICT_RESOLUTION`).",
+    )
+    p_rbr.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
+    p_rbr.add_argument("--workdir", default="", help="Optional worktree or repository directory.")
+    p_rbr.add_argument("--branch", default="", help="Optional branch name (defaults to locked slot branch).")
+    p_rbr.add_argument("--base", default="main", help="Base branch name (default: main).")
+    p_rbr.add_argument("--fetch", action="store_true", help="Fetch origin before rebasing.")
+    p_rbr.add_argument("--send-email", action="store_true", help="Send Ready-for-PR notification email when auto-promoted to Slot #1 human PR.")
+
     return parser.parse_args(argv)
 
 
@@ -7195,10 +8767,13 @@ def main(argv: list[str] | None = None) -> int:
             branch_timestamp=args.timestamp,
             summary=args.summary,
             proposed_fix=args.proposed_fix,
+            target_files=getattr(args, "target_files", []) or None,
             sibling_ids=args.sibling_ids,
             scheduled=getattr(args, "scheduled", False),
             repo_slug=getattr(args, "repo_slug", ""),
             workdir=getattr(args, "workdir", "") or None,
+            section_anchors=getattr(args, "section_anchors", []) or None,
+            allow_slot2=bool(getattr(args, "allow_slot2", False)),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("acquired") else 1
@@ -7258,6 +8833,8 @@ def main(argv: list[str] | None = None) -> int:
             scheduled=getattr(args, "scheduled", False),
             workdir=getattr(args, "workdir", "") or None,
             worker_cid=getattr(args, "worker_cid", ""),
+            section_anchors=getattr(args, "section_anchors", []) or None,
+            allow_slot2=bool(getattr(args, "allow_slot2", False)),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
@@ -7383,6 +8960,7 @@ def main(argv: list[str] | None = None) -> int:
             rca_summary=args.rca_summary,
             proposed_fix=args.proposed_fix,
             target_files=args.target_files,
+            section_anchors=getattr(args, "section_anchors", []) or None,
             branch_names=args.branches,
             pr_urls=args.pr_urls,
             notes=args.notes,
@@ -7470,6 +9048,33 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(c_res, indent=2, ensure_ascii=False))
         return 0 if c_res.get("status") == "ok" else 1
+
+    if args.subcommand == "analyze-overlap":
+        ov_res = analyze_queue_or_tasks_overlap(
+            repo_slug=getattr(args, "repo_slug", ""),
+            workdir=getattr(args, "workdir", "") or None,
+            candidate_ids=list(getattr(args, "candidate_ids", []) or []) or None,
+            files_a=list(getattr(args, "files_a", []) or []) or None,
+            files_b=list(getattr(args, "files_b", []) or []) or None,
+            anchors_a=list(getattr(args, "anchors_a", []) or []) or None,
+            anchors_b=list(getattr(args, "anchors_b", []) or []) or None,
+            tasks_json=str(getattr(args, "tasks_json", "") or ""),
+            include_active_lock=not bool(getattr(args, "no_active_lock", False)),
+        )
+        print(json.dumps(ov_res, indent=2, ensure_ascii=False))
+        return 0 if ov_res.get("status") == "ok" else 1
+
+    if args.subcommand == "rebase-reverify":
+        rbr_res = run_slot_rebase_reverify(
+            repo_slug=getattr(args, "repo_slug", ""),
+            workdir=getattr(args, "workdir", "") or None,
+            branch_name=str(getattr(args, "branch", "") or ""),
+            base_branch=str(getattr(args, "base", "main") or "main"),
+            fetch=bool(getattr(args, "fetch", False)),
+            send_email=bool(getattr(args, "send_email", False)),
+        )
+        print(json.dumps(rbr_res, indent=2, ensure_ascii=False))
+        return 0 if rbr_res.get("status") == "ok" else 1
 
     parse_args(["--help"])
     return 0
