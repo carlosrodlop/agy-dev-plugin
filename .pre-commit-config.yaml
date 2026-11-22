@@ -43,4 +43,4 @@ repos:
         entry: bash -c 'if command -v bats >/dev/null 2>&1; then env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR -u GIT_PREFIX bats tests/bats/*.bats; else echo "bats not installed; skipping"; fi'
         language: system
         pass_filenames: false
-        files: '(\.sh|\.bats|\.pre-commit-config\.ya?ml|hooks\.json|plugin\.json|agents/.*\.md|sidecars/.*|(dev_common|git_client|pr_remediator|project_audit|dev_queue_tui)\.py)$'
+        files: '(\.sh|\.bats|\.pre-commit-config\.ya?ml|hooks\.json|plugin\.json|agents/.*\.md|sidecars/.*|(dev_common|git_client|pr_remediator|dev_flow_optimizer|dev_queue_doctor|parallel_scope|rebase_gate|project_audit|dev_queue_tui)\.py)$'

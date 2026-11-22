@@ -5,20 +5,45 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
   coverage:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    env:
+      AGY_OFFLINE_ONLY: "1"
+      PRE_COMMIT_HOOK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
-      - name: Install dev test dependencies
-        run: python3 -m pip install --upgrade pip pytest pytest-cov
-      - name: Run pytest with coverage
-        run: python3 -m pytest tests/ --cov=clients --cov=skills --cov-report=term-missing
+          cache: "pip"
+          cache-dependency-path: pyproject.toml
+      - name: Install dev test & coverage dependencies
+        run: python3 -m pip install --upgrade pip pyyaml pytest pytest-cov coverage
+      - name: Run pytest with coverage & publish Markdown summary
+        run: |
+          python3 -m pytest tests/ \
+            --cov=clients \
+            --cov=skills \
+            --cov=sidecars \
+            --cov=tests/scripts \
+            --cov-report=term-missing \
+            --cov-fail-under=75
+          {
+            echo "## 🧪 Hermetic Offline Coverage Report (\`>= 75%\` Gate)"
+            echo ""
+            python3 -m coverage report --format=markdown
+          } >> "$GITHUB_STEP_SUMMARY"
