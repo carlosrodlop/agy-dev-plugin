@@ -6188,6 +6188,9 @@ DEV_QUEUE_STATUSES: tuple[str, ...] = (
 )
 DEV_QUEUE_DONE_STATUSES: tuple[str, ...] = ("merged", "cleaned", "rejected", "cancelled")
 DEV_QUEUE_HOLD_STATUSES: tuple[str, ...] = ("standby", "hitl_blocked")
+DEV_QUEUE_OPEN_STATUSES: frozenset[str] = frozenset({"pending", "in_progress", "pr_open", "hitl_blocked"})
+INFRA_PRIORITY_PRECEDENCE_MAX = 17
+DEFAULT_MAX_PARTIAL_WIP = 3
 DEV_QUEUE_STATUS_RANK: dict[str, int] = {
     "in_progress": 0,
     "pr_open": 1,
@@ -6275,19 +6278,130 @@ def _find_queue_item_index(items: list[dict[str, Any]], conversation_id: str) ->
     return -1
 
 
+def _raw_queue_priority(item: Mapping[str, Any]) -> int:
+    """Extract raw numeric priority from a queue item (default `50`)."""
+    try:
+        val = item.get("priority", 50)
+        return int(val) if val is not None else 50
+    except (TypeError, ValueError):
+        return 50
+
+
+def _resolve_prioritize_partial_wip() -> bool:
+    """Return True when `AGY_DEV_PRIORITIZE_PARTIAL_WIP` enables 50% WIP-finish boost (default `1`)."""
+    raw = str(os.environ.get("AGY_DEV_PRIORITIZE_PARTIAL_WIP", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _resolve_max_partial_wip() -> int:
+    """Resolve `AGY_DEV_MAX_PARTIAL_WIP` cap for half-merged downstream WIP (default `3`)."""
+    raw = str(os.environ.get("AGY_DEV_MAX_PARTIAL_WIP") or "").strip()
+    if raw:
+        with contextlib.suppress(TypeError, ValueError):
+            parsed = int(raw)
+            if parsed >= 0:
+                return parsed
+    return DEFAULT_MAX_PARTIAL_WIP
+
+
+def compute_effective_priorities(items: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Compute cycle-safe transitive `effective_priority` across open queue items.
+
+    For every open item, `effective_priority` is the minimum of its own `priority` and all
+    transitive open dependents' priorities (`depends_on` reverse reachability), breaking any
+    dependency cycle via explicit per-source `visited` sets without recursion. Raw `priority`
+    is strictly preserved while `effective_priority` and `inherited_priority_from` are stamped.
+    """
+    copied: list[dict[str, Any]] = [dict(it) for it in items]
+    open_by_cid: dict[str, dict[str, Any]] = {}
+    for it in copied:
+        cid = str(it.get("conversation_id") or "").strip()
+        st = str(it.get("status") or "pending").strip().lower()
+        if cid and st in DEV_QUEUE_OPEN_STATUSES:
+            open_by_cid[cid] = it
+
+    # Build reverse dependency adjacency: prerequisite_cid -> [dependent_cid, ...]
+    dependents_map: dict[str, list[str]] = {cid: [] for cid in open_by_cid}
+    open_cids = list(open_by_cid.keys())
+    for dep_cid, dep_item in open_by_cid.items():
+        for raw_ref in dep_item.get("depends_on") or []:
+            ref_clean = str(raw_ref or "").strip()
+            if not ref_clean:
+                continue
+            matched_targets = [
+                cand for cand in open_cids if cand.lower() == ref_clean.lower() and cand != dep_cid
+            ]
+            if not matched_targets:
+                matched_targets = [
+                    cand for cand in open_cids if _matches_cid(cand, ref_clean) and cand != dep_cid
+                ]
+            for target_cid in matched_targets:
+                if dep_cid not in dependents_map[target_cid]:
+                    dependents_map[target_cid].append(dep_cid)
+
+    for it in copied:
+        raw_p = _raw_queue_priority(it)
+        cid = str(it.get("conversation_id") or "").strip()
+        if cid not in open_by_cid:
+            it["effective_priority"] = raw_p
+            it["inherited_priority_from"] = ""
+            continue
+
+        best_dep_key: tuple[int, str, str] | None = None
+        visited: set[str] = {cid}
+        frontier: list[str] = list(dependents_map.get(cid, ()))
+        while frontier:
+            cur = frontier.pop(0)
+            if cur in visited:
+                continue
+            visited.add(cur)
+            cur_item = open_by_cid.get(cur)
+            if cur_item is None:
+                continue
+            cur_p = _raw_queue_priority(cur_item)
+            cand_key = (cur_p, str(cur_item.get("added_at") or ""), cur)
+            if best_dep_key is None or cand_key < best_dep_key:
+                best_dep_key = cand_key
+            for nxt in dependents_map.get(cur, ()):
+                if nxt not in visited:
+                    frontier.append(nxt)
+
+        if best_dep_key is not None and best_dep_key[0] < raw_p:
+            it["effective_priority"] = best_dep_key[0]
+            it["inherited_priority_from"] = best_dep_key[2]
+        else:
+            it["effective_priority"] = raw_p
+            it["inherited_priority_from"] = ""
+
+    return copied
+
+
 def _sort_dev_queue_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Sort queue items deterministically by lifecycle bucket, numeric priority, added_at, and CID."""
-    def _prio_val(it: dict[str, Any]) -> int:
-        try:
-            return int(it.get("priority", 50))
-        except (TypeError, ValueError):
-            return 50
+    """Sort queue items deterministically by lifecycle bucket, transitive `effective_priority`, raw `priority`, `added_at`, and CID."""
+    enriched = compute_effective_priorities(items)
+    open_cids_lower = {
+        str(it.get("conversation_id") or "").strip(): str(it.get("status") or "pending").strip().lower()
+        for it in enriched
+        if str(it.get("conversation_id") or "").strip()
+    }
+
+    def _has_open_unmet_dep(it: dict[str, Any]) -> int:
+        for raw_ref in it.get("depends_on") or []:
+            ref_clean = str(raw_ref or "").strip()
+            if not ref_clean:
+                continue
+            for cand_cid, cand_st in open_cids_lower.items():
+                if _matches_cid(cand_cid, ref_clean) and cand_st not in ("merged", "cleaned"):
+                    return 1
+        return 0
 
     return sorted(
-        items,
+        enriched,
         key=lambda it: (
             DEV_QUEUE_STATUS_RANK.get(str(it.get("status") or "pending").lower(), 9),
-            _prio_val(it),
+            int(it.get("effective_priority", _raw_queue_priority(it))),
+            _has_open_unmet_dep(it),
+            _raw_queue_priority(it),
             str(it.get("added_at") or ""),
             str(it.get("conversation_id") or ""),
         ),
@@ -7533,6 +7647,52 @@ def get_next_dev_queue_item(
         annotated["slot1_status"] = str(act.get("status") or "")
         return (True, annotated, "")
 
+    prioritize_partial_wip = _resolve_prioritize_partial_wip()
+    max_partial_wip = _resolve_max_partial_wip()
+
+    # Count open half-merged (`merged_repos` non-empty) items waiting on each remaining downstream repo
+    partial_wip_by_repo: dict[str, int] = {}
+    for open_it in items:
+        open_st = str(open_it.get("status") or "pending").strip().lower()
+        if open_st not in DEV_QUEUE_OPEN_STATUSES:
+            continue
+        open_merged = {
+            dev_common.normalize_repo_slug(str(r))
+            for r in (open_it.get("merged_repos") or [])
+            if str(r).strip()
+        }
+        if not open_merged:
+            continue
+        open_repos = _normalize_str_list(
+            [dev_common.normalize_repo_slug(str(r)) for r in (open_it.get("repo_slugs") or []) if str(r).strip()]
+        )
+        for rem_slug in open_repos:
+            if rem_slug and rem_slug not in open_merged:
+                partial_wip_by_repo[rem_slug] = partial_wip_by_repo.get(rem_slug, 0) + 1
+
+    def _has_partial_wip(item: Mapping[str, Any]) -> bool:
+        return any(str(r).strip() for r in (item.get("merged_repos") or []))
+
+    def _dispatch_order_key(item: Mapping[str, Any]) -> tuple[int, int, int, int, int, str, str]:
+        """Order queue-next candidates: preserve P<=17 infra precedence, then boost partial-WIP closure over 0% items."""
+        st_rank = DEV_QUEUE_STATUS_RANK.get(str(item.get("status") or "pending").lower(), 9)
+        eff_p = int(item.get("effective_priority", _raw_queue_priority(item)))
+        raw_p = _raw_queue_priority(item)
+        wip_rank = 0 if (prioritize_partial_wip and _has_partial_wip(item)) else 1
+        if eff_p <= INFRA_PRIORITY_PRECEDENCE_MAX:
+            band_a, band_b, band_c = (0, eff_p, wip_rank)
+        else:
+            band_a, band_b, band_c = (1, wip_rank, eff_p)
+        return (
+            st_rank,
+            band_a,
+            band_b,
+            band_c,
+            raw_p,
+            str(item.get("added_at") or ""),
+            str(item.get("conversation_id") or ""),
+        )
+
     next_item: dict[str, Any] | None = None
     next_pending_item: dict[str, Any] | None = None
     next_unlocked_item: dict[str, Any] | None = None
@@ -7541,8 +7701,9 @@ def get_next_dev_queue_item(
     slot2_by_repo: dict[str, dict[str, Any]] = {}
     blocked_deps: list[dict[str, Any]] = []
     blocked_repos: list[dict[str, Any]] = []
+    blocked_partial_wip: list[dict[str, Any]] = []
 
-    for it in items:
+    for it in sorted(items, key=_dispatch_order_key):
         st = str(it.get("status") or "pending").lower()
         if st not in ("in_progress", "pr_open", "pending"):
             continue
@@ -7568,6 +7729,7 @@ def get_next_dev_queue_item(
                 else (False, {}, "slot2_already_selected")
             )
             if s2_ok:
+                s2_annotated["wip_finish_boost"] = bool(prioritize_partial_wip and _has_partial_wip(it))
                 slot2_candidates.append(s2_annotated)
                 slot2_by_repo[first_repo] = s2_annotated
                 if first_repo not in runnable_by_repo:
@@ -7597,7 +7759,34 @@ def get_next_dev_queue_item(
             if skip_locked_repos:
                 continue
         else:
+            is_new_zero_pct_partial = bool(foreign_locked) and not _has_partial_wip(it)
+            capped_downstream = (
+                [r for r in foreign_locked if partial_wip_by_repo.get(r, 0) >= max_partial_wip]
+                if is_new_zero_pct_partial
+                else []
+            )
+            if capped_downstream:
+                cap_entry: dict[str, Any] = {
+                    "conversation_id": it.get("conversation_id"),
+                    "title": it.get("title"),
+                    "capped_downstream_repos": capped_downstream,
+                    "partial_wip_counts": {r: partial_wip_by_repo[r] for r in capped_downstream},
+                    "max_partial_wip": max_partial_wip,
+                }
+                blocked_partial_wip.append(cap_entry)
+                blocked_repos.append(
+                    {
+                        "conversation_id": it.get("conversation_id"),
+                        "title": it.get("title"),
+                        "locked_repos": foreign_locked,
+                        "partial_wip_capped": True,
+                        "capped_downstream_repos": capped_downstream,
+                    }
+                )
+                continue
+
             annotated = dict(it)
+            annotated["wip_finish_boost"] = bool(prioritize_partial_wip and _has_partial_wip(it))
             if remaining_repos:
                 annotated["target_slot"] = 1
                 annotated["dispatch_repos"] = list(dispatch_repos)
@@ -7632,8 +7821,10 @@ def get_next_dev_queue_item(
         "slot2_candidates": slot2_candidates,
         "slot2_by_repo": slot2_by_repo,
         "locked_repos": locked_repos,
+        "partial_wip_by_repo": partial_wip_by_repo,
         "blocked_by_dependencies": blocked_deps,
         "blocked_by_repo_locks": blocked_repos,
+        "blocked_by_partial_wip_cap": blocked_partial_wip,
         "summary": data.get("summary", {}),
     }
 

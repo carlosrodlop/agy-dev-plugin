@@ -36,6 +36,7 @@ for _cand_clients in (_PLUGIN_ROOT / "clients", _INSTALLED_PLUGIN_ROOT / "client
 import dev_common  # noqa: E402
 
 DEFAULT_STALL_THRESHOLD_SECONDS = 900
+DEFAULT_MAX_PARTIAL_WIP = 3
 STALL_ELIGIBLE_LOCK_STATUSES: frozenset[str] = frozenset({"DEVELOPING", "NEEDS_REVISION_ITERATING"})
 OPEN_QUEUE_STATUSES: frozenset[str] = frozenset({"pending", "in_progress", "pr_open", "hitl_blocked"})
 CODE_EXTENSIONS: frozenset[str] = frozenset({".py", ".js", ".css", ".html", ".sh"})
@@ -786,6 +787,182 @@ def _detect_repo_contention_hotspots(items: list[dict[str, Any]]) -> list[dict[s
     ]
 
 
+def resolve_max_partial_wip(max_partial_wip: int | None = None) -> int:
+    """Resolve partial-WIP accumulation threshold (default `3`, env `AGY_DEV_MAX_PARTIAL_WIP`)."""
+    if max_partial_wip is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            parsed = int(max_partial_wip)
+            if parsed >= 1:
+                return parsed
+    env_raw = str(os.environ.get("AGY_DEV_MAX_PARTIAL_WIP") or "").strip()
+    if env_raw:
+        with contextlib.suppress(TypeError, ValueError):
+            parsed = int(env_raw)
+            if parsed >= 1:
+                return parsed
+    return DEFAULT_MAX_PARTIAL_WIP
+
+
+def _raw_item_priority(item: dict[str, Any]) -> int:
+    """Extract raw integer priority from a queue item (default `50`)."""
+    try:
+        val = item.get("priority", 50)
+        return int(val) if val is not None else 50
+    except (TypeError, ValueError):
+        return 50
+
+
+def _detect_priority_inversions(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Detect open items depending on strictly lower-priority (higher-number) open prerequisites (e.g. P20 -> P26)."""
+    open_items = [
+        it
+        for it in items
+        if str(it.get("status") or "pending").strip().lower() in OPEN_QUEUE_STATUSES
+        and str(it.get("conversation_id") or "").strip()
+    ]
+    if len(open_items) < 2:
+        return []
+
+    by_cid = {str(it.get("conversation_id") or "").strip(): it for it in open_items}
+    open_cids = list(by_cid.keys())
+    inversions: list[dict[str, Any]] = []
+
+    for dep_cid, dep_item in by_cid.items():
+        dep_prio = _raw_item_priority(dep_item)
+        for raw_ref in dep_item.get("depends_on") or []:
+            ref_clean = str(raw_ref or "").strip()
+            if not ref_clean:
+                continue
+            matched = [c for c in open_cids if c.lower() == ref_clean.lower() and c != dep_cid]
+            if not matched:
+                matched = [c for c in open_cids if _cids_match(c, ref_clean) and c != dep_cid]
+            for prereq_cid in matched:
+                prereq_item = by_cid[prereq_cid]
+                prereq_prio = _raw_item_priority(prereq_item)
+                if prereq_prio > dep_prio:
+                    inversions.append(
+                        {
+                            "dependent_id": dep_cid,
+                            "dependent_title": str(dep_item.get("title") or ""),
+                            "dependent_priority": dep_prio,
+                            "dependency_id": prereq_cid,
+                            "dependency_title": str(prereq_item.get("title") or ""),
+                            "dependency_priority": prereq_prio,
+                            "priority_gap": prereq_prio - dep_prio,
+                        }
+                    )
+
+    if not inversions:
+        return []
+
+    inversions.sort(key=lambda inv: (int(inv["dependent_priority"]), -int(inv["priority_gap"]), inv["dependent_id"]))
+    top = inversions[0]
+    return [
+        _make_finding(
+            code="priority_inversion",
+            severity="high",
+            category="scheduling",
+            title=(
+                f"Priority inversion across {len(inversions)} open dependency edge(s) "
+                f"(P{top['dependent_priority']} {top['dependent_id'][:8]} depends on "
+                f"P{top['dependency_priority']} {top['dependency_id'][:8]})"
+            ),
+            evidence={
+                "count": len(inversions),
+                "inversions": inversions,
+                "dependent_ids": [inv["dependent_id"] for inv in inversions],
+                "dependency_ids": list(dict.fromkeys(inv["dependency_id"] for inv in inversions)),
+            },
+            recommendation=(
+                "Promote blocking prerequisite priorities (`queue-add --id <DEP_CID> --priority <MIN_DEPENDENT_PRIO>`) "
+                "to match their highest-priority open dependent (`effective_priority` auto-inherits during `queue-next`)."
+            ),
+            auto_action_hint=(
+                f"pr_remediator.py queue-add --id {top['dependency_id']} --priority {top['dependent_priority']}"
+            ),
+            estimated_savings_min=len(inversions) * 12,
+        )
+    ]
+
+
+def _detect_partial_wip_accumulation(
+    items: list[dict[str, Any]],
+    *,
+    max_partial_wip: int | None = None,
+) -> list[dict[str, Any]]:
+    """Detect downstream repositories accumulating `>= AGY_DEV_MAX_PARTIAL_WIP` half-merged open items."""
+    cap = resolve_max_partial_wip(max_partial_wip)
+    open_items = [
+        it
+        for it in items
+        if str(it.get("status") or "pending").strip().lower() in OPEN_QUEUE_STATUSES
+    ]
+    by_repo: dict[str, list[dict[str, Any]]] = {}
+    for it in open_items:
+        merged_set = {
+            dev_common.normalize_repo_slug(str(r))
+            for r in (it.get("merged_repos") or [])
+            if str(r).strip()
+        }
+        if not merged_set:
+            continue
+        repo_slugs = [
+            dev_common.normalize_repo_slug(str(r))
+            for r in (it.get("repo_slugs") or [])
+            if str(r).strip()
+        ]
+        remaining: list[str] = []
+        for slug in repo_slugs:
+            if slug and slug not in merged_set and slug not in remaining:
+                remaining.append(slug)
+        for rem_slug in remaining:
+            by_repo.setdefault(rem_slug, []).append(it)
+
+    flagged: list[dict[str, Any]] = []
+    for slug, waiting in sorted(by_repo.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        if len(waiting) >= cap:
+            flagged.append(
+                {
+                    "repo_slug": slug,
+                    "count": len(waiting),
+                    "conversation_ids": [str(w.get("conversation_id") or "") for w in waiting],
+                    "titles": [str(w.get("title") or "") for w in waiting],
+                }
+            )
+
+    if not flagged:
+        return []
+
+    top = flagged[0]
+    return [
+        _make_finding(
+            code="partial_wip_accumulation",
+            severity="high",
+            category="throughput",
+            title=(
+                f"Partial-WIP accumulation on {top['repo_slug']} "
+                f"({top['count']} half-merged items >= cap {cap})"
+            ),
+            evidence={
+                "max_partial_wip": cap,
+                "count": len(flagged),
+                "repos": flagged,
+                "top_repo_slug": top["repo_slug"],
+                "top_count": top["count"],
+                "conversation_ids": top["conversation_ids"],
+            },
+            recommendation=(
+                "Close existing half-merged (`merged_repos` non-empty) items on the downstream repository before "
+                f"starting new 0% partial multi-repo dispatches (`AGY_DEV_PRIORITIZE_PARTIAL_WIP=1`, `AGY_DEV_MAX_PARTIAL_WIP={cap}`)."
+            ),
+            auto_action_hint=(
+                f"Finish half-merged PRs on {top['repo_slug']} via `pr_remediator.py queue-next --unlocked`."
+            ),
+            estimated_savings_min=sum(int(entry["count"]) * 10 for entry in flagged),
+        )
+    ]
+
+
 def _detect_unanchored_pending_tasks(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     unanchored = [
         it
@@ -1322,6 +1499,11 @@ def format_compact_opt_hint(analysis: dict[str, Any], max_width: int = 120) -> s
         elif code == "missing_selective_test_runner":
             cnt = len(ev.get("repos") or [])
             bits.append(f"selective tests missing ({cnt} repo)")
+        elif code == "priority_inversion":
+            bits.append(f"prio inversion ({ev.get('count', 1)})")
+        elif code == "partial_wip_accumulation":
+            r_short = str(ev.get("top_repo_slug") or "").split("/")[-1]
+            bits.append(f"partial WIP {r_short} ({ev.get('top_count', DEFAULT_MAX_PARTIAL_WIP)})")
         else:
             bits.append(str(f.get("title") or code))
 
@@ -1400,9 +1582,12 @@ def analyze_dev_flow_optimizations(
             brain_dir=resolved_brain_dirs,
         )
     )
-    # 1b. Phantom pr_open items (0 active locks & 0 pr_urls) and untracked ad-hoc active locks
+    # 1b. Phantom pr_open items (0 active locks & 0 pr_urls), untracked ad-hoc active locks,
+    #     priority inversions, and downstream partial-WIP accumulation
     findings.extend(_detect_phantom_pr_open(items, active_locks))
     findings.extend(_detect_untracked_active_locks(items, active_locks))
+    findings.extend(_detect_priority_inversions(items))
+    findings.extend(_detect_partial_wip_accumulation(items))
     # 2. Micro-PR batch candidates
     findings.extend(_detect_micro_pr_batch_candidates(items))
     # 3. Repo contention hotspots

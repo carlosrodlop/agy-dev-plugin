@@ -1473,7 +1473,7 @@ def _compact_repos(
     max_w: int,
     pr_repo_slug: str = "",
 ) -> str:
-    """Format compact repository list, highlighting merged (`✓`) and PR-ready (`★`) repos first on truncation."""
+    """Format compact repository list, highlighting PR-ready (`★`) or remaining partial-WIP (`(k/n✓)`) repos."""
 
     def _fmt(slug: str) -> str:
         name = label_map.get(slug, slug.split("/")[-1])
@@ -1484,9 +1484,30 @@ def _compact_repos(
         return name
 
     ordered = [str(s) for s in (repo_slugs or []) if s]
-    parts = [_fmt(s) for s in ordered]
-    if not parts:
+    if not ordered:
         return "-"
+
+    merged_norm = {str(m).strip().lower() for m in (merged_repos or set()) if str(m).strip()}
+    done_slugs = [s for s in ordered if s in merged_repos or s.lower() in merged_norm]
+    pending_slugs = [s for s in ordered if s not in merged_repos and s.lower() not in merged_norm]
+
+    # Partially-merged rows without an active human PR explicitly highlight remaining pending repo(s) + (done/total✓)
+    if not (pr_repo_slug and pr_repo_slug in ordered) and 0 < len(done_slugs) < len(ordered):
+        badge = f"({len(done_slugs)}/{len(ordered)}✓)"
+        rem_names = [label_map.get(s, s.split("/")[-1]) for s in pending_slugs]
+        full_partial = f"{', '.join(rem_names)} {badge}"
+        if len(full_partial) <= max_w:
+            return full_partial
+        if len(rem_names) > 1:
+            multi_suffix = f" +{len(rem_names) - 1} {badge}"
+            if max_w - len(multi_suffix) >= 5:
+                return f"{_trunc(rem_names[0], max_w - len(multi_suffix))}{multi_suffix}"
+        suffix = f" {badge}"
+        if max_w - len(suffix) >= 4:
+            return f"{_trunc(rem_names[0], max_w - len(suffix))}{suffix}"
+        return _trunc(full_partial, max_w)
+
+    parts = [_fmt(s) for s in ordered]
     full = ", ".join(parts)
     if len(full) <= max_w:
         return full
@@ -2188,6 +2209,11 @@ def render(
     filtered.sort(
         key=lambda x: (
             STATUS_ORDER.get(str(x.get("status") or "pending"), 99),
+            int(
+                x.get("effective_priority")
+                if x.get("effective_priority") is not None
+                else (x.get("priority") if x.get("priority") is not None else 999)
+            ),
             int(x.get("priority") if x.get("priority") is not None else 999),
             str(x.get("added_at") or ""),
         )
