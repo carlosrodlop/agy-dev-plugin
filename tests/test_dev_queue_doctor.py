@@ -927,7 +927,8 @@ class TestDevQueueDoctor(unittest.TestCase):
             rendered_a = doctor.render_doctor_report(res_desktop, color=False)
             self.assertIn("(agentapi)", rendered_a)
 
-            # ANTIGRAVITY_AGENTAPI_EXE override takes top precedence
+            # Standalone ~/.gemini/antigravity/bin/agentapi takes precedence over ANTIGRAVITY_AGENTAPI_EXE,
+            # while ANTIGRAVITY_AGENTAPI_EXE serves as fallback once standalone agentapi is absent
             custom_agentapi = root / "custom_agentapi"
             custom_agentapi.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             self.assertEqual(
@@ -936,11 +937,20 @@ class TestDevQueueDoctor(unittest.TestCase):
                     home_dir=home_dir,
                     which_fn=lambda _n: None,
                 ),
-                str(custom_agentapi),
+                str(agentapi_path),
             )
 
-            # Path B fallback: ANTIGRAVITY_LS_ADDRESS set, but agentapi unavailable -> falls back to agy_cli
+            # Path B fallback: ANTIGRAVITY_LS_ADDRESS set, standalone agentapi removed -> ANTIGRAVITY_AGENTAPI_EXE fallback works,
+            # and when neither exists -> falls back to agy_cli
             agentapi_path.unlink()
+            self.assertEqual(
+                doctor.resolve_agentapi_cli(
+                    env={"ANTIGRAVITY_AGENTAPI_EXE": str(custom_agentapi)},
+                    home_dir=home_dir,
+                    which_fn=lambda _n: None,
+                ),
+                str(custom_agentapi),
+            )
             res_fallback = doctor.run_queue_doctor(
                 state_dir=state_dir,
                 brain_dir=brain_dir,

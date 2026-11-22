@@ -28,6 +28,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -60,12 +61,19 @@ from dev_flow_optimizer import (  # noqa: E402
 )
 
 DEFAULT_WAKE_COOLDOWN_SECONDS = 900
+DEFAULT_WAKE_STARTUP_PROBE_SECONDS = 0.25
 DOCTOR_STATE_FILENAME = "agy_doctor_state.json"
 DOCTOR_LOCK_FILENAME = "agy_doctor_state.lock"
 TRANSCRIPT_TAIL_MAX_BYTES = 262_144
+WAKE_LOG_TAIL_MAX_BYTES = 16_384
 SERVER_RESTART_NOTICE = "All your subagents and background tasks have been stopped due to server restart"
 
 _LOCAL_HOME_PATH_RE = re.compile(r"/(?:Users|home)/(?!testuser\b|test\b|Shared\b)[A-Za-z0-9._-]+")
+_WAKE_NONZERO_EXIT_RE = re.compile(
+    r"(?:exit_code|returncode|exited\s+with\s+(?:code|status)|exit\s+(?:code|status))\s*[=:]?\s*(-?[1-9]\d*)",
+    re.IGNORECASE,
+)
+_WAKE_SIGABRT_RE = re.compile(r"\bsigabrt\b|abort\s+trap:\s*6|signal:\s*aborted", re.IGNORECASE)
 _TERMINAL_FAILURE_STATUSES: frozenset[str] = frozenset(
     {"STOPPED", "CANCELLED", "CANCELED", "INTERRUPTED", "ERROR", "FAILED", "ABORTED"}
 )
@@ -79,6 +87,7 @@ _ANOMALY_CODES_OWNED_BY_DOCTOR: frozenset[str] = frozenset(
         "stalled_worker",
         "missing_wait_for_unlock",
         "phantom_pr_open",
+        "wake_process_crash",
     }
 )
 
@@ -160,6 +169,43 @@ def resolve_agy_cli(*, home_dir: Path | None = None, which_fn: Callable[[str], s
     return "agy"
 
 
+def resolve_agentapi_cmd(
+    *,
+    env: Mapping[str, str] | None = None,
+    home_dir: Path | None = None,
+    which_fn: Callable[[str], str | None] | None = None,
+) -> list[str]:
+    """Resolve Antigravity Desktop `agentapi` argv prefix, preferring standalone `agentapi` before `ANTIGRAVITY_AGENTAPI_EXE`.
+
+    When the resolved executable basename starts with `language_server` (e.g.
+    `language_server_macos_arm`), `"agentapi"` is injected as `argv[1]` so `language_server`
+    runs its CLI subcommand mode instead of blocking on LSP/gRPC stdin metadata and aborting.
+    """
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    default_bin = base_home / ".gemini" / "antigravity" / "bin" / "agentapi"
+    resolved_exe = ""
+    if default_bin.is_file():
+        resolved_exe = str(default_bin)
+    else:
+        finder = which_fn if which_fn is not None else shutil.which
+        found = finder("agentapi")
+        if found:
+            resolved_exe = str(found)
+        else:
+            eff_env = os.environ if env is None else env
+            env_exe = str(eff_env.get("ANTIGRAVITY_AGENTAPI_EXE") or "").strip()
+            if env_exe:
+                env_path = Path(env_exe).expanduser()
+                if env_path.is_file():
+                    resolved_exe = str(env_path)
+
+    if not resolved_exe:
+        return []
+    if Path(resolved_exe).name.lower().startswith("language_server"):
+        return [resolved_exe, "agentapi"]
+    return [resolved_exe]
+
+
 def resolve_agentapi_cli(
     *,
     env: Mapping[str, str] | None = None,
@@ -167,23 +213,8 @@ def resolve_agentapi_cli(
     which_fn: Callable[[str], str | None] | None = None,
 ) -> str:
     """Resolve Antigravity Desktop `agentapi` binary path, returning `""` when unavailable."""
-    eff_env = os.environ if env is None else env
-    env_exe = str(eff_env.get("ANTIGRAVITY_AGENTAPI_EXE") or "").strip()
-    if env_exe:
-        env_path = Path(env_exe).expanduser()
-        if env_path.is_file():
-            return str(env_path)
-
-    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
-    default_bin = base_home / ".gemini" / "antigravity" / "bin" / "agentapi"
-    if default_bin.is_file():
-        return str(default_bin)
-
-    finder = which_fn if which_fn is not None else shutil.which
-    found = finder("agentapi")
-    if found:
-        return str(found)
-    return ""
+    cmd_prefix = resolve_agentapi_cmd(env=env, home_dir=home_dir, which_fn=which_fn)
+    return cmd_prefix[0] if cmd_prefix else ""
 
 
 def _strip_prompt_tokens(cmd: str, *, _depth: int = 0) -> tuple[str, list[str]]:
@@ -489,6 +520,110 @@ def inspect_transcript_tail(
         "restart_notice_seen": restart_notice_seen,
         "restart_interrupted": restart_interrupted,
         "tail_lines_scanned": len(lines),
+    }
+
+
+def inspect_wake_logs(
+    state_dir: Path | str,
+    *,
+    max_logs: int = 5,
+    max_bytes: int = WAKE_LOG_TAIL_MAX_BYTES,
+) -> dict[str, Any]:
+    """Inspect recent `agy_doctor_wake_*.log` files for SIGABRT / stdin metadata / non-zero exit crashes."""
+    sdir = Path(state_dir).expanduser()
+    logs_dir = sdir / "logs"
+    if not logs_dir.is_dir():
+        return {
+            "has_active_crash": False,
+            "crash_count": 0,
+            "scanned_count": 0,
+            "signatures": [],
+            "latest_log": "",
+            "snippet": "",
+        }
+
+    candidates: list[tuple[int, str, Path]] = []
+    with contextlib.suppress(OSError):
+        for p in logs_dir.glob("agy_doctor_wake_*.log"):
+            if p.is_file():
+                with contextlib.suppress(OSError):
+                    st = p.stat()
+                    candidates.append((int(st.st_mtime_ns), p.name, p))
+    if not candidates:
+        return {
+            "has_active_crash": False,
+            "crash_count": 0,
+            "scanned_count": 0,
+            "signatures": [],
+            "latest_log": "",
+            "snippet": "",
+        }
+
+    candidates.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+    selected = candidates[: max(1, int(max_logs))]
+
+    crashed_logs: list[dict[str, Any]] = []
+    newest_is_clean = False
+    for idx, (_mtime_ns, _name, lpath) in enumerate(selected):
+        try:
+            tail_lines = _read_tail_lines(lpath, max_bytes=max_bytes)
+        except OSError:
+            continue
+        blob = "\n".join(tail_lines)
+        blob_lower = blob.lower()
+        sigs: list[str] = []
+        if "failed to read initial metadata from stdin" in blob_lower:
+            sigs.append("Failed to read initial metadata from stdin")
+        if _WAKE_SIGABRT_RE.search(blob):
+            sigs.append("SIGABRT")
+        m_exit = _WAKE_NONZERO_EXIT_RE.search(blob)
+        if m_exit:
+            sigs.append(f"non-zero exit ({m_exit.group(1)})")
+        if sigs:
+            snippet_line = ""
+            for ln in tail_lines:
+                ln_l = ln.lower()
+                if (
+                    "failed to read initial metadata" in ln_l
+                    or _WAKE_SIGABRT_RE.search(ln)
+                    or _WAKE_NONZERO_EXIT_RE.search(ln)
+                ):
+                    snippet_line = _sanitize_path(ln.strip())[:200]
+                    break
+            crashed_logs.append(
+                {
+                    "log_path": _sanitize_path(str(lpath)),
+                    "signatures": sigs,
+                    "snippet": snippet_line,
+                }
+            )
+        elif idx == 0:
+            newest_is_clean = True
+
+    if not crashed_logs or newest_is_clean:
+        return {
+            "has_active_crash": False,
+            "crash_count": 0,
+            "scanned_count": len(selected),
+            "signatures": [],
+            "latest_log": "",
+            "snippet": "",
+        }
+
+    dedup_sigs: list[str] = []
+    for cl in crashed_logs:
+        for s in cl["signatures"]:
+            if s not in dedup_sigs:
+                dedup_sigs.append(s)
+
+    return {
+        "has_active_crash": True,
+        "crash_count": len(crashed_logs),
+        "scanned_count": len(selected),
+        "signatures": dedup_sigs,
+        "latest_log": str(crashed_logs[0]["log_path"]),
+        "snippet": str(crashed_logs[0]["snippet"]),
+        "crashed_logs": crashed_logs,
     }
 
 
@@ -840,6 +975,35 @@ def diagnose_orchestrator(
             )
         )
 
+    # 6. Recent wake process crash signatures (`SIGABRT`, stdin metadata failure, non-zero exit)
+    wake_log_audit = inspect_wake_logs(resolved_state)
+    if wake_log_audit.get("has_active_crash"):
+        sigs_list = list(wake_log_audit.get("signatures") or [])
+        sigs_label = ", ".join(sigs_list) or "non-zero exit"
+        crash_cnt = int(wake_log_audit.get("crash_count") or 1)
+        anomalies.append(
+            _make_anomaly(
+                code="wake_process_crash",
+                severity="high",
+                title=(
+                    f"Orchestrator wake process crashed ({crash_cnt} recent wake log(s): {sigs_label})"
+                ),
+                cause=(
+                    "Recent `agy_doctor_wake_*.log` output contains fatal startup/crash signatures "
+                    f"({sigs_label}), such as `language_server` invoked without the `agentapi` subcommand."
+                ),
+                evidence={
+                    "crash_count": crash_cnt,
+                    "signatures": sigs_list,
+                    "latest_log": str(wake_log_audit.get("latest_log") or ""),
+                    "snippet": str(wake_log_audit.get("snippet") or ""),
+                },
+                safe_fix_action="agy-doctor --wake --force",
+                requires_wake=True,
+                auto_fixable=False,
+            )
+        )
+
     anomalies.sort(
         key=lambda a: (
             SEVERITY_RANK.get(str(a.get("severity") or "low").lower(), 9),
@@ -1066,12 +1230,98 @@ def build_wake_prompt(diagnosis: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _extract_int_returncode(val: Any) -> int | None:
+    """Return `int(val)` strictly when `val` is a non-bool integer, else `None`."""
+    if isinstance(val, int) and not isinstance(val, bool):
+        return int(val)
+    return None
+
+
+def _format_exit_signal(exit_code: int) -> str:
+    """Resolve POSIX signal name (e.g. `SIGABRT`) for negative returncodes or `128+SIGABRT`."""
+    sig_num = 0
+    if exit_code < 0:
+        sig_num = -exit_code
+    elif exit_code == 128 + int(signal.SIGABRT):
+        sig_num = int(signal.SIGABRT)
+    if sig_num <= 0:
+        return ""
+    with contextlib.suppress(ValueError):
+        return signal.Signals(sig_num).name
+    return f"SIG{sig_num}"
+
+
+def _probe_wake_process_startup(
+    proc: Any,
+    *,
+    startup_probe_seconds: float | None = None,
+    is_custom_launcher: bool = False,
+    env: Mapping[str, str] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+) -> int | None:
+    """Probe spawned wake process across a short startup window; return `int` exit code if exited, else `None`."""
+    poll_fn = getattr(proc, "poll", None)
+    has_raw_poll_none = False
+    if callable(poll_fn):
+        raw_poll = poll_fn()
+        immediate_rc = _extract_int_returncode(raw_poll)
+        if immediate_rc is not None:
+            return immediate_rc
+        has_raw_poll_none = raw_poll is None
+
+    attr_rc = _extract_int_returncode(getattr(proc, "returncode", None))
+    if attr_rc is not None:
+        return attr_rc
+
+    # Default MagicMock instances return non-None MagicMock from `poll()` — avoid blocking unit tests
+    if not isinstance(proc, subprocess.Popen) and not has_raw_poll_none:
+        return None
+
+    eff_env = os.environ if env is None else env
+    if startup_probe_seconds is not None:
+        probe_secs = max(0.0, float(startup_probe_seconds))
+    else:
+        env_probe = str(eff_env.get("AGY_DOCTOR_STARTUP_PROBE_SECONDS") or "").strip()
+        if env_probe:
+            try:
+                probe_secs = max(0.0, float(env_probe))
+            except ValueError:
+                probe_secs = 0.02 if is_custom_launcher else DEFAULT_WAKE_STARTUP_PROBE_SECONDS
+        else:
+            probe_secs = 0.02 if is_custom_launcher else DEFAULT_WAKE_STARTUP_PROBE_SECONDS
+
+    if probe_secs <= 0.0:
+        return None
+
+    if isinstance(proc, subprocess.Popen):
+        try:
+            wait_rc = proc.wait(timeout=probe_secs)
+            return _extract_int_returncode(wait_rc)
+        except subprocess.TimeoutExpired:
+            return None
+
+    if callable(poll_fn):
+        sleeper = sleep_fn if sleep_fn is not None else time.sleep
+        step = min(0.01 if is_custom_launcher else 0.025, probe_secs)
+        steps = max(1, int(round(probe_secs / max(step, 1e-4))))
+        for _ in range(steps):
+            sleeper(step)
+            polled = _extract_int_returncode(poll_fn())
+            if polled is not None:
+                return polled
+            attr_after = _extract_int_returncode(getattr(proc, "returncode", None))
+            if attr_after is not None:
+                return attr_after
+    return None
+
+
 def trigger_orchestrator_wake(
     diagnosis: dict[str, Any],
     *,
     state_dir: Path | str | None = None,
     portfolio_dir: Path | str | None = None,
     cooldown_seconds: int = DEFAULT_WAKE_COOLDOWN_SECONDS,
+    startup_probe_seconds: float | None = None,
     dry_run: bool = False,
     force: bool = False,
     now_ts: float | None = None,
@@ -1080,6 +1330,7 @@ def trigger_orchestrator_wake(
     which_fn: Callable[[str], str | None] | None = None,
     popen_fn: Callable[..., Any] | None = None,
     pid_alive_fn: Callable[[int], bool] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     """Launch detached hybrid orchestrator wake (`agentapi` in Desktop/sidecar; `agy` CLI in terminal)."""
     resolved_state = dev_common.resolve_state_dir(
@@ -1143,14 +1394,14 @@ def trigger_orchestrator_wake(
 
         prompt = build_wake_prompt(diagnosis)
         ls_addr = str(eff_env.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
-        agentapi_bin = (
-            resolve_agentapi_cli(env=eff_env, home_dir=home_dir, which_fn=which_fn)
+        agentapi_cmd = (
+            resolve_agentapi_cmd(env=eff_env, home_dir=home_dir, which_fn=which_fn)
             if ls_addr
-            else ""
+            else []
         )
-        if ls_addr and agentapi_bin:
+        if ls_addr and agentapi_cmd:
             transport = "agentapi"
-            cmd = [agentapi_bin, "new-conversation", "--title=[agy-doctor] Orchestrator Recovery", prompt]
+            cmd = [*agentapi_cmd, "new-conversation", "--title=[agy-doctor] Orchestrator Recovery", prompt]
         else:
             transport = "agy_cli"
             agy_bin = resolve_agy_cli(home_dir=home_dir, which_fn=which_fn)
@@ -1196,6 +1447,46 @@ def trigger_orchestrator_wake(
             with contextlib.suppress(OSError):
                 log_fp.close()
 
+        startup_exit_code = _probe_wake_process_startup(
+            proc,
+            startup_probe_seconds=startup_probe_seconds,
+            is_custom_launcher=popen_fn is not None,
+            env=eff_env,
+            sleep_fn=sleep_fn,
+        )
+        if startup_exit_code is not None and startup_exit_code != 0:
+            sig_name = _format_exit_signal(startup_exit_code)
+            sig_suffix = f" signal={sig_name}" if sig_name else ""
+            with contextlib.suppress(OSError):
+                with log_path.open("a", encoding="utf-8") as crash_fp:
+                    crash_fp.write(
+                        f"[agy-doctor] wake_startup_failed exit_code={startup_exit_code}{sig_suffix} "
+                        f"transport={transport}\n"
+                    )
+            log_snippet = ""
+            with contextlib.suppress(OSError):
+                tail = _read_tail_lines(log_path, max_bytes=4096)
+                non_meta = [ln for ln in tail if not ln.startswith("[agy-doctor] wake_startup_failed")]
+                if non_meta:
+                    log_snippet = _sanitize_path(non_meta[-1].strip())[:200]
+            err_detail = f"wake process exited immediately with exit_code={startup_exit_code}"
+            if sig_name:
+                err_detail += f" ({sig_name})"
+            if log_snippet:
+                err_detail += f": {log_snippet}"
+            return {
+                "status": "error",
+                "woke": False,
+                "transport": transport,
+                "reason": "wake_startup_crashed" if sig_name == "SIGABRT" else "wake_exited_nonzero",
+                "exit_code": startup_exit_code,
+                "signal": sig_name,
+                "cooldown_persisted": False,
+                "log_path": _sanitize_path(str(log_path)),
+                "error": err_detail,
+                "command": cmd,
+            }
+
         raw_new_pid = getattr(proc, "pid", 0)
         new_pid = int(raw_new_pid) if isinstance(raw_new_pid, int) and not isinstance(raw_new_pid, bool) else 0
         wake_iso = _utc_now_iso(cur_ts)
@@ -1239,6 +1530,7 @@ def run_queue_doctor(
     dry_run: bool = False,
     force: bool = False,
     cooldown_seconds: int = DEFAULT_WAKE_COOLDOWN_SECONDS,
+    startup_probe_seconds: float | None = None,
     stall_threshold_seconds: int | float | None = None,
     now_ts: float | None = None,
     ps_output: str | None = None,
@@ -1249,6 +1541,7 @@ def run_queue_doctor(
     which_fn: Callable[[str], str | None] | None = None,
     popen_fn: Callable[..., Any] | None = None,
     pid_alive_fn: Callable[[int], bool] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
     """Execute full `queue-doctor` pipeline: diagnose -> optional `--fix` -> optional `--wake`."""
     eff_sync_git = bool(sync_git or heal)
@@ -1321,6 +1614,7 @@ def run_queue_doctor(
             diag,
             state_dir=target_state,
             cooldown_seconds=cooldown_seconds,
+            startup_probe_seconds=startup_probe_seconds,
             dry_run=dry_run,
             force=force,
             now_ts=now_ts,
@@ -1329,6 +1623,7 @@ def run_queue_doctor(
             which_fn=which_fn,
             popen_fn=popen_fn,
             pid_alive_fn=pid_alive_fn,
+            sleep_fn=sleep_fn,
         )
     else:
         wake_result = {
