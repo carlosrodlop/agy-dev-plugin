@@ -10,6 +10,7 @@ Pure Python 3 stdlib module (Santa Lockdown compliant, Unix portable, Zero-PII) 
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import contextlib
 from datetime import datetime, timezone
 import json
@@ -17,8 +18,22 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import time
 from typing import Any
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_PLUGIN_ROOT = _SCRIPT_DIR.parents[2]
+_INSTALLED_PLUGIN_ROOT = Path.home() / ".gemini" / "config" / "plugins" / "agy-dev-plugin"
+
+for _cand_clients in (_PLUGIN_ROOT / "clients", _INSTALLED_PLUGIN_ROOT / "clients"):
+    if _cand_clients.is_dir():
+        _clients_str = str(_cand_clients)
+        if _clients_str not in sys.path:
+            sys.path.insert(0, _clients_str)
+        break
+
+import dev_common  # noqa: E402
 
 DEFAULT_STALL_THRESHOLD_SECONDS = 900
 STALL_ELIGIBLE_LOCK_STATUSES: frozenset[str] = frozenset({"DEVELOPING", "NEEDS_REVISION_ITERATING"})
@@ -152,7 +167,8 @@ def detect_stalled_lock(
     *,
     now_ts: float | None = None,
     threshold_seconds: int | float | None = None,
-    brain_dir: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Detect whether an active `DEVELOPING` / `NEEDS_REVISION_ITERATING` lock has gone stalled.
 
@@ -202,17 +218,10 @@ def detect_stalled_lock(
     ]
 
     if worker_cid:
-        if brain_dir is not None:
-            b_str = str(brain_dir).strip()
-            b_root = Path(b_str).expanduser() if b_str else None
-        else:
-            env_b = str(os.environ.get("AGY_BRAIN_DIR") or "").strip()
-            b_root = Path(env_b).expanduser() if env_b else (Path.home() / ".gemini" / "antigravity" / "brain")
-        if b_root is not None:
-            tpath = b_root / worker_cid / ".system_generated" / "logs" / "transcript.jsonl"
-            if tpath.is_file():
-                with contextlib.suppress(OSError):
-                    candidates.append(float(tpath.stat().st_mtime))
+        tpath = dev_common.resolve_transcript_path(worker_cid, brain_dir, home_dir=home_dir)
+        if tpath is not None:
+            with contextlib.suppress(OSError):
+                candidates.append(float(tpath.stat().st_mtime))
 
     last_activity_ts = max(candidates, default=0.0)
     if last_activity_ts <= 0.0:
@@ -486,7 +495,7 @@ def _detect_untracked_active_locks(
 def _detect_idle_orchestrator_with_runnable_work(
     items: list[dict[str, Any]],
     active_locks: dict[str, dict[str, Any]],
-    brain_dir: Path | None,
+    brain_dir: Path | str | Sequence[Path | str] | None,
     *,
     orchestrator_cid: str = "",
     now_ts: float | None = None,
@@ -494,10 +503,10 @@ def _detect_idle_orchestrator_with_runnable_work(
 ) -> list[dict[str, Any]]:
     """Detect when runnable pending tasks exist for unlocked repos while the orchestrator session is idle."""
     orch_clean = str(orchestrator_cid or "").strip()
-    if not orch_clean or brain_dir is None or not brain_dir.is_dir():
+    if not orch_clean or brain_dir is None:
         return []
-    tpath = brain_dir / orch_clean / ".system_generated" / "logs" / "transcript.jsonl"
-    if not tpath.is_file():
+    tpath = dev_common.resolve_transcript_path(orch_clean, brain_dir)
+    if tpath is None:
         return []
     try:
         orch_mtime = float(tpath.stat().st_mtime)
@@ -594,7 +603,7 @@ def _detect_stalled_workers(
     *,
     now_ts: float | None,
     threshold_seconds: int | float | None,
-    brain_dir: Path | str | None,
+    brain_dir: Path | str | Sequence[Path | str] | None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for repo_slug, lk in sorted(active_locks.items()):
@@ -1041,25 +1050,37 @@ def _inspect_single_transcript(tpath: Path) -> dict[str, Any]:
 
 
 def _detect_telemetry_efficiency_anomalies(
-    brain_dir: Path | None,
+    brain_dir: Path | str | Sequence[Path | str] | None,
     *,
     orchestrator_cid: str = "",
     max_recent_transcripts: int = 25,
 ) -> tuple[list[dict[str, Any]], int]:
     """Read-only bounded scan of recent `transcript.jsonl` files for efficiency anomalies."""
-    if brain_dir is None or not brain_dir.is_dir():
+    if brain_dir is None:
+        return ([], 0)
+    brain_roots = dev_common.resolve_antigravity_brain_dirs(brain_dir)
+    if not brain_roots:
         return ([], 0)
 
-    candidates: list[tuple[float, str, Path]] = []
-    with contextlib.suppress(OSError):
-        for entry in brain_dir.iterdir():
-            if not entry.is_dir():
-                continue
-            tpath = entry / ".system_generated" / "logs" / "transcript.jsonl"
-            if tpath.is_file():
-                with contextlib.suppress(OSError):
-                    candidates.append((float(tpath.stat().st_mtime), entry.name, tpath))
+    by_cid: dict[str, tuple[float, Path]] = {}
+    for b_root in brain_roots:
+        if not b_root.is_dir():
+            continue
+        with contextlib.suppress(OSError):
+            for entry in b_root.iterdir():
+                if not entry.is_dir():
+                    continue
+                tpath = entry / ".system_generated" / "logs" / "transcript.jsonl"
+                if tpath.is_file():
+                    with contextlib.suppress(OSError):
+                        mt = float(tpath.stat().st_mtime)
+                        prev = by_cid.get(entry.name)
+                        if prev is None or mt > prev[0]:
+                            by_cid[entry.name] = (mt, tpath)
 
+    candidates: list[tuple[float, str, Path]] = [
+        (mt, cid, tpath) for cid, (mt, tpath) in by_cid.items()
+    ]
     if not candidates:
         return ([], 0)
 
@@ -1069,8 +1090,8 @@ def _detect_telemetry_efficiency_anomalies(
 
     orch_clean = str(orchestrator_cid or "").strip()
     if orch_clean and orch_clean not in selected_cids:
-        orch_tpath = brain_dir / orch_clean / ".system_generated" / "logs" / "transcript.jsonl"
-        if orch_tpath.is_file():
+        orch_tpath = dev_common.resolve_transcript_path(orch_clean, brain_roots)
+        if orch_tpath is not None:
             selected.append((0.0, orch_clean, orch_tpath))
 
     findings: list[dict[str, Any]] = []
@@ -1315,7 +1336,7 @@ def analyze_dev_flow_optimizations(
     *,
     portfolio_dir: Path | str | None = None,
     repos_dir: Path | str | None = None,
-    brain_dir: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
     orchestrator_cid: str = "",
     stall_threshold_seconds: int | float | None = None,
     god_file_line_threshold: int = 5000,
@@ -1350,14 +1371,13 @@ def analyze_dev_flow_optimizations(
 
     eff_orch_cid = str(orchestrator_cid or "").strip() or queue_orch_cid
 
-    # Hermetic brain_dir resolution: never touch real ~/.gemini/antigravity/brain when caller isolated portfolio_dir
-    resolved_brain: Path | None = None
+    # Hermetic brain_dir resolution: never touch real ~/.gemini/antigravity*/brain when caller isolated portfolio_dir
     if brain_dir is not None:
-        b_str = str(brain_dir).strip()
-        resolved_brain = Path(b_str).expanduser() if b_str else None
+        resolved_brain_dirs = dev_common.resolve_antigravity_brain_dirs(brain_dir)
     elif portfolio_dir is None and not lightweight:
-        env_b = str(os.environ.get("AGY_BRAIN_DIR") or "").strip()
-        resolved_brain = Path(env_b).expanduser() if env_b else (Path.home() / ".gemini" / "antigravity" / "brain")
+        resolved_brain_dirs = dev_common.resolve_antigravity_brain_dirs(None)
+    else:
+        resolved_brain_dirs = []
 
     if preloaded_repo_dirs is not None:
         repo_dirs = dict(preloaded_repo_dirs)
@@ -1377,7 +1397,7 @@ def analyze_dev_flow_optimizations(
             active_locks,
             now_ts=now_ts,
             threshold_seconds=stall_threshold_seconds,
-            brain_dir=resolved_brain if resolved_brain is not None else "",
+            brain_dir=resolved_brain_dirs,
         )
     )
     # 1b. Phantom pr_open items (0 active locks & 0 pr_urls) and untracked ad-hoc active locks
@@ -1407,7 +1427,7 @@ def analyze_dev_flow_optimizations(
             )
         # 7. Telemetry efficiency anomalies + idle orchestrator with runnable work
         tel_findings, scanned_transcripts = _detect_telemetry_efficiency_anomalies(
-            resolved_brain,
+            resolved_brain_dirs,
             orchestrator_cid=eff_orch_cid,
             max_recent_transcripts=max_recent_transcripts,
         )
@@ -1416,7 +1436,7 @@ def analyze_dev_flow_optimizations(
             _detect_idle_orchestrator_with_runnable_work(
                 items,
                 active_locks,
-                resolved_brain,
+                resolved_brain_dirs,
                 orchestrator_cid=eff_orch_cid,
                 now_ts=now_ts,
                 threshold_seconds=stall_threshold_seconds,

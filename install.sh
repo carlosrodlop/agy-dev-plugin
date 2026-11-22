@@ -41,7 +41,7 @@ fi
 mkdir -p "${CONFIG_ROOT}/plugins" "${PLUGIN_DEST}" "${STATE_DIR}"
 chmod 700 "${STATE_DIR}" || true
 
-for item in plugin.json pyproject.toml README.md assets rules agents skills clients shell; do
+for item in plugin.json pyproject.toml README.md assets rules agents skills clients shell sidecars; do
   if [[ -e "${SCRIPT_DIR}/${item}" ]]; then
     rm -rf "${PLUGIN_DEST:?}/${item}"
     cp -R "${SCRIPT_DIR}/${item}" "${PLUGIN_DEST}/${item}"
@@ -80,6 +80,7 @@ find "${PLUGIN_DEST}" \( -name "*.bak.*" -o -name "*.old" \) -type f -delete || 
 chmod 755 "${PLUGIN_DEST}/clients"/*.py 2>/dev/null || true
 chmod 755 "${PLUGIN_DEST}/skills"/*/scripts/*.py 2>/dev/null || true
 chmod 755 "${PLUGIN_DEST}/shell"/*.sh 2>/dev/null || true
+chmod 755 "${PLUGIN_DEST}/sidecars"/*/*.py 2>/dev/null || true
 
 if [[ -x "${PLUGIN_DEST}/shell/agy_dev_queue.sh" ]]; then
   mkdir -p "${HOME}/.local/bin"

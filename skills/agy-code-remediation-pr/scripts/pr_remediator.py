@@ -7135,7 +7135,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_qdoc.add_argument("--json", dest="as_json", action="store_true", help="Emit structured JSON diagnosis report.")
     p_qdoc.add_argument("--sync-git", dest="sync_git", action="store_true", help="Sync per-repo locks and local main with git before diagnosing.")
     p_qdoc.add_argument("--fix", action="store_true", help="Apply safe runtime-only reconciliations (sync locks & phantom pr_open items; never mutates tracked code).")
-    p_qdoc.add_argument("--wake", action="store_true", help="Launch detached native `agy --agent agy-dev-orchestrator` when needed (cooldown + live-PID gated).")
+    p_qdoc.add_argument("--wake", action="store_true", help="Launch detached hybrid `agentapi` (Desktop/sidecar) or `agy --agent agy-dev-orchestrator` (terminal) recovery when needed (cooldown + live-PID gated).")
     p_qdoc.add_argument("--heal", action="store_true", help="Shorthand for `--sync-git --fix --wake`.")
     p_qdoc.add_argument("--check-only", dest="check_only", action="store_true", help="0-LLM sidecar/cron health gate: exit 0 when healthy, exit 2 when anomaly requires wake or fix.")
     p_qdoc.add_argument("--dry-run", dest="dry_run", action="store_true", help="Preview safe fixes and exact wake command/prompt without spawning processes or mutating state.")

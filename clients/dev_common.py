@@ -15,6 +15,7 @@ Provides zero-dependency stdlib primitives for `agy-dev-plugin` scripts:
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 import contextlib
 from dataclasses import asdict, dataclass, field
@@ -28,7 +29,7 @@ import shlex
 import subprocess
 import sys
 import time
-from typing import Any, Iterator
+from typing import Any
 import urllib.parse
 
 PLUGIN_NAME = "agy-dev-plugin"
@@ -420,6 +421,66 @@ def try_build_control_tower_ui_url(
     return f"http://{host}:{port}/ui#{clean_page}" if clean_page else f"http://{host}:{port}/ui"
 
 
+def resolve_antigravity_brain_dirs(
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
+    *,
+    home_dir: Path | None = None,
+    explicit_state_dir: bool = False,
+) -> list[Path]:
+    """Resolve ordered Antigravity `brain/` candidate directories across Desktop and CLI runtimes.
+
+    Precedence:
+      1. Explicit `brain_dir`: non-empty path(s) -> `[Path(...).expanduser()]`; empty string/sequence -> `[]`
+      2. `AGY_BRAIN_DIR` env var when non-empty -> `[Path(env_b).expanduser()]`
+      3. `explicit_state_dir=True` -> `[]` (preserves 100% hermetic custom-state unit tests)
+      4. Default -> `[<home>/.gemini/antigravity/brain, <home>/.gemini/antigravity-cli/brain]`
+    """
+    if brain_dir is not None:
+        if isinstance(brain_dir, Sequence) and not isinstance(brain_dir, (str, bytes)):
+            out: list[Path] = []
+            for item in brain_dir:
+                s = str(item or "").strip()
+                if s:
+                    out.append(Path(s).expanduser())
+            return out
+        b_str = str(brain_dir).strip()
+        return [Path(b_str).expanduser()] if b_str else []
+
+    env_b = str(os.environ.get("AGY_BRAIN_DIR") or "").strip()
+    if env_b:
+        return [Path(env_b).expanduser()]
+    if explicit_state_dir:
+        return []
+
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    return [
+        base_home / ".gemini" / "antigravity" / "brain",
+        base_home / ".gemini" / "antigravity-cli" / "brain",
+    ]
+
+
+def resolve_transcript_path(
+    conversation_id: str,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
+    *,
+    home_dir: Path | None = None,
+    explicit_state_dir: bool = False,
+) -> Path | None:
+    """Return the first existing `transcript.jsonl` path for `conversation_id` across candidate `brain/` dirs."""
+    cid = str(conversation_id or "").strip()
+    if not cid:
+        return None
+    for b_root in resolve_antigravity_brain_dirs(
+        brain_dir,
+        home_dir=home_dir,
+        explicit_state_dir=explicit_state_dir,
+    ):
+        cand = b_root / cid / ".system_generated" / "logs" / "transcript.jsonl"
+        if cand.is_file():
+            return cand
+    return None
+
+
 def try_inspect_antigravity_conversation(
     conversation_id: str,
     *,
@@ -433,15 +494,13 @@ def try_inspect_antigravity_conversation(
         if wc_mod is not None and hasattr(wc_mod, "inspect_antigravity_conversation"):
             try:
                 res = wc_mod.inspect_antigravity_conversation(conversation_id)
-                if isinstance(res, dict):
+                if isinstance(res, dict) and res.get("status") == "ok":
                     return res
             except Exception:
                 pass
 
-    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
-    resolved_brain = Path(brain_dir).expanduser() if brain_dir is not None else (base_home / ".gemini" / "antigravity" / "brain")
-    tpath = resolved_brain / conversation_id.strip() / ".system_generated" / "logs" / "transcript.jsonl"
-    if not tpath.is_file():
+    tpath = resolve_transcript_path(conversation_id, brain_dir=brain_dir, home_dir=home_dir)
+    if tpath is None:
         return {"status": "not_found", "conversation_id": conversation_id}
 
     details = ""

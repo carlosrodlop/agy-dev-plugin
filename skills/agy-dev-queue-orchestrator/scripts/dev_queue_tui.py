@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 import ast
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import contextlib
 from datetime import datetime
 import hashlib
@@ -159,14 +159,27 @@ def _resolve_conv_summaries_db(override: Path | str | None = None) -> Path:
     return Path.home() / ".gemini" / "antigravity" / "conversation_summaries.db"
 
 
-def _resolve_brain_dir(override: Path | str | None = None) -> Path:
-    """Resolve the Antigravity brain artifact directory."""
-    if override is not None and str(override).strip():
-        return Path(str(override)).expanduser()
+def _resolve_brain_dirs(
+    override: Path | str | Sequence[Path | str] | None = None,
+    *,
+    home_dir: Path | None = None,
+) -> list[Path]:
+    """Resolve Antigravity Desktop + CLI `brain/` directories via `dev_common`."""
+    if _dev_common is not None and hasattr(_dev_common, "resolve_antigravity_brain_dirs"):
+        return list(_dev_common.resolve_antigravity_brain_dirs(override, home_dir=home_dir))
+    if override is not None:
+        if isinstance(override, Sequence) and not isinstance(override, (str, bytes)):
+            return [Path(str(p).strip()).expanduser() for p in override if str(p).strip()]
+        s = str(override).strip()
+        return [Path(s).expanduser()] if s else []
     env_val = str(os.environ.get("AGY_BRAIN_DIR") or "").strip()
     if env_val:
-        return Path(env_val).expanduser()
-    return Path.home() / ".gemini" / "antigravity" / "brain"
+        return [Path(env_val).expanduser()]
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    return [
+        base_home / ".gemini" / "antigravity" / "brain",
+        base_home / ".gemini" / "antigravity-cli" / "brain",
+    ]
 
 
 def _color(text: str, code: str, enabled: bool) -> str:
@@ -2018,27 +2031,28 @@ def _synthesize_untracked_lock_items(
 def _resolve_orchestrator_liveness(
     orch_full: str,
     *,
-    brain_dir: Path | str | None,
+    brain_dir: Path | str | Sequence[Path | str] | None,
     counts: dict[str, int],
     now_ts: float | None = None,
     stall_threshold_seconds: int | float | None = None,
+    home_dir: Path | None = None,
 ) -> tuple[str, str]:
-    """Read orchestrator transcript `mtime` safely and return `(badge_text, ansi_code)`."""
+    """Read orchestrator transcript `mtime` safely across Desktop + CLI `brain/` dirs and return `(badge_text, ansi_code)`."""
     clean_orch = (orch_full or "").strip()
     if not _is_uuid(clean_orch):
         return ("", "")
-    if brain_dir is not None:
-        b_str = str(brain_dir).strip()
-        if not b_str:
-            return ("", "")
-        b_root = Path(b_str).expanduser()
+    tpath: Path | None = None
+    if _dev_common is not None and hasattr(_dev_common, "resolve_transcript_path"):
+        tpath = _dev_common.resolve_transcript_path(clean_orch, brain_dir, home_dir=home_dir)
     else:
-        b_root = _resolve_brain_dir(None)
-
-    tpath = b_root / clean_orch / ".system_generated" / "logs" / "transcript.jsonl"
+        for b_root in _resolve_brain_dirs(brain_dir, home_dir=home_dir):
+            cand = b_root / clean_orch / ".system_generated" / "logs" / "transcript.jsonl"
+            if cand.is_file():
+                tpath = cand
+                break
+    if tpath is None:
+        return ("", "")
     try:
-        if not tpath.is_file():
-            return ("", "")
         mtime = float(tpath.stat().st_mtime)
     except OSError:
         return ("", "")
@@ -2387,7 +2401,7 @@ def render(
     board_rows: list[dict[str, str]] = []
     hitl_board_rows: list[dict[str, str]] = []
     hitl_idx = 0
-    resolved_brain_root = _resolve_brain_dir(brain_dir)
+    resolved_brain_roots = _resolve_brain_dirs(brain_dir)
 
     for idx, it in enumerate(filtered, 1):
         prio = int(it.get("priority") if it.get("priority") is not None else 99)
@@ -2469,8 +2483,15 @@ def render(
             pill_styled = _color(pill_raw, "1;35", color_on)
             action_cell = _pad_visible(pill_styled, link_col)
             action_md = f"[Abrir chat](conversation://{cid_full})" if _is_uuid(cid_full) else "—"
-            cid_brain_dir = resolved_brain_root / cid_full
-            prop_mds = sorted(cid_brain_dir.glob("*.md")) if cid_brain_dir.is_dir() else []
+            prop_mds: list[Path] = []
+            seen_prop_names: set[str] = set()
+            for b_root in resolved_brain_roots:
+                cid_brain_dir = b_root / cid_full
+                if cid_brain_dir.is_dir():
+                    for md_cand in sorted(cid_brain_dir.glob("*.md")):
+                        if md_cand.name not in seen_prop_names:
+                            seen_prop_names.add(md_cand.name)
+                            prop_mds.append(md_cand)
             art_link = " · ".join(f"[{p.name}](file://{p})" for p in prop_mds[:2]) if prop_mds else "—"
             hitl_board_rows.append(
                 {
@@ -2910,7 +2931,9 @@ def _handle_doctor_hotkey(
             w_info = wake_rep.get("wake") if isinstance(wake_rep.get("wake"), dict) else {}
             w_st = str(w_info.get("status") or "not_requested")
             if w_st == "woke":
-                return f"✓ Doctor: woke orchestrator (pid {w_info.get('pid')})"
+                w_tr = str(w_info.get("transport") or "").strip()
+                via_lbl = f" via {w_tr}" if w_tr else ""
+                return f"✓ Doctor: woke orchestrator{via_lbl} (pid {w_info.get('pid')})"
             if w_st == "skipped_cooldown":
                 return f"⚠ Doctor: wake cooldown ({w_info.get('remaining_seconds', 0)}s left)"
             if w_st == "skipped_wake_in_flight":

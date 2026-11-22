@@ -1,0 +1,10 @@
+{
+  "args": [
+    "watchdog.py"
+  ],
+  "command": "python3",
+  "description": "Zero-LLM background watchdog that checks dev_queue.json and dev_pr_locks every 5 minutes via agy-doctor and triggers cooldown-gated agy-dev-orchestrator recovery via native agentapi only when actionable anomalies exist.",
+  "display_name": "Dev Queue 0-LLM Watchdog",
+  "has_web_ui": false,
+  "restart_policy": "always"
+}

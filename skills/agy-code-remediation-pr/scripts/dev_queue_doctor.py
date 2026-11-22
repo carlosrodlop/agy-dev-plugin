@@ -5,24 +5,28 @@ Pure Python 3 stdlib module (Santa Lockdown compliant, Unix portable, Zero-PII) 
   1. `diagnose_orchestrator`: 0-LLM full diagnosis across `dev_pr_locks`, `dev_queue.json`,
      runnable repos (`queue-next --unlocked`), `dev_flow_optimizer.analyze_dev_flow()`,
      live OS processes (`wait-for-unlock`, `watch-pr-merge`), and tail-bounded transcripts
-     (`server_restart_interrupted`, `idle_orchestrator_with_runnable_work`, `stalled_worker`,
-     `missing_wait_for_unlock`, `phantom_pr_open`).
+     across Desktop + CLI `brain/` directories (`server_restart_interrupted`,
+     `idle_orchestrator_with_runnable_work`, `stalled_worker`, `missing_wait_for_unlock`,
+     `phantom_pr_open`).
   2. `apply_safe_fixes`: safe runtime-only reconciliations (`sync_dev_pr_lock_with_git` and
      `reconcile_dev_queue_with_git`) that NEVER mutate tracked source files or push to `main`.
-  3. `trigger_orchestrator_wake`: cooldown- and live-PID-gated detached native `agy` CLI
-     wake-up (`agy_doctor_state.json` `0600` + `file_lock`) with `--dry-run` & `--force`.
+  3. `trigger_orchestrator_wake`: cooldown- and live-PID-gated detached hybrid wake-up
+     (`agentapi new-conversation` inside Antigravity Desktop/sidecars when `ANTIGRAVITY_LS_ADDRESS`
+     is set; `agy --agent agy-dev-orchestrator --dangerously-skip-permissions -p` from external
+     terminals; `agy_doctor_state.json` `0600` + `file_lock`) with `--dry-run` & `--force`.
   4. `render_doctor_report`: crisp 3-part terminal report for CLI and `dev_queue_tui.py` `[d]`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 import contextlib
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -138,6 +142,11 @@ def is_pid_alive(pid: int) -> bool:
         return False
 
 
+_PROMPT_FLAG_NAMES: frozenset[str] = frozenset({"-p", "--prompt", "-i", "--prompt-interactive"})
+_PROMPT_FLAG_PREFIXES: tuple[str, ...] = ("--prompt=", "--prompt-interactive=", "-p=", "-i=")
+_SHELL_INTERPRETER_NAMES: frozenset[str] = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+
+
 def resolve_agy_cli(*, home_dir: Path | None = None, which_fn: Callable[[str], str | None] | None = None) -> str:
     """Resolve native `agy` CLI binary path (`shutil.which("agy")` or `$HOME/.local/bin/agy`)."""
     finder = which_fn if which_fn is not None else shutil.which
@@ -151,13 +160,116 @@ def resolve_agy_cli(*, home_dir: Path | None = None, which_fn: Callable[[str], s
     return "agy"
 
 
+def resolve_agentapi_cli(
+    *,
+    env: Mapping[str, str] | None = None,
+    home_dir: Path | None = None,
+    which_fn: Callable[[str], str | None] | None = None,
+) -> str:
+    """Resolve Antigravity Desktop `agentapi` binary path, returning `""` when unavailable."""
+    eff_env = os.environ if env is None else env
+    env_exe = str(eff_env.get("ANTIGRAVITY_AGENTAPI_EXE") or "").strip()
+    if env_exe:
+        env_path = Path(env_exe).expanduser()
+        if env_path.is_file():
+            return str(env_path)
+
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    default_bin = base_home / ".gemini" / "antigravity" / "bin" / "agentapi"
+    if default_bin.is_file():
+        return str(default_bin)
+
+    finder = which_fn if which_fn is not None else shutil.which
+    found = finder("agentapi")
+    if found:
+        return str(found)
+    return ""
+
+
+def _strip_prompt_tokens(cmd: str, *, _depth: int = 0) -> tuple[str, list[str]]:
+    """Tokenize a `ps` command string and strip prompt arguments after `-p`/`--prompt`/`-i`/`--prompt-interactive`."""
+    shlex_ok = True
+    try:
+        tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+        shlex_ok = False
+        tokens = cmd.split()
+
+    if not tokens:
+        return ("", [])
+
+    exe_idx = 0
+    if exe_idx < len(tokens) and Path(tokens[exe_idx]).name.lower() == "env":
+        exe_idx += 1
+    while exe_idx < len(tokens) and "=" in tokens[exe_idx] and not tokens[exe_idx].startswith("-"):
+        exe_idx += 1
+    exe_base = Path(tokens[exe_idx]).name.lower() if exe_idx < len(tokens) else ""
+
+    has_quoted_prompt = bool(re.search(r"""(?:^|\s)(?:-p|--prompt|-i|--prompt-interactive)(?:=|\s+)["']""", cmd))
+
+    cleaned: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        tok_l = tok.lower()
+        if tok_l in _PROMPT_FLAG_NAMES:
+            if not shlex_ok:
+                break
+            if exe_base == "agy" and not has_quoted_prompt:
+                # `ps -eo pid,args` flattens argv without shell quotes: consume unquoted prompt words until next `--*` flag
+                idx += 1
+                while idx < len(tokens) and not tokens[idx].startswith("--"):
+                    idx += 1
+                continue
+            idx += 2
+            continue
+        if tok_l.startswith(_PROMPT_FLAG_PREFIXES):
+            if not shlex_ok:
+                break
+            idx += 1
+            continue
+        if (
+            _depth < 2
+            and exe_base in _SHELL_INTERPRETER_NAMES
+            and tok == "-c"
+            and idx + 1 < len(tokens)
+        ):
+            cleaned.append(tok)
+            _, sub_tokens = _strip_prompt_tokens(tokens[idx + 1], _depth=_depth + 1)
+            cleaned.extend(sub_tokens)
+            idx += 2
+            continue
+        cleaned.append(tok)
+        idx += 1
+
+    return (exe_base, cleaned)
+
+
+def _is_orchestrator_wake_process(exe_base: str, clean_tokens: list[str], raw_cmd_lower: str) -> bool:
+    """Return True when process tokens represent an `agy-dev-orchestrator` CLI or `[agy-doctor]` `agentapi` wake."""
+    tokens_l = [t.lower() for t in clean_tokens]
+    for idx, tok_l in enumerate(tokens_l):
+        if tok_l == "--agent" and idx + 1 < len(tokens_l) and tokens_l[idx + 1] == "agy-dev-orchestrator":
+            return True
+        if tok_l == "--agent=agy-dev-orchestrator":
+            return True
+    if ("--agent" in raw_cmd_lower) and ("agy-dev-orchestrator" in raw_cmd_lower):
+        if exe_base == "agy" or any(Path(t).name.lower() == "agy" for t in clean_tokens):
+            return True
+    has_agentapi = exe_base == "agentapi" or any(Path(t).name.lower() == "agentapi" for t in clean_tokens)
+    if has_agentapi and "new-conversation" in tokens_l:
+        if "[agy-doctor]" in raw_cmd_lower or "agy-dev-orchestrator" in raw_cmd_lower:
+            return True
+    return False
+
+
 def inspect_live_processes(
     *,
     ps_output: str | None = None,
     ps_runner: Callable[[], str] | None = None,
     self_pid: int | None = None,
 ) -> dict[str, Any]:
-    """Inspect live OS processes (`ps -eo pid,args`) for `wait-for-unlock` and `watch-pr-merge`."""
+    """Inspect live OS processes (`ps -eo pid,args`) for orchestrator wakes, `wait-for-unlock`, and `watch-pr-merge`."""
     raw_text = ""
     probe_error = ""
     if ps_output is not None:
@@ -202,12 +314,21 @@ def inspect_live_processes(
         cmd_l = cmd.lower()
         if "ps -eo" in cmd_l:
             continue
-        if "pr_remediator" in cmd_l and "wait-for-unlock" in cmd_l:
-            wait_pids.append(pid)
-        elif "pr_remediator" in cmd_l and "watch-pr-merge" in cmd_l:
-            watch_pids.append(pid)
-        elif ("agy-dev-orchestrator" in cmd_l) and ("--agent" in cmd_l):
+
+        exe_base, clean_tokens = _strip_prompt_tokens(cmd)
+        if _is_orchestrator_wake_process(exe_base, clean_tokens, cmd_l):
             wake_pids.append(pid)
+            continue
+
+        if exe_base in ("agy", "agentapi"):
+            continue
+
+        clean_tokens_l = [t.lower() for t in clean_tokens]
+        has_remediator = any("pr_remediator" in t for t in clean_tokens_l)
+        if has_remediator and "wait-for-unlock" in clean_tokens_l:
+            wait_pids.append(pid)
+        elif has_remediator and "watch-pr-merge" in clean_tokens_l:
+            watch_pids.append(pid)
 
     return {
         "wait_for_unlock_running": len(wait_pids) > 0,
@@ -273,14 +394,21 @@ def _step_has_recovery_dispatch(step_obj: dict[str, Any], raw_line: str) -> bool
 
 def inspect_transcript_tail(
     conversation_id: str,
-    brain_dir: Path | None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
     *,
     now_ts: float | None = None,
     max_bytes: int = TRANSCRIPT_TAIL_MAX_BYTES,
+    home_dir: Path | None = None,
+    explicit_state_dir: bool = False,
 ) -> dict[str, Any]:
     """Inspect a conversation's `transcript.jsonl` tail (read-only, Zero-PII) for restart & liveness state."""
     cid = str(conversation_id or "").strip()
-    if not cid or brain_dir is None:
+    brain_dirs = dev_common.resolve_antigravity_brain_dirs(
+        brain_dir,
+        home_dir=home_dir,
+        explicit_state_dir=explicit_state_dir,
+    )
+    if not cid or not brain_dirs:
         return {
             "conversation_id": cid,
             "exists": False,
@@ -293,8 +421,8 @@ def inspect_transcript_tail(
             "tail_lines_scanned": 0,
         }
 
-    tpath = brain_dir / cid / ".system_generated" / "logs" / "transcript.jsonl"
-    if not tpath.is_file():
+    tpath = dev_common.resolve_transcript_path(cid, brain_dirs)
+    if tpath is None:
         return {
             "conversation_id": cid,
             "exists": False,
@@ -364,23 +492,6 @@ def inspect_transcript_tail(
     }
 
 
-def _resolve_brain_dir(
-    brain_dir: Path | str | None,
-    *,
-    explicit_state_dir: bool,
-) -> Path | None:
-    """Resolve Antigravity `brain/` directory while keeping custom-state unit tests 100% hermetic."""
-    if brain_dir is not None:
-        b_str = str(brain_dir).strip()
-        return Path(b_str).expanduser() if b_str else None
-    env_b = str(os.environ.get("AGY_BRAIN_DIR") or "").strip()
-    if env_b:
-        return Path(env_b).expanduser()
-    if explicit_state_dir:
-        return None
-    return Path.home() / ".gemini" / "antigravity" / "brain"
-
-
 def _make_anomaly(
     *,
     code: str,
@@ -409,7 +520,8 @@ def diagnose_orchestrator(
     state_dir: Path | str | None = None,
     portfolio_dir: Path | str | None = None,
     repos_dir: Path | str | None = None,
-    brain_dir: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
     orchestrator_cid: str = "",
     sync_git: bool = False,
     stall_threshold_seconds: int | float | None = None,
@@ -422,8 +534,12 @@ def diagnose_orchestrator(
     pr_rem = _load_pr_remediator()
     raw_explicit_state = state_dir if state_dir is not None else portfolio_dir
     has_explicit_state = raw_explicit_state is not None and bool(str(raw_explicit_state).strip())
-    resolved_state = dev_common.resolve_state_dir(raw_explicit_state)
-    resolved_brain = _resolve_brain_dir(brain_dir, explicit_state_dir=has_explicit_state)
+    resolved_state = dev_common.resolve_state_dir(raw_explicit_state, home_dir=home_dir)
+    resolved_brain_dirs = dev_common.resolve_antigravity_brain_dirs(
+        brain_dir,
+        home_dir=home_dir,
+        explicit_state_dir=has_explicit_state,
+    )
     stall_thresh = resolve_stall_threshold_seconds(stall_threshold_seconds)
     cur_ts = float(now_ts if now_ts is not None else time.time())
 
@@ -469,7 +585,7 @@ def diagnose_orchestrator(
     flow_report = dev_flow_optimizer.analyze_dev_flow(
         portfolio_dir=resolved_state,
         repos_dir=repos_dir,
-        brain_dir=resolved_brain if resolved_brain is not None else "",
+        brain_dir=resolved_brain_dirs,
         orchestrator_cid=eff_orch_cid,
         stall_threshold_seconds=stall_thresh,
         now_ts=cur_ts,
@@ -478,7 +594,7 @@ def diagnose_orchestrator(
     proc_info = inspect_live_processes(ps_output=ps_output, ps_runner=ps_runner)
     orch_transcript = inspect_transcript_tail(
         eff_orch_cid,
-        resolved_brain,
+        resolved_brain_dirs,
         now_ts=cur_ts,
     )
 
@@ -488,7 +604,7 @@ def diagnose_orchestrator(
         if w_cid and w_cid not in worker_transcripts:
             worker_transcripts[w_cid] = inspect_transcript_tail(
                 w_cid,
-                resolved_brain,
+                resolved_brain_dirs,
                 now_ts=cur_ts,
             )
 
@@ -555,7 +671,8 @@ def diagnose_orchestrator(
             lk,
             now_ts=cur_ts,
             threshold_seconds=stall_thresh,
-            brain_dir=resolved_brain if resolved_brain is not None else "",
+            brain_dir=resolved_brain_dirs,
+            home_dir=home_dir,
         )
         w_cid = str(lk.get("worker_cid") or "").strip()
         wt_info = worker_transcripts.get(w_cid) or {}
@@ -917,7 +1034,9 @@ def build_wake_prompt(diagnosis: dict[str, Any]) -> str:
         )
 
     parts: list[str] = [
-        "[agy-doctor Auto-Wake Recovery] Pre-computed 0-LLM orchestrator diagnosis:",
+        "[agy-doctor Auto-Wake Recovery] Act as `agy-dev-orchestrator` and read/follow "
+        "`$HOME/.gemini/config/plugins/agy-dev-plugin/agents/agy-dev-orchestrator.md`.",
+        "Pre-computed 0-LLM orchestrator diagnosis:",
         f"- Overall Status: `{diagnosis.get('overall_status', 'degraded')}` "
         f"(Previous Orchestrator CID: `{prev_orch_cid or 'none'}`)",
         "- Detected Anomalies:",
@@ -932,6 +1051,8 @@ def build_wake_prompt(diagnosis: dict[str, Any]) -> str:
         [
             "",
             "Action Plan:",
+            "0. Adopt the `agy-dev-orchestrator` persona and follow the Core Orchestration Protocol in "
+            "`$HOME/.gemini/config/plugins/agy-dev-plugin/agents/agy-dev-orchestrator.md`.",
             "1. Register your active conversation ID and verify state via "
             "`pr_remediator.py lock-status --all --sync-git` and "
             "`pr_remediator.py queue-next --unlocked --orchestrator-id <YOUR_CONVERSATION_ID>`.",
@@ -955,15 +1076,17 @@ def trigger_orchestrator_wake(
     force: bool = False,
     now_ts: float | None = None,
     home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
     which_fn: Callable[[str], str | None] | None = None,
     popen_fn: Callable[..., Any] | None = None,
     pid_alive_fn: Callable[[int], bool] | None = None,
 ) -> dict[str, Any]:
-    """Launch detached `agy --agent agy-dev-orchestrator --mode auto -p <prompt>` guarded by PID + cooldown."""
+    """Launch detached hybrid orchestrator wake (`agentapi` in Desktop/sidecar; `agy` CLI in terminal)."""
     resolved_state = dev_common.resolve_state_dir(
         state_dir if state_dir is not None else portfolio_dir,
         home_dir=home_dir,
     )
+    eff_env = os.environ if env is None else env
     eff_cooldown = max(0, int(cooldown_seconds))
     cur_ts = float(now_ts if now_ts is not None else time.time())
     needs_wake = bool(diagnosis.get("needs_wake"))
@@ -998,6 +1121,7 @@ def trigger_orchestrator_wake(
                 "status": "skipped_wake_in_flight",
                 "woke": False,
                 "pid": prev_pid,
+                "transport": str(prev_state.get("transport") or ""),
                 "last_wake_at": str(prev_state.get("last_wake_at") or ""),
                 "last_wake_reason": str(prev_state.get("last_wake_reason") or ""),
             }
@@ -1012,19 +1136,32 @@ def trigger_orchestrator_wake(
                     "woke": False,
                     "cooldown_seconds": eff_cooldown,
                     "remaining_seconds": remaining,
+                    "transport": str(prev_state.get("transport") or ""),
                     "last_wake_at": str(prev_state.get("last_wake_at") or ""),
                     "last_wake_pid": prev_pid,
                 }
 
         prompt = build_wake_prompt(diagnosis)
-        agy_bin = resolve_agy_cli(home_dir=home_dir, which_fn=which_fn)
-        cmd = [agy_bin, "--agent", "agy-dev-orchestrator", "--mode", "auto", "-p", prompt]
+        ls_addr = str(eff_env.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
+        agentapi_bin = (
+            resolve_agentapi_cli(env=eff_env, home_dir=home_dir, which_fn=which_fn)
+            if ls_addr
+            else ""
+        )
+        if ls_addr and agentapi_bin:
+            transport = "agentapi"
+            cmd = [agentapi_bin, "new-conversation", "--title=[agy-doctor] Orchestrator Recovery", prompt]
+        else:
+            transport = "agy_cli"
+            agy_bin = resolve_agy_cli(home_dir=home_dir, which_fn=which_fn)
+            cmd = [agy_bin, "--agent", "agy-dev-orchestrator", "--dangerously-skip-permissions", "-p", prompt]
 
         if dry_run:
             return {
                 "status": "dry_run",
                 "woke": False,
                 "dry_run": True,
+                "transport": transport,
                 "reason": wake_reason,
                 "command": cmd,
                 "prompt": prompt,
@@ -1035,20 +1172,23 @@ def trigger_orchestrator_wake(
         log_path = logs_dir / f"agy_doctor_wake_{_utc_compact_stamp(cur_ts)}.log"
         log_fd = os.open(str(log_path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
         log_fp = os.fdopen(log_fd, "a", encoding="utf-8")
+        popen_kwargs: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": log_fp,
+            "stderr": subprocess.STDOUT,
+            "start_new_session": True,
+            "close_fds": True,
+        }
+        if env is not None:
+            popen_kwargs["env"] = dict(eff_env)
         try:
-            proc = launcher(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=log_fp,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                close_fds=True,
-            )
+            proc = launcher(cmd, **popen_kwargs)
         except OSError as exc:
             return {
                 "status": "error",
                 "woke": False,
-                "reason": "agy_spawn_failed",
+                "transport": transport,
+                "reason": "agentapi_spawn_failed" if transport == "agentapi" else "agy_spawn_failed",
                 "error": _sanitize_path(str(exc)),
                 "command": cmd,
             }
@@ -1059,12 +1199,13 @@ def trigger_orchestrator_wake(
         raw_new_pid = getattr(proc, "pid", 0)
         new_pid = int(raw_new_pid) if isinstance(raw_new_pid, int) and not isinstance(raw_new_pid, bool) else 0
         wake_iso = _utc_now_iso(cur_ts)
-        sanitized_cmd = [*(_sanitize_path(c) for c in cmd[:5]), "<prompt>"] if len(cmd) >= 6 else list(cmd)
+        sanitized_cmd = [*(_sanitize_path(c) for c in cmd[:-1]), "<prompt>"] if cmd else []
         persisted_state = {
             "last_wake_at": wake_iso,
             "last_wake_pid": new_pid,
             "last_wake_reason": wake_reason,
             "last_wake_log": _sanitize_path(str(log_path)),
+            "transport": transport,
             "last_command": sanitized_cmd,
         }
         dev_common.atomic_write_json(state_file, persisted_state, mode=0o600)
@@ -1072,6 +1213,7 @@ def trigger_orchestrator_wake(
         return {
             "status": "woke",
             "woke": True,
+            "transport": transport,
             "pid": new_pid,
             "woke_at": wake_iso,
             "reason": wake_reason,
@@ -1087,7 +1229,7 @@ def run_queue_doctor(
     state_dir: Path | str | None = None,
     portfolio_dir: Path | str | None = None,
     repos_dir: Path | str | None = None,
-    brain_dir: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
     orchestrator_cid: str = "",
     sync_git: bool = False,
     fix: bool = False,
@@ -1103,6 +1245,7 @@ def run_queue_doctor(
     ps_runner: Callable[[], str] | None = None,
     git_client: Any | None = None,
     home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
     which_fn: Callable[[str], str | None] | None = None,
     popen_fn: Callable[..., Any] | None = None,
     pid_alive_fn: Callable[[int], bool] | None = None,
@@ -1128,6 +1271,7 @@ def run_queue_doctor(
                 state_dir=target_state,
                 repos_dir=repos_dir,
                 brain_dir=brain_dir,
+                home_dir=home_dir,
                 orchestrator_cid=orchestrator_cid,
                 sync_git=False,
                 stall_threshold_seconds=stall_threshold_seconds,
@@ -1147,6 +1291,7 @@ def run_queue_doctor(
                 state_dir=target_state,
                 repos_dir=repos_dir,
                 brain_dir=brain_dir,
+                home_dir=home_dir,
                 orchestrator_cid=orchestrator_cid,
                 sync_git=False,
                 stall_threshold_seconds=stall_threshold_seconds,
@@ -1160,6 +1305,7 @@ def run_queue_doctor(
             state_dir=target_state,
             repos_dir=repos_dir,
             brain_dir=brain_dir,
+            home_dir=home_dir,
             orchestrator_cid=orchestrator_cid,
             sync_git=bool(eff_sync_git and not dry_run and not check_only),
             stall_threshold_seconds=stall_threshold_seconds,
@@ -1179,6 +1325,7 @@ def run_queue_doctor(
             force=force,
             now_ts=now_ts,
             home_dir=home_dir,
+            env=env,
             which_fn=which_fn,
             popen_fn=popen_fn,
             pid_alive_fn=pid_alive_fn,
@@ -1280,14 +1427,20 @@ def render_doctor_report(report: dict[str, Any], *, color: bool = True) -> str:
 
     wake_info = report.get("wake") if isinstance(report.get("wake"), dict) else {}
     w_status = str(wake_info.get("status") or "not_requested")
+    w_transport = str(wake_info.get("transport") or "agy_cli")
     if w_status == "woke":
         lines.append(
-            f"  • Wake: {_color('LAUNCHED', '1;32', color)} pid={wake_info.get('pid')} "
+            f"  • Wake: {_color('LAUNCHED', '1;32', color)} ({w_transport}) pid={wake_info.get('pid')} "
             f"(log: {wake_info.get('log_path', '')})"
         )
     elif w_status == "dry_run":
+        dry_cmd_lbl = (
+            "`agentapi new-conversation \"--title=[agy-doctor] Orchestrator Recovery\" <prompt>`"
+            if w_transport == "agentapi"
+            else "`agy --agent agy-dev-orchestrator --dangerously-skip-permissions -p <prompt>`"
+        )
         lines.append(
-            f"  • Wake: {_color('DRY-RUN', '1;36', color)} would spawn `agy --agent agy-dev-orchestrator --mode auto -p <prompt>`"
+            f"  • Wake: {_color('DRY-RUN', '1;36', color)} ({w_transport}) would spawn {dry_cmd_lbl}"
         )
     elif w_status == "skipped_healthy":
         lines.append("  • Wake: skipped (queue & orchestrator healthy — 0 LLM tokens used).")
