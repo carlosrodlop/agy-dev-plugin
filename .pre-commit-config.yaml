@@ -33,18 +33,14 @@ repos:
         entry: python3 ./tests/scripts/qa_static_audit.py --strict --incremental
         language: system
         pass_filenames: false
-      - id: install-sh-syntax
-        name: POSIX Shell Syntax Check (install.sh)
-        entry: bash -n install.sh
-        language: system
-        files: '\.sh$'
       - id: unit-tests-fast
         name: Offline Unit Tests
-        entry: python3 ./tests/scripts/selective_test_runner.py
+        entry: env PRE_COMMIT_HOOK=1 AGY_OFFLINE_ONLY=1 python3 ./tests/scripts/selective_test_runner.py --no-bats
         language: system
         pass_filenames: false
       - id: bats-suite
         name: BATS CLI & Installer Tests
         entry: bash -c 'if command -v bats >/dev/null 2>&1; then env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_COMMON_DIR -u GIT_PREFIX bats tests/bats/*.bats; else echo "bats not installed; skipping"; fi'
         language: system
-        files: '(\.sh|\.bats|hooks\.json|agents/.*\.md)$'
+        pass_filenames: false
+        files: '(\.sh|\.bats|\.pre-commit-config\.ya?ml|hooks\.json|plugin\.json|agents/.*\.md|sidecars/.*|(dev_common|git_client|pr_remediator|project_audit|dev_queue_tui)\.py)$'

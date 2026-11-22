@@ -2496,7 +2496,8 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             qa_calls = [c for c, _ in call_log if any("qa_static_audit.py" in tok for tok in c)]
             ut_calls = [c for c, _ in call_log if "-m" in c and "unittest" in c]
             self.assertEqual(len(pc_calls), 1)
-            self.assertEqual(pc_calls[0][1], "unit-tests,qa-static-audit")
+            self.assertEqual(pc_calls[0][0], ["/usr/local/bin/pre-commit", "run", "--files", "feature.py"])
+            self.assertEqual(pc_calls[0][1], "unit-tests,unit-tests-fast,qa-static-audit,bats-suite")
             self.assertEqual(len(qa_calls), 1)
             self.assertIn("--incremental", qa_calls[0])
             self.assertEqual(len(ut_calls), 1)
@@ -3368,6 +3369,144 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             hint = prs._flow_opt.format_compact_opt_hint(report)
             self.assertTrue(hint.startswith("OPT:"))
             self.assertTrue(any(tok in hint for tok in ("phantom PR", "untracked lock", "orch idle")))
+
+    def test_test_local_incremental_pre_commit_fallbacks_and_selective_bats_routing(self) -> None:
+        """Verify incremental `pre-commit run --files`, `--all-files` fallbacks, `bats-suite` in SKIP, and `should_run_bats` routing."""
+        self.assertTrue(prs.parse_args(["test-local", "--all"]).run_all)
+        self.assertTrue(prs.parse_args(["test-local", "--all-files"]).run_all)
+        self.assertFalse(prs.parse_args(["test-local"]).run_all)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-p0-fast")
+            (repo_a / ".pre-commit-config.yaml").write_text(
+                "repos:\n  - repo: local\n    hooks:\n      - id: unit-tests-fast\n        entry: python3 -m unittest\n",
+                encoding="utf-8",
+            )
+            (repo_a / "obsolete.py").write_text("OLD = 1\n", encoding="utf-8")
+            (repo_a / "install.sh").write_text("#!/usr/bin/env bash\nset -euo pipefail\necho ok\n", encoding="utf-8")
+            (repo_a / "tests" / "scripts").mkdir(parents=True)
+            (repo_a / "tests" / "bats").mkdir(parents=True)
+            (repo_a / "tests" / "bats" / "smoke.bats").write_text("#!/usr/bin/env bats\n@test 'ok' { [ 1 -eq 1 ]; }\n", encoding="utf-8")
+            (repo_a / "tests" / "scripts" / "selective_test_runner.py").write_text(
+                "#!/usr/bin/env python3\n"
+                "def should_run_bats(changed_files, *, run_all=False):\n"
+                "    if run_all:\n"
+                "        return True\n"
+                "    return any(str(f).endswith(('.sh', '.bats')) for f in changed_files)\n"
+                "if __name__ == '__main__':\n"
+                "    print('Ran 1 test in 0.001s\\n\\nOK')\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo_a), "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "commit", "-m", "chore: seed repo"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "origin", "main"], check=True, capture_output=True)
+
+            pc_seen: list[tuple[list[str], str]] = []
+            bats_seen: list[list[str]] = []
+            real_run = subprocess.run
+
+            def _fake_which(bin_name: str) -> str | None:
+                if bin_name == "pre-commit":
+                    return "/usr/local/bin/pre-commit"
+                if bin_name == "bats":
+                    return "/usr/local/bin/bats"
+                return None
+
+            def _intercept(cmd, *args, **kwargs):
+                cmd_list = [str(c) for c in cmd]
+                env_used = kwargs.get("env") or {}
+                if cmd_list and cmd_list[0].endswith("pre-commit"):
+                    pc_seen.append((cmd_list, str(env_used.get("SKIP") or "")))
+                    return subprocess.CompletedProcess(cmd_list, 0, stdout="Passed\n", stderr="")
+                if cmd_list and cmd_list[0].endswith("bats"):
+                    bats_seen.append(cmd_list)
+                    return subprocess.CompletedProcess(cmd_list, 0, stdout="1..1\nok 1 smoke\n", stderr="")
+                return real_run(cmd, *args, **kwargs)
+
+            with (
+                mock.patch.object(prs.shutil, "which", side_effect=_fake_which),
+                mock.patch.object(prs.subprocess, "run", side_effect=_intercept),
+            ):
+                # 1. Clean working tree (empty changed-files list) -> falls back to --all-files; should_run_bats=False skips bats
+                res_clean = prs.run_local_validation_suite(
+                    workdir=repo_a,
+                    portfolio_dir=pdir,
+                    run_pre_commit=True,
+                    run_bats=True,
+                )
+                self.assertTrue(res_clean["passed"])
+                self.assertEqual(pc_seen[-1][0], ["/usr/local/bin/pre-commit", "run", "--all-files"])
+                self.assertEqual(pc_seen[-1][1], "unit-tests,unit-tests-fast,qa-static-audit,bats-suite")
+                self.assertEqual(len(bats_seen), 0)
+                self.assertEqual(res_clean["verification_results"]["bats"]["status"], "skipped")
+
+                # 2. Docs/Python edit + deleted file -> incremental --files omits deleted file; should_run_bats=False skips bats
+                subprocess.run(["git", "-C", str(repo_a), "rm", "-q", "obsolete.py"], check=True, capture_output=True)
+                (repo_a / "README.md").write_text("# Updated docs\n", encoding="utf-8")
+                res_inc = prs.run_local_validation_suite(
+                    workdir=repo_a,
+                    portfolio_dir=pdir,
+                    run_pre_commit=True,
+                    run_bats=True,
+                )
+                self.assertTrue(res_inc["passed"])
+                self.assertEqual(pc_seen[-1][0], ["/usr/local/bin/pre-commit", "run", "--files", "README.md"])
+                self.assertEqual(res_inc["verification_results"]["pre_commit"]["mode"], "incremental")
+                self.assertEqual(len(bats_seen), 0)
+                self.assertEqual(res_inc["verification_results"]["bats"]["status"], "skipped")
+
+                # 3. Explicit --all (run_all=True) -> forces --all-files on pre-commit and runs BATS
+                res_all = prs.run_local_validation_suite(
+                    workdir=repo_a,
+                    portfolio_dir=pdir,
+                    run_pre_commit=True,
+                    run_bats=True,
+                    run_all=True,
+                )
+                self.assertTrue(res_all["passed"])
+                self.assertEqual(pc_seen[-1][0], ["/usr/local/bin/pre-commit", "run", "--all-files"])
+                self.assertEqual(len(bats_seen), 1)
+                self.assertEqual(res_all["verification_results"]["bats"]["status"], "pass")
+
+                # 4. Shell edit -> incremental --files includes install.sh AND should_run_bats=True runs BATS
+                (repo_a / "install.sh").write_text("#!/usr/bin/env bash\nset -euo pipefail\necho v2\n", encoding="utf-8")
+                res_sh = prs.run_local_validation_suite(
+                    workdir=repo_a,
+                    portfolio_dir=pdir,
+                    run_pre_commit=True,
+                    run_bats=True,
+                )
+                self.assertTrue(res_sh["passed"])
+                self.assertEqual(pc_seen[-1][0][:3], ["/usr/local/bin/pre-commit", "run", "--files"])
+                self.assertIn("install.sh", pc_seen[-1][0][3:])
+                self.assertNotIn("obsolete.py", pc_seen[-1][0][3:])
+                self.assertEqual(len(bats_seen), 2)
+                self.assertEqual(res_sh["verification_results"]["bats"]["status"], "pass")
+
+                # 5. Editing .pre-commit-config.yaml -> forces --all-files fallback and runs BATS even without --all
+                subprocess.run(["git", "-C", str(repo_a), "checkout", "--", "install.sh"], check=True, capture_output=True)
+                (repo_a / ".pre-commit-config.yaml").write_text(
+                    "repos:\n  - repo: local\n    hooks:\n      - id: unit-tests-fast\n        entry: python3 -m unittest -v\n",
+                    encoding="utf-8",
+                )
+                res_cfg = prs.run_local_validation_suite(
+                    workdir=repo_a,
+                    portfolio_dir=pdir,
+                    run_pre_commit=True,
+                    run_bats=True,
+                )
+                self.assertTrue(res_cfg["passed"])
+                self.assertEqual(pc_seen[-1][0], ["/usr/local/bin/pre-commit", "run", "--all-files"])
+                self.assertEqual(len(bats_seen), 3)
+                self.assertEqual(res_cfg["verification_results"]["bats"]["status"], "pass")
 
 
 if __name__ == "__main__":
