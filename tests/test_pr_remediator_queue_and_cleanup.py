@@ -2569,6 +2569,123 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertEqual(fail_res["pre_commit_status"], "FAILED")
             self.assertIn("trailing-whitespace...Failed", fail_res["pre_commit_output"])
 
+    def test_test_local_pre_commit_indexes_untracked_files_and_snapshot_tracks_exec_bit(self) -> None:
+        """Verify `test-local --with-pre-commit` temporarily indexes untracked files and `_snapshot_worktree_state` hashes exec bits."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True)
+
+            _, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-untracked")
+            (repo_a / ".pre-commit-config.yaml").write_text(
+                "repos:\n  - repo: local\n    hooks:\n      - id: unit-tests\n        entry: python3 -m unittest\n",
+                encoding="utf-8",
+            )
+            (repo_a / "tests").mkdir(exist_ok=True)
+            (repo_a / "tests" / "test_smoke.py").write_text(
+                "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self): self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo_a), "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "commit", "-m", "chore: init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_a), "push", "origin", "main"], check=True, capture_output=True)
+
+            # Pre-existing staged file must remain staged after cleanup
+            staged_keep = repo_a / "staged_keep.py"
+            staged_keep.write_text("KEEP = True\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo_a), "add", "staged_keep.py"], check=True, capture_output=True)
+
+            # Untracked script with shebang starts non-executable (0644)
+            new_script = repo_a / "new_tool.py"
+            new_script.write_text("#!/usr/bin/env python3\nprint('ok')\n", encoding="utf-8")
+            os.chmod(new_script, 0o644)
+
+            snap_644 = prs._snapshot_worktree_state(repo_a)
+            os.chmod(new_script, 0o755)
+            snap_755 = prs._snapshot_worktree_state(repo_a)
+            self.assertNotEqual(
+                snap_644["content_fingerprint"],
+                snap_755["content_fingerprint"],
+                "_snapshot_worktree_state must include executable mode bits for untracked files",
+            )
+            os.chmod(new_script, 0o644)
+
+            observed_stage_lines: list[str] = []
+            real_subproc_run = subprocess.run
+
+            def _intercept_check_stage(cmd, *args, **kwargs):
+                cmd_list = [str(c) for c in cmd]
+                if cmd_list and cmd_list[0].endswith("pre-commit"):
+                    stage = real_subproc_run(
+                        ["git", "-C", str(repo_a), "ls-files", "--stage", "--", "new_tool.py"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    stage_out = stage.stdout.strip()
+                    observed_stage_lines.append(stage_out)
+                    is_exec = stage_out.startswith("100755 ")
+                    return subprocess.CompletedProcess(
+                        cmd_list,
+                        0 if is_exec else 1,
+                        stdout="check-shebang...Passed\n" if is_exec else "new_tool.py: not executable\n",
+                        stderr="",
+                    )
+                return real_subproc_run(cmd, *args, **kwargs)
+
+            with (
+                mock.patch.object(prs.shutil, "which", side_effect=lambda b: "/usr/local/bin/pre-commit" if b == "pre-commit" else None),
+                mock.patch.object(prs.subprocess, "run", side_effect=_intercept_check_stage),
+            ):
+                res_nonexec = prs.run_local_validation_suite(
+                    workdir=repo_a,
+                    portfolio_dir=pdir,
+                    run_pre_commit=True,
+                    run_bats=False,
+                )
+            self.assertFalse(res_nonexec["passed"])
+            self.assertEqual(res_nonexec["pre_commit_status"], "FAILED")
+            self.assertTrue(observed_stage_lines and observed_stage_lines[-1].startswith("100644 "))
+
+            # Untracked file must be unstaged after failure while staged_keep.py stays staged and on disk
+            porcelain_after_fail = subprocess.run(
+                ["git", "-C", str(repo_a), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.splitlines()
+            self.assertIn("A  staged_keep.py", porcelain_after_fail)
+            self.assertIn("?? new_tool.py", porcelain_after_fail)
+            self.assertTrue(new_script.exists())
+
+            # After chmod +x, re-running sees 100755 in git index and passes, still cleaning up index
+            os.chmod(new_script, 0o755)
+            with (
+                mock.patch.object(prs.shutil, "which", side_effect=lambda b: "/usr/local/bin/pre-commit" if b == "pre-commit" else None),
+                mock.patch.object(prs.subprocess, "run", side_effect=_intercept_check_stage),
+            ):
+                res_exec = prs.run_local_validation_suite(
+                    workdir=repo_a,
+                    portfolio_dir=pdir,
+                    run_pre_commit=True,
+                    run_bats=False,
+                )
+            self.assertTrue(res_exec["passed"])
+            self.assertEqual(res_exec["pre_commit_status"], "PASSED")
+            self.assertTrue(observed_stage_lines[-1].startswith("100755 "))
+            porcelain_after_pass = subprocess.run(
+                ["git", "-C", str(repo_a), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.splitlines()
+            self.assertIn("A  staged_keep.py", porcelain_after_pass)
+            self.assertIn("?? new_tool.py", porcelain_after_pass)
+
     def test_analyze_dev_flow_optimizations_all_seven_detectors_and_cli(self) -> None:
         """Verify all 7 deterministic 0-LLM detectors in `analyze_dev_flow_optimizations` and `queue-optimize` CLI."""
         with tempfile.TemporaryDirectory() as tmp:
