@@ -95,6 +95,10 @@ ALT_SCREEN_EXIT = "\033[?25h\033[?1049l"
 
 STATUS_ORDER: dict[str, int] = {
     "pr_open": 0,
+    "needs_rebase_reverify": 1,
+    "ready_awaiting_base_merge": 1,
+    "needs_agent_semantic_fix": 1,
+    "needs_agent_conflict_resolution": 1,
     "in_progress": 1,
     "pending": 2,
     "hitl_blocked": 3,
@@ -127,16 +131,30 @@ AGENT_REVIEW_LOCK_STATUSES: frozenset[str] = frozenset(
     }
 )
 
-UNREADY_PR_GATE_LOCK_STATUSES: frozenset[str] = getattr(
-    _dev_common,
-    "UNREADY_PR_GATE_LOCK_STATUSES",
-    frozenset(
-        {
-            "AWAITING_AGENT_REVIEW",
-            "NEEDS_REVISION_ITERATING",
-            "ESCALATED_MAX_REVIEW_ITERATIONS",
-        }
-    ),
+REBASE_OR_AWAIT_LOCK_STATUSES: frozenset[str] = frozenset(
+    {
+        "READY_AWAITING_BASE_MERGE",
+        "NEEDS_REBASE_REVERIFY",
+        "NEEDS_AGENT_SEMANTIC_FIX",
+        "NEEDS_AGENT_CONFLICT_RESOLUTION",
+    }
+)
+
+UNREADY_PR_GATE_LOCK_STATUSES: frozenset[str] = frozenset(
+    set(
+        getattr(
+            _dev_common,
+            "UNREADY_PR_GATE_LOCK_STATUSES",
+            frozenset(
+                {
+                    "AWAITING_AGENT_REVIEW",
+                    "NEEDS_REVISION_ITERATING",
+                    "ESCALATED_MAX_REVIEW_ITERATIONS",
+                }
+            ),
+        )
+    )
+    | set(REBASE_OR_AWAIT_LOCK_STATUSES)
 )
 
 
@@ -367,28 +385,117 @@ def _load_conversation_titles(
 ) -> dict[str, str]:
     """Read exact Antigravity Desktop sidebar conversation titles from `conversation_summaries.db`."""
     clean_ids = [c for c in dict.fromkeys(cids) if _is_uuid(c)]
+    explicit_db = bool(
+        (db_path is not None and str(db_path).strip())
+        or str(os.environ.get("AGY_CONVERSATION_SUMMARIES_DB") or "").strip()
+    )
     resolved_db = _resolve_conv_summaries_db(db_path)
     if not clean_ids or not resolved_db.is_file():
         return {}
     titles: dict[str, str] = {}
-    try:
-        conn = sqlite3.connect(f"file:{resolved_db}?mode=ro", uri=True, timeout=0.5)
+    for uri in (f"file:{resolved_db}?mode=ro", f"file:{resolved_db}?mode=ro&immutable=1"):
         try:
-            placeholders = ",".join("?" for _ in clean_ids)
-            for cid, title in conn.execute(
-                f"SELECT conversation_id, title FROM conversation_summaries WHERE conversation_id IN ({placeholders})",
-                clean_ids,
-            ).fetchall():
-                if title:
-                    titles[str(cid)] = str(title).strip()
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        if strict:
-            raise
-    except Exception:
-        pass
+            conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+            try:
+                placeholders = ",".join("?" for _ in clean_ids)
+                for cid, title in conn.execute(
+                    f"SELECT conversation_id, title FROM conversation_summaries WHERE conversation_id IN ({placeholders})",
+                    clean_ids,
+                ).fetchall():
+                    if title:
+                        titles[str(cid)] = str(title).strip()
+            finally:
+                conn.close()
+            return titles
+        except sqlite3.OperationalError:
+            if uri.endswith("immutable=1") and strict and explicit_db:
+                raise
+            continue
+        except sqlite3.Error:
+            if strict and explicit_db:
+                raise
+            break
+        except Exception:
+            break
     return titles
+
+
+def _is_lock_base_stale(lk: dict[str, Any]) -> bool:
+    """Return True when a lock or slot has `base_stale=True`, `needs_base_rebase=True`, or rebase-required status."""
+    if bool(lk.get("base_stale")) or bool(lk.get("needs_base_rebase")):
+        return True
+    status_u = str(lk.get("status") or "").strip().upper()
+    return status_u in {
+        "NEEDS_REBASE_REVERIFY",
+        "NEEDS_AGENT_SEMANTIC_FIX",
+        "NEEDS_AGENT_CONFLICT_RESOLUTION",
+    }
+
+
+def _iter_active_lock_slots(lk: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return ordered active slot dictionaries (`slot_id` 1, 2, ...) for a repository lock."""
+    if not isinstance(lk, dict) or not bool(lk.get("active", True)):
+        return []
+    raw_slots = lk.get("slots")
+    collected: dict[int, dict[str, Any]] = {}
+    if isinstance(raw_slots, dict):
+        for raw_k, raw_v in raw_slots.items():
+            if not isinstance(raw_v, dict) or not bool(raw_v.get("active", True)):
+                continue
+            try:
+                s_id = int(raw_v.get("slot_id") or raw_k)
+            except (TypeError, ValueError):
+                continue
+            if s_id < 1:
+                continue
+            s_entry = dict(raw_v)
+            s_entry["slot_id"] = s_id
+            s_entry["active"] = True
+            s_entry["base_stale"] = _is_lock_base_stale(s_entry)
+            s_entry.setdefault("target_repo_dir", str(lk.get("target_repo_dir") or ""))
+            collected[s_id] = s_entry
+
+    if 1 not in collected and (
+        not isinstance(raw_slots, dict)
+        or not raw_slots
+        or str(lk.get("branch_name") or "").strip()
+        or str(lk.get("conversation_id") or "").strip()
+        or str(lk.get("status") or "").strip()
+    ):
+        top_slot = {k: v for k, v in lk.items() if k != "slots"}
+        try:
+            top_sid = int(lk.get("slot_id") or 1)
+        except (TypeError, ValueError):
+            top_sid = 1
+        top_slot["slot_id"] = top_sid
+        top_slot["active"] = True
+        top_slot["base_stale"] = _is_lock_base_stale(top_slot)
+        collected.setdefault(top_sid, top_slot)
+
+    return [collected[k] for k in sorted(collected)]
+
+
+def _normalize_repo_lock_slots(slug: str, info: dict[str, Any]) -> dict[str, Any]:
+    """Normalize an active repository lock with multi-slot occupancy (`1/2`, `2/2`) and `base_stale` flags."""
+    if not isinstance(info, dict) or not bool(info.get("active")):
+        return dict(info or {})
+    norm = dict(info)
+    active_slots = _iter_active_lock_slots(norm)
+    try:
+        raw_max = int(norm.get("max_slots") or 2)
+    except (TypeError, ValueError):
+        raw_max = 2
+    max_slots = max(len(active_slots), raw_max, 2)
+    slots_map = {str(s["slot_id"]): s for s in active_slots}
+    norm["slots"] = slots_map
+    norm["max_slots"] = max_slots
+    norm["active_slots_count"] = len(active_slots)
+    norm["slot_occupancy"] = f"{len(active_slots)}/{max_slots}"
+    primary = slots_map.get("1") or (active_slots[0] if active_slots else norm)
+    norm["base_stale"] = _is_lock_base_stale(primary)
+    if slug and not norm.get("repo_slug"):
+        norm["repo_slug"] = slug
+    return norm
 
 
 def _load_locks(
@@ -396,7 +503,7 @@ def _load_locks(
     *,
     strict: bool = False,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Load active and historical per-repository `dev_pr_locks` from state files."""
+    """Load active and historical per-repository `dev_pr_locks` (including `slots`) from state files."""
     active: dict[str, dict[str, Any]] = {}
     all_locks: dict[str, dict[str, Any]] = {}
     for candidate in (state_dir / "dev_pr_lock.json", state_dir / "actions_state.json"):
@@ -416,16 +523,28 @@ def _load_locks(
             for slug, info in raw_map.items():
                 if isinstance(info, dict):
                     slug_key = str(slug)
-                    all_locks[slug_key] = info
                     if info.get("active"):
-                        active[slug_key] = info
+                        norm_info = _normalize_repo_lock_slots(slug_key, info)
+                        all_locks[slug_key] = norm_info
+                        active[slug_key] = norm_info
                     else:
+                        all_locks[slug_key] = dict(info)
                         active.pop(slug_key, None)
     return (active, all_locks)
 
 
 def is_lock_human_ready(lk: dict[str, Any]) -> bool:
-    """Return True only when a lock has passed review and satisfied the human PR validation gate."""
+    """Return True iff a Slot #1 lock has `base_stale == False`, `pr_gate_ready == True`, and passed review."""
+    if not isinstance(lk, dict):
+        return False
+    try:
+        slot_num = int(lk.get("slot_id") or 1)
+    except (TypeError, ValueError):
+        slot_num = 1
+    if slot_num != 1:
+        return False
+    if _is_lock_base_stale(lk):
+        return False
     status_u = str(lk.get("status") or "").upper()
     if status_u in UNREADY_PR_GATE_LOCK_STATUSES:
         return False
@@ -780,16 +899,17 @@ def _snapshot_state_fingerprint(
     for _slug, lk in sorted((locks or {}).items()):
         if not isinstance(lk, dict):
             continue
-        wt_raw = str(lk.get("worktree_path") or "").replace("$HOME", home_str).strip()
-        if not wt_raw:
-            continue
-        wt_dir = Path(wt_raw).expanduser()
-        candidates.append(wt_dir)
-        candidates.append(wt_dir / ".git")
-        gitdir = _resolve_worktree_gitdir(wt_dir)
-        if gitdir is not None:
-            candidates.append(gitdir / "HEAD")
-            candidates.append(gitdir / "index")
+        for slot_entry in _iter_active_lock_slots(lk):
+            wt_raw = str(slot_entry.get("worktree_path") or "").replace("$HOME", home_str).strip()
+            if not wt_raw:
+                continue
+            wt_dir = Path(wt_raw).expanduser()
+            candidates.append(wt_dir)
+            candidates.append(wt_dir / ".git")
+            gitdir = _resolve_worktree_gitdir(wt_dir)
+            if gitdir is not None:
+                candidates.append(gitdir / "HEAD")
+                candidates.append(gitdir / "index")
 
     entries: list[tuple[str, int, int, int]] = []
     for p in candidates:
@@ -1238,6 +1358,15 @@ def _detect_stalled_lock_info(
     }
 
 
+def _slot_progress_cache_key(slug: str, lk: dict[str, Any]) -> str:
+    """Build a slot-isolated cache key so Slot #1 and Slot #2 never share progress entries."""
+    try:
+        s_num = int(lk.get("slot_id") or 1)
+    except (TypeError, ValueError):
+        s_num = 1
+    return f"{slug}#slot{s_num}" if s_num > 1 else slug
+
+
 def _compute_lock_progress(
     lk: dict[str, Any],
     *,
@@ -1251,9 +1380,11 @@ def _compute_lock_progress(
     has_pr = bool(lk.get("pr_url"))
 
     is_human_ready = is_lock_human_ready(lk)
+    is_awaiting_base = st_u == "READY_AWAITING_BASE_MERGE"
+    is_needs_rebase = st_u == "NEEDS_REBASE_REVERIFY" or _is_lock_base_stale(lk)
     is_escalated = st_u == "ESCALATED_MAX_REVIEW_ITERATIONS"
-    is_iterating = st_u == "NEEDS_REVISION_ITERATING"
-    is_agent_review = (not is_human_ready and not is_escalated) and (
+    is_iterating = st_u in ("NEEDS_REVISION_ITERATING", "NEEDS_AGENT_SEMANTIC_FIX", "NEEDS_AGENT_CONFLICT_RESOLUTION")
+    is_agent_review = (not is_human_ready and not is_escalated and not is_awaiting_base and not is_needs_rebase) and (
         st_u in AGENT_REVIEW_LOCK_STATUSES or branch_pushed or has_pr
     )
 
@@ -1277,6 +1408,10 @@ def _compute_lock_progress(
         tag = f"~{int(eta_mins)}m" if isinstance(eta_mins, (int, float)) else str(lk.get("stage_label") or "")[:5]
     elif is_human_ready:
         pct, tag = 90, "PR"
+    elif is_awaiting_base:
+        pct, tag = 85, "await"
+    elif is_needs_rebase:
+        pct, tag = 70, "rebase"
     elif is_escalated:
         pct, tag = 0, "esc"
     elif is_iterating:
@@ -1298,6 +1433,8 @@ def _compute_lock_progress(
         "pct": pct,
         "tag": tag,
         "is_human_ready": is_human_ready,
+        "is_awaiting_base": is_awaiting_base,
+        "is_needs_rebase": is_needs_rebase,
         "is_agent_review": is_agent_review,
         "is_escalated": is_escalated,
         "is_stalled": is_stalled,
@@ -1323,7 +1460,11 @@ def _compute_item_progress(
 
     if st in INACTIVE_STATUSES:
         return None
-    if st not in ("in_progress", "pr_open") and not linked_locks and not merged_set:
+    if (
+        st not in ("in_progress", "pr_open", "ready_awaiting_base_merge", "needs_rebase_reverify")
+        and not linked_locks
+        and not merged_set
+    ):
         return None
     if link_state in ("merged", "stale"):
         return {
@@ -1342,10 +1483,11 @@ def _compute_item_progress(
     stalled_idle_label = ""
 
     for slug, lk in linked_locks:
-        lp = lock_progress_cache.get(slug)
+        p_key = _slot_progress_cache_key(slug, lk)
+        lp = lock_progress_cache.get(p_key)
         if lp is None:
             lp = _compute_lock_progress(lk)
-            lock_progress_cache[slug] = lp
+            lock_progress_cache[p_key] = lp
         if slug not in merged_set:
             per_repo_pct[slug] = int(lp["pct"])  # type: ignore[arg-type]
             if lp.get("tag"):
@@ -1682,7 +1824,13 @@ def _resolve_item_human_pr_link(
     repo_local_dirs: dict[str, Path],
 ) -> tuple[str, str, bool, str, str]:
     """Resolve the best validated human-ready PR URL and owning repo slug for a queue item."""
+    if _is_lock_base_stale(it) or ("pr_gate_ready" in it and not bool(it.get("pr_gate_ready"))):
+        return ("", "", False, "", "")
+
     st = str(it.get("status") or "pending").lower()
+    if st in ("ready_awaiting_base_merge", "needs_rebase_reverify", "needs_agent_semantic_fix", "needs_agent_conflict_resolution"):
+        return ("", "", False, "", "")
+
     merged_set = {str(r) for r in (it.get("merged_repos") or []) if r}
     repo_slugs = [str(r) for r in (it.get("repo_slugs") or []) if r]
     unmerged = [r for r in repo_slugs if r not in merged_set]
@@ -1720,8 +1868,12 @@ def _resolve_item_human_pr_link(
             slug = _extract_repo_slug_from_url(u)
             if slug and (slug in merged_set or slug in unready_locked_slugs):
                 continue
+            if not slug and unmerged and all(r in unready_locked_slugs for r in unmerged):
+                continue
             if _is_created_pr_url(u):
                 fallback_slug = next((r for r in unmerged if r not in unready_locked_slugs), "")
+                if not slug and not fallback_slug and unready_locked_slugs:
+                    continue
                 open_candidates.append((_score_pr_url_richness(u, idx_u), u, "open", slug or fallback_slug))
                 continue
             br = _extract_compare_branch_from_url(u)
@@ -1757,20 +1909,63 @@ def _resolve_item_human_pr_link(
     return ("", "", False, "", "")
 
 
-def _status_badge(status: str, color_on: bool) -> str:
-    styles = {
-        "pr_open": ("1;33", "PR_OPEN"),
-        "in_progress": ("1;36", "IN_PROGRESS"),
-        "pending": ("0;37", "PENDING"),
-        "hitl_blocked": ("1;35", "HITL_BLOCK"),
-        "standby": ("2;37", "STANDBY"),
-        "merged": ("0;32", "MERGED"),
-        "cleaned": ("2;32", "CLEANED"),
-        "cancelled": ("2;31", "CANCELLED"),
-        "rejected": ("0;31", "REJECTED"),
-    }
-    code, label = styles.get(status, ("0", status.upper()))
-    return _color(f"{label:<11}", code, color_on)
+_STATUS_STYLES: dict[str, tuple[str, str]] = {
+    "pr_open": ("1;33", "PR_OPEN"),
+    "ready_awaiting_base_merge": ("1;34", "READY_AWAITING_BASE_MERGE"),
+    "needs_rebase_reverify": ("1;35", "NEEDS_REBASE_REVERIFY"),
+    "needs_agent_semantic_fix": ("1;31", "NEEDS_AGENT_SEMANTIC_FIX"),
+    "needs_agent_conflict_resolution": ("1;31", "NEEDS_AGENT_CONFLICT_RESOLUTION"),
+    "in_progress": ("1;36", "IN_PROGRESS"),
+    "pending": ("0;37", "PENDING"),
+    "hitl_blocked": ("1;35", "HITL_BLOCK"),
+    "standby": ("2;37", "STANDBY"),
+    "merged": ("0;32", "MERGED"),
+    "cleaned": ("2;32", "CLEANED"),
+    "cancelled": ("2;31", "CANCELLED"),
+    "rejected": ("0;31", "REJECTED"),
+}
+
+
+def _status_badge(status: str, color_on: bool, width: int = 11) -> str:
+    norm_key = str(status or "").strip().lower()
+    code, label = _STATUS_STYLES.get(norm_key, ("0", str(status or "").strip().upper()))
+    eff_w = max(11, int(width))
+    return _color(f"{label:<{eff_w}}", code, color_on)
+
+
+def _resolve_effective_item_status(
+    it: dict[str, Any],
+    locks_by_cid: dict[str, list[tuple[str, dict[str, Any]]]],
+) -> str:
+    """Resolve effective display status for a queue row, surfacing `READY_AWAITING_BASE_MERGE` & `NEEDS_REBASE_REVERIFY`."""
+    raw_st = str(it.get("status") or "pending").strip().lower()
+    if raw_st in INACTIVE_STATUSES:
+        return raw_st
+    if raw_st in (
+        "ready_awaiting_base_merge",
+        "needs_rebase_reverify",
+        "needs_agent_semantic_fix",
+        "needs_agent_conflict_resolution",
+    ):
+        return raw_st
+    if _is_lock_base_stale(it):
+        return "needs_rebase_reverify"
+
+    cid = str(it.get("conversation_id") or "")
+    merged_set = {str(r) for r in (it.get("merged_repos") or []) if r}
+    unmerged_locks = [(s, lk) for s, lk in locks_by_cid.get(cid, []) if s not in merged_set]
+    if unmerged_locks:
+        for _slug, lk in unmerged_locks:
+            lk_st = str(lk.get("status") or "").strip().upper()
+            if lk_st == "READY_AWAITING_BASE_MERGE":
+                return "ready_awaiting_base_merge"
+            if lk_st == "NEEDS_REBASE_REVERIFY" or _is_lock_base_stale(lk):
+                return "needs_rebase_reverify"
+            if lk_st in ("NEEDS_AGENT_SEMANTIC_FIX", "NEEDS_AGENT_CONFLICT_RESOLUTION"):
+                return lk_st.lower()
+        if raw_st == "pr_open" and not any(is_lock_human_ready(lk) for _, lk in unmerged_locks):
+            return raw_st
+    return raw_st
 
 
 def _resolve_board_artifact_path(state_dir: Path, explicit: str = "") -> Path | None:
@@ -1864,6 +2059,7 @@ def _write_live_antigravity_board(
             lbl = label_map.get(slug, slug)
             lk = locks.get(slug)
             if lk:
+                occ = str(lk.get("slot_occupancy") or f"{lk.get('active_slots_count', 1)}/{lk.get('max_slots', 2)}")
                 lp = lock_progress_cache.get(slug) or {}
                 is_pr = bool(lp.get("is_human_ready"))
                 is_stalled = bool(lp.get("is_stalled"))
@@ -1871,12 +2067,24 @@ def _write_live_antigravity_board(
                     tag = "PR listo"
                 elif is_stalled:
                     tag = str(lp.get("tag") or "STALL")
+                elif lp.get("is_needs_rebase"):
+                    tag = "NEEDS_REBASE_REVERIFY"
+                elif lp.get("is_awaiting_base"):
+                    tag = "READY_AWAITING_BASE_MERGE"
                 elif lp.get("is_escalated"):
                     tag = "escalated"
                 elif lp.get("is_agent_review"):
                     tag = "agent review"
                 else:
                     tag = f"{int(lp.get('pct') or 0)}%"  # type: ignore[arg-type]
+                s2_lp = lock_progress_cache.get(f"{slug}#slot2")
+                if isinstance(s2_lp, dict):
+                    s2_tag = (
+                        "READY_AWAITING_BASE_MERGE"
+                        if s2_lp.get("is_awaiting_base")
+                        else ("NEEDS_REBASE_REVERIFY" if s2_lp.get("is_needs_rebase") else str(s2_lp.get("tag") or f"{int(s2_lp.get('pct') or 0)}%"))
+                    )
+                    tag = f"{tag} · S2:{s2_tag}"
                 _, u, lock_has_pr, _ = _resolve_lock_human_pr_link(
                     slug,
                     lk,
@@ -1891,7 +2099,7 @@ def _write_live_antigravity_board(
                     else (f" · [Pulls]({u_md})" if u_md else "")
                 )
                 icon = "🔴" if is_stalled else "🟡"
-                md.append(f"- {icon} **`{lbl}`** — `{tag}`{link_part}")
+                md.append(f"- {icon} **`{lbl}`** `[{occ}]` — `{tag}`{link_part}")
             else:
                 pu = _repo_pulls_url(slug, repo_web_bases)
                 link_part = f" · [Pulls]({pu})" if pu else ""
@@ -1982,7 +2190,7 @@ def _synthesize_untracked_lock_items(
     locks: dict[str, dict[str, Any]],
     locks_by_cid: dict[str, list[tuple[str, dict[str, Any]]]],
 ) -> list[dict[str, Any]]:
-    """Synthesize live table items for active `dev_pr_locks` not represented among active `dev_queue.json` rows."""
+    """Synthesize live table items for active `dev_pr_locks` (across all `slots`) not represented in `dev_queue.json`."""
     active_queue_cids = [
         str(it.get("conversation_id") or "").strip()
         for it in items
@@ -1990,61 +2198,78 @@ def _synthesize_untracked_lock_items(
         and str(it.get("conversation_id") or "").strip()
     ]
     grouped: dict[str, dict[str, Any]] = {}
-    for slug, lk in sorted(locks.items()):
-        if not isinstance(lk, dict) or not bool(lk.get("active", True)):
+    for slug, repo_lk in sorted(locks.items()):
+        if not isinstance(repo_lk, dict) or not bool(repo_lk.get("active", True)):
             continue
-        primary_cid = str(lk.get("conversation_id") or "").strip()
-        sibs = [str(s).strip() for s in (lk.get("sibling_conversation_ids") or []) if str(s).strip()]
-        lock_cids = [c for c in [primary_cid, *sibs] if c]
-        if any(_cids_match(lcid, qcid) for lcid in lock_cids for qcid in active_queue_cids):
-            continue
+        for lk in _iter_active_lock_slots(repo_lk):
+            slot_num = int(lk.get("slot_id") or 1)
+            primary_cid = str(lk.get("conversation_id") or "").strip()
+            sibs = [str(s).strip() for s in (lk.get("sibling_conversation_ids") or []) if str(s).strip()]
+            lock_cids = [c for c in [primary_cid, *sibs] if c]
+            if any(_cids_match(lcid, qcid) for lcid in lock_cids for qcid in active_queue_cids):
+                continue
 
-        synth_cid = primary_cid or f"lock-{slug.split('/')[-1]}"
-        is_ready = is_lock_human_ready(lk)
-        raw_title = (
-            str(lk.get("proposal_title") or "").strip()
-            or str(lk.get("action_id") or "").strip()
-            or str(lk.get("summary") or "").strip()
-            or str(lk.get("branch_name") or "").strip()
-            or slug.split("/")[-1]
-        )
-        pr_candidates: list[str] = []
-        if is_ready:
-            for k in ("pr_url", "manual_pr_url"):
-                u = _sanitize_full_url(str(lk.get(k) or ""))
-                if u:
-                    pr_candidates.append(u)
-                    break
-
-        entry = grouped.get(synth_cid)
-        if entry is None:
-            grouped[synth_cid] = {
-                "conversation_id": synth_cid,
-                "priority": 10,
-                "status": "pr_open" if is_ready else "in_progress",
-                "repo_slugs": [slug],
-                "merged_repos": [],
-                "branch_names": [str(lk.get("branch_name") or "").strip()] if lk.get("branch_name") else [],
-                "pr_urls": pr_candidates,
-                "title": f"[ad-hoc] {raw_title}",
-                "source": "ad_hoc_lock",
-                "synthetic_live_lock": True,
-                "added_at": str(lk.get("acquired_at") or ""),
-            }
-        else:
-            if slug not in entry["repo_slugs"]:
-                entry["repo_slugs"].append(slug)
+            synth_cid = primary_cid or (
+                f"lock-{slug.split('/')[-1]}-s{slot_num}" if slot_num > 1 else f"lock-{slug.split('/')[-1]}"
+            )
+            is_ready = is_lock_human_ready(lk)
+            lk_st_u = str(lk.get("status") or "").strip().upper()
             if is_ready:
-                entry["status"] = "pr_open"
-                for u in pr_candidates:
-                    if u not in entry["pr_urls"]:
-                        entry["pr_urls"].append(u)
-            br_n = str(lk.get("branch_name") or "").strip()
-            if br_n and br_n not in entry["branch_names"]:
-                entry["branch_names"].append(br_n)
+                synth_status = "pr_open"
+            elif lk_st_u == "READY_AWAITING_BASE_MERGE":
+                synth_status = "ready_awaiting_base_merge"
+            elif lk_st_u == "NEEDS_REBASE_REVERIFY" or _is_lock_base_stale(lk):
+                synth_status = "needs_rebase_reverify"
+            else:
+                synth_status = "in_progress"
 
-        if synth_cid not in locks_by_cid or all(s != slug for s, _ in locks_by_cid[synth_cid]):
-            locks_by_cid.setdefault(synth_cid, []).append((slug, lk))
+            raw_title = (
+                str(lk.get("proposal_title") or "").strip()
+                or str(lk.get("action_id") or "").strip()
+                or str(lk.get("summary") or "").strip()
+                or str(lk.get("branch_name") or "").strip()
+                or slug.split("/")[-1]
+            )
+            pr_candidates: list[str] = []
+            if is_ready:
+                for k in ("pr_url", "manual_pr_url"):
+                    u = _sanitize_full_url(str(lk.get(k) or ""))
+                    if u:
+                        pr_candidates.append(u)
+                        break
+
+            entry = grouped.get(synth_cid)
+            if entry is None:
+                grouped[synth_cid] = {
+                    "conversation_id": synth_cid,
+                    "priority": 10 if slot_num == 1 else 12,
+                    "status": synth_status,
+                    "repo_slugs": [slug],
+                    "merged_repos": [],
+                    "branch_names": [str(lk.get("branch_name") or "").strip()] if lk.get("branch_name") else [],
+                    "pr_urls": pr_candidates,
+                    "title": f"[ad-hoc] {raw_title}",
+                    "source": "ad_hoc_lock",
+                    "synthetic_live_lock": True,
+                    "added_at": str(lk.get("acquired_at") or ""),
+                }
+            else:
+                if slug not in entry["repo_slugs"]:
+                    entry["repo_slugs"].append(slug)
+                if is_ready:
+                    entry["status"] = "pr_open"
+                    for u in pr_candidates:
+                        if u not in entry["pr_urls"]:
+                            entry["pr_urls"].append(u)
+                br_n = str(lk.get("branch_name") or "").strip()
+                if br_n and br_n not in entry["branch_names"]:
+                    entry["branch_names"].append(br_n)
+
+            if synth_cid not in locks_by_cid or all(
+                not (s == slug and int(cur_lk.get("slot_id") or 1) == slot_num)
+                for s, cur_lk in locks_by_cid[synth_cid]
+            ):
+                locks_by_cid.setdefault(synth_cid, []).append((slug, lk))
 
     return list(grouped.values())
 
@@ -2130,15 +2355,16 @@ def render(
         repo_cache,
     )
 
-    lock_progress_cache: dict[str, dict[str, object]] = {
-        slug: _compute_lock_progress(
-            lk,
-            now_ts=now_ts_override,
-            threshold_seconds=stall_threshold_seconds,
-            brain_dir=brain_dir,
-        )
-        for slug, lk in locks.items()
-    }
+    lock_progress_cache: dict[str, dict[str, object]] = {}
+    for slug, repo_lk in locks.items():
+        for slot_entry in _iter_active_lock_slots(repo_lk):
+            p_key = _slot_progress_cache_key(slug, slot_entry)
+            lock_progress_cache[p_key] = _compute_lock_progress(
+                slot_entry,
+                now_ts=now_ts_override,
+                threshold_seconds=stall_threshold_seconds,
+                brain_dir=brain_dir,
+            )
     opt_enabled = not bool(getattr(args, "no_opt", False))
     opt_hint = _compute_lightweight_opt_hint(
         items=items,
@@ -2154,9 +2380,12 @@ def render(
 
     all_managed_slugs: set[str] = set(locks.keys()) | set(repo_web_bases.keys())
     item_urls_by_cid: dict[str, list[str]] = {}
+    known_item_cids: list[str] = []
     for it in items:
         icid = str(it.get("conversation_id") or "")
         if icid:
+            if icid not in known_item_cids:
+                known_item_cids.append(icid)
             urls = [str(u).strip() for u in (it.get("pr_urls") or []) if str(u or "").strip()]
             if urls:
                 item_urls_by_cid.setdefault(icid, []).extend(urls)
@@ -2166,40 +2395,48 @@ def render(
     label_map = _build_repo_labels(all_managed_slugs)
 
     locks_by_cid: dict[str, list[tuple[str, dict[str, Any]]]] = {}
-    seen_lock_cid_pairs: set[tuple[str, str]] = set()
-    for slug, lk in locks.items():
-        lock_cids: list[str] = []
-        primary_cid = str(lk.get("conversation_id") or "").strip()
-        if primary_cid:
-            lock_cids.append(primary_cid)
-        raw_siblings = lk.get("sibling_conversation_ids")
-        if isinstance(raw_siblings, list):
-            for sib in raw_siblings:
-                sib_clean = str(sib or "").strip()
-                if sib_clean:
-                    lock_cids.append(sib_clean)
-        for lcid in lock_cids:
-            pair = (lcid, slug)
-            if pair not in seen_lock_cid_pairs:
-                seen_lock_cid_pairs.add(pair)
-                locks_by_cid.setdefault(lcid, []).append((slug, lk))
+    seen_lock_cid_pairs: set[tuple[str, str, int]] = set()
+    for slug, repo_lk in locks.items():
+        for slot_lk in _iter_active_lock_slots(repo_lk):
+            slot_num = int(slot_lk.get("slot_id") or 1)
+            lock_cids: list[str] = []
+            primary_cid = str(slot_lk.get("conversation_id") or "").strip()
+            if primary_cid:
+                lock_cids.append(primary_cid)
+            raw_siblings = slot_lk.get("sibling_conversation_ids")
+            if isinstance(raw_siblings, list):
+                for sib in raw_siblings:
+                    sib_clean = str(sib or "").strip()
+                    if sib_clean:
+                        lock_cids.append(sib_clean)
+            matched_item_cids = [
+                qcid
+                for qcid in known_item_cids
+                if any(_cids_match(lcid, qcid) for lcid in lock_cids)
+            ]
+            for lcid in dict.fromkeys([*lock_cids, *matched_item_cids]):
+                pair = (lcid, slug, slot_num)
+                if pair not in seen_lock_cid_pairs:
+                    seen_lock_cid_pairs.add(pair)
+                    locks_by_cid.setdefault(lcid, []).append((slug, slot_lk))
 
     synthetic_lock_items = _synthesize_untracked_lock_items(items, locks, locks_by_cid)
     effective_items = [*synthetic_lock_items, *items]
 
     counts: dict[str, int] = {}
     for it in effective_items:
-        st = str(it.get("status") or "pending")
+        st = _resolve_effective_item_status(it, locks_by_cid)
         counts[st] = counts.get(st, 0) + 1
 
     filtered: list[dict[str, Any]] = []
     repo_filter = (args.repo or "").strip().lower()
     status_filter = (args.status or "").strip().lower()
     for it in effective_items:
-        st = str(it.get("status") or "pending")
-        if not args.all and not status_filter and st in INACTIVE_STATUSES:
+        eff_st = _resolve_effective_item_status(it, locks_by_cid)
+        raw_st = str(it.get("status") or "pending").strip().lower()
+        if not args.all and not status_filter and eff_st in INACTIVE_STATUSES:
             continue
-        if status_filter and st.lower() != status_filter:
+        if status_filter and eff_st != status_filter and raw_st != status_filter:
             continue
         repos_raw = [str(r) for r in (it.get("repo_slugs") or [])]
         if repo_filter and not any(repo_filter in r.lower() for r in repos_raw):
@@ -2208,7 +2445,7 @@ def render(
 
     filtered.sort(
         key=lambda x: (
-            STATUS_ORDER.get(str(x.get("status") or "pending"), 99),
+            STATUS_ORDER.get(_resolve_effective_item_status(x, locks_by_cid), 99),
             int(
                 x.get("effective_priority")
                 if x.get("effective_priority") is not None
@@ -2228,18 +2465,28 @@ def render(
         for it in filtered:
             entry = dict(it)
             cid_full = str(it.get("conversation_id") or "")
+            entry["effective_status"] = _resolve_effective_item_status(it, locks_by_cid)
             if cid_full in ag_titles:
                 entry["sidebar_title"] = ag_titles[cid_full]
             enriched_items.append(entry)
         active_locks_payload = {
-            slug: {**lk, "progress": lock_progress_cache.get(slug, {})}
+            slug: {
+                **lk,
+                "progress": lock_progress_cache.get(slug, {}),
+                **(
+                    {"slot2_progress": lock_progress_cache[f"{slug}#slot2"]}
+                    if f"{slug}#slot2" in lock_progress_cache
+                    else {}
+                ),
+            }
             for slug, lk in locks.items()
             if not repo_filter or repo_filter in slug.lower()
         }
         stalled_locks_payload = {
-            slug: lock_progress_cache[slug]
-            for slug in active_locks_payload
-            if bool((lock_progress_cache.get(slug) or {}).get("is_stalled"))
+            p_key: lp_val
+            for p_key, lp_val in lock_progress_cache.items()
+            if bool((lp_val or {}).get("is_stalled"))
+            and (not repo_filter or repo_filter in p_key.lower())
         }
         payload = json.dumps(
             {
@@ -2270,9 +2517,16 @@ def render(
         now_ts=now_ts_override,
         stall_threshold_seconds=stall_threshold_seconds,
     )
+    in_flight_run = (
+        counts.get("in_progress", 0)
+        + counts.get("ready_awaiting_base_merge", 0)
+        + counts.get("needs_rebase_reverify", 0)
+        + counts.get("needs_agent_semantic_fix", 0)
+        + counts.get("needs_agent_conflict_resolution", 0)
+    )
     summary_bits = [
         _color(f"pr:{counts.get('pr_open', 0)}", "1;33", color_on),
-        _color(f"run:{counts.get('in_progress', 0)}", "1;36", color_on),
+        _color(f"run:{in_flight_run}", "1;36", color_on),
         _color(f"pending:{counts.get('pending', 0)}", "1;37", color_on),
         _color(f"hitl:{counts.get('hitl_blocked', 0)}", "1;35", color_on),
         _color(f"standby:{counts.get('standby', 0)}", "2;37", color_on),
@@ -2303,13 +2557,16 @@ def render(
 
     stalled_alerts: list[tuple[str, str, str]] = []
     for slug in managed_list:
-        lk = locks.get(slug)
-        lp = lock_progress_cache.get(slug) or {}
-        if lk and bool(lp.get("is_stalled")):
-            lbl = label_map.get(slug, slug)
-            stalled_alerts.append(
-                (lbl, str(lp.get("idle_label") or ""), str(lk.get("branch_name") or ""))
-            )
+        repo_lk = locks.get(slug)
+        if not repo_lk:
+            continue
+        for slot_entry in _iter_active_lock_slots(repo_lk):
+            lp = lock_progress_cache.get(_slot_progress_cache_key(slug, slot_entry)) or {}
+            if bool(lp.get("is_stalled")):
+                lbl = label_map.get(slug, slug)
+                stalled_alerts.append(
+                    (lbl, str(lp.get("idle_label") or ""), str(slot_entry.get("branch_name") or ""))
+                )
 
     if managed_list:
         repo_pills: list[str] = []
@@ -2317,22 +2574,46 @@ def render(
             lbl = label_map.get(slug, slug)
             lk = locks.get(slug)
             if lk:
+                occ = str(lk.get("slot_occupancy") or f"{lk.get('active_slots_count', 1)}/{lk.get('max_slots', 2)}")
                 lp = lock_progress_cache.get(slug) or {}
                 is_human_pr = bool(lp.get("is_human_ready"))
                 is_stalled = bool(lp.get("is_stalled"))
+                is_needs_rebase = bool(lp.get("is_needs_rebase"))
+                is_awaiting_base = bool(lp.get("is_awaiting_base"))
                 is_rev = bool(lp.get("is_agent_review"))
                 is_esc = bool(lp.get("is_escalated"))
                 if is_human_pr:
                     tag = "PR"
                 elif is_stalled:
                     tag = str(lp.get("tag") or "STALL")
+                elif is_needs_rebase:
+                    tag = "rebase"
+                elif is_awaiting_base:
+                    tag = "await"
                 elif is_esc:
                     tag = "esc"
                 elif is_rev:
                     tag = str(lp.get("tag") or "rev")
                 else:
                     tag = f"{int(lp.get('pct') or 0)}%"  # type: ignore[arg-type]
-                dot_code = "1;33" if is_human_pr else ("1;31" if is_stalled else ("1;35" if is_esc else "1;36"))
+                s2_lp = lock_progress_cache.get(f"{slug}#slot2")
+                if isinstance(s2_lp, dict):
+                    if s2_lp.get("is_stalled"):
+                        s2_short = str(s2_lp.get("tag") or "STALL")
+                    elif s2_lp.get("is_awaiting_base"):
+                        s2_short = "await"
+                    elif s2_lp.get("is_needs_rebase"):
+                        s2_short = "rebase"
+                    elif s2_lp.get("is_agent_review"):
+                        s2_short = str(s2_lp.get("tag") or "rev")
+                    else:
+                        s2_short = f"{int(s2_lp.get('pct') or 0)}%"  # type: ignore[arg-type]
+                    tag = f"{tag}·S2:{s2_short}"
+                dot_code = (
+                    "1;33"
+                    if is_human_pr
+                    else ("1;31" if is_stalled else ("1;35" if (is_esc or is_needs_rebase) else "1;36"))
+                )
                 dot = _color("●", dot_code, color_on)
                 _, repo_u, _, _ = _resolve_lock_human_pr_link(
                     slug,
@@ -2342,10 +2623,11 @@ def render(
                     extra_urls=_collect_lock_extra_urls(lk, item_urls_by_cid),
                 )
                 styled_name = _color(lbl, "1;33" if is_human_pr else ("1;31" if is_stalled else "1"), color_on)
-                tag_code = "1;33" if is_human_pr else ("1;35" if is_stalled else "2")
+                occ_styled = _color(f"[{occ}]", "1;36" if occ.startswith("2/") else "2", color_on)
+                tag_code = "1;33" if is_human_pr else ("1;35" if (is_stalled or is_needs_rebase) else "2")
                 repo_pills.append(
                     f"{dot} {_osc8_link(styled_name, repo_u, use_osc8)} "
-                    f"{_color(f'({tag})', tag_code, color_on)}"
+                    f"{occ_styled} {_color(f'({tag})', tag_code, color_on)}"
                 )
             else:
                 dot = _color("○", "0;32", color_on)
@@ -2402,14 +2684,19 @@ def render(
             )
         return ("\n".join(lines), {}, {}, None, state_dir, repo_local_dirs)
 
+    row_eff_statuses = [_resolve_effective_item_status(it, locks_by_cid) for it in filtered]
+    status_col = max(
+        11,
+        *(len(_STATUS_STYLES.get(es, ("0", es.upper()))[1]) for es in row_eff_statuses),
+    )
     prog_col = 20 if bar_w >= 112 else 15
     repo_col = 19 if bar_w >= 112 else 14
     link_col = 9
-    fixed = 2 + 1 + 4 + 2 + 11 + 2 + prog_col + 2 + repo_col + 2 + 8 + 2 + 2 + link_col
+    fixed = 2 + 1 + 4 + 2 + status_col + 2 + prog_col + 2 + repo_col + 2 + 8 + 2 + 2 + link_col
     title_col = max(14, bar_w - fixed)
 
     hdr = (
-        f"{'#':>2} {'Prio':>4}  {'STATUS':<11}  {'PROGRESS':<{prog_col}}  "
+        f"{'#':>2} {'Prio':>4}  {'STATUS':<{status_col}}  {'PROGRESS':<{prog_col}}  "
         f"{'REPOS':<{repo_col}}  {'ID':<8}  {'TITLE':<{title_col}}  {'ACTION':<{link_col}}"
     )
     header_lines.append(_color(hdr, "1;4", color_on))
@@ -2429,10 +2716,10 @@ def render(
     hitl_idx = 0
     resolved_brain_roots = _resolve_brain_dirs(brain_dir)
 
-    for idx, it in enumerate(filtered, 1):
+    for idx, (it, eff_st) in enumerate(zip(filtered, row_eff_statuses), 1):
         prio = int(it.get("priority") if it.get("priority") is not None else 99)
-        st = str(it.get("status") or "pending")
-        st_lower = st.lower()
+        st = eff_st
+        st_lower = eff_st.lower()
         repo_slugs_list = [str(r) for r in (it.get("repo_slugs") or []) if r]
         merged_set = {str(r) for r in (it.get("merged_repos") or []) if r}
         cid_full = str(it.get("conversation_id") or "")
@@ -2531,7 +2818,8 @@ def render(
                 }
             )
         else:
-            if st_lower == "in_progress":
+            raw_item_st = str(it.get("status") or "pending").strip().lower()
+            if raw_item_st == "in_progress" and st_lower == "in_progress":
                 unmerged = [r for r in repo_slugs_list if r not in merged_set]
                 if unmerged:
                     pu = _repo_pulls_url(str(unmerged[0]), repo_web_bases)
@@ -2542,11 +2830,14 @@ def render(
                 action_md = f"[Chat](conversation://{cid_full})"
 
         row_line = (
-            f"{idx:>2} {prio:>4}  {_status_badge(st, color_on)}  {prog_cell}  "
+            f"{idx:>2} {prio:>4}  {_status_badge(st, color_on, width=status_col)}  {prog_cell}  "
             f"{repos_str:<{repo_col}}  {_color(f'{cid_disp:<8}', '36', color_on)}  "
             f"{_trunc(' '.join(title.split()), title_col):<{title_col}}  {action_cell}"
         )
-        if st_lower in ("pr_open", "in_progress") or bool(locks_by_cid.get(cid_full)):
+        if (
+            st_lower in ("pr_open", "in_progress", "ready_awaiting_base_merge", "needs_rebase_reverify")
+            or bool(locks_by_cid.get(cid_full))
+        ):
             active_row_lines.append(row_line)
         else:
             middle_row_lines.append(row_line)
@@ -2555,7 +2846,7 @@ def render(
             {
                 "idx": str(idx),
                 "prio": str(prio),
-                "status": st.upper(),
+                "status": _STATUS_STYLES.get(st_lower, ("0", st.upper()))[1],
                 "progress": prog_md,
                 "repos": repos_md,
                 "title": _trunc(_sanitize_md_table_cell(title), 72),

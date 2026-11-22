@@ -33,12 +33,27 @@ for _cand_clients in (_PLUGIN_ROOT / "clients", _INSTALLED_PLUGIN_ROOT / "client
             sys.path.insert(0, _clients_str)
         break
 
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
 import dev_common  # noqa: E402
+import parallel_scope as _parallel_scope  # noqa: E402
 
 DEFAULT_STALL_THRESHOLD_SECONDS = 900
 DEFAULT_MAX_PARTIAL_WIP = 3
 STALL_ELIGIBLE_LOCK_STATUSES: frozenset[str] = frozenset({"DEVELOPING", "NEEDS_REVISION_ITERATING"})
-OPEN_QUEUE_STATUSES: frozenset[str] = frozenset({"pending", "in_progress", "pr_open", "hitl_blocked"})
+OPEN_QUEUE_STATUSES: frozenset[str] = frozenset(
+    {
+        "pending",
+        "in_progress",
+        "pr_open",
+        "hitl_blocked",
+        "ready_awaiting_base_merge",
+        "needs_rebase_reverify",
+        "needs_agent_semantic_fix",
+        "needs_agent_conflict_resolution",
+    }
+)
 CODE_EXTENSIONS: frozenset[str] = frozenset({".py", ".js", ".css", ".html", ".sh"})
 WALK_SKIP_DIRS: frozenset[str] = frozenset(
     {
@@ -381,16 +396,64 @@ def _cids_match(cid_a: str, cid_b: str) -> bool:
     return False
 
 
-def _lock_matches_cid(lock_info: dict[str, Any], cid: str) -> bool:
-    """Return True when an active lock's primary or sibling conversation IDs match `cid`."""
-    if not isinstance(lock_info, dict) or not cid:
+def _iter_active_lock_slots(lock_info: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return ordered active slot dicts (`slot_id` 1, 2, ...) from multi-slot or flat `lock_info`."""
+    if not isinstance(lock_info, dict) or not bool(lock_info.get("active", True)):
+        return []
+    raw_slots = lock_info.get("slots")
+    collected: dict[int, dict[str, Any]] = {}
+    if isinstance(raw_slots, dict):
+        for raw_k, raw_v in raw_slots.items():
+            if not isinstance(raw_v, dict) or not bool(raw_v.get("active", True)):
+                continue
+            try:
+                s_id = int(raw_v.get("slot_id") or raw_k)
+            except (TypeError, ValueError):
+                continue
+            if s_id < 1:
+                continue
+            entry = dict(raw_v)
+            entry["slot_id"] = s_id
+            entry["active"] = True
+            entry.setdefault("target_repo_dir", str(lock_info.get("target_repo_dir") or ""))
+            collected[s_id] = entry
+    if 1 not in collected and (
+        not isinstance(raw_slots, dict)
+        or not raw_slots
+        or str(lock_info.get("branch_name") or "").strip()
+        or str(lock_info.get("conversation_id") or "").strip()
+        or str(lock_info.get("status") or "").strip()
+    ):
+        top_entry = {k: v for k, v in lock_info.items() if k != "slots"}
+        try:
+            top_sid = int(lock_info.get("slot_id") or 1)
+        except (TypeError, ValueError):
+            top_sid = 1
+        top_entry["slot_id"] = top_sid
+        top_entry["active"] = True
+        collected.setdefault(top_sid, top_entry)
+    return [collected[k] for k in sorted(collected)]
+
+
+def _slot_matches_cid(slot_info: dict[str, Any], cid: str) -> bool:
+    """Return True when a single slot's primary or sibling conversation IDs match `cid`."""
+    if not isinstance(slot_info, dict) or not cid:
         return False
-    if _cids_match(str(lock_info.get("conversation_id") or ""), cid):
+    if _cids_match(str(slot_info.get("conversation_id") or ""), cid):
         return True
-    for sib in lock_info.get("sibling_conversation_ids") or []:
+    for sib in slot_info.get("sibling_conversation_ids") or []:
         if _cids_match(str(sib or ""), cid):
             return True
     return False
+
+
+def _lock_matches_cid(lock_info: dict[str, Any], cid: str) -> bool:
+    """Return True when any active slot in `lock_info` matches `cid`."""
+    if not isinstance(lock_info, dict) or not cid:
+        return False
+    if _slot_matches_cid(lock_info, cid):
+        return True
+    return any(_slot_matches_cid(slot, cid) for slot in _iter_active_lock_slots(lock_info))
 
 
 def _detect_phantom_pr_open(
@@ -458,18 +521,20 @@ def _detect_untracked_active_locks(
     for repo_slug, lk in sorted(active_locks.items()):
         if not isinstance(lk, dict) or not bool(lk.get("active", True)):
             continue
-        l_cid = str(lk.get("conversation_id") or "").strip()
-        if any(_lock_matches_cid(lk, ocid) for ocid in open_cids):
-            continue
-        untracked.append(
-            {
-                "repo_slug": repo_slug,
-                "conversation_id": l_cid,
-                "branch_name": str(lk.get("branch_name") or ""),
-                "status": str(lk.get("status") or ""),
-                "pr_gate_ready": bool(lk.get("pr_gate_ready")),
-            }
-        )
+        for slot_entry in _iter_active_lock_slots(lk):
+            l_cid = str(slot_entry.get("conversation_id") or "").strip()
+            if any(_slot_matches_cid(slot_entry, ocid) for ocid in open_cids):
+                continue
+            untracked.append(
+                {
+                    "repo_slug": repo_slug,
+                    "slot_id": int(slot_entry.get("slot_id") or 1),
+                    "conversation_id": l_cid,
+                    "branch_name": str(slot_entry.get("branch_name") or ""),
+                    "status": str(slot_entry.get("status") or ""),
+                    "pr_gate_ready": bool(slot_entry.get("pr_gate_ready")),
+                }
+            )
     if not untracked:
         return []
     repos_str = ", ".join(u["repo_slug"].split("/")[-1] for u in untracked)
@@ -607,47 +672,49 @@ def _detect_stalled_workers(
     brain_dir: Path | str | Sequence[Path | str] | None,
 ) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
-    for repo_slug, lk in sorted(active_locks.items()):
-        if not isinstance(lk, dict):
+    for repo_slug, repo_lk in sorted(active_locks.items()):
+        if not isinstance(repo_lk, dict):
             continue
-        st = detect_stalled_lock(
-            lk,
-            now_ts=now_ts,
-            threshold_seconds=threshold_seconds,
-            brain_dir=brain_dir,
-        )
-        if not st.get("stalled"):
-            continue
-        wt_clean = _sanitize_path(str(lk.get("worktree_path") or lk.get("target_repo_dir") or ""))
-        br_name = str(lk.get("branch_name") or "").strip()
-        idle_lbl = str(st.get("idle_label") or "")
-        findings.append(
-            _make_finding(
-                code="stalled_worker",
-                severity="critical",
-                category="reliability",
-                title=f"Stalled worker on {repo_slug} (idle {idle_lbl})",
-                evidence={
-                    "repo_slug": repo_slug,
-                    "branch_name": br_name,
-                    "worktree_path": wt_clean,
-                    "status": str(lk.get("status") or ""),
-                    "conversation_id": str(lk.get("conversation_id") or ""),
-                    "worker_cid": str(st.get("worker_cid") or ""),
-                    "idle_seconds": int(st.get("idle_seconds") or 0),
-                    "idle_label": idle_lbl,
-                    "threshold_seconds": int(st.get("threshold_seconds") or DEFAULT_STALL_THRESHOLD_SECONDS),
-                },
-                recommendation=(
-                    "Inspect worktree progress immediately; re-dispatch a fresh worker with `--reuse-active` "
-                    "(or release the abandoned lock) and schedule a 1200s watchdog timer on dispatch."
-                ),
-                auto_action_hint=(
-                    f"git -C {wt_clean or '.'} status -sb && pr_remediator.py lock-status --repo {repo_slug}"
-                ),
-                estimated_savings_min=max(15, int(st.get("idle_seconds") or 0) // 60),
+        for lk in _iter_active_lock_slots(repo_lk):
+            st = detect_stalled_lock(
+                lk,
+                now_ts=now_ts,
+                threshold_seconds=threshold_seconds,
+                brain_dir=brain_dir,
             )
-        )
+            if not st.get("stalled"):
+                continue
+            wt_clean = _sanitize_path(str(lk.get("worktree_path") or lk.get("target_repo_dir") or ""))
+            br_name = str(lk.get("branch_name") or "").strip()
+            idle_lbl = str(st.get("idle_label") or "")
+            findings.append(
+                _make_finding(
+                    code="stalled_worker",
+                    severity="critical",
+                    category="reliability",
+                    title=f"Stalled worker on {repo_slug} (idle {idle_lbl})",
+                    evidence={
+                        "repo_slug": repo_slug,
+                        "slot_id": int(lk.get("slot_id") or 1),
+                        "branch_name": br_name,
+                        "worktree_path": wt_clean,
+                        "status": str(lk.get("status") or ""),
+                        "conversation_id": str(lk.get("conversation_id") or ""),
+                        "worker_cid": str(st.get("worker_cid") or ""),
+                        "idle_seconds": int(st.get("idle_seconds") or 0),
+                        "idle_label": idle_lbl,
+                        "threshold_seconds": int(st.get("threshold_seconds") or DEFAULT_STALL_THRESHOLD_SECONDS),
+                    },
+                    recommendation=(
+                        "Inspect worktree progress immediately; re-dispatch a fresh worker with `--reuse-active` "
+                        "(or release the abandoned lock) and schedule a 1200s watchdog timer on dispatch."
+                    ),
+                    auto_action_hint=(
+                        f"git -C {wt_clean or '.'} status -sb && pr_remediator.py lock-status --repo {repo_slug}"
+                    ),
+                    estimated_savings_min=max(15, int(st.get("idle_seconds") or 0) // 60),
+                )
+            )
     return findings
 
 
@@ -959,6 +1026,246 @@ def _detect_partial_wip_accumulation(
                 f"Finish half-merged PRs on {top['repo_slug']} via `pr_remediator.py queue-next --unlocked`."
             ),
             estimated_savings_min=sum(int(entry["count"]) * 10 for entry in flagged),
+        )
+    ]
+
+
+def _detect_stale_follower_needs_rebase(
+    active_locks: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Detect any parallel follower / Slot #2 lock in `NEEDS_REBASE_REVERIFY` or `base_stale=True` needing `rebase-reverify`."""
+    flagged: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for repo_slug, repo_lk in sorted(active_locks.items()):
+        if not isinstance(repo_lk, dict) or not bool(repo_lk.get("active", True)):
+            continue
+        for slot in _iter_active_lock_slots(repo_lk):
+            slot_id = int(slot.get("slot_id") or 1)
+            st_u = str(slot.get("status") or "").strip().upper()
+            base_stale = bool(slot.get("base_stale")) or bool(slot.get("needs_base_rebase"))
+            if st_u != "NEEDS_REBASE_REVERIFY" and not base_stale:
+                continue
+            br = str(slot.get("branch_name") or "").strip()
+            dedup_key = (repo_slug, br or f"slot-{slot_id}")
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            wt_clean = _sanitize_path(str(slot.get("worktree_path") or slot.get("target_repo_dir") or ""))
+            flagged.append(
+                {
+                    "repo_slug": repo_slug,
+                    "slot_id": slot_id,
+                    "promoted_from_slot": slot.get("promoted_from_slot"),
+                    "conversation_id": str(slot.get("conversation_id") or ""),
+                    "branch_name": br,
+                    "status": st_u or "NEEDS_REBASE_REVERIFY",
+                    "base_stale": True,
+                    "worktree_path": wt_clean,
+                }
+            )
+
+    if not flagged:
+        return []
+    top = flagged[0]
+    wt_arg = f" --workdir {top['worktree_path']}" if top["worktree_path"] else ""
+    return [
+        _make_finding(
+            code="stale_follower_needs_rebase",
+            severity="high",
+            category="throughput",
+            title=(
+                f"{len(flagged)} follower lock(s) require rebase-reverify "
+                f"({top['repo_slug']} · {top['branch_name'] or top['status']})"
+            ),
+            evidence={
+                "count": len(flagged),
+                "top_repo_slug": top["repo_slug"],
+                "branch_name": top["branch_name"],
+                "conversation_ids": [f["conversation_id"] for f in flagged if f["conversation_id"]],
+                "slots": flagged,
+            },
+            recommendation=(
+                "Run `pr_remediator.py rebase-reverify --fetch` so drifted follower branches rebase onto updated "
+                "`origin/main` and run union cross-impact verification (`AUTO_PROMOTED_ZERO_LLM` when clean)."
+            ),
+            auto_action_hint=f"pr_remediator.py rebase-reverify --repo {top['repo_slug']}{wt_arg} --fetch",
+            estimated_savings_min=len(flagged) * 12,
+        )
+    ]
+
+
+def _detect_parallel_lookahead_opportunity(
+    items: list[dict[str, Any]],
+    active_locks: dict[str, dict[str, Any]],
+    repo_dirs: dict[str, Path],
+) -> list[dict[str, Any]]:
+    """Detect when Slot #1 is `PENDING_HUMAN_PR_VALIDATION` and Slot #2 is free with a disjoint pending task in the same repo."""
+    if not items or not active_locks:
+        return []
+
+    status_by_cid = {
+        str(it.get("conversation_id") or "").strip(): str(it.get("status") or "").strip().lower()
+        for it in items
+        if str(it.get("conversation_id") or "").strip()
+    }
+    pending_sorted = sorted(
+        (
+            it
+            for it in items
+            if str(it.get("status") or "pending").strip().lower() == "pending"
+            and str(it.get("conversation_id") or "").strip()
+        ),
+        key=lambda x: (
+            int(
+                x.get("effective_priority")
+                if x.get("effective_priority") is not None
+                else _raw_item_priority(x)
+            ),
+            _raw_item_priority(x),
+            str(x.get("added_at") or ""),
+            str(x.get("conversation_id") or ""),
+        ),
+    )
+    if not pending_sorted:
+        return []
+
+    opportunities: list[dict[str, Any]] = []
+    for repo_slug, repo_lk in sorted(active_locks.items()):
+        if not isinstance(repo_lk, dict) or not bool(repo_lk.get("active", True)):
+            continue
+        try:
+            max_slots = int(repo_lk.get("max_slots") or 2)
+        except (TypeError, ValueError):
+            max_slots = 2
+        if max_slots < 2:
+            continue
+
+        active_slots = _iter_active_lock_slots(repo_lk)
+        if len(active_slots) != 1 or int(active_slots[0].get("slot_id") or 1) != 1:
+            continue
+        slot1 = active_slots[0]
+        s1_status = str(slot1.get("status") or "").strip().upper()
+        if s1_status != "PENDING_HUMAN_PR_VALIDATION":
+            continue
+        if bool(slot1.get("base_stale")) or bool(slot1.get("needs_base_rebase")):
+            continue
+
+        norm_repo = dev_common.normalize_repo_slug(repo_slug) or repo_slug.lower()
+        r_dir = repo_dirs.get(repo_slug) or repo_dirs.get(norm_repo)
+
+        s1_targets = [str(f).strip() for f in (slot1.get("target_files") or []) if str(f).strip()]
+        if not s1_targets and not slot1.get("section_anchors"):
+            wt_raw = str(slot1.get("worktree_path") or "").replace("$HOME", str(Path.home())).strip()
+            wt_dir = Path(wt_raw).expanduser() if wt_raw else r_dir
+            if wt_dir is not None and (wt_dir / ".git").exists():
+                s1_targets = _parallel_scope.collect_git_changed_files(
+                    wt_dir,
+                    base_ref=str(slot1.get("base_sha") or "origin/main"),
+                    head_ref=str(slot1.get("branch_name") or "HEAD"),
+                )
+        s1_spec = _parallel_scope.TaskAnchorSpec.from_mapping({**slot1, "target_files": s1_targets})
+        if not s1_spec.target_files and not s1_spec.section_anchors:
+            continue
+
+        disjoint_cands: list[dict[str, Any]] = []
+        for cand in pending_sorted:
+            cand_cid = str(cand.get("conversation_id") or "").strip()
+            if _lock_matches_cid(repo_lk, cand_cid):
+                continue
+
+            unmet_dep = False
+            for raw_dep in cand.get("depends_on") or []:
+                dep_s = str(raw_dep or "").strip()
+                if not dep_s:
+                    continue
+                if _slot_matches_cid(slot1, dep_s):
+                    unmet_dep = True
+                    break
+                for ocid, ost in status_by_cid.items():
+                    if _cids_match(ocid, dep_s) and ost not in ("merged", "cleaned"):
+                        unmet_dep = True
+                        break
+                if unmet_dep:
+                    break
+            if unmet_dep:
+                continue
+
+            merged_set = {
+                dev_common.normalize_repo_slug(str(r)) or str(r).strip().lower()
+                for r in (cand.get("merged_repos") or [])
+                if str(r).strip()
+            }
+            rem_repos = [
+                dev_common.normalize_repo_slug(str(r)) or str(r).strip().lower()
+                for r in (cand.get("repo_slugs") or [])
+                if str(r).strip()
+                and (dev_common.normalize_repo_slug(str(r)) or str(r).strip().lower()) not in merged_set
+            ]
+            if not rem_repos or rem_repos[0] != norm_repo:
+                continue
+
+            cand_spec = _parallel_scope.TaskAnchorSpec.from_mapping(cand)
+            if not cand_spec.target_files and not cand_spec.section_anchors:
+                continue
+
+            ov = _parallel_scope.analyze_pair_overlap(
+                s1_spec,
+                cand_spec,
+                repo_dir=r_dir,
+                repo_slug=repo_slug,
+            )
+            if ov.parallel_safe:
+                disjoint_cands.append(
+                    {
+                        "conversation_id": cand_cid,
+                        "title": str(cand.get("title") or ""),
+                        "priority": _raw_item_priority(cand),
+                        "overlap_tier": ov.overlap_tier,
+                    }
+                )
+
+        if disjoint_cands:
+            best = disjoint_cands[0]
+            opportunities.append(
+                {
+                    "repo_slug": repo_slug,
+                    "slot1_conversation_id": str(slot1.get("conversation_id") or ""),
+                    "slot1_branch": str(slot1.get("branch_name") or ""),
+                    "candidate_count": len(disjoint_cands),
+                    "top_candidate_id": best["conversation_id"],
+                    "top_candidate_title": best["title"],
+                    "top_overlap_tier": best["overlap_tier"],
+                    "candidates": disjoint_cands[:5],
+                }
+            )
+
+    if not opportunities:
+        return []
+    top_op = opportunities[0]
+    return [
+        _make_finding(
+            code="parallel_lookahead_opportunity",
+            severity="high",
+            category="throughput",
+            title=(
+                f"Slot #2 free on {top_op['repo_slug']} while Slot #1 awaits PR merge "
+                f"({top_op['candidate_count']} disjoint pending task(s), top: {top_op['top_candidate_id'][:8]} [{top_op['top_overlap_tier']}])"
+            ),
+            evidence={
+                "count": len(opportunities),
+                "top_repo_slug": top_op["repo_slug"],
+                "top_candidate_id": top_op["top_candidate_id"],
+                "top_overlap_tier": top_op["top_overlap_tier"],
+                "opportunities": opportunities,
+            },
+            recommendation=(
+                "Dispatch the disjoint pending candidate into parallel Slot #2 (`start-remediation --allow-slot2 --worktree`) "
+                "while Slot #1 awaits human PR validation (`READY_AWAITING_BASE_MERGE` preserves max 1 open GitHub PR per repo)."
+            ),
+            auto_action_hint=(
+                f"pr_remediator.py queue-next --unlocked && pr_remediator.py start-remediation --id {top_op['top_candidate_id']} --allow-slot2 --worktree"
+            ),
+            estimated_savings_min=len(opportunities) * 15,
         )
     ]
 
@@ -1504,6 +1811,12 @@ def format_compact_opt_hint(analysis: dict[str, Any], max_width: int = 120) -> s
         elif code == "partial_wip_accumulation":
             r_short = str(ev.get("top_repo_slug") or "").split("/")[-1]
             bits.append(f"partial WIP {r_short} ({ev.get('top_count', DEFAULT_MAX_PARTIAL_WIP)})")
+        elif code == "stale_follower_needs_rebase":
+            r_short = str(ev.get("top_repo_slug") or "").split("/")[-1]
+            bits.append(f"rebase-reverify {r_short} ({ev.get('count', 1)})")
+        elif code == "parallel_lookahead_opportunity":
+            r_short = str(ev.get("top_repo_slug") or "").split("/")[-1]
+            bits.append(f"slot2 lookahead {r_short} ({ev.get('count', 1)})")
         else:
             bits.append(str(f.get("title") or code))
 
@@ -1583,11 +1896,13 @@ def analyze_dev_flow_optimizations(
         )
     )
     # 1b. Phantom pr_open items (0 active locks & 0 pr_urls), untracked ad-hoc active locks,
-    #     priority inversions, and downstream partial-WIP accumulation
+    #     priority inversions, downstream partial-WIP accumulation, stale follower rebase, and Slot #2 lookahead
     findings.extend(_detect_phantom_pr_open(items, active_locks))
     findings.extend(_detect_untracked_active_locks(items, active_locks))
     findings.extend(_detect_priority_inversions(items))
     findings.extend(_detect_partial_wip_accumulation(items))
+    findings.extend(_detect_stale_follower_needs_rebase(active_locks))
+    findings.extend(_detect_parallel_lookahead_opportunity(items, active_locks, repo_dirs))
     # 2. Micro-PR batch candidates
     findings.extend(_detect_micro_pr_batch_candidates(items))
     # 3. Repo contention hotspots
