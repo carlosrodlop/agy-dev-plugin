@@ -45,6 +45,7 @@ import contextlib
 from datetime import datetime, timezone
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -3396,7 +3397,13 @@ def _format_verification_checks_markdown(verification_results: dict[str, Any] | 
         else ("`BATS suite passed`" if bats_st == "pass" else "`BATS suite failed`" if bats_st == "fail" else "`no BATS suite`")
     )
     pc_st = str(pc_info.get("status") or "not_run")
-    pc_det = "`pre-commit run --all-files`" if pc_st in ("pass", "fail") else "`not recorded in test-local`"
+    if pc_st in ("pass", "fail"):
+        if pc_info.get("mode") == "incremental":
+            pc_det = f"`pre-commit run --files ({int(pc_info.get('files_count') or 0)} files)`"
+        else:
+            pc_det = "`pre-commit run --all-files`"
+    else:
+        pc_det = "`not recorded in test-local`"
 
     lines.extend(
         [
@@ -3412,22 +3419,130 @@ def _format_verification_checks_markdown(verification_results: dict[str, Any] | 
 
 
 def _build_single_pass_pre_commit_skip(target_dir: Path, base_skip: str = "") -> tuple[str, list[str]]:
-    """Build `SKIP` value for single-pass `test-local --with-pre-commit` avoiding duplicate audit/tests."""
+    """Build `SKIP` value for single-pass `test-local --with-pre-commit` avoiding duplicate audit/tests/BATS."""
+    _ = target_dir
     hooks: list[str] = []
     for raw_tok in (base_skip or "").split(","):
         tok = raw_tok.strip()
         if tok and tok not in hooks:
             hooks.append(tok)
-    for required_skip in ("unit-tests", "qa-static-audit"):
+    for required_skip in ("unit-tests", "unit-tests-fast", "qa-static-audit", "bats-suite"):
         if required_skip not in hooks:
             hooks.append(required_skip)
-    pc_cfg = target_dir / ".pre-commit-config.yaml"
-    if pc_cfg.is_file():
-        with contextlib.suppress(OSError):
-            cfg_text = pc_cfg.read_text(encoding="utf-8", errors="ignore")
-            if re.search(r"(?m)^\s*-\s*id:\s*unit-tests-fast\b", cfg_text) and "unit-tests-fast" not in hooks:
-                hooks.append("unit-tests-fast")
     return (",".join(hooks), hooks)
+
+
+def _detect_validation_changed_files(
+    target_dir: Path,
+    env: dict[str, str] | None = None,
+) -> list[str]:
+    """Return deduplicated modified/staged/untracked/branch-diff relative paths inside `target_dir`."""
+    if not (target_dir / ".git").exists():
+        return []
+
+    seen: set[str] = set()
+    changed: list[str] = []
+
+    def _collect_nul(git_args: list[str]) -> None:
+        proc = subprocess.run(
+            ["git", "-C", str(target_dir), *git_args],
+            env=env,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return
+        for raw in proc.stdout.split(b"\x00"):
+            if not raw:
+                continue
+            rel = raw.decode("utf-8", errors="surrogateescape").strip().replace("\\", "/")
+            while rel.startswith("./"):
+                rel = rel[2:]
+            if not rel or "__pycache__/" in rel or rel.endswith((".pyc", ".pyo")):
+                continue
+            if rel not in seen:
+                seen.add(rel)
+                changed.append(rel)
+
+    for base_ref in ("origin/main", "main"):
+        ref_proc = subprocess.run(
+            ["git", "-C", str(target_dir), "rev-parse", "--verify", "--quiet", base_ref],
+            env=env,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        if ref_proc.returncode == 0:
+            _collect_nul(["diff", "--name-only", "-z", f"{base_ref}...HEAD"])
+            break
+
+    _collect_nul(["diff", "--cached", "--name-only", "-z"])
+    _collect_nul(["diff", "--name-only", "-z"])
+    _collect_nul(["ls-files", "--others", "--exclude-standard", "-z"])
+    return changed
+
+
+def _build_single_pass_pre_commit_cmd(
+    pc_bin: str,
+    target_dir: Path,
+    raw_changed_files: list[str],
+    *,
+    run_all: bool = False,
+) -> tuple[list[str], str, list[str]]:
+    """Build incremental `--files` or fallback `--all-files` command for `pre-commit run`."""
+    cfg_changed = any(
+        Path(rel).name in (".pre-commit-config.yaml", ".pre-commit-config.yml")
+        for rel in raw_changed_files
+    )
+    existing_files = [
+        rel
+        for rel in raw_changed_files
+        if (target_dir / rel).is_file() or (target_dir / rel).is_symlink()
+    ]
+    if run_all or cfg_changed or not existing_files:
+        return ([pc_bin, "run", "--all-files"], "all-files", [])
+    return ([pc_bin, "run", "--files", *existing_files], "incremental", existing_files)
+
+
+def _resolve_selective_should_run_bats(
+    selective_runner: Path,
+    raw_changed_files: list[str],
+    *,
+    run_all: bool = False,
+) -> bool:
+    """Inspect `selective_test_runner.py` to determine whether BATS is required for `raw_changed_files`."""
+    if run_all:
+        return True
+    if any(Path(rel).name in (".pre-commit-config.yaml", ".pre-commit-config.yml") for rel in raw_changed_files):
+        return True
+    if not selective_runner.is_file():
+        return True
+
+    try:
+        spec = importlib.util.spec_from_file_location("_validation_selective_runner", str(selective_runner))
+        if spec is not None and spec.loader is not None:
+            mod = importlib.util.module_from_spec(spec)
+            prev_no_bytecode = sys.dont_write_bytecode
+            sys.dont_write_bytecode = True
+            try:
+                spec.loader.exec_module(mod)
+            finally:
+                sys.dont_write_bytecode = prev_no_bytecode
+            if hasattr(mod, "should_run_bats"):
+                return bool(mod.should_run_bats(list(raw_changed_files), run_all=run_all))
+            if hasattr(mod, "build_test_plan"):
+                plan = mod.build_test_plan(
+                    selective_runner.parents[2],
+                    changed_files=list(raw_changed_files),
+                    run_all=run_all,
+                )
+                if isinstance(plan, dict) and "should_run_bats" in plan:
+                    return bool(plan["should_run_bats"])
+    except Exception:
+        return True
+
+    return any(rel.endswith((".sh", ".bats")) for rel in raw_changed_files)
 
 
 @contextlib.contextmanager
@@ -3494,8 +3609,9 @@ def run_local_validation_suite(
     run_pre_commit: bool = False,
     pre_commit_status: str = "",
     run_bats: bool = True,
+    run_all: bool = False,
 ) -> dict[str, Any]:
-    """Execute Step 6: Optional single-pass `pre-commit` (`SKIP=unit-tests,qa-static-audit`), `qa_static_audit.py --incremental`, `selective_test_runner.py` / `unittest`, and BATS, persisting unified `verification_results` bound to `head_sha` into `dev_pr_lock`."""
+    """Execute Step 6: Optional single-pass `pre-commit` (`SKIP=unit-tests,unit-tests-fast,qa-static-audit,bats-suite`), `qa_static_audit.py --incremental`, `selective_test_runner.py` / `unittest`, and selective BATS, persisting unified `verification_results` bound to `head_sha` into `dev_pr_lock`."""
     vcs = GitVcsIntegrationClient()
     target_dir = Path(workdir).expanduser().resolve() if workdir else vcs.resolve_repo_dir()
     if not target_dir.is_dir():
@@ -3508,20 +3624,27 @@ def run_local_validation_suite(
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
+    raw_changed_files = _detect_validation_changed_files(target_dir, env=clean_env)
 
-    # Single-pass pre-commit execution FIRST (skipping duplicate test & static-audit hooks)
+    # Single-pass pre-commit execution FIRST (skipping duplicate test, static-audit & BATS hooks)
     pre_commit_entry: dict[str, Any] = {"status": "not_run", "passed": None}
     pre_commit_status_label = "NOT_RUN"
     pre_commit_output = ""
     if run_pre_commit:
-        if (target_dir / ".pre-commit-config.yaml").is_file():
+        if (target_dir / ".pre-commit-config.yaml").is_file() or (target_dir / ".pre-commit-config.yml").is_file():
             pc_bin = shutil.which("pre-commit")
             if pc_bin:
                 skip_val, skip_hooks = _build_single_pass_pre_commit_skip(target_dir, clean_env.get("SKIP", ""))
                 pc_env = {**clean_env, "SKIP": skip_val}
+                pc_cmd, pc_mode, pc_files = _build_single_pass_pre_commit_cmd(
+                    pc_bin,
+                    target_dir,
+                    raw_changed_files,
+                    run_all=run_all,
+                )
                 with _temporarily_index_untracked_files(target_dir, env=clean_env):
                     proc_pc = subprocess.run(
-                        [pc_bin, "run", "--all-files"],
+                        pc_cmd,
                         cwd=str(target_dir),
                         env=pc_env,
                         capture_output=True,
@@ -3535,6 +3658,8 @@ def run_local_validation_suite(
                 pre_commit_entry = {
                     "status": "pass" if pc_ok else "fail",
                     "passed": pc_ok,
+                    "mode": pc_mode,
+                    "files_count": len(pc_files),
                     "skipped_hooks": skip_hooks,
                 }
             else:
@@ -3574,7 +3699,7 @@ def run_local_validation_suite(
     if targets:
         cmd = [sys.executable, "-m", "unittest", *targets]
     elif selective_runner.is_file():
-        cmd = [sys.executable, str(selective_runner)]
+        cmd = [sys.executable, str(selective_runner), *(["--all"] if run_all else [])]
     elif tests_dir.is_dir():
         cmd = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
     else:
@@ -3594,16 +3719,21 @@ def run_local_validation_suite(
         tests_passed = proc_test.returncode == 0
         test_output = f"{proc_test.stdout}\n{proc_test.stderr}".strip()
 
-    # Capture BATS status either from selective_test_runner TAP output or direct execution
+    # Capture BATS status either from selective_test_runner TAP output or direct execution when needed
     bats_files = sorted((target_dir / "tests" / "bats").glob("*.bats")) if (target_dir / "tests" / "bats").is_dir() else []
     bats_ran = False
     bats_passed = True
     bats_output = ""
+    effective_run_bats = bool(run_bats) and _resolve_selective_should_run_bats(
+        selective_runner,
+        raw_changed_files,
+        run_all=run_all,
+    )
     if re.search(r"(?m)^1\.\.\d+\s*$", test_output):
         bats_ran = True
         bats_passed = tests_passed and not bool(re.search(r"(?m)^not ok\s+\d+\b", test_output))
         bats_output = test_output
-    elif run_bats and not targets and bats_files:
+    elif effective_run_bats and not targets and bats_files:
         bats_bin = shutil.which("bats")
         if bats_bin:
             bats_ran = True
@@ -8602,19 +8732,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_test.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
     p_test.add_argument("--targets", nargs="*", default=[], help="Optional unittest target modules.")
     p_test.add_argument(
+        "--all",
+        "--all-files",
+        dest="run_all",
+        action="store_true",
+        help="Force `--all-files` on pre-commit and `--all` on selective_test_runner / BATS.",
+    )
+    p_test.add_argument(
         "--with-pre-commit",
         "--run-pre-commit",
         "--pre-commit",
         dest="run_pre_commit",
         action="store_true",
-        help="Single-pass mode: run `pre-commit run --all-files` with SKIP=unit-tests,qa-static-audit, then run qa_static_audit + tests once.",
+        help="Single-pass mode: run incremental `pre-commit run --files` (or `--all-files` fallback) with SKIP=unit-tests,unit-tests-fast,qa-static-audit,bats-suite, then run qa_static_audit + tests once.",
     )
     p_test.add_argument(
         "--pre-commit-status",
         type=lambda v: normalize_pre_commit_status(v)[0] if str(v or "").strip() else "",
         choices=("", "pass", "fail", "skipped"),
         default="",
-        help="Optional recorded status from an external `pre-commit run --all-files` invocation (pass/PASSED, fail/FAILED, skipped).",
+        help="Optional recorded status from an external `pre-commit run` invocation (pass/PASSED, fail/FAILED, skipped).",
     )
 
     for push_cmd in ("push-branch", "prepare-review", "create-pr"):
@@ -8910,6 +9047,7 @@ def main(argv: list[str] | None = None) -> int:
             test_targets=args.targets or None,
             run_pre_commit=bool(getattr(args, "run_pre_commit", False)),
             pre_commit_status=str(getattr(args, "pre_commit_status", "") or ""),
+            run_all=bool(getattr(args, "run_all", False)),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("passed") else 1

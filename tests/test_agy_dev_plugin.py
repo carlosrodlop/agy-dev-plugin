@@ -977,11 +977,146 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
 
         import selective_test_runner
 
-        with mock.patch.dict(os.environ, {"GIT_DIR": "/tmp/outer.git", "GIT_INDEX_FILE": "/tmp/idx", "KEEP_VAR": "ok"}):
+        with mock.patch.dict(
+            os.environ,
+            {"GIT_DIR": "/tmp/outer.git", "GIT_INDEX_FILE": "/tmp/idx", "KEEP_VAR": "ok"},
+            clear=False,
+        ):
+            os.environ.pop("PRE_COMMIT_HOOK", None)
+            os.environ.pop("AGY_OFFLINE_ONLY", None)
             cleaned = selective_test_runner._clean_git_env()
             self.assertNotIn("GIT_DIR", cleaned)
             self.assertNotIn("GIT_INDEX_FILE", cleaned)
             self.assertEqual(cleaned.get("KEEP_VAR"), "ok")
+            self.assertEqual(cleaned.get("PRE_COMMIT_HOOK"), "1")
+            self.assertEqual(cleaned.get("AGY_OFFLINE_ONLY"), "1")
+
+        with mock.patch.dict(os.environ, {"PRE_COMMIT_HOOK": "0", "AGY_OFFLINE_ONLY": "0"}, clear=False):
+            preserved = selective_test_runner._clean_git_env()
+            self.assertEqual(preserved.get("PRE_COMMIT_HOOK"), "0")
+            self.assertEqual(preserved.get("AGY_OFFLINE_ONLY"), "0")
+            overridden = selective_test_runner._clean_git_env({"AGY_OFFLINE_ONLY": "custom"})
+            self.assertEqual(overridden.get("AGY_OFFLINE_ONLY"), "custom")
+
+    def test_selective_runner_p0_velocity_integrity_and_precommit_config_contracts(self) -> None:
+        import time
+        import selective_test_runner
+
+        # 1. Clean working tree skips unit tests & BATS unless --all is passed
+        self.assertEqual(selective_test_runner.select_test_modules([], run_all=False), [])
+        self.assertFalse(selective_test_runner.should_run_bats([], run_all=False))
+        self.assertEqual(
+            selective_test_runner.select_test_modules([], run_all=True),
+            selective_test_runner.ALL_TEST_MODULES,
+        )
+        self.assertTrue(selective_test_runner.should_run_bats([], run_all=True))
+
+        clean_plan = selective_test_runner.build_test_plan(REPO_ROOT, changed_files=[], run_all=False)
+        self.assertEqual(clean_plan["mode"], "skip_clean")
+        self.assertTrue(clean_plan["skip_unit_tests"])
+        self.assertFalse(clean_plan["should_run_bats"])
+        self.assertFalse(clean_plan["run_bats"])
+
+        # 2. Docs-only edits route to <2s smoke targets without running all modules or BATS
+        for doc_only in (["README.md"], ["docs/architecture.md"], [".github/copilot-instructions.md"]):
+            selected_docs = selective_test_runner.select_test_modules(doc_only)
+            self.assertEqual(selected_docs, selective_test_runner.DOCS_SMOKE_TARGETS)
+            self.assertNotIn("tests.test_agy_dev_plugin", selected_docs)
+            self.assertFalse(selective_test_runner.should_run_bats(doc_only))
+
+        t0 = time.perf_counter()
+        readme_proc = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tests" / "scripts" / "selective_test_runner.py"), "README.md"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        readme_elapsed = time.perf_counter() - t0
+        self.assertEqual(readme_proc.returncode, 0, msg=readme_proc.stdout + readme_proc.stderr)
+        self.assertLess(readme_elapsed, 2.0, msg=f"Expected <2s docs-only selective run, took {readme_elapsed:.2f}s")
+
+        # Structural plugin markdown (rules/, skills/, agents/) still runs full contract module(s)
+        for plugin_md in ("rules/engineering-pillars.md", "skills/agy-project-standards/SKILL.md", "agents/agy-dev-planner.md"):
+            self.assertFalse(selective_test_runner.is_docs_only_path(plugin_md))
+            self.assertIn("tests.test_agy_dev_plugin", selective_test_runner.select_test_modules([plugin_md]))
+        self.assertIn(
+            "tests.test_pr_remediator_queue_and_cleanup",
+            selective_test_runner.select_test_modules(["agents/agy-dev-planner.md"]),
+        )
+
+        # 3. clients/git_client.py maps to test_pr_remediator_queue_and_cleanup + covering suites
+        git_client_mods = selective_test_runner.select_test_modules(["clients/git_client.py"])
+        for expected_mod in (
+            "tests.test_pr_remediator_queue_and_cleanup",
+            "tests.test_parallel_subagent_orchestration",
+            "tests.test_dev_queue_tui",
+            "tests.test_agy_dev_plugin",
+        ):
+            self.assertIn(expected_mod, git_client_mods)
+
+        # 4. audit_router_integrity() passes on real repo and fails loudly on orphaned test_*.py
+        self.assertIn("tests.test_parallel_subagent_orchestration", selective_test_runner.ALL_TEST_MODULES)
+        self.assertEqual(selective_test_runner.audit_router_integrity(REPO_ROOT), [])
+        audit_cli = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tests" / "scripts" / "selective_test_runner.py"), "--audit-integrity"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(audit_cli.returncode, 0, msg=audit_cli.stdout + audit_cli.stderr)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_repo = pathlib.Path(tmp) / "repo"
+            fake_tests = fake_repo / "tests"
+            fake_tests.mkdir(parents=True)
+            for mod_name in selective_test_runner.ALL_TEST_MODULES:
+                (fake_repo / (mod_name.replace(".", "/") + ".py")).write_text("# stub\n", encoding="utf-8")
+            self.assertEqual(selective_test_runner.audit_router_integrity(fake_repo), [])
+
+            (fake_tests / "test_orphan.py").write_text("# orphan\n", encoding="utf-8")
+            orphan_issues = selective_test_runner.audit_router_integrity(fake_repo)
+            self.assertEqual(len(orphan_issues), 1)
+            self.assertIn("test_orphan.py", orphan_issues[0])
+            import contextlib
+            import io
+
+            err_buf = io.StringIO()
+            with (
+                mock.patch.object(selective_test_runner, "REPO_ROOT", fake_repo),
+                contextlib.redirect_stderr(err_buf),
+            ):
+                self.assertEqual(selective_test_runner.main(["--audit-integrity"]), 1)
+            self.assertIn("test_orphan.py", err_buf.getvalue())
+
+            # Also verify qa_static_audit catches shell syntax errors in arbitrary .sh files (not just install.sh)
+            (fake_repo / "shell").mkdir(parents=True)
+            (fake_repo / "shell" / "broken_syntax.sh").write_text("#!/usr/bin/env bash\nif [[\n", encoding="utf-8")
+            qa_broken = qa_static_audit.run_qa_audit(fake_repo, strict=False)
+            self.assertFalse(qa_broken["passed"])
+            self.assertIn("sh:syntax-error", {e["rule_id"] for e in qa_broken["errors"]})
+
+        # 5. .pre-commit-config.yaml contract: no broken install-sh-syntax, no duplicate BATS, offline env on unit-tests-fast
+        pc_text = (REPO_ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8")
+        active_pc_lines = [ln for ln in pc_text.splitlines() if not ln.lstrip().startswith("#")]
+        active_pc = "\n".join(active_pc_lines)
+        self.assertNotIn("install-sh-syntax", active_pc)
+        self.assertNotIn("bash -n install.sh", active_pc)
+
+        ut_block_match = re.search(
+            r"(?ms)^\s*-\s*id:\s*unit-tests-fast\b(.*?)(?=^\s*-\s*id:|\Z)",
+            active_pc,
+        )
+        self.assertIsNotNone(ut_block_match, msg="unit-tests-fast hook must exist in .pre-commit-config.yaml")
+        ut_block = ut_block_match.group(1) if ut_block_match else ""
+        self.assertIn("PRE_COMMIT_HOOK=1", ut_block)
+        self.assertIn("AGY_OFFLINE_ONLY=1", ut_block)
+        self.assertIn("selective_test_runner.py", ut_block)
+        self.assertIn("--no-bats", ut_block)
+
+        bats_hooks = re.findall(r"(?m)^\s*-\s*id:\s*(bats[^\s]*)", active_pc)
+        self.assertEqual(bats_hooks, ["bats-suite"])
 
     def test_current_repo_passes_strict_qa_static_audit_and_size_contracts(self) -> None:
         audit_res = qa_static_audit.run_qa_audit(REPO_ROOT, strict=True)
