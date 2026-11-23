@@ -1,0 +1,23 @@
+{
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "args": [
+    "server.py"
+  ],
+  "command": "python3",
+  "description": "Compact read-only multi-repo Dev Queue & HITL Navigator panel with 1-click conversation and artifact switching plus [h#] terminal nav_intent bridge.",
+  "display_name": "Dev Queue",
+  "has_web_ui": true,
+  "restart_policy": "always",
+  "ui_config": {
+    "display_name": "Dev Queue",
+    "views": [
+      {
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "path": "/",
+        "title": "Dev Queue"
+      }
+    ]
+  }
+}

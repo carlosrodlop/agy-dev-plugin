@@ -18,6 +18,7 @@ ALL_TEST_MODULES = [
     "tests.test_agy_dev_plugin",
     "tests.test_dev_queue_cli_ux",
     "tests.test_dev_queue_doctor",
+    "tests.test_dev_queue_sidecar_panel",
     "tests.test_dev_queue_tui",
     "tests.test_orchestration_wip_and_wake_fixes",
     "tests.test_parallel_file_leases_and_tui",
@@ -72,6 +73,7 @@ BATS_TRIGGER_PREFIXES = (
 ISOLATED_TEST_FILE_MODULES = {
     "tests/test_dev_queue_cli_ux.py": "tests.test_dev_queue_cli_ux",
     "tests/test_dev_queue_doctor.py": "tests.test_dev_queue_doctor",
+    "tests/test_dev_queue_sidecar_panel.py": "tests.test_dev_queue_sidecar_panel",
     "tests/test_dev_queue_tui.py": "tests.test_dev_queue_tui",
     "tests/test_orchestration_wip_and_wake_fixes.py": "tests.test_orchestration_wip_and_wake_fixes",
     "tests/test_parallel_file_leases_and_tui.py": "tests.test_parallel_file_leases_and_tui",
@@ -243,6 +245,19 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_dev_queue_doctor" not in selected:
                 selected.append("tests.test_dev_queue_doctor")
+        if (
+            norm.endswith(
+                (
+                    "dev_queue_tui.py",
+                    "test_dev_queue_sidecar_panel.py",
+                    "selective_test_runner.py",
+                    "dev_common.py",
+                )
+            )
+            or norm.startswith(("sidecars/dev-queue-panel/", "skills/agy-dev-queue-orchestrator/"))
+        ):
+            if "tests.test_dev_queue_sidecar_panel" not in selected:
+                selected.append("tests.test_dev_queue_sidecar_panel")
         if (
             norm.endswith(
                 (
