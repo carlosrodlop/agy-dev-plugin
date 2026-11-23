@@ -23,6 +23,7 @@ if str(_CLIENTS_DIR) not in _sys.path:
 import dev_common as _dev_common  # noqa: F401, E402
 
 import argparse
+import ast
 import contextlib
 import json
 from pathlib import Path
@@ -289,6 +290,28 @@ def _maybe_restart_control_tower_after_deploy(
     try:
         return bool(try_restart_control_tower_api())
     except Exception:
+        return False
+
+
+def _resolve_real_os_home() -> Path:
+    """Resolve the real OS user home directory independently of `$HOME` overrides."""
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir).expanduser().resolve()
+    except Exception:
+        return Path.home().expanduser().resolve()
+
+
+def _is_valid_git_client_cli_script(script_path: Path) -> bool:
+    """Verify `script_path` parses cleanly via `ast.parse` and exposes the `deploy-home` CLI."""
+    try:
+        src = script_path.read_text(encoding="utf-8")
+        if "def deploy_repo_to_home" not in src or "deploy-home" not in src:
+            return False
+        ast.parse(src, filename=str(script_path))
+        return True
+    except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
         return False
 
 
@@ -1787,18 +1810,45 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         home_dir: Path | None = None,
         require_base_branch: str = "main",
         prune_orphans: bool = True,
+        *,
+        _allow_in_tests: bool = False,
     ) -> dict[str, Any]:
         """Atomically deploy tracked plugin/customization files from the pinned `main` checkout into `$HOME` in `<15 ms` using `git ls-files`.
 
         Guarantees `origin/main` is the single source of truth:
           - Refuses to deploy to `$HOME` if `repo_dir` is checked out on an unmerged `fix/*` branch (`require_base_branch="main"`).
+          - Refuses unisolated `unittest`/`pytest` runs targeting real `$HOME` unless explicitly opted in.
+          - Re-execs a single fresh subprocess pass (`AGY_DEPLOY_REEXEC=1`) when `clients/git_client.py` itself is updated so newly added tracked roots deploy atomically without stale `prune_orphans` deletion.
           - Expands `$HOME/` in `.gemini/config/mcp_config.json`, `.gemini/config/hooks.json`, plugin manifests, and `.gemini/config/sidecars/*.json`.
           - Stamps the live `HEAD` `<short_sha>-<YYYYMMDD>` into `.gemini/config/plugins/<plugin_name>/plugin.json`.
           - Applies deterministic permissions (`0755` for scripts/clients/bin, `0600` for `.ssh/*`, `0644` otherwise).
           - Prunes orphaned files in managed customization subdirectories of `$HOME` so rejected branch edits never linger.
         """
         target_dir = repo_dir or self.resolve_repo_dir()
-        target_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+        target_home = (
+            Path(home_dir).expanduser().resolve()
+            if home_dir is not None
+            else Path.home().expanduser().resolve()
+        )
+        in_test_runner = (
+            "unittest" in sys.modules
+            or "pytest" in sys.modules
+            or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+        )
+        allow_real_home_in_tests = (
+            _allow_in_tests or os.environ.get("AGY_ALLOW_TEST_REAL_HOME_DEPLOY") == "1"
+        )
+        if in_test_runner and not allow_real_home_in_tests and target_home == _resolve_real_os_home():
+            return {
+                "status": "skipped",
+                "deployed": False,
+                "reason": "blocked_unisolated_test_real_home",
+                "repo_dir": str(target_dir),
+                "home_dir": str(target_home),
+                "deployed_files": [],
+                "pruned_files": [],
+                "pruned_orphans": [],
+            }
         src_home = (
             target_dir / "home"
             if (target_dir / "home").is_dir()
@@ -1995,6 +2045,92 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                         os.chmod(dest_file, mode)
                 except OSError:
                     pass
+
+        deployed_git_client_rel = next(
+            (
+                rel
+                for rel in deployed_files
+                if rel == "clients/git_client.py" or rel.endswith("/clients/git_client.py")
+            ),
+            "",
+        )
+        if deployed_git_client_rel and os.environ.get("AGY_DEPLOY_REEXEC") != "1":
+            reexec_script = target_home / deployed_git_client_rel
+            if reexec_script.is_file() and _is_valid_git_client_cli_script(reexec_script):
+                reexec_env = {
+                    **os.environ,
+                    "AGY_DEPLOY_REEXEC": "1",
+                    "AGY_CONF_REPO_DIR": str(target_dir),
+                    "HOME": str(target_home),
+                    "PYTHONPATH": os.pathsep.join(
+                        [p for p in (os.environ.get("PYTHONPATH", ""), str(_CLIENTS_DIR)) if p]
+                    ),
+                }
+                if allow_real_home_in_tests:
+                    reexec_env["AGY_ALLOW_TEST_REAL_HOME_DEPLOY"] = "1"
+                cmd = [
+                    sys.executable,
+                    str(reexec_script),
+                    "deploy-home",
+                    "--base",
+                    req_branch,
+                    "--repo-dir",
+                    str(target_dir),
+                    "--home-dir",
+                    str(target_home),
+                ]
+                if not prune_orphans:
+                    cmd.append("--no-prune")
+                try:
+                    proc_reexec = subprocess.run(
+                        cmd,
+                        env=reexec_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    proc_reexec = subprocess.CompletedProcess(cmd, 1, stdout="", stderr=str(exc))
+                if proc_reexec.returncode == 0:
+                    with contextlib.suppress(json.JSONDecodeError, ValueError):
+                        sub_res = json.loads(proc_reexec.stdout or "{}")
+                        if isinstance(sub_res, dict) and sub_res.get("status") == "ok" and sub_res.get("deployed"):
+                            sub_deployed = [str(f) for f in (sub_res.get("deployed_files") or []) if f]
+                            merged_deployed = list(dict.fromkeys([*deployed_files, *sub_deployed]))
+                            sub_res["deployed_files"] = merged_deployed
+                            sub_res["deployed_count"] = len(merged_deployed)
+                            sub_res["updated_count"] = len(merged_deployed)
+                            sub_res["unchanged_count"] = max(
+                                0,
+                                int(sub_res.get("tracked_count") or len(tracked_set)) - len(merged_deployed),
+                            )
+                            sub_res["reexec_pass"] = True
+                            if not sub_res.get("control_tower_restarted"):
+                                sub_res["control_tower_restarted"] = _maybe_restart_control_tower_after_deploy(
+                                    merged_deployed,
+                                    target_home=target_home,
+                                )
+                            return sub_res
+                restarted = _maybe_restart_control_tower_after_deploy(deployed_files, target_home=target_home)
+                return {
+                    "status": "ok",
+                    "deployed": True,
+                    "repo_dir": str(target_dir),
+                    "home_dir": str(target_home),
+                    "branch": cur_branch,
+                    "tracked_count": len(tracked_set),
+                    "deployed_count": len(deployed_files),
+                    "updated_count": len(deployed_files),
+                    "unchanged_count": max(0, len(tracked_set) - len(deployed_files)),
+                    "deployed_files": deployed_files,
+                    "pruned_count": 0,
+                    "pruned_files": [],
+                    "pruned_orphans": [],
+                    "control_tower_restarted": restarted,
+                    "reexec_pass": False,
+                    "reexec_error": (proc_reexec.stderr or proc_reexec.stdout or "reexec_failed").strip(),
+                }
 
         pruned_files: list[str] = []
         if prune_orphans:
@@ -2238,6 +2374,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Atomically deploy tracked src/home/ files from the pinned main branch into $HOME using git ls-files.",
     )
     p_deploy.add_argument("--base", default="main", help="Required base branch name (default: main).")
+    p_deploy.add_argument("--repo-dir", default="", help="Optional repository directory override.")
+    p_deploy.add_argument("--home-dir", default="", help="Optional target $HOME directory override.")
     p_deploy.add_argument("--no-prune", action="store_true", help="Do not prune orphaned files in managed $HOME directories.")
 
     return parser.parse_args(argv)
@@ -2295,7 +2433,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res.get("status") == "ok" else 1
 
     if args.subcommand == "deploy-home":
+        repo_override = Path(args.repo_dir).expanduser().resolve() if getattr(args, "repo_dir", "") else None
+        home_override = Path(args.home_dir).expanduser().resolve() if getattr(args, "home_dir", "") else None
         res = client.deploy_repo_to_home(
+            repo_dir=repo_override,
+            home_dir=home_override,
             require_base_branch=getattr(args, "base", "main"),
             prune_orphans=not getattr(args, "no_prune", False),
         )
