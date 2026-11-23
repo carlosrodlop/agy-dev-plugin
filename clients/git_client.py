@@ -1804,6 +1804,39 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
             return rel_str
         return ""
 
+    @staticmethod
+    def _sync_plugin_local_bin_symlinks(target_home: Path, plugin_prefix: str) -> list[str]:
+        """Atomically synchronize `~/.local/bin/agy-queue` & `agy-doctor` symlinks when `shell/agy_dev_queue.sh` exists."""
+        if not plugin_prefix:
+            return []
+        wrapper_abs = target_home / plugin_prefix / "shell" / "agy_dev_queue.sh"
+        if not wrapper_abs.is_file():
+            return []
+        bin_dir = target_home / ".local" / "bin"
+        synced: list[str] = []
+        try:
+            bin_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return []
+        target_str = str(wrapper_abs)
+        for link_name in ("agy-queue", "agy-doctor"):
+            link_path = bin_dir / link_name
+            rel_link = f".local/bin/{link_name}"
+            try:
+                if link_path.is_symlink() and os.readlink(link_path) == target_str:
+                    synced.append(rel_link)
+                    continue
+                tmp_link = bin_dir / f".{link_name}.tmp.{os.getpid()}"
+                with contextlib.suppress(OSError):
+                    tmp_link.unlink()
+                tmp_link.symlink_to(wrapper_abs)
+                os.replace(tmp_link, link_path)
+                synced.append(rel_link)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    (bin_dir / f".{link_name}.tmp.{os.getpid()}").unlink()
+        return synced
+
     def deploy_repo_to_home(
         self,
         repo_dir: Path | None = None,
@@ -2106,12 +2139,16 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                                 int(sub_res.get("tracked_count") or len(tracked_set)) - len(merged_deployed),
                             )
                             sub_res["reexec_pass"] = True
+                            sub_res["synced_symlinks"] = self._sync_plugin_local_bin_symlinks(
+                                target_home, plugin_prefix
+                            )
                             if not sub_res.get("control_tower_restarted"):
                                 sub_res["control_tower_restarted"] = _maybe_restart_control_tower_after_deploy(
                                     merged_deployed,
                                     target_home=target_home,
                                 )
                             return sub_res
+                synced_symlinks = self._sync_plugin_local_bin_symlinks(target_home, plugin_prefix)
                 restarted = _maybe_restart_control_tower_after_deploy(deployed_files, target_home=target_home)
                 return {
                     "status": "ok",
@@ -2124,6 +2161,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     "updated_count": len(deployed_files),
                     "unchanged_count": max(0, len(tracked_set) - len(deployed_files)),
                     "deployed_files": deployed_files,
+                    "synced_symlinks": synced_symlinks,
                     "pruned_count": 0,
                     "pruned_files": [],
                     "pruned_orphans": [],
@@ -2267,6 +2305,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     if obs_abs.is_dir():
                         shutil.rmtree(obs_abs, ignore_errors=True)
 
+        synced_symlinks = self._sync_plugin_local_bin_symlinks(target_home, plugin_prefix)
         restarted = _maybe_restart_control_tower_after_deploy(deployed_files, target_home=target_home)
 
         return {
@@ -2280,6 +2319,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
             "updated_count": len(deployed_files),
             "unchanged_count": max(0, len(tracked_set) - len(deployed_files)),
             "deployed_files": deployed_files,
+            "synced_symlinks": synced_symlinks,
             "pruned_count": len(pruned_files),
             "pruned_files": pruned_files,
             "pruned_orphans": pruned_files,

@@ -16,6 +16,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ALL_TEST_MODULES = [
     "tests.test_agy_dev_plugin",
+    "tests.test_dev_queue_cli_ux",
     "tests.test_dev_queue_doctor",
     "tests.test_dev_queue_tui",
     "tests.test_orchestration_wip_and_wake_fixes",
@@ -68,6 +69,7 @@ BATS_TRIGGER_PREFIXES = (
     "agents/",
 )
 ISOLATED_TEST_FILE_MODULES = {
+    "tests/test_dev_queue_cli_ux.py": "tests.test_dev_queue_cli_ux",
     "tests/test_dev_queue_doctor.py": "tests.test_dev_queue_doctor",
     "tests/test_dev_queue_tui.py": "tests.test_dev_queue_tui",
     "tests/test_orchestration_wip_and_wake_fixes.py": "tests.test_orchestration_wip_and_wake_fixes",
@@ -247,6 +249,24 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_dev_queue_tui" not in selected:
                 selected.append("tests.test_dev_queue_tui")
+        if (
+            norm.endswith(
+                (
+                    "dev_queue_tui.py",
+                    "dev_flow_optimizer.py",
+                    "pr_remediator.py",
+                    "test_dev_queue_cli_ux.py",
+                    "agy_dev_queue.sh",
+                    "dev_common.py",
+                    "git_client.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith("skills/agy-dev-queue-orchestrator/")
+            or norm.startswith("shell/")
+        ):
+            if "tests.test_dev_queue_cli_ux" not in selected:
+                selected.append("tests.test_dev_queue_cli_ux")
         if (
             norm.endswith(
                 (

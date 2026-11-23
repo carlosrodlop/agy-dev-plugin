@@ -2354,18 +2354,19 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertEqual(det_stale["threshold_seconds"], 900)
             self.assertEqual(det_stale["worker_cid"], worker_cid)
 
-            # NEEDS_REVISION_ITERATING is also eligible for stall detection
-            det_iter = prs.detect_stalled_lock(
-                {**stale_lock, "status": "NEEDS_REVISION_ITERATING"},
-                now_ts=base_now,
-                brain_dir=brain_dir,
-            )
-            self.assertTrue(det_iter["stalled"])
+            # NEEDS_REVISION_ITERATING and AWAITING_AGENT_REVIEW are also eligible for stall detection
+            for eligible_status in ("NEEDS_REVISION_ITERATING", "AWAITING_AGENT_REVIEW"):
+                det_iter = prs.detect_stalled_lock(
+                    {**stale_lock, "status": eligible_status},
+                    now_ts=base_now,
+                    brain_dir=brain_dir,
+                )
+                self.assertTrue(det_iter["stalled"], msg=f"Expected {eligible_status} to be stall-eligible")
 
-            # Human-ready or non-developing locks are NEVER flagged as stalled
+            # Human-ready or non-developing/non-review locks are NEVER flagged as stalled
             for exempt in (
                 {**stale_lock, "status": "PENDING_HUMAN_PR_VALIDATION", "pr_gate_ready": True},
-                {**stale_lock, "status": "AWAITING_AGENT_REVIEW"},
+                {**stale_lock, "status": "READY_AWAITING_BASE_MERGE", "pr_gate_ready": False},
                 {**stale_lock, "status": "DEVELOPING", "pr_gate_ready": True},
                 {**stale_lock, "active": False},
             ):
