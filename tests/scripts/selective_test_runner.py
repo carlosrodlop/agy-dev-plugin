@@ -22,6 +22,7 @@ ALL_TEST_MODULES = [
     "tests.test_orchestration_wip_and_wake_fixes",
     "tests.test_parallel_file_leases_and_tui",
     "tests.test_parallel_subagent_orchestration",
+    "tests.test_pr_remediator_preview_staging",
     "tests.test_pr_remediator_queue_and_cleanup",
 ]
 
@@ -75,6 +76,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_orchestration_wip_and_wake_fixes.py": "tests.test_orchestration_wip_and_wake_fixes",
     "tests/test_parallel_file_leases_and_tui.py": "tests.test_parallel_file_leases_and_tui",
     "tests/test_parallel_subagent_orchestration.py": "tests.test_parallel_subagent_orchestration",
+    "tests/test_pr_remediator_preview_staging.py": "tests.test_pr_remediator_preview_staging",
     "tests/test_pr_remediator_queue_and_cleanup.py": "tests.test_pr_remediator_queue_and_cleanup",
 }
 
@@ -198,6 +200,16 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_parallel_subagent_orchestration" not in selected:
                 selected.append("tests.test_parallel_subagent_orchestration")
+        if norm.endswith(
+            (
+                "pr_remediator.py",
+                "dev_common.py",
+                "test_pr_remediator_preview_staging.py",
+                "selective_test_runner.py",
+            )
+        ):
+            if "tests.test_pr_remediator_preview_staging" not in selected:
+                selected.append("tests.test_pr_remediator_preview_staging")
         if (
             norm.endswith(
                 (
