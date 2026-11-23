@@ -31,6 +31,17 @@ MAX_MARKDOWN_INSTRUCTION_BYTES = 24000
 MAX_COPILOT_INSTRUCTIONS_BYTES = 4000
 MAX_CSS_IMPORTANT_PER_FILE = 10
 COPILOT_INSTRUCTIONS_REL_PATH = ".github/copilot-instructions.md"
+REQUIREMENTS_MANIFEST_FILENAME = "requirements.json"
+REQUIREMENTS_SCHEMA_VERSION = "1.0"
+VALID_REQUIREMENT_MECHANISMS = frozenset(
+    {
+        "mcp_bridge",
+        "python_client",
+        "native_oauth_plugin",
+        "system_binary",
+    }
+)
+DOTENV_ASSIGNMENT_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
 
 SKIP_DIR_NAMES = frozenset(
     {
@@ -924,6 +935,464 @@ def _check_markdown_limits(fpath: Path, rel: str, errors: list[AuditFinding], wa
             )
 
 
+def _parse_dotenv_example_keys(dotenv_path: Path) -> set[str]:
+    """Extract declared environment variable names from `.env.example` (ignoring `#` comment lines)."""
+    try:
+        text = dotenv_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    keys: set[str] = set()
+    for raw_line in text.splitlines():
+        stripped = raw_line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = DOTENV_ASSIGNMENT_RE.match(stripped)
+        if m:
+            keys.add(m.group(1))
+    return keys
+
+
+def _is_nonempty_str_list(val: Any, *, allow_empty: bool = False) -> bool:
+    """Return True when `val` is a `list` of non-empty `str` items."""
+    if not isinstance(val, list):
+        return False
+    if not allow_empty and len(val) == 0:
+        return False
+    return all(isinstance(item, str) and bool(item.strip()) for item in val)
+
+
+def validate_plugin_requirements(repo_dir: Path | str) -> list[AuditFinding]:
+    """Validate `requirements.json` against the 4 Plugin Requirements as Code invariants.
+
+    Invariants enforced whenever `<repo_dir>/requirements.json` exists:
+      1. Schema compliance (`schema_version == "1.0"`, valid `mechanism` in
+         `mcp_bridge | python_client | native_oauth_plugin | system_binary`, required fields).
+      2. 100% coverage of `clients/*_client.py` and `mcp_config.json` servers.
+      3. 100% of `required_by_skills` exist under `skills/*/SKILL.md`.
+      4. 100% of declared `env_vars` exist in `.env.example` (when `.env.example` exists).
+    """
+    resolved_repo = Path(repo_dir).expanduser().resolve()
+    req_path = resolved_repo / REQUIREMENTS_MANIFEST_FILENAME
+    if not req_path.is_file():
+        return []
+
+    findings: list[AuditFinding] = []
+    try:
+        rdata = json.loads(req_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        findings.append(
+            AuditFinding("error", "req:invalid-json", REQUIREMENTS_MANIFEST_FILENAME, 0, f"Invalid JSON: {exc}")
+        )
+        return findings
+
+    if not isinstance(rdata, dict):
+        findings.append(
+            AuditFinding(
+                "error",
+                "req:schema",
+                REQUIREMENTS_MANIFEST_FILENAME,
+                0,
+                "requirements.json root must be a JSON object.",
+            )
+        )
+        return findings
+
+    schema_version = rdata.get("schema_version")
+    if not isinstance(schema_version, str) or schema_version != REQUIREMENTS_SCHEMA_VERSION:
+        findings.append(
+            AuditFinding(
+                "error",
+                "req:schema",
+                REQUIREMENTS_MANIFEST_FILENAME,
+                0,
+                f"requirements.json must declare schema_version == '{REQUIREMENTS_SCHEMA_VERSION}' (got {schema_version!r}).",
+            )
+        )
+
+    plugin_id = rdata.get("plugin_id")
+    if not isinstance(plugin_id, str) or not plugin_id.strip():
+        findings.append(
+            AuditFinding(
+                "error",
+                "req:schema",
+                REQUIREMENTS_MANIFEST_FILENAME,
+                0,
+                "requirements.json must declare a non-empty string 'plugin_id'.",
+            )
+        )
+        plugin_id_clean = ""
+    else:
+        plugin_id_clean = plugin_id.strip()
+        plugin_manifest = resolved_repo / "plugin.json"
+        if plugin_manifest.is_file():
+            try:
+                pdata = json.loads(plugin_manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pdata = None
+            if isinstance(pdata, dict):
+                pname = str(pdata.get("name") or "").strip()
+                if pname and plugin_id_clean != pname:
+                    findings.append(
+                        AuditFinding(
+                            "error",
+                            "req:schema",
+                            REQUIREMENTS_MANIFEST_FILENAME,
+                            0,
+                            f"requirements.json plugin_id '{plugin_id_clean}' must match plugin.json name '{pname}'.",
+                        )
+                    )
+
+    raw_items = rdata.get("requirements")
+    if not isinstance(raw_items, list):
+        findings.append(
+            AuditFinding(
+                "error",
+                "req:schema",
+                REQUIREMENTS_MANIFEST_FILENAME,
+                0,
+                "requirements.json must contain a 'requirements' array.",
+            )
+        )
+        return findings
+
+    seen_ids: set[str] = set()
+    covered_client_scripts: set[str] = set()
+    covered_mcp_servers: set[str] = set()
+
+    skills_dir = resolved_repo / "skills"
+    existing_skills = (
+        {p.parent.name for p in skills_dir.glob("*/SKILL.md") if p.is_file()}
+        if skills_dir.is_dir()
+        else set()
+    )
+
+    dotenv_example_path = resolved_repo / ".env.example"
+    has_dotenv_example = dotenv_example_path.is_file()
+    declared_dotenv_keys = _parse_dotenv_example_keys(dotenv_example_path) if has_dotenv_example else set()
+
+    mcp_config_path = resolved_repo / "mcp_config.json"
+    repo_mcp_servers: set[str] = set()
+    if mcp_config_path.is_file():
+        try:
+            mcp_data = json.loads(mcp_config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            mcp_data = None
+        if isinstance(mcp_data, dict) and isinstance(mcp_data.get("mcpServers"), dict):
+            repo_mcp_servers = {str(k).strip() for k in mcp_data["mcpServers"] if str(k).strip()}
+
+    for idx, entry in enumerate(raw_items):
+        if not isinstance(entry, dict):
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "req:schema",
+                    REQUIREMENTS_MANIFEST_FILENAME,
+                    0,
+                    f"requirements[{idx}] must be a JSON object.",
+                )
+            )
+            continue
+
+        req_id_raw = entry.get("id")
+        if not isinstance(req_id_raw, str) or not req_id_raw.strip():
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "req:schema",
+                    REQUIREMENTS_MANIFEST_FILENAME,
+                    0,
+                    f"requirements[{idx}] must declare a non-empty string 'id'.",
+                )
+            )
+            req_label = f"requirements[{idx}]"
+            req_id = ""
+        else:
+            req_id = req_id_raw.strip()
+            req_label = req_id
+            if req_id in seen_ids:
+                findings.append(
+                    AuditFinding(
+                        "error",
+                        "req:schema",
+                        REQUIREMENTS_MANIFEST_FILENAME,
+                        0,
+                        f"Duplicate requirement id '{req_id}' in requirements.json.",
+                    )
+                )
+            seen_ids.add(req_id)
+
+        if "name" in entry and (not isinstance(entry["name"], str) or not entry["name"].strip()):
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "req:schema",
+                    REQUIREMENTS_MANIFEST_FILENAME,
+                    0,
+                    f"Requirement '{req_label}' field 'name' must be a non-empty string.",
+                )
+            )
+
+        mechanism = entry.get("mechanism")
+        if not isinstance(mechanism, str) or mechanism not in VALID_REQUIREMENT_MECHANISMS:
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "req:schema",
+                    REQUIREMENTS_MANIFEST_FILENAME,
+                    0,
+                    (
+                        f"Requirement '{req_label}' has invalid mechanism {mechanism!r}; "
+                        f"expected one of {sorted(VALID_REQUIREMENT_MECHANISMS)}."
+                    ),
+                )
+            )
+            mechanism = ""
+
+        provider_plugin = entry.get("provider_plugin_id")
+        if not isinstance(provider_plugin, str) or not provider_plugin.strip():
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "req:schema",
+                    REQUIREMENTS_MANIFEST_FILENAME,
+                    0,
+                    f"Requirement '{req_label}' must declare a non-empty string 'provider_plugin_id'.",
+                )
+            )
+            provider_clean = ""
+        else:
+            provider_clean = provider_plugin.strip()
+
+        req_by_plugins = entry.get("required_by_plugins")
+        if not _is_nonempty_str_list(req_by_plugins, allow_empty=False):
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "req:schema",
+                    REQUIREMENTS_MANIFEST_FILENAME,
+                    0,
+                    f"Requirement '{req_label}' must declare a non-empty list of strings 'required_by_plugins'.",
+                )
+            )
+
+        req_by_skills = entry.get("required_by_skills")
+        if not _is_nonempty_str_list(req_by_skills, allow_empty=True):
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "req:schema",
+                    REQUIREMENTS_MANIFEST_FILENAME,
+                    0,
+                    f"Requirement '{req_label}' must declare 'required_by_skills' as a list of non-empty skill names.",
+                )
+            )
+        else:
+            for skill_name in req_by_skills:
+                clean_skill = skill_name.strip()
+                if clean_skill not in existing_skills:
+                    findings.append(
+                        AuditFinding(
+                            "error",
+                            "req:unknown-skill",
+                            REQUIREMENTS_MANIFEST_FILENAME,
+                            0,
+                            (
+                                f"Requirement '{req_label}' references unknown skill '{clean_skill}' "
+                                f"(missing skills/{clean_skill}/SKILL.md)."
+                            ),
+                        )
+                    )
+
+        if "env_vars" in entry:
+            env_vars_val = entry["env_vars"]
+            if not _is_nonempty_str_list(env_vars_val, allow_empty=True):
+                findings.append(
+                    AuditFinding(
+                        "error",
+                        "req:schema",
+                        REQUIREMENTS_MANIFEST_FILENAME,
+                        0,
+                        f"Requirement '{req_label}' field 'env_vars' must be a list of non-empty variable names.",
+                    )
+                )
+            elif has_dotenv_example:
+                for env_var in env_vars_val:
+                    clean_env = env_var.strip()
+                    if clean_env not in declared_dotenv_keys:
+                        findings.append(
+                            AuditFinding(
+                                "error",
+                                "req:missing-env-example",
+                                REQUIREMENTS_MANIFEST_FILENAME,
+                                0,
+                                f"Requirement '{req_label}' declares env_var '{clean_env}' missing from .env.example.",
+                            )
+                        )
+
+        is_local_provider = bool(plugin_id_clean and provider_clean == plugin_id_clean)
+        client_script_raw = entry.get("client_script")
+        norm_client_script = ""
+        if client_script_raw is not None:
+            if not isinstance(client_script_raw, str) or not client_script_raw.strip():
+                findings.append(
+                    AuditFinding(
+                        "error",
+                        "req:schema",
+                        REQUIREMENTS_MANIFEST_FILENAME,
+                        0,
+                        f"Requirement '{req_label}' field 'client_script' must be a non-empty string.",
+                    )
+                )
+            else:
+                norm_client_script = client_script_raw.strip().replace("\\", "/")
+                while norm_client_script.startswith("./"):
+                    norm_client_script = norm_client_script[2:]
+
+        if mechanism == "python_client":
+            if is_local_provider and not norm_client_script:
+                findings.append(
+                    AuditFinding(
+                        "error",
+                        "req:schema",
+                        REQUIREMENTS_MANIFEST_FILENAME,
+                        0,
+                        f"Local python_client requirement '{req_label}' must declare 'client_script' (e.g. 'clients/{req_id or 'example_client'}.py').",
+                    )
+                )
+            elif norm_client_script:
+                covered_client_scripts.add(norm_client_script)
+                if is_local_provider and not norm_client_script.startswith(("$HOME/", "~/")):
+                    if not (resolved_repo / norm_client_script).is_file():
+                        findings.append(
+                            AuditFinding(
+                                "error",
+                                "req:missing-client-file",
+                                REQUIREMENTS_MANIFEST_FILENAME,
+                                0,
+                                f"Requirement '{req_label}' client_script '{norm_client_script}' does not exist on disk.",
+                            )
+                        )
+        elif mechanism == "mcp_bridge":
+            if norm_client_script:
+                covered_client_scripts.add(norm_client_script)
+                if is_local_provider and not norm_client_script.startswith(("$HOME/", "~/")):
+                    if not (resolved_repo / norm_client_script).is_file():
+                        findings.append(
+                            AuditFinding(
+                                "error",
+                                "req:missing-client-file",
+                                REQUIREMENTS_MANIFEST_FILENAME,
+                                0,
+                                f"Requirement '{req_label}' client_script '{norm_client_script}' does not exist on disk.",
+                            )
+                        )
+            entry_servers: list[str] = []
+            if "mcp_servers" in entry:
+                if not _is_nonempty_str_list(entry["mcp_servers"], allow_empty=False):
+                    findings.append(
+                        AuditFinding(
+                            "error",
+                            "req:schema",
+                            REQUIREMENTS_MANIFEST_FILENAME,
+                            0,
+                            f"Requirement '{req_label}' field 'mcp_servers' must be a non-empty list of server names.",
+                        )
+                    )
+                else:
+                    entry_servers.extend(s.strip() for s in entry["mcp_servers"])
+            if "mcp_server" in entry:
+                if not isinstance(entry["mcp_server"], str) or not entry["mcp_server"].strip():
+                    findings.append(
+                        AuditFinding(
+                            "error",
+                            "req:schema",
+                            REQUIREMENTS_MANIFEST_FILENAME,
+                            0,
+                            f"Requirement '{req_label}' field 'mcp_server' must be a non-empty string.",
+                        )
+                    )
+                else:
+                    entry_servers.append(entry["mcp_server"].strip())
+            if not entry_servers and req_id in repo_mcp_servers:
+                entry_servers.append(req_id)
+            if is_local_provider and not entry_servers:
+                findings.append(
+                    AuditFinding(
+                        "error",
+                        "req:schema",
+                        REQUIREMENTS_MANIFEST_FILENAME,
+                        0,
+                        f"Local mcp_bridge requirement '{req_label}' must declare 'mcp_servers' (or 'mcp_server').",
+                    )
+                )
+            for srv in entry_servers:
+                covered_mcp_servers.add(srv)
+                if is_local_provider and mcp_config_path.is_file() and srv not in repo_mcp_servers:
+                    findings.append(
+                        AuditFinding(
+                            "error",
+                            "req:unknown-mcp-server",
+                            REQUIREMENTS_MANIFEST_FILENAME,
+                            0,
+                            f"Requirement '{req_label}' declares MCP server '{srv}' missing from mcp_config.json.",
+                        )
+                    )
+        elif mechanism == "system_binary":
+            has_bin_str = "binary" in entry
+            has_bin_list = "binaries" in entry
+            if has_bin_str and (not isinstance(entry["binary"], str) or not entry["binary"].strip()):
+                findings.append(
+                    AuditFinding(
+                        "error",
+                        "req:schema",
+                        REQUIREMENTS_MANIFEST_FILENAME,
+                        0,
+                        f"Requirement '{req_label}' field 'binary' must be a non-empty string.",
+                    )
+                )
+            if has_bin_list and not _is_nonempty_str_list(entry["binaries"], allow_empty=False):
+                findings.append(
+                    AuditFinding(
+                        "error",
+                        "req:schema",
+                        REQUIREMENTS_MANIFEST_FILENAME,
+                        0,
+                        f"Requirement '{req_label}' field 'binaries' must be a non-empty list of strings.",
+                    )
+                )
+
+    clients_dir = resolved_repo / "clients"
+    if clients_dir.is_dir():
+        for client_file in sorted(clients_dir.glob("*_client.py")):
+            if not client_file.is_file():
+                continue
+            rel_client = f"clients/{client_file.name}"
+            if rel_client not in covered_client_scripts:
+                findings.append(
+                    AuditFinding(
+                        "error",
+                        "req:missing-client-coverage",
+                        REQUIREMENTS_MANIFEST_FILENAME,
+                        0,
+                        f"Python client '{rel_client}' is not declared in requirements.json.",
+                    )
+                )
+
+    for srv_name in sorted(repo_mcp_servers):
+        if srv_name not in covered_mcp_servers:
+            findings.append(
+                AuditFinding(
+                    "error",
+                    "req:missing-mcp-coverage",
+                    REQUIREMENTS_MANIFEST_FILENAME,
+                    0,
+                    f"MCP server '{srv_name}' in mcp_config.json is not declared with mechanism='mcp_bridge' in requirements.json.",
+                )
+            )
+
+    return findings
+
+
 def _check_hooks_and_plugin_manifest(
     resolved_repo: Path,
     errors: list[AuditFinding],
@@ -937,6 +1406,16 @@ def _check_hooks_and_plugin_manifest(
         except (OSError, json.JSONDecodeError):
             pdata = None
         if isinstance(pdata, dict):
+            if "requirements" in pdata:
+                errors.append(
+                    AuditFinding(
+                        "error",
+                        "agy:plugin-json-unknown-key",
+                        "plugin.json",
+                        0,
+                        "Do not add top-level 'requirements' to plugin.json (forbidden by Antigravity loader); use sibling requirements.json.",
+                    )
+                )
             prompts = pdata.get("suggestedPrompts")
             if isinstance(prompts, list) and len(prompts) > 3:
                 warnings.append(
@@ -1138,6 +1617,19 @@ def audit_repository(repo_dir: Path | str, *, strict: bool = False) -> AuditRepo
                 )
         _check_hooks_and_plugin_manifest(resolved_repo, errors, warnings)
 
+    has_requirements_manifest = (resolved_repo / REQUIREMENTS_MANIFEST_FILENAME).is_file()
+    if has_requirements_manifest:
+        already_invalid_req_json = any(
+            e.rule_id == "json:invalid" and e.file == REQUIREMENTS_MANIFEST_FILENAME for e in errors
+        )
+        for req_finding in validate_plugin_requirements(resolved_repo):
+            if already_invalid_req_json and req_finding.rule_id == "req:invalid-json":
+                continue
+            if req_finding.severity == "warning":
+                warnings.append(req_finding)
+            else:
+                errors.append(req_finding)
+
     passed = len(errors) == 0 and (len(warnings) == 0 if strict else True)
     return AuditReport(
         repo_dir=str(resolved_repo),
@@ -1152,6 +1644,7 @@ def audit_repository(repo_dir: Path | str, *, strict: bool = False) -> AuditRepo
             "html_files": sum(1 for f in files if f.suffix.lower() in HTML_SUFFIXES),
             "css_files": sum(1 for f in files if f.suffix.lower() == ".css"),
             "markdown_files": sum(1 for f in files if f.suffix.lower() == ".md"),
+            "plugin_requirements_checked": has_requirements_manifest,
             "strict_mode": strict,
         },
     )

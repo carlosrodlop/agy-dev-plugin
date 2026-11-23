@@ -420,6 +420,92 @@ class TestGitClientAndRemediation(unittest.TestCase):
             hooks_text = (deployed_root / "hooks.json").read_text(encoding="utf-8")
             self.assertIn(str(fake_home), hooks_text)
 
+    def test_deploy_repo_to_home_and_install_sh_deploy_requirements_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            _, src_repo = _create_bare_and_clone(troot, name="req-plugin")
+            fake_home = troot / "fake-home"
+            fake_home.mkdir(parents=True)
+
+            (src_repo / "plugin.json").write_text('{"name": "agy-dev-plugin", "version": "1.0.0"}\n', encoding="utf-8")
+            (src_repo / "clients").mkdir()
+            (src_repo / "clients" / "git_client.py").write_text('"""mock git_client"""\n', encoding="utf-8")
+            req_payload = {
+                "schema_version": "1.0",
+                "plugin_id": "agy-dev-plugin",
+                "requirements": [
+                    {
+                        "id": "git_client",
+                        "mechanism": "python_client",
+                        "provider_plugin_id": "agy-dev-plugin",
+                        "client_script": "clients/git_client.py",
+                        "config_hint": "$HOME/.gemini/config/plugins/agy-dev-plugin/clients/git_client.py",
+                        "required_by_plugins": ["agy-dev-plugin"],
+                        "required_by_skills": [],
+                    }
+                ],
+            }
+            (src_repo / "requirements.json").write_text(
+                json.dumps(req_payload, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(src_repo), "add", "plugin.json", "requirements.json", "clients/git_client.py"],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(src_repo), "commit", "-m", "feat: add requirements.json"],
+                check=True,
+                capture_output=True,
+            )
+
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(src_repo)})
+            with mock.patch.dict(os.environ, {"AGY_DEPLOY_REEXEC": "1"}):
+                res = vcs.deploy_repo_to_home(repo_dir=src_repo, home_dir=fake_home)
+            self.assertEqual(res["status"], "ok")
+            deployed_req = fake_home / ".gemini" / "config" / "plugins" / "agy-dev-plugin" / "requirements.json"
+            self.assertTrue(deployed_req.is_file())
+            self.assertEqual(stat.S_IMODE(deployed_req.stat().st_mode), 0o644)
+            deployed_req_data = json.loads(deployed_req.read_text(encoding="utf-8"))
+            self.assertEqual(deployed_req_data["schema_version"], "1.0")
+            self.assertIn(str(fake_home), deployed_req_data["requirements"][0]["config_hint"])
+
+            # Removing requirements.json from main prunes the orphaned manifest cleanly
+            subprocess.run(["git", "-C", str(src_repo), "rm", "requirements.json"], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(src_repo), "commit", "-m", "chore: remove requirements.json"],
+                check=True,
+                capture_output=True,
+            )
+            with mock.patch.dict(os.environ, {"AGY_DEPLOY_REEXEC": "1"}):
+                res_prune = vcs.deploy_repo_to_home(repo_dir=src_repo, home_dir=fake_home, prune_orphans=True)
+            self.assertEqual(res_prune["status"], "ok")
+            self.assertFalse(deployed_req.exists())
+            self.assertIn(".gemini/config/plugins/agy-dev-plugin/requirements.json", res_prune["pruned_files"])
+
+            # Verify install.sh copies requirements.json into isolated HOME cleanly
+            install_home = troot / "install-home"
+            install_home.mkdir(parents=True)
+            install_env = {
+                **os.environ,
+                "HOME": str(install_home),
+                "AGY_DEV_STATE_DIR": str(install_home / ".local" / "share" / "agy-dev-plugin"),
+            }
+            proc_install = subprocess.run(
+                ["bash", str(REPO_ROOT / "install.sh"), "--skip-venv"],
+                env=install_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc_install.returncode, 0, msg=proc_install.stdout + proc_install.stderr)
+            installed_req = install_home / ".gemini" / "config" / "plugins" / "agy-dev-plugin" / "requirements.json"
+            self.assertTrue(installed_req.is_file())
+            installed_data = json.loads(installed_req.read_text(encoding="utf-8"))
+            self.assertEqual(installed_data["schema_version"], "1.0")
+            self.assertEqual(installed_data["plugin_id"], "agy-dev-plugin")
+
     def test_manual_pr_url_formatting_for_major_vcs_hosts(self) -> None:
         self.assertEqual(
             git_client.build_vcs_manual_pr_url(
@@ -1142,7 +1228,22 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
 
         plugin_json = json.loads((REPO_ROOT / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(plugin_json["name"], "agy-dev-plugin")
+        self.assertNotIn("requirements", plugin_json)
         self.assertLessEqual(len(plugin_json.get("suggestedPrompts", [])), 3)
+
+        req_json = json.loads((REPO_ROOT / "requirements.json").read_text(encoding="utf-8"))
+        self.assertEqual(req_json["schema_version"], "1.0")
+        self.assertEqual(req_json["plugin_id"], "agy-dev-plugin")
+        req_by_id = {item["id"]: item for item in req_json["requirements"]}
+        self.assertIn("git_client", req_by_id)
+        self.assertEqual(req_by_id["git_client"]["mechanism"], "python_client")
+        self.assertEqual(req_by_id["git_client"]["client_script"], "clients/git_client.py")
+        self.assertEqual(req_by_id["git_client"]["provider_plugin_id"], "agy-dev-plugin")
+        for expected_bin in ("git", "ssh", "python3", "bash", "jq", "pre-commit", "bats"):
+            self.assertIn(expected_bin, req_by_id)
+            self.assertEqual(req_by_id[expected_bin]["mechanism"], "system_binary")
+        self.assertEqual(project_audit.validate_plugin_requirements(REPO_ROOT), [])
+        self.assertEqual(qa_static_audit.validate_plugin_requirements(REPO_ROOT), [])
 
         hooks_json = json.loads((REPO_ROOT / "hooks.json").read_text(encoding="utf-8"))
         self.assertNotIn("hooks", hooks_json)
@@ -2449,6 +2550,186 @@ class TestGitClientDevCommonAndRunnerCoverage(unittest.TestCase):
         hints = typing.get_type_hints(pr_mod.compute_effective_priorities)
         self.assertIn("items", hints)
         self.assertIn("return", hints)
+
+    def test_plugin_requirements_four_invariants_validator(self) -> None:
+        """Validate all 4 Plugin Requirements as Code invariants across `project_audit` & `qa_static_audit`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+
+            def _seed_valid_plugin(name: str = "acme-plugin") -> pathlib.Path:
+                pdir = troot / name
+                (pdir / "clients").mkdir(parents=True)
+                (pdir / "skills" / "acme-sync").mkdir(parents=True)
+                (pdir / "skills" / "acme-docs").mkdir(parents=True)
+                (pdir / ".gitignore").write_text(".env\n.venv/\n", encoding="utf-8")
+                (pdir / ".tool-versions").write_text("python 3.11.15\n", encoding="utf-8")
+                (pdir / "pyproject.toml").write_text('[project]\nname = "acme-plugin"\nversion = "0.1.0"\n', encoding="utf-8")
+                (pdir / "install.sh").write_text("#!/usr/bin/env bash\nset -euo pipefail\necho ok\n", encoding="utf-8")
+                (pdir / "plugin.json").write_text(
+                    json.dumps({"name": "acme-plugin", "version": "0.1.0"}, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                (pdir / ".env.example").write_text(
+                    "# Mock template\nACME_API_URL=\"https://api.acme.example\"\n# ACME_COMMENTED_OUT=\"1\"\n",
+                    encoding="utf-8",
+                )
+                (pdir / "mcp_config.json").write_text(
+                    json.dumps(
+                        {
+                            "mcpServers": {
+                                "acme-mcp": {"command": "python3", "args": ["clients/acme_mcp_client.py"]},
+                            }
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                (pdir / "clients" / "acme_api_client.py").write_text('"""Acme client."""\n', encoding="utf-8")
+                (pdir / "clients" / "acme_mcp_client.py").write_text('"""Acme MCP bridge."""\n', encoding="utf-8")
+                (pdir / "clients" / "acme_common.py").write_text('"""Shared helper (non-*_client.py)."""\n', encoding="utf-8")
+                for sk in ("acme-sync", "acme-docs"):
+                    (pdir / "skills" / sk / "SKILL.md").write_text(
+                        f"---\nname: {sk}\ndescription: synthetic skill\n---\n# {sk}\n",
+                        encoding="utf-8",
+                    )
+                valid_manifest = {
+                    "schema_version": "1.0",
+                    "plugin_id": "acme-plugin",
+                    "requirements": [
+                        {
+                            "id": "acme_api_client",
+                            "name": "Acme API Client",
+                            "mechanism": "python_client",
+                            "provider_plugin_id": "acme-plugin",
+                            "client_script": "clients/acme_api_client.py",
+                            "required_by_plugins": ["acme-plugin"],
+                            "required_by_skills": ["acme-sync"],
+                            "env_vars": ["ACME_API_URL"],
+                        },
+                        {
+                            "id": "acme_mcp_client",
+                            "name": "Acme MCP Bridge",
+                            "mechanism": "mcp_bridge",
+                            "provider_plugin_id": "acme-plugin",
+                            "client_script": "clients/acme_mcp_client.py",
+                            "mcp_servers": ["acme-mcp"],
+                            "required_by_plugins": ["acme-plugin"],
+                            "required_by_skills": ["acme-docs"],
+                            "env_vars": [],
+                        },
+                        {
+                            "id": "companion_git_client",
+                            "name": "Companion Git Client",
+                            "mechanism": "python_client",
+                            "provider_plugin_id": "agy-dev-plugin",
+                            "client_script": "$HOME/.gemini/config/plugins/agy-dev-plugin/clients/git_client.py",
+                            "required_by_plugins": ["acme-plugin"],
+                            "required_by_skills": ["acme-sync"],
+                        },
+                        {
+                            "id": "gdrive",
+                            "name": "Google Drive OAuth Plugin",
+                            "mechanism": "native_oauth_plugin",
+                            "provider_plugin_id": "google-workspace",
+                            "required_by_plugins": ["acme-plugin"],
+                            "required_by_skills": ["acme-docs"],
+                        },
+                        {
+                            "id": "git",
+                            "name": "Git CLI",
+                            "mechanism": "system_binary",
+                            "provider_plugin_id": "system",
+                            "binary": "git",
+                            "required_by_plugins": ["acme-plugin"],
+                            "required_by_skills": [],
+                        },
+                    ],
+                }
+                (pdir / "requirements.json").write_text(json.dumps(valid_manifest, indent=2) + "\n", encoding="utf-8")
+                return pdir
+
+            # 0. Valid manifest covering all 4 mechanisms passes both auditors cleanly
+            valid_dir = _seed_valid_plugin("valid-acme")
+            rep_ok = project_audit.audit_repository(valid_dir, strict=True)
+            self.assertTrue(rep_ok.passed, msg=json.dumps(rep_ok.to_dict(), indent=2))
+            self.assertTrue(rep_ok.checks_summary["plugin_requirements_checked"])
+            qa_ok = qa_static_audit.run_qa_audit(valid_dir, strict=True)
+            self.assertTrue(qa_ok["passed"], msg=json.dumps(qa_ok, indent=2))
+
+            # 1. Invariant #1: Schema compliance + forbidden plugin.json top-level 'requirements' key
+            bad_schema_dir = _seed_valid_plugin("bad-schema")
+            (bad_schema_dir / "plugin.json").write_text(
+                json.dumps({"name": "acme-plugin", "version": "0.1.0", "requirements": []}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            bad_schema_manifest = {
+                "schema_version": "2.0",
+                "plugin_id": "wrong-plugin-id",
+                "requirements": [
+                    {
+                        "id": "dup_item",
+                        "mechanism": "invalid_mechanism",
+                        "provider_plugin_id": "",
+                        "required_by_plugins": [],
+                        "required_by_skills": "not-a-list",
+                    },
+                    {
+                        "id": "dup_item",
+                        "mechanism": "python_client",
+                        "provider_plugin_id": "wrong-plugin-id",
+                        "required_by_plugins": ["acme-plugin"],
+                        "required_by_skills": [],
+                    },
+                ],
+            }
+            (bad_schema_dir / "requirements.json").write_text(json.dumps(bad_schema_manifest, indent=2) + "\n", encoding="utf-8")
+            rep_schema = project_audit.audit_repository(bad_schema_dir, strict=True)
+            self.assertFalse(rep_schema.passed)
+            schema_rule_ids = [e.rule_id for e in rep_schema.errors]
+            self.assertIn("agy:plugin-json-unknown-key", schema_rule_ids)
+            self.assertGreaterEqual(schema_rule_ids.count("req:schema"), 5)
+
+            # 2. Invariant #2: Missing clients/*_client.py coverage & missing mcp_config.json coverage
+            bad_cov_dir = _seed_valid_plugin("bad-coverage")
+            (bad_cov_dir / "clients" / "orphan_client.py").write_text('"""Uncovered client."""\n', encoding="utf-8")
+            (bad_cov_dir / "mcp_config.json").write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "acme-mcp": {"command": "python3", "args": ["clients/acme_mcp_client.py"]},
+                            "acme-shadow-mcp": {"command": "python3", "args": ["clients/acme_mcp_client.py"]},
+                        }
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            cov_findings = project_audit.validate_plugin_requirements(bad_cov_dir)
+            cov_ids = {f.rule_id for f in cov_findings}
+            self.assertIn("req:missing-client-coverage", cov_ids)
+            self.assertIn("req:missing-mcp-coverage", cov_ids)
+
+            # 3. Invariant #3: Unknown skill in required_by_skills
+            bad_skill_dir = _seed_valid_plugin("bad-skill")
+            skill_manifest = json.loads((bad_skill_dir / "requirements.json").read_text(encoding="utf-8"))
+            skill_manifest["requirements"][0]["required_by_skills"] = ["acme-sync", "ghost-skill"]
+            (bad_skill_dir / "requirements.json").write_text(json.dumps(skill_manifest, indent=2) + "\n", encoding="utf-8")
+            skill_findings = project_audit.validate_plugin_requirements(bad_skill_dir)
+            self.assertEqual([f.rule_id for f in skill_findings], ["req:unknown-skill"])
+            self.assertIn("ghost-skill", skill_findings[0].message)
+
+            # 4. Invariant #4: Missing env_var in .env.example (commented-out keys do not satisfy it; absent .env.example skips)
+            bad_env_dir = _seed_valid_plugin("bad-env")
+            env_manifest = json.loads((bad_env_dir / "requirements.json").read_text(encoding="utf-8"))
+            env_manifest["requirements"][0]["env_vars"] = ["ACME_API_URL", "ACME_COMMENTED_OUT", "ACME_MISSING_SECRET"]
+            (bad_env_dir / "requirements.json").write_text(json.dumps(env_manifest, indent=2) + "\n", encoding="utf-8")
+            env_findings = project_audit.validate_plugin_requirements(bad_env_dir)
+            self.assertEqual([f.rule_id for f in env_findings], ["req:missing-env-example", "req:missing-env-example"])
+
+            (bad_env_dir / ".env.example").unlink()
+            self.assertEqual(project_audit.validate_plugin_requirements(bad_env_dir), [])
 
 
 if __name__ == "__main__":

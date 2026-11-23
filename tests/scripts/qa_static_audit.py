@@ -13,13 +13,28 @@ AUDIT_SCRIPTS_DIR = REPO_ROOT / "skills" / "agy-project-standards" / "scripts"
 if str(AUDIT_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(AUDIT_SCRIPTS_DIR))
 
-from project_audit import AuditFinding, audit_repository  # noqa: E402
+from project_audit import (  # noqa: E402
+    AuditFinding,
+    audit_repository,
+    validate_plugin_requirements,
+)
 
 
 def run_qa_audit(repo_dir: Path | str | None = None, *, strict: bool = False) -> dict[str, object]:
-    """Run generic `project_audit` checks plus `agy-dev-plugin` independence contracts."""
+    """Run generic `project_audit` checks plus `agy-dev-plugin` independence and requirements contracts."""
     target = Path(repo_dir).expanduser().resolve() if repo_dir else REPO_ROOT
     report = audit_repository(target, strict=strict)
+
+    if target == REPO_ROOT and not (target / "requirements.json").is_file():
+        report.errors.append(
+            AuditFinding(
+                "error",
+                "req:missing-manifest",
+                "requirements.json",
+                0,
+                "Plugin repository must provide a root requirements.json manifest (schema_version == '1.0').",
+            )
+        )
 
     # Verify core dev plugin runtime (`clients/dev_common.py` and `clients/git_client.py`) stays independent of `wiz_common`
     for rel_py in ("clients/dev_common.py", "clients/git_client.py"):
