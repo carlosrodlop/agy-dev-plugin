@@ -58,6 +58,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, TextIO
 import urllib.parse
@@ -3784,6 +3785,8 @@ def _format_verification_checks_markdown(verification_results: dict[str, Any] | 
         meta_parts.append(f"**Tree SHA**: `{tree_sha[:12]}`")
     if verified_at:
         meta_parts.append(f"**Verified At (UTC)**: `{verified_at}`")
+    if verification_results.get("ci_parity"):
+        meta_parts.append("**Mode**: `ci-parity`")
     if meta_parts:
         lines.append("- " + " · ".join(meta_parts))
         lines.append("")
@@ -3800,12 +3803,14 @@ def _format_verification_checks_markdown(verification_results: dict[str, Any] | 
 
     qa_info = verification_results.get("qa_static_audit") if isinstance(verification_results.get("qa_static_audit"), dict) else {}
     ut_info = verification_results.get("unittest") if isinstance(verification_results.get("unittest"), dict) else {}
+    cov_info = verification_results.get("coverage") if isinstance(verification_results.get("coverage"), dict) else {}
     bats_info = verification_results.get("bats") if isinstance(verification_results.get("bats"), dict) else {}
     pc_info = verification_results.get("pre_commit") if isinstance(verification_results.get("pre_commit"), dict) else {}
 
     qa_st = str(qa_info.get("status") or "skipped")
+    qa_mode_suffix = f" ({qa_info['mode']})" if qa_info.get("mode") in ("full", "incremental") else ""
     qa_det = (
-        f"`{int(qa_info.get('errors') or 0)} errors, {int(qa_info.get('warnings') or 0)} warnings`"
+        f"`{int(qa_info.get('errors') or 0)} errors, {int(qa_info.get('warnings') or 0)} warnings{qa_mode_suffix}`"
         if qa_st != "skipped"
         else "`qa_static_audit.py` not present"
     )
@@ -3817,6 +3822,23 @@ def _format_verification_checks_markdown(verification_results: dict[str, Any] | 
         if ut_total > 0
         else ("`all targeted checks passed`" if ut_st == "pass" else "`tests failed`" if ut_st == "fail" else "`no tests/` directory")
     )
+    cov_pct_raw = cov_info.get("coverage_pct", verification_results.get("coverage_pct"))
+    cov_thr_raw = cov_info.get("coverage_threshold", verification_results.get("coverage_threshold"))
+    cov_st = str(cov_info.get("status") or ("pass" if cov_pct_raw is not None else "not_run"))
+    if cov_pct_raw is not None:
+        cov_pct_val = float(cov_pct_raw)
+        if cov_thr_raw is not None:
+            cov_thr_str = _format_threshold_number(float(cov_thr_raw))
+            cmp_op = ">=" if cov_st in ("pass", "passed") else "<"
+            cov_det = f"`{cov_pct_val:.2f}% {cmp_op} {cov_thr_str}% gate`"
+        else:
+            cov_det = f"`{cov_pct_val:.2f}% total coverage`"
+    elif cov_st == "skipped":
+        cov_reason = str(cov_info.get("reason") or "coverage skipped")
+        cov_det = f"`{cov_reason}`"
+    else:
+        cov_det = "`not run (pass --ci-parity)`"
+
     bats_st = str(bats_info.get("status") or "skipped")
     bats_total = int(bats_info.get("total_count") or 0)
     bats_passed = int(bats_info.get("passed_count") or 0)
@@ -3840,6 +3862,7 @@ def _format_verification_checks_markdown(verification_results: dict[str, Any] | 
             "| :--- | :--- | :--- |",
             f"| `qa_static_audit` | {_status_badge(qa_st)} | {qa_det} |",
             f"| `unittest` | {_status_badge(ut_st)} | {ut_det} |",
+            f"| `coverage` | {_status_badge(cov_st)} | {cov_det} |",
             f"| `bats` | {_status_badge(bats_st)} | {bats_det} |",
             f"| `pre_commit` | {_status_badge(pc_st)} | {pc_det} |",
         ]
@@ -4029,6 +4052,123 @@ def _temporarily_index_untracked_files(
             )
 
 
+def _format_threshold_number(val: float) -> str:
+    """Format coverage threshold percentage cleanly without trailing `.0` when integer-valued."""
+    rounded = round(float(val), 2)
+    return str(int(rounded)) if rounded == int(rounded) else f"{rounded:g}"
+
+
+def _is_coverage_module_available() -> bool:
+    """Return True when Python `coverage` is importable in the active interpreter."""
+    try:
+        return importlib.util.find_spec("coverage") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _parse_coverage_report_pct(output: str) -> float | None:
+    """Parse total coverage percentage from `python3 -m coverage report` stdout/stderr."""
+    if not output:
+        return None
+    matches = re.findall(r"(?m)^TOTAL\b.*?([0-9]+(?:\.[0-9]+)?)%\s*$", output)
+    if matches:
+        try:
+            return round(float(matches[-1]), 2)
+        except ValueError:
+            return None
+    return None
+
+
+def _inspect_repo_ci_parity_config(target_dir: Path) -> dict[str, Any]:
+    """Inspect `.github/workflows/*.y*ml` and `pyproject.toml` for `ENABLE_GHA_HOSTED_RUNNERS`, `--fail-under`, and coverage sources."""
+    wf_dir = target_dir / ".github" / "workflows"
+    gha_runners_gated = False
+    fail_under_values: list[float] = []
+    workflow_sources: list[str] = []
+    pythonpath_entries: list[str] = []
+
+    if wf_dir.is_dir():
+        for wf_file in sorted(wf_dir.glob("*.y*ml")):
+            if not wf_file.is_file():
+                continue
+            try:
+                raw_text = wf_file.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            active_lines = [ln for ln in raw_text.splitlines() if not ln.lstrip().startswith("#")]
+            active_text = "\n".join(active_lines)
+            if "ENABLE_GHA_HOSTED_RUNNERS" in active_text:
+                gha_runners_gated = True
+            for m_fu in re.finditer(r"--(?:cov-)?fail-under(?:=|\s+)([0-9]+(?:\.[0-9]+)?)", active_text):
+                try:
+                    fu_val = float(m_fu.group(1))
+                    if fu_val > 0:
+                        fail_under_values.append(fu_val)
+                except ValueError:
+                    pass
+            for m_cov in re.finditer(r"--cov=([A-Za-z0-9_./-]+)", active_text):
+                cand = m_cov.group(1).strip().strip("/")
+                if cand and cand not in workflow_sources:
+                    workflow_sources.append(cand)
+            for m_src in re.finditer(r"--source(?:=|\s+)([A-Za-z0-9_,./-]+)", active_text):
+                for part in m_src.group(1).split(","):
+                    cand = part.strip().strip("/")
+                    if cand and cand not in workflow_sources:
+                        workflow_sources.append(cand)
+            for m_pp in re.finditer(r"(?m)^\s*PYTHONPATH\s*:\s*[\"']?([^\"'\n#]+)[\"']?", active_text):
+                for pp_tok in m_pp.group(1).split(":"):
+                    pp_clean = pp_tok.strip()
+                    if pp_clean and pp_clean not in pythonpath_entries:
+                        pythonpath_entries.append(pp_clean)
+
+    threshold_source = "workflow"
+    if fail_under_values:
+        coverage_threshold = max(fail_under_values)
+    else:
+        pyproject_path = target_dir / "pyproject.toml"
+        pyproj_thresholds: list[float] = []
+        if pyproject_path.is_file():
+            try:
+                pyproj_text = pyproject_path.read_text(encoding="utf-8", errors="ignore")
+                for m_pf in re.finditer(r"(?m)^\s*fail_under\s*=\s*([0-9]+(?:\.[0-9]+)?)\b", pyproj_text):
+                    pf_val = float(m_pf.group(1))
+                    if pf_val > 0:
+                        pyproj_thresholds.append(pf_val)
+            except (OSError, ValueError):
+                pass
+        if pyproj_thresholds:
+            coverage_threshold = max(pyproj_thresholds)
+            threshold_source = "pyproject"
+        else:
+            coverage_threshold = 65.0 if gha_runners_gated else 75.0
+            threshold_source = "default"
+
+    resolved_sources = [src for src in workflow_sources if (target_dir / src).exists()]
+    if not resolved_sources:
+        for default_dir in ("clients", "skills", "sidecars", "api", "src"):
+            if (target_dir / default_dir).is_dir():
+                resolved_sources.append(default_dir)
+        if resolved_sources and (target_dir / "tests" / "scripts").is_dir():
+            resolved_sources.append("tests/scripts")
+
+    return {
+        "gha_runners_gated": gha_runners_gated,
+        "coverage_threshold": round(float(coverage_threshold), 2),
+        "threshold_source": threshold_source,
+        "coverage_sources": resolved_sources,
+        "pythonpath_entries": pythonpath_entries,
+    }
+
+
+def _qa_script_supports_strict_flag(qa_script: Path) -> bool:
+    """Return True when `qa_static_audit.py` explicitly declares a `--strict` CLI argument."""
+    try:
+        src = qa_script.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return bool(re.search(r"add_argument\(\s*[\"']--strict[\"']", src))
+
+
 def run_local_validation_suite(
     workdir: Path | str | None = None,
     test_targets: list[str] | None = None,
@@ -4039,12 +4179,29 @@ def run_local_validation_suite(
     pre_commit_status: str = "",
     run_bats: bool = True,
     run_all: bool = False,
+    ci_parity: bool = False,
 ) -> dict[str, Any]:
-    """Execute Step 6: Optional single-pass `pre-commit` (`SKIP=unit-tests,unit-tests-fast,qa-static-audit,bats-suite`), `qa_static_audit.py --incremental`, `selective_test_runner.py` / `unittest`, and selective BATS, persisting unified `verification_results` bound to `head_sha` into `dev_pr_lock`."""
+    """Execute Step 6: Optional single-pass `pre-commit` (`SKIP=unit-tests,unit-tests-fast,qa-static-audit,bats-suite`), `qa_static_audit.py` (`--incremental` or full `--ci-parity`), `selective_test_runner.py` / `unittest` (+ local `coverage` gate in `--ci-parity`), and BATS, persisting unified `verification_results` bound to `head_sha` into `dev_pr_lock`."""
     vcs = GitVcsIntegrationClient()
     target_dir = Path(workdir).expanduser().resolve() if workdir else vcs.resolve_repo_dir()
     if not target_dir.is_dir():
         return {"status": "error", "passed": False, "error": f"Workdir not found: {target_dir}"}
+
+    targets = list(test_targets or [])
+    wf_cfg = _inspect_repo_ci_parity_config(target_dir)
+    if ci_parity:
+        effective_ci_parity = True
+        ci_parity_reason = "explicit"
+    elif not targets and run_all:
+        effective_ci_parity = True
+        ci_parity_reason = "run_all"
+    elif not targets and wf_cfg["gha_runners_gated"]:
+        effective_ci_parity = True
+        ci_parity_reason = "gha_runners_gated"
+    else:
+        effective_ci_parity = False
+        ci_parity_reason = ""
+    effective_run_all = bool(run_all or effective_ci_parity)
 
     clean_env = _clean_git_subprocess_env(
         {
@@ -4069,7 +4226,7 @@ def run_local_validation_suite(
                     pc_bin,
                     target_dir,
                     raw_changed_files,
-                    run_all=run_all,
+                    run_all=effective_run_all,
                 )
                 with _temporarily_index_untracked_files(target_dir, env=clean_env):
                     proc_pc = subprocess.run(
@@ -4106,9 +4263,16 @@ def run_local_validation_suite(
     qa_ran = qa_script.is_file()
     qa_passed = True
     qa_output = ""
+    qa_mode = "full" if effective_ci_parity else "incremental"
     if qa_ran:
+        qa_cmd = [sys.executable, str(qa_script)]
+        if effective_ci_parity:
+            if _qa_script_supports_strict_flag(qa_script):
+                qa_cmd.append("--strict")
+        else:
+            qa_cmd.append("--incremental")
         proc_qa = subprocess.run(
-            [sys.executable, str(qa_script), "--incremental"],
+            qa_cmd,
             cwd=str(target_dir),
             env=clean_env,
             capture_output=True,
@@ -4119,34 +4283,184 @@ def run_local_validation_suite(
         qa_passed = proc_qa.returncode == 0
         qa_output = f"{proc_qa.stdout}\n{proc_qa.stderr}".strip()
 
-    targets = list(test_targets or [])
     selective_runner = target_dir / "tests" / "scripts" / "selective_test_runner.py"
     tests_dir = target_dir / "tests"
+    has_unittest_files = tests_dir.is_dir() and any(tests_dir.glob("test_*.py"))
     unittest_ran = True
     tests_passed = True
     test_output = ""
-    if targets:
-        cmd = [sys.executable, "-m", "unittest", *targets]
-    elif selective_runner.is_file():
-        cmd = [sys.executable, str(selective_runner), *(["--all"] if run_all else [])]
-    elif tests_dir.is_dir():
-        cmd = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
-    else:
-        cmd = []
-        unittest_ran = False
 
-    if cmd:
-        proc_test = subprocess.run(
-            cmd,
-            cwd=str(target_dir),
-            env=clean_env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        tests_passed = proc_test.returncode == 0
-        test_output = f"{proc_test.stdout}\n{proc_test.stderr}".strip()
+    coverage_threshold: float | None = wf_cfg["coverage_threshold"] if effective_ci_parity else None
+    coverage_sources: list[str] = list(wf_cfg["coverage_sources"])
+    coverage_pct: float | None = None
+    coverage_passed = True
+    coverage_output = ""
+    coverage_entry: dict[str, Any] = {
+        "status": "not_run",
+        "passed": True,
+        "coverage_pct": None,
+        "coverage_threshold": coverage_threshold,
+        "sources": coverage_sources if effective_ci_parity else [],
+    }
+
+    test_env = dict(clean_env)
+    test_env.pop("PYTHONPATH", None)
+    pp_parts: list[str] = []
+    for cand_pp in (*wf_cfg["pythonpath_entries"], "clients", ".", "tests/scripts"):
+        if cand_pp == "." or (target_dir / cand_pp).exists():
+            resolved_pp = str(target_dir) if cand_pp == "." else str(target_dir / cand_pp)
+            if resolved_pp not in pp_parts:
+                pp_parts.append(resolved_pp)
+    if pp_parts:
+        test_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
+
+    if effective_ci_parity:
+        if targets:
+            unittest_args = ["-m", "unittest", *targets]
+        elif has_unittest_files:
+            unittest_args = ["-m", "unittest", "discover", "-s", "tests"]
+            if (tests_dir / "__init__.py").is_file():
+                unittest_args.extend(["-t", "."])
+            unittest_args.extend(["-p", "test_*.py"])
+        elif selective_runner.is_file():
+            unittest_args = [str(selective_runner), "--all"]
+        else:
+            unittest_args = []
+            unittest_ran = False
+
+        can_measure_cov = bool(unittest_args) and bool(targets or has_unittest_files) and bool(coverage_sources)
+        if can_measure_cov and _is_coverage_module_available():
+            with tempfile.TemporaryDirectory() as cov_tmp_dir:
+                cov_data_file = Path(cov_tmp_dir) / ".coverage"
+                cov_run_cmd = [
+                    sys.executable,
+                    "-m",
+                    "coverage",
+                    "run",
+                    f"--data-file={cov_data_file}",
+                    f"--source={','.join(coverage_sources)}",
+                    *unittest_args,
+                ]
+                proc_test = subprocess.run(
+                    cov_run_cmd,
+                    cwd=str(target_dir),
+                    env=test_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+                if proc_test.returncode != 0 and "No module named coverage" in (proc_test.stderr or ""):
+                    proc_fallback = subprocess.run(
+                        [sys.executable, *unittest_args],
+                        cwd=str(target_dir),
+                        env=test_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        check=False,
+                    )
+                    tests_passed = proc_fallback.returncode == 0
+                    test_output = f"{proc_fallback.stdout}\n{proc_fallback.stderr}".strip()
+                    coverage_entry = {
+                        "status": "skipped",
+                        "passed": True,
+                        "coverage_pct": None,
+                        "coverage_threshold": coverage_threshold,
+                        "sources": coverage_sources,
+                        "reason": "coverage_not_installed",
+                    }
+                else:
+                    tests_passed = proc_test.returncode == 0
+                    test_output = f"{proc_test.stdout}\n{proc_test.stderr}".strip()
+                    thr_arg = _format_threshold_number(float(coverage_threshold or 75.0))
+                    cov_rep_cmd = [
+                        sys.executable,
+                        "-m",
+                        "coverage",
+                        "report",
+                        f"--data-file={cov_data_file}",
+                        "--precision=2",
+                        f"--fail-under={thr_arg}",
+                    ]
+                    proc_cov = subprocess.run(
+                        cov_rep_cmd,
+                        cwd=str(target_dir),
+                        env=test_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
+                    )
+                    coverage_output = f"{proc_cov.stdout}\n{proc_cov.stderr}".strip()
+                    if "No data to report" in coverage_output:
+                        coverage_entry = {
+                            "status": "skipped",
+                            "passed": True,
+                            "coverage_pct": None,
+                            "coverage_threshold": coverage_threshold,
+                            "sources": coverage_sources,
+                            "reason": "no_coverage_data",
+                        }
+                    else:
+                        coverage_pct = _parse_coverage_report_pct(coverage_output)
+                        coverage_passed = (proc_cov.returncode == 0) and (
+                            coverage_pct >= float(coverage_threshold)
+                            if (coverage_pct is not None and coverage_threshold is not None)
+                            else proc_cov.returncode == 0
+                        )
+                        coverage_entry = {
+                            "status": "pass" if coverage_passed else "fail",
+                            "passed": coverage_passed,
+                            "coverage_pct": coverage_pct,
+                            "coverage_threshold": coverage_threshold,
+                            "sources": coverage_sources,
+                        }
+        else:
+            if unittest_args:
+                proc_test = subprocess.run(
+                    [sys.executable, *unittest_args],
+                    cwd=str(target_dir),
+                    env=test_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+                tests_passed = proc_test.returncode == 0
+                test_output = f"{proc_test.stdout}\n{proc_test.stderr}".strip()
+            skip_reason = "coverage_not_installed" if can_measure_cov else "no_coverage_sources"
+            coverage_entry = {
+                "status": "skipped",
+                "passed": True,
+                "coverage_pct": None,
+                "coverage_threshold": coverage_threshold,
+                "sources": coverage_sources,
+                "reason": skip_reason,
+            }
+    else:
+        if targets:
+            cmd = [sys.executable, "-m", "unittest", *targets]
+        elif selective_runner.is_file():
+            cmd = [sys.executable, str(selective_runner), *(["--all"] if run_all else [])]
+        elif tests_dir.is_dir():
+            cmd = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
+        else:
+            cmd = []
+            unittest_ran = False
+
+        if cmd:
+            proc_test = subprocess.run(
+                cmd,
+                cwd=str(target_dir),
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+            tests_passed = proc_test.returncode == 0
+            test_output = f"{proc_test.stdout}\n{proc_test.stderr}".strip()
 
     # Capture BATS status either from selective_test_runner TAP output or direct execution when needed
     bats_files = sorted((target_dir / "tests" / "bats").glob("*.bats")) if (target_dir / "tests" / "bats").is_dir() else []
@@ -4156,7 +4470,7 @@ def run_local_validation_suite(
     effective_run_bats = bool(run_bats) and _resolve_selective_should_run_bats(
         selective_runner,
         raw_changed_files,
-        run_all=run_all,
+        run_all=effective_run_all,
     )
     if re.search(r"(?m)^1\.\.\d+\s*$", test_output):
         bats_ran = True
@@ -4193,7 +4507,11 @@ def run_local_validation_suite(
             _, pre_commit_status_label, _ = normalize_pre_commit_status(str(pre_commit_entry.get("status") or ""))
 
     pre_commit_passed = pre_commit_entry.get("passed")
-    overall_passed = bool(qa_passed and tests_passed and bats_passed and (pre_commit_passed is not False))
+    overall_passed = bool(qa_passed and tests_passed and bats_passed and coverage_passed and (pre_commit_passed is not False))
+
+    qa_summary = _parse_qa_static_audit_summary(qa_output, qa_passed, qa_ran)
+    if qa_ran:
+        qa_summary["mode"] = qa_mode
 
     verification_results: dict[str, Any] = {
         "head_sha": wt_state["head_sha"],
@@ -4202,9 +4520,14 @@ def run_local_validation_suite(
         "content_fingerprint": wt_state["content_fingerprint"],
         "verified_at_utc": _utc_now_iso(),
         "overall_passed": overall_passed,
+        "ci_parity": effective_ci_parity,
+        "ci_parity_reason": ci_parity_reason,
+        "coverage_pct": coverage_pct,
+        "coverage_threshold": coverage_threshold,
         "pre_commit_status": pre_commit_status_label,
-        "qa_static_audit": _parse_qa_static_audit_summary(qa_output, qa_passed, qa_ran),
+        "qa_static_audit": qa_summary,
         "unittest": _parse_unittest_summary(test_output, tests_passed, unittest_ran),
+        "coverage": coverage_entry,
         "bats": _parse_bats_summary(bats_output, bats_passed, bats_ran),
         "pre_commit": pre_commit_entry,
     }
@@ -4222,8 +4545,13 @@ def run_local_validation_suite(
     return {
         "status": "ok" if overall_passed else "error",
         "passed": overall_passed,
+        "ci_parity": effective_ci_parity,
+        "ci_parity_reason": ci_parity_reason,
         "qa_static_passed": qa_passed,
         "unit_tests_passed": tests_passed,
+        "coverage_passed": coverage_passed,
+        "coverage_pct": coverage_pct,
+        "coverage_threshold": coverage_threshold,
         "bats_passed": bats_passed,
         "pre_commit_passed": pre_commit_passed,
         "pre_commit_status": pre_commit_status_label,
@@ -4233,6 +4561,7 @@ def run_local_validation_suite(
         "verification_results": verification_results,
         "qa_output": qa_output[-1500:],
         "test_output": test_output[-2500:],
+        "coverage_output": coverage_output[-1500:] if coverage_output else "",
         "pre_commit_output": pre_commit_output[-2000:] if pre_commit_output else "",
     }
 
@@ -10466,7 +10795,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--all-files",
         dest="run_all",
         action="store_true",
-        help="Force `--all-files` on pre-commit and `--all` on selective_test_runner / BATS.",
+        help="Force `--all-files` on pre-commit and full CI parity (`qa_static_audit`, `unittest`, `coverage`, and BATS).",
+    )
+    p_test.add_argument(
+        "--ci-parity",
+        dest="ci_parity",
+        action="store_true",
+        help="Run full GitHub Actions CI parity locally: full `qa_static_audit.py` (no `--incremental`), full `unittest` + BATS, and local `coverage` gate against workflow `--fail-under` threshold (auto-enabled when workflows gate on `ENABLE_GHA_HOSTED_RUNNERS` or `--all`).",
     )
     p_test.add_argument(
         "--with-pre-commit",
@@ -10817,6 +11152,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
             run_pre_commit=bool(getattr(args, "run_pre_commit", False)),
             pre_commit_status=str(getattr(args, "pre_commit_status", "") or ""),
             run_all=bool(getattr(args, "run_all", False)),
+            ci_parity=bool(getattr(args, "ci_parity", False)),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("passed") else 1

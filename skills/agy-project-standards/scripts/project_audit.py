@@ -3,7 +3,7 @@
 
 Validates any repository or Antigravity plugin against core engineering pillars in
 100% pure Python 3 stdlib + `bash -n` (Santa Lockdown safe — zero Node/npm/ruff/shellcheck binaries required):
-  - Python AST & safety (syntax, bare `except:`, `eval`/`exec`, unsafe `yaml.load`, mutable defaults, `shell=True`)
+  - Python AST & safety (syntax, `F821` undefined names, bare `except:`, `eval`/`exec`, unsafe `yaml.load`, mutable defaults, `shell=True`)
   - POSIX / Bash / Zsh shell (`bash -n`/`zsh -n`, strict mode on standalone scripts, unquoted `rm -rf $VAR`)
   - JavaScript (`eval`/`new Function`, `document.write`, `javascript:` URI, `debugger;`)
   - HTML5 (`html.parser` duplicate IDs, `javascript:` URI, `img` alt, `target=_blank` noopener, inline handlers, button type, external SRI)
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 from dataclasses import asdict, dataclass, field
 from html.parser import HTMLParser
 import json
@@ -453,8 +454,264 @@ def _is_subprocess_call(func: ast.AST) -> bool:
     return False
 
 
+_PYTHON_BASE_BUILTINS: frozenset[str] = frozenset(dir(builtins)) | frozenset(
+    {
+        "__all__",
+        "__annotations__",
+        "__builtins__",
+        "__cached__",
+        "__class__",
+        "__doc__",
+        "__file__",
+        "__loader__",
+        "__name__",
+        "__package__",
+        "__path__",
+        "__spec__",
+    }
+)
+
+
+def _check_python_undefined_names(
+    tree: ast.Module,
+    rel: str,
+    errors: list[AuditFinding],
+) -> None:
+    """Detect F821 undefined variable names in pure Python AST respecting lexical, class, comprehension, and annotation scopes."""
+    comp_types = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    scope_types: tuple[type[ast.AST], ...] = (
+        ast.Module,
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Lambda,
+        *comp_types,
+    )
+    type_alias_cls = getattr(ast, "TypeAlias", None)
+    if type_alias_cls is not None:
+        scope_types = (*scope_types, type_alias_cls)
+
+    global_defs: set[str] = set()
+    for gnode in ast.walk(tree):
+        if isinstance(gnode, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            declared_globals: set[str] = set()
+            stored_names: set[str] = set()
+            for sub in ast.walk(gnode):
+                if isinstance(sub, ast.Global):
+                    declared_globals.update(sub.names)
+                elif isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                    stored_names.add(sub.id)
+            global_defs.update(declared_globals & stored_names)
+
+    reported: set[tuple[int, int, str]] = set()
+
+    def _collect_comp_walrus_targets(comp_node: ast.AST, target_defs: set[str]) -> None:
+        """Bind PEP 572 `:=` targets inside comprehensions into the enclosing non-comprehension scope."""
+        walk_stack = list(ast.iter_child_nodes(comp_node))
+        while walk_stack:
+            cur = walk_stack.pop()
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            if isinstance(cur, ast.NamedExpr) and isinstance(cur.target, ast.Name):
+                target_defs.add(cur.target.id)
+            walk_stack.extend(ast.iter_child_nodes(cur))
+
+    def _visit_scope(
+        scope_node: ast.AST,
+        enclosing_defs: set[str],
+        annotation_defs: set[str],
+    ) -> None:
+        local_defs: set[str] = set()
+        if isinstance(scope_node, ast.Module):
+            local_defs.update(global_defs)
+
+        if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for arg in (
+                *scope_node.args.posonlyargs,
+                *scope_node.args.args,
+                *scope_node.args.kwonlyargs,
+            ):
+                local_defs.add(arg.arg)
+            if scope_node.args.vararg:
+                local_defs.add(scope_node.args.vararg.arg)
+            if scope_node.args.kwarg:
+                local_defs.add(scope_node.args.kwarg.arg)
+
+        type_param_names: set[str] = set()
+        for tp in getattr(scope_node, "type_params", ()):
+            tp_name = getattr(tp, "name", None)
+            if tp_name:
+                type_param_names.add(str(tp_name))
+                local_defs.add(str(tp_name))
+
+        if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            local_defs.add(scope_node.name)
+
+        has_star_import = False
+        child_scopes: list[ast.AST] = []
+        load_nodes: list[tuple[ast.Name, bool]] = []
+        outer_load_nodes: list[tuple[ast.Name, set[str]]] = []
+        ann_roots: set[int] = set()
+
+        def _seed_outer_expr(expr: ast.AST, extra_allowed: set[str] | None = None) -> None:
+            allowed_extra = extra_allowed or set()
+            estk = [expr]
+            while estk:
+                enode = estk.pop()
+                if isinstance(enode, scope_types):
+                    if isinstance(enode, comp_types):
+                        if not isinstance(scope_node, comp_types):
+                            _collect_comp_walrus_targets(enode, local_defs)
+                        if enode.generators:
+                            _seed_outer_expr(enode.generators[0].iter, allowed_extra)
+                    child_scopes.append(enode)
+                    continue
+                if isinstance(enode, ast.Name):
+                    if isinstance(enode.ctx, ast.Store):
+                        local_defs.add(enode.id)
+                    elif isinstance(enode.ctx, ast.Load):
+                        outer_load_nodes.append((enode, allowed_extra))
+                estk.extend(reversed(list(ast.iter_child_nodes(enode))))
+
+        skipped_child_ids: set[int] = set()
+        if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in scope_node.decorator_list:
+                skipped_child_ids.add(id(dec))
+            for dflt in (*scope_node.args.defaults, *(d for d in scope_node.args.kw_defaults if d is not None)):
+                skipped_child_ids.add(id(dflt))
+            if scope_node.returns is not None:
+                ann_roots.add(id(scope_node.returns))
+            for arg in (
+                *scope_node.args.posonlyargs,
+                *scope_node.args.args,
+                *scope_node.args.kwonlyargs,
+                *([scope_node.args.vararg] if scope_node.args.vararg else []),
+                *([scope_node.args.kwarg] if scope_node.args.kwarg else []),
+            ):
+                if arg.annotation is not None:
+                    ann_roots.add(id(arg.annotation))
+        elif isinstance(scope_node, ast.Lambda):
+            for dflt in (*scope_node.args.defaults, *(d for d in scope_node.args.kw_defaults if d is not None)):
+                skipped_child_ids.add(id(dflt))
+        elif isinstance(scope_node, ast.ClassDef):
+            for dec in scope_node.decorator_list:
+                skipped_child_ids.add(id(dec))
+            for base_expr in (*scope_node.bases, *(kw.value for kw in scope_node.keywords)):
+                skipped_child_ids.add(id(base_expr))
+                _seed_outer_expr(base_expr, type_param_names)
+        elif isinstance(scope_node, comp_types) and scope_node.generators:
+            skipped_child_ids.add(id(scope_node.generators[0].iter))
+
+        stack: list[tuple[ast.AST, bool]] = []
+        for ch in reversed(list(ast.iter_child_nodes(scope_node))):
+            if id(ch) in skipped_child_ids:
+                continue
+            stack.append((ch, id(ch) in ann_roots))
+
+        while stack:
+            node, in_ann = stack.pop()
+            if id(node) in skipped_child_ids:
+                continue
+            if isinstance(node, scope_types):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for dec in node.decorator_list:
+                        _seed_outer_expr(dec)
+                    for dflt in (*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)):
+                        _seed_outer_expr(dflt)
+                    local_defs.add(node.name)
+                elif isinstance(node, ast.Lambda):
+                    for dflt in (*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)):
+                        _seed_outer_expr(dflt)
+                elif isinstance(node, ast.ClassDef):
+                    for dec in node.decorator_list:
+                        _seed_outer_expr(dec)
+                    local_defs.add(node.name)
+                elif type_alias_cls is not None and isinstance(node, type_alias_cls):
+                    if isinstance(node.name, ast.Name):
+                        local_defs.add(node.name.id)
+                elif isinstance(node, comp_types):
+                    if not isinstance(scope_node, comp_types):
+                        _collect_comp_walrus_targets(node, local_defs)
+                    if node.generators:
+                        _seed_outer_expr(node.generators[0].iter)
+                child_scopes.append(node)
+                continue
+
+            if isinstance(node, ast.AnnAssign) and node.annotation is not None:
+                ann_roots.add(id(node.annotation))
+
+            if isinstance(node, ast.Name):
+                if isinstance(node.ctx, ast.Store):
+                    local_defs.add(node.id)
+                elif isinstance(node.ctx, ast.Load):
+                    load_nodes.append((node, in_ann))
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    if alias.name == "*":
+                        has_star_import = True
+                    else:
+                        local_defs.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                local_defs.add(node.name)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and getattr(node, "name", None):
+                local_defs.add(str(node.name))
+            elif isinstance(node, ast.MatchMapping) and getattr(node, "rest", None):
+                local_defs.add(str(node.rest))
+
+            for ch in reversed(list(ast.iter_child_nodes(node))):
+                if id(ch) in skipped_child_ids:
+                    continue
+                stack.append((ch, in_ann or (id(ch) in ann_roots)))
+
+        if has_star_import:
+            return
+
+        visible = enclosing_defs | local_defs
+        visible_ann = visible | annotation_defs
+        parent_visible = (
+            enclosing_defs
+            if isinstance(scope_node, ast.ClassDef)
+            else visible
+        )
+
+        for o_node, extra_allowed in outer_load_nodes:
+            if o_node.id not in (parent_visible | extra_allowed):
+                key = (o_node.lineno, o_node.col_offset, o_node.id)
+                if key not in reported:
+                    reported.add(key)
+
+        for load_node, in_ann in load_nodes:
+            allowed = visible_ann if in_ann else visible
+            if load_node.id not in allowed:
+                key = (load_node.lineno, load_node.col_offset, load_node.id)
+                if key not in reported:
+                    reported.add(key)
+
+        if isinstance(scope_node, ast.ClassDef):
+            child_enclosing = enclosing_defs | {scope_node.name} | type_param_names
+            child_ann = visible_ann
+        else:
+            child_enclosing = visible
+            child_ann = visible_ann
+
+        for child_scope in child_scopes:
+            _visit_scope(child_scope, child_enclosing, child_ann)
+
+    _visit_scope(tree, set(_PYTHON_BASE_BUILTINS), set())
+    for lineno, _col, undef_name in sorted(reported):
+        errors.append(
+            AuditFinding(
+                "error",
+                "py:undefined-name",
+                rel,
+                lineno,
+                f"F821 undefined name '{undef_name}' (missing import or declaration).",
+            )
+        )
+
+
 def _check_python_ast(fpath: Path, rel: str, errors: list[AuditFinding], warnings: list[AuditFinding]) -> None:
-    """Validate Python AST syntax, bare except, eval/exec, unsafe yaml.load, mutable defaults, and shell=True."""
+    """Validate Python AST syntax, F821 undefined names, bare except, eval/exec, unsafe yaml.load, mutable defaults, and shell=True."""
     try:
         src = fpath.read_text(encoding="utf-8")
     except OSError as exc:
@@ -468,6 +725,8 @@ def _check_python_ast(fpath: Path, rel: str, errors: list[AuditFinding], warning
             AuditFinding("error", "py:syntax-error", rel, exc.lineno or 0, f"SyntaxError: {exc.msg}")
         )
         return
+
+    _check_python_undefined_names(tree, rel, errors)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.ExceptHandler) and node.type is None:

@@ -4396,6 +4396,161 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertEqual(q_final[superseded_done_cid], "cancelled")
             self.assertEqual(q_final[unmerged_branch_cid], "merged")
 
+    def test_test_local_ci_parity_workflow_auto_detection_coverage_gate_and_pr_table(self) -> None:
+        """Verify `test-local --ci-parity`, `ENABLE_GHA_HOSTED_RUNNERS` auto-detection, `--fail-under` parsing, PR table rendering, and missing-coverage resilience."""
+        self.assertTrue(prs.parse_args(["test-local", "--ci-parity"]).ci_parity)
+        self.assertFalse(prs.parse_args(["test-local"]).ci_parity)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True)
+
+            _, repo_priv = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "acme-private-tam")
+            (repo_priv / ".github" / "workflows").mkdir(parents=True)
+            (repo_priv / ".github" / "workflows" / "coverage-report.yml").write_text(
+                "name: Coverage Report\n"
+                "on:\n"
+                "  pull_request:\n"
+                "    branches: [main]\n"
+                "  workflow_dispatch:\n"
+                "jobs:\n"
+                "  coverage:\n"
+                "    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_GHA_HOSTED_RUNNERS == 'true'\n"
+                "    runs-on: ubuntu-24.04\n"
+                "    env:\n"
+                "      PYTHONPATH: \"clients:.:tests/scripts\"\n"
+                "    steps:\n"
+                "      - run: |\n"
+                "          python -m coverage run --source=clients ./tests/scripts/selective_test_runner.py\n"
+                "          python -m coverage report --show-missing --fail-under=65\n"
+                "          python -m coverage report --fail-under=0\n",
+                encoding="utf-8",
+            )
+            (repo_priv / "clients").mkdir(parents=True)
+            (repo_priv / "clients" / "acme_calc.py").write_text(
+                '"""Synthetic AcmeCorp calculator."""\n'
+                "def add_vals(a: int, b: int) -> int:\n"
+                "    if a < 0:\n"
+                "        return a + b\n"
+                "    return a + b\n\n"
+                "def mult_vals(a: int, b: int) -> int:\n"
+                "    return a * b\n",
+                encoding="utf-8",
+            )
+            (repo_priv / "tests" / "scripts").mkdir(parents=True)
+            qa_args_log = troot / "qa_argv.json"
+            (repo_priv / "tests" / "scripts" / "qa_static_audit.py").write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                f"pathlib.Path({str(qa_args_log)!r}).write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+                "print('[qa_static_audit] PASS: 2 files scanned (0 errors, 0 warnings)')\n",
+                encoding="utf-8",
+            )
+            (repo_priv / "tests" / "test_acme_calc.py").write_text(
+                '"""Hermetic unit tests for acme_calc."""\n'
+                "import unittest\n"
+                "import acme_calc\n\n"
+                "class TestAcmeCalc(unittest.TestCase):\n"
+                "    def test_ops(self) -> None:\n"
+                "        self.assertEqual(acme_calc.add_vals(2, 3), 5)\n"
+                "        self.assertEqual(acme_calc.add_vals(-1, 3), 2)\n"
+                "        self.assertEqual(acme_calc.mult_vals(3, 4), 12)\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo_priv), "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_priv), "commit", "-m", "chore: seed private repo"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo_priv), "push", "origin", "main"], check=True, capture_output=True)
+
+            # 1. Inspect workflow CI parity config: ignores --fail-under=0 and picks 65.0 + ENABLE_GHA_HOSTED_RUNNERS
+            wf_cfg = prs._inspect_repo_ci_parity_config(repo_priv)
+            self.assertTrue(wf_cfg["gha_runners_gated"])
+            self.assertEqual(wf_cfg["coverage_threshold"], 65.0)
+            self.assertEqual(wf_cfg["coverage_sources"], ["clients"])
+            self.assertIn("clients", wf_cfg["pythonpath_entries"])
+
+            # 2. Targeted dev loop (`test_targets` passed without `--ci-parity`) stays fast without repo-wide coverage gate
+            targeted_res = prs.run_local_validation_suite(
+                workdir=repo_priv,
+                test_targets=["tests.test_acme_calc"],
+                portfolio_dir=pdir,
+            )
+            self.assertTrue(targeted_res["passed"])
+            self.assertFalse(targeted_res["ci_parity"])
+            self.assertEqual(json.loads(qa_args_log.read_text(encoding="utf-8")), ["--incremental"])
+
+            # 3. Default `test-local` on `ENABLE_GHA_HOSTED_RUNNERS` repo auto-enables CI parity (full QA, no --incremental, coverage >= 65%)
+            auto_res = prs.run_local_validation_suite(
+                workdir=repo_priv,
+                portfolio_dir=pdir,
+            )
+            self.assertTrue(auto_res["passed"], msg=json.dumps(auto_res, indent=2))
+            self.assertTrue(auto_res["ci_parity"])
+            self.assertEqual(auto_res["ci_parity_reason"], "gha_runners_gated")
+            self.assertEqual(json.loads(qa_args_log.read_text(encoding="utf-8")), [])
+            self.assertEqual(auto_res["verification_results"]["qa_static_audit"]["mode"], "full")
+            self.assertFalse((repo_priv / ".coverage").exists())
+            self.assertFalse(auto_res["verification_results"]["dirty"])
+
+            if prs._is_coverage_module_available():
+                self.assertIsNotNone(auto_res["coverage_pct"])
+                self.assertGreaterEqual(float(auto_res["coverage_pct"]), 65.0)
+                self.assertEqual(auto_res["coverage_threshold"], 65.0)
+                self.assertEqual(auto_res["verification_results"]["coverage"]["status"], "pass")
+                md_table = "\n".join(prs._format_verification_checks_markdown(auto_res["verification_results"]))
+                self.assertIn("**Mode**: `ci-parity`", md_table)
+                self.assertIn("| `coverage` | ✅ PASS |", md_table)
+                self.assertIn(">= 65% gate`", md_table)
+
+                # 4. Raising workflow `--cov-fail-under=99` with uncovered module fails `test-local --ci-parity`
+                (repo_priv / "clients" / "uncovered_mod.py").write_text(
+                    "\n".join([f"def fn_{idx}(x: int) -> int:\n    return x + {idx}\n" for idx in range(25)]),
+                    encoding="utf-8",
+                )
+                (repo_priv / ".github" / "workflows" / "coverage-report.yml").write_text(
+                    "name: Coverage Report\n"
+                    "on:\n"
+                    "  pull_request:\n"
+                    "jobs:\n"
+                    "  coverage:\n"
+                    "    runs-on: ubuntu-24.04\n"
+                    "    steps:\n"
+                    "      - run: python3 -m pytest tests/ --cov=clients --cov-fail-under=99\n",
+                    encoding="utf-8",
+                )
+                fail_cov_res = prs.run_local_validation_suite(
+                    workdir=repo_priv,
+                    portfolio_dir=pdir,
+                    ci_parity=True,
+                )
+                self.assertFalse(fail_cov_res["passed"])
+                self.assertFalse(fail_cov_res["coverage_passed"])
+                self.assertEqual(fail_cov_res["ci_parity_reason"], "explicit")
+                self.assertEqual(fail_cov_res["coverage_threshold"], 99.0)
+                self.assertEqual(fail_cov_res["verification_results"]["coverage"]["status"], "fail")
+                fail_md = "\n".join(prs._format_verification_checks_markdown(fail_cov_res["verification_results"]))
+                self.assertIn("| `coverage` | ❌ FAIL |", fail_md)
+                self.assertIn("< 99% gate`", fail_md)
+
+            # 5. Graceful resilience when `coverage` is not installed in an isolated Python environment
+            with mock.patch.object(prs, "_is_coverage_module_available", return_value=False):
+                no_cov_res = prs.run_local_validation_suite(
+                    workdir=repo_priv,
+                    portfolio_dir=pdir,
+                    ci_parity=True,
+                )
+            self.assertTrue(no_cov_res["passed"])
+            self.assertTrue(no_cov_res["coverage_passed"])
+            self.assertIsNone(no_cov_res["coverage_pct"])
+            self.assertEqual(no_cov_res["verification_results"]["coverage"]["status"], "skipped")
+            self.assertEqual(no_cov_res["verification_results"]["coverage"]["reason"], "coverage_not_installed")
+            skip_md = "\n".join(prs._format_verification_checks_markdown(no_cov_res["verification_results"]))
+            self.assertIn("| `coverage` | ⏭️ SKIPPED | `coverage_not_installed` |", skip_md)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2731,6 +2731,118 @@ class TestGitClientDevCommonAndRunnerCoverage(unittest.TestCase):
             (bad_env_dir / ".env.example").unlink()
             self.assertEqual(project_audit.validate_plugin_requirements(bad_env_dir), [])
 
+    def test_project_audit_ast_f821_undefined_names_positive_and_negative_scopes(self) -> None:
+        """Verify pure-Python AST F821 undefined-name detection catches real bugs with zero false positives across Python scopes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+
+            # 1. Complex valid Python constructs must produce ZERO F821 false positives
+            valid_repo = troot / "valid-f821"
+            valid_repo.mkdir(parents=True)
+            (valid_repo / "clean_scopes.py").write_text(
+                '"""Synthetic scope coverage fixture for AcmeCorp."""\n'
+                "from __future__ import annotations\n\n"
+                "from typing import TYPE_CHECKING\n\n"
+                "if TYPE_CHECKING:\n"
+                "    from collections.abc import Sequence\n\n"
+                "def init_global_registry() -> None:\n"
+                "    global _ACME_REGISTRY\n"
+                "    _ACME_REGISTRY = {'org': 'AcmeCorp'}\n\n"
+                "def read_global_registry() -> dict[str, str]:\n"
+                "    return _ACME_REGISTRY\n\n"
+                "class TreeNode:\n"
+                "    parent: TreeNode | None = None\n"
+                "    sibling: LaterSibling | None = None\n\n"
+                "    class InnerSpec:\n"
+                "        label: str = 'Globex'\n\n"
+                "    def build_spec(self, items: Sequence[str]) -> InnerSpec:\n"
+                "        counter = 0\n"
+                "        def _bump() -> int:\n"
+                "            nonlocal counter\n"
+                "            counter += 1\n"
+                "            return counter\n"
+                "        flattened = [tok for row in items for tok in row if (last_tok := tok)]\n"
+                "        mapped = {k: len(k) for k in flattened}\n"
+                "        unique = {ch for ch in (last_tok if flattened else 'x')}\n"
+                "        gen_total = sum(v for v in mapped.values())\n"
+                "        try:\n"
+                "            _ = _bump() + gen_total + len(unique) + len(__name__)\n"
+                "        except ValueError as exc:\n"
+                "            raise RuntimeError(str(exc)) from exc\n"
+                "        payload: dict[str, object] = {'kind': 'spec', 'extra': 1}\n"
+                "        match payload:\n"
+                "            case {'kind': kind_val, **rest_fields}:\n"
+                "                _ = (kind_val, rest_fields)\n"
+                "            case [head_item, *tail_items]:\n"
+                "                _ = (head_item, tail_items)\n"
+                "        return TreeNode.InnerSpec()\n\n"
+                "class LaterSibling:\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+            (valid_repo / "star_import_ok.py").write_text(
+                '"""Wildcard import scope exemption check."""\n'
+                "from typing import *\n\n"
+                "def annotate_any(val: Any) -> Any:\n"
+                "    return val\n",
+                encoding="utf-8",
+            )
+            clean_report = project_audit.audit_repository(valid_repo, strict=False)
+            f821_clean = [e for e in clean_report.errors if e.rule_id == "py:undefined-name"]
+            self.assertEqual(f821_clean, [], msg=str([e.message for e in f821_clean]))
+
+            # 2. Undefined variable, unprefixed class attribute in method, undefined comprehension iter,
+            #    parameter used in sibling default, and unassigned global MUST all be caught as py:undefined-name (F821)
+            bad_repo = troot / "bad-f821"
+            bad_repo.mkdir(parents=True)
+            (bad_repo / "broken_scopes.py").write_text(
+                '"""Negative F821 test cases."""\n'
+                "from __future__ import annotations\n\n"
+                "def call_missing() -> object:\n"
+                "    return missing_helper_fn()\n\n"
+                "class BadService:\n"
+                "    CLASS_TIMEOUT = 30\n"
+                "    def timeout(self) -> int:\n"
+                "        return CLASS_TIMEOUT\n\n"
+                "def bad_comp() -> list[int]:\n"
+                "    return [item for item in missing_iterable]\n\n"
+                "def bad_default(first_arg: int, second_arg: int = first_arg) -> int:\n"
+                "    return first_arg + second_arg\n\n"
+                "def bad_global() -> object:\n"
+                "    global UNASSIGNED_GLOBAL_TOKEN\n"
+                "    return UNASSIGNED_GLOBAL_TOKEN\n",
+                encoding="utf-8",
+            )
+            bad_report = project_audit.audit_repository(bad_repo, strict=False)
+            self.assertFalse(bad_report.passed)
+            f821_errors = [e for e in bad_report.errors if e.rule_id == "py:undefined-name"]
+            flagged_messages = "\n".join(e.message for e in f821_errors)
+            for expected_undef in (
+                "missing_helper_fn",
+                "CLASS_TIMEOUT",
+                "missing_iterable",
+                "first_arg",
+                "UNASSIGNED_GLOBAL_TOKEN",
+            ):
+                self.assertIn(f"F821 undefined name '{expected_undef}'", flagged_messages)
+
+        # 3. Real repository passes full strict audit with 0 F821 findings, Makefile exposes ci-local,
+        #    and rules/python-and-testing.md documents cross-OS portability under 24,000 bytes
+        repo_qa = qa_static_audit.run_qa_audit(REPO_ROOT, strict=True)
+        self.assertTrue(repo_qa["passed"], msg=json.dumps(repo_qa, indent=2))
+
+        makefile_txt = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("ci-local:", makefile_txt)
+        self.assertIn("coverage run", makefile_txt)
+        self.assertIn("--fail-under=75", makefile_txt)
+
+        py_rule_path = REPO_ROOT / "rules" / "python-and-testing.md"
+        py_rule_bytes = py_rule_path.read_bytes()
+        self.assertLess(len(py_rule_bytes), 24000)
+        py_rule_txt = py_rule_bytes.decode("utf-8")
+        for portability_token in ("mode=ro", "immutable=1", "APFS", "ext4", "/private/tmp", "--ci-parity", "ci-local"):
+            self.assertIn(portability_token, py_rule_txt)
+
 
 if __name__ == "__main__":
     unittest.main()

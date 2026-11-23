@@ -14,5 +14,5 @@
     "Audit this repository with static QA, AST, shell, and Zero-PII gates",
     "Create a timestamped branch and run the manual Pull Request review workflow"
   ],
-  "version": "bf92ca6-20261123"
+  "version": "7949a90-20261123"
 }
