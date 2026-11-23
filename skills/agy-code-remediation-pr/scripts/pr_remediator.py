@@ -4794,6 +4794,31 @@ def _stage_preview_plugin_bundle(
     return False
 
 
+_PREVIEW_TOP_LEVEL_ASSETS: tuple[str, ...] = ("index.html", "styles.css", "dashboard.js", "favicon.svg")
+_PREVIEW_WEB_SUBDIRS: tuple[str, ...] = ("css", "js")
+
+
+def _sync_preview_subtree(
+    src_dir: Path,
+    dest_dir: Path,
+    *,
+    ignore_patterns: tuple[str, ...],
+) -> None:
+    """Prune stale `dest_dir` and copy `src_dir` with `symlinks=False` when present."""
+    if dest_dir.is_symlink() or dest_dir.is_file():
+        with contextlib.suppress(OSError):
+            dest_dir.unlink()
+    elif dest_dir.exists():
+        shutil.rmtree(dest_dir, ignore_errors=True)
+    if src_dir.is_dir():
+        shutil.copytree(
+            src_dir,
+            dest_dir,
+            symlinks=False,
+            ignore=shutil.ignore_patterns(*ignore_patterns),
+        )
+
+
 def push_remediation_branch_and_build_reviewer_plan(
     title: str,
     body: str = "",
@@ -5102,17 +5127,21 @@ def push_remediation_branch_and_build_reviewer_plan(
         if has_preview_bundle:
             dev_server_res = stop_dev_api_server(portfolio_dir=portfolio_dir)
             preview_dir.mkdir(parents=True, exist_ok=True)
-            for asset_name in ("index.html", "styles.css", "dashboard.js", "favicon.svg"):
+            for asset_name in _PREVIEW_TOP_LEVEL_ASSETS:
                 src_asset = web_src_dir / asset_name
                 if src_asset.is_file():
                     shutil.copy2(src_asset, preview_dir / asset_name)
-            if api_src_dir.is_dir():
-                shutil.copytree(
-                    api_src_dir,
-                    preview_dir / "api",
-                    dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            for subdir in _PREVIEW_WEB_SUBDIRS:
+                _sync_preview_subtree(
+                    web_src_dir / subdir,
+                    preview_dir / subdir,
+                    ignore_patterns=("__pycache__", "*.pyc", ".DS_Store"),
                 )
+            _sync_preview_subtree(
+                api_src_dir,
+                preview_dir / "api",
+                ignore_patterns=("__pycache__", "*.pyc"),
+            )
             has_staged_plugin = _stage_preview_plugin_bundle(target_repo_dir, preview_dir)
         elif is_plugin_repo:
             has_staged_plugin = _stage_preview_plugin_bundle(target_repo_dir, preview_dir)
@@ -5137,11 +5166,18 @@ def push_remediation_branch_and_build_reviewer_plan(
             )
 
     if slot_num == 1 and (has_preview_bundle or has_staged_plugin):
-        for asset_name in ("index.html", "styles.css", "dashboard.js", "favicon.svg"):
+        for asset_name in _PREVIEW_TOP_LEVEL_ASSETS:
             staged_asset = preview_dir / asset_name
             if staged_asset.is_file():
                 with contextlib.suppress(OSError):
                     os.utime(staged_asset, None)
+        for subdir in _PREVIEW_WEB_SUBDIRS:
+            staged_sub = preview_dir / subdir
+            if staged_sub.is_dir():
+                for staged_file in staged_sub.rglob("*"):
+                    if staged_file.is_file():
+                        with contextlib.suppress(OSError):
+                            os.utime(staged_file, None)
         restart_pro_api_server(portfolio_dir=portfolio_dir)
 
     updated_rb = {
