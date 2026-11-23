@@ -5,14 +5,14 @@ Renders a single-table multi-repo status dashboard backed by `dev_queue.json` an
 per-repository `dev_pr_locks` (`actions_state.json` / `dev_pr_lock.json`), with:
   - Dynamic zero-hardcode state and repository discovery (`dev_common` + `git_client`)
   - Strict `pr_gate_ready` and `HUMAN_READY_LOCK_STATUSES` gating (never leaking unreviewed PRs)
-  - Multi-repo PR-ready progress clarity (`PR 1/2 listo` yellow / `PR listo` green; never averaging
+  - Live inactivity semaphore inside `PROGRESS` (`<3m` `ok·<idle>`, `3-14m` amber `idle <idle>`,
+    `>=15m` red `STALL <idle>`) including `AWAITING_AGENT_REVIEW` + `reviewer_subagent_id`
+  - Multi-repo PR-ready progress clarity (`PR 1/2 ready` yellow / `PR ready` green; never averaging
     a human-ready PR with unstarted downstream repos) and exact `★` repo attribution + unlock footer
-  - Richest PR URL ranking (`/pull/` > verified `?title=&body=` > bare `?expand=1`) with full
-    query preservation across OSC-8 hyperlinks, browser hotkeys, and `dev_queue_board.md`
-  - GUI-first Antigravity Desktop integration (`conversation_summaries.db` lookup, clipboard copy +
-    app focus, and atomic `dev_queue_board.md` Markdown artifact sync with `conversation://` links)
-  - Flicker-free alternate-screen `--watch` mode with `/dev/tty` cbreak hotkeys and offline-safe
-    local Git ref validation (`AGY_OFFLINE_ONLY=1`)
+  - Richest PR URL ranking (`/pull/` > verified `?title=&body=` > bare `?expand=1`) with compact
+    OSC-8 hyperlink labels and full query preservation across hotkeys and `dev_queue_board.md`
+  - Unified `agy-queue` subcommands (`watch`, `doctor`, `optimize`, `sync`, `list`, `show`,
+    `locks`, `set-status`) + `<1ms` pure viewport repaint and interactive TUI overlays
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import argparse
 import ast
 from collections.abc import Callable, Sequence
 import contextlib
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import math
@@ -38,8 +38,10 @@ import sys
 import termios
 import threading
 import time
+import traceback
 import tty
 from typing import Any, TextIO
+import unicodedata
 from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
 
@@ -69,19 +71,36 @@ except Exception:
     _dev_common = None
 
 try:
-    import git_client as _git_client  # type: ignore[import-not-found]
-except Exception:
-    _git_client = None
-
-try:
     import dev_flow_optimizer as _flow_opt  # type: ignore[import-not-found]
 except Exception:
     _flow_opt = None
 
-try:
-    import dev_queue_doctor as _queue_doctor  # type: ignore[import-not-found]
-except Exception:
-    _queue_doctor = None
+_git_client: Any = None
+_git_client_loaded = False
+_queue_doctor: Any = None
+_queue_doctor_loaded = False
+
+
+def _get_git_client() -> Any:
+    global _git_client, _git_client_loaded
+    if not _git_client_loaded:
+        _git_client_loaded = True
+        with contextlib.suppress(Exception):
+            import git_client as _gc  # type: ignore[import-not-found]
+
+            _git_client = _gc
+    return _git_client
+
+
+def _get_queue_doctor() -> Any:
+    global _queue_doctor, _queue_doctor_loaded
+    if not _queue_doctor_loaded:
+        _queue_doctor_loaded = True
+        with contextlib.suppress(Exception):
+            import dev_queue_doctor as _qd  # type: ignore[import-not-found]
+
+            _queue_doctor = _qd
+    return _queue_doctor
 
 ANSI_RE = re.compile(r"\x1b\]8;;[^\x1b\x07]*(?:\x1b\\|\x07)|\x1b\[[0-9;?]*[A-Za-z]")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
@@ -92,6 +111,9 @@ _RELOAD_ENV_FLAG = "_AGY_QUEUE_RELOADED"
 
 ALT_SCREEN_ENTER = "\033[?1049h\033[?25l\033[H\033[2J"
 ALT_SCREEN_EXIT = "\033[?25h\033[?1049l"
+
+JSON_SCHEMA_VERSION = 1
+IDLE_AMBER_THRESHOLD_SECONDS = 180
 
 STATUS_ORDER: dict[str, int] = {
     "pr_open": 0,
@@ -108,6 +130,18 @@ STATUS_ORDER: dict[str, int] = {
     "cancelled": 7,
     "rejected": 8,
 }
+
+VALID_QUEUE_STATUSES: tuple[str, ...] = tuple(STATUS_ORDER.keys())
+AGY_QUEUE_SUBCOMMANDS: tuple[str, ...] = (
+    "watch",
+    "doctor",
+    "optimize",
+    "sync",
+    "list",
+    "show",
+    "locks",
+    "set-status",
+)
 
 INACTIVE_STATUSES: frozenset[str] = frozenset({"merged", "cleaned", "cancelled", "rejected"})
 
@@ -200,12 +234,93 @@ def _resolve_brain_dirs(
     ]
 
 
+def _is_dumb_terminal() -> bool:
+    """Return True when `TERM=dumb` is set in the environment."""
+    return (os.environ.get("TERM") or "").strip().lower() == "dumb"
+
+
+def _is_no_color_env() -> bool:
+    """Return True when non-empty `NO_COLOR` is set (`https://no-color.org`)."""
+    return bool((os.environ.get("NO_COLOR") or "").strip())
+
+
+def _should_enable_color(no_color_flag: bool, is_tty: bool, *, honor_dumb_term: bool = True) -> bool:
+    """Determine whether ANSI SGR colors should be emitted."""
+    if not is_tty or bool(no_color_flag) or _is_no_color_env():
+        return False
+    if honor_dumb_term and _is_dumb_terminal():
+        return False
+    return True
+
+
+def _resolve_cli_version() -> str:
+    """Resolve `agy-queue` CLI version from `plugin.json` or `pyproject.toml`."""
+    for root in (_SCRIPT_PLUGIN_ROOT, _INSTALLED_PLUGIN_ROOT):
+        pjson = root / "plugin.json"
+        if pjson.is_file():
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                ver = str((json.loads(pjson.read_text(encoding="utf-8")) or {}).get("version") or "").strip()
+                if ver:
+                    return ver
+        pyproj = root / "pyproject.toml"
+        if pyproj.is_file():
+            with contextlib.suppress(OSError):
+                m = re.search(r'^version\s*=\s*"([^"]+)"', pyproj.read_text(encoding="utf-8"), re.MULTILINE)
+                if m and m.group(1).strip():
+                    return m.group(1).strip()
+    return "1.0.0"
+
+
+def _debug_log(enabled: bool, msg: str) -> None:
+    """Emit timestamped debug diagnostics to `stderr` when `--debug` is enabled."""
+    if enabled:
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+        with contextlib.suppress(OSError):
+            sys.stderr.write(f"[agy-queue:debug {ts}Z] {msg}\n")
+
+
+def _silence_broken_pipe_stdout() -> int:
+    """Redirect stdout fd to `/dev/null` on `BrokenPipeError` so pipe consumers (`head`) exit cleanly."""
+    with contextlib.suppress(OSError, ValueError):
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_fd, sys.stdout.fileno())
+        finally:
+            os.close(devnull_fd)
+    return 0
+
+
+def _install_sigpipe_hygiene() -> None:
+    """Ensure `SIGPIPE` raises `BrokenPipeError` cleanly without signal tracebacks."""
+    sigpipe = getattr(signal, "SIGPIPE", None)
+    if sigpipe is not None:
+        with contextlib.suppress(OSError, ValueError):
+            signal.signal(sigpipe, signal.SIG_IGN)
+
+
 def _color(text: str, code: str, enabled: bool) -> str:
     return f"\033[{code}m{text}\033[0m" if enabled else text
 
 
+def _char_display_width(ch: str) -> int:
+    """Compute terminal column width for a single Unicode codepoint (`0`, `1`, or `2`)."""
+    cp = ord(ch)
+    if cp < 32 or cp == 127:
+        return 0
+    if unicodedata.combining(ch):
+        return 0
+    cat = unicodedata.category(ch)
+    if cat in ("Mn", "Me", "Cf"):
+        return 0
+    if unicodedata.east_asian_width(ch) in ("W", "F"):
+        return 2
+    return 1
+
+
 def _visible_len(text: str) -> int:
-    return len(ANSI_RE.sub("", text))
+    """Compute visible terminal display width ignoring ANSI/OSC-8 escapes and accounting for wide/combining chars."""
+    plain = ANSI_RE.sub("", text or "")
+    return sum(_char_display_width(ch) for ch in plain)
 
 
 def _pad_visible(text: str, width: int) -> str:
@@ -214,12 +329,42 @@ def _pad_visible(text: str, width: int) -> str:
 
 
 def _trunc(text: str, width: int) -> str:
-    if width <= 3:
-        return text[: max(width, 0)]
-    return text if len(text) <= width else text[: width - 1] + "…"
+    """Truncate `text` to at most `width` terminal display columns using `unicodedata` cell widths."""
+    if width <= 0:
+        return ""
+    plain = ANSI_RE.sub("", str(text or ""))
+    if _visible_len(plain) <= width:
+        return plain
+    if width <= 1:
+        out_min: list[str] = []
+        used_min = 0
+        for ch in plain:
+            cw = _char_display_width(ch)
+            if used_min + cw > width:
+                break
+            out_min.append(ch)
+            used_min += cw
+        return "".join(out_min)
+
+    limit = width - 1
+    out_chars: list[str] = []
+    used = 0
+    for ch in plain:
+        cw = _char_display_width(ch)
+        if cw == 0:
+            if out_chars:
+                out_chars.append(ch)
+            continue
+        if used + cw > limit:
+            break
+        out_chars.append(ch)
+        used += cw
+    return "".join(out_chars) + "…"
 
 
 def _supports_osc8(stream: TextIO | None = None) -> bool:
+    if _is_dumb_terminal():
+        return False
     term_prog = (os.environ.get("TERM_PROGRAM") or "").lower()
     if term_prog == "apple_terminal":
         return False
@@ -267,6 +412,23 @@ def _osc8_link(label: str, url: str, enabled: bool) -> str:
         return label
     target = _sanitize_full_url(url) or url
     return f"\033]8;;{target}\007{label}\033]8;;\007"
+
+
+def _compact_osc8_pr_label(url: str, repo_lbl: str = "", *, max_width: int = 84) -> str:
+    """Build a compact single-line OSC-8 PR label that never overflows 123-col terminals."""
+    clean = _sanitize_full_url(url)
+    if not clean:
+        return ""
+    parsed = urlsplit(clean)
+    slug = _extract_repo_slug_from_url(clean)
+    disp_repo = repo_lbl or (slug.split("/")[-1] if slug else parsed.netloc)
+    m_num = re.search(r"/(?:pull|pulls|pull-requests|merge_requests)/(\d+)(?:/|$)", parsed.path or "")
+    if m_num:
+        return _trunc(f"↗ Open PR #{m_num.group(1)} ({disp_repo})", max_width)
+    br = _extract_compare_branch_from_url(clean)
+    if br:
+        return _trunc(f"↗ Open PR · {disp_repo} (main...{br})", max_width)
+    return _trunc(f"↗ Open PR · {_clean_clickable_url(clean)}", max_width)
 
 
 def _copy_to_clipboard(text: str) -> bool:
@@ -572,9 +734,10 @@ def _parse_remote_to_web_info(remote_url: str) -> tuple[str, str, str]:
     raw = (remote_url or "").strip()
     if not _is_network_remote(raw):
         return ("", "", "")
-    if _git_client is not None and hasattr(_git_client, "detect_vcs_provider_from_remote"):
+    gc_mod = _get_git_client()
+    if gc_mod is not None and hasattr(gc_mod, "detect_vcs_provider_from_remote"):
         try:
-            provider, web_base, slug = _git_client.detect_vcs_provider_from_remote(raw)
+            provider, web_base, slug = gc_mod.detect_vcs_provider_from_remote(raw)
             if web_base and slug:
                 return (str(provider), str(web_base).rstrip("/"), str(slug))
         except Exception:
@@ -1333,7 +1496,7 @@ def _detect_stalled_lock_info(
     *,
     now_ts: float | None = None,
     threshold_seconds: int | float | None = None,
-    brain_dir: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
 ) -> dict[str, Any]:
     """Delegate stalled-worker inspection to `dev_flow_optimizer.detect_stalled_lock` safely."""
     if _flow_opt is not None and hasattr(_flow_opt, "detect_stalled_lock"):
@@ -1352,9 +1515,13 @@ def _detect_stalled_lock_info(
         "stalled": False,
         "idle_seconds": 0,
         "idle_label": "0s",
+        "elapsed_seconds": 0,
+        "elapsed_label": "0s",
         "threshold_seconds": 900,
         "last_activity_ts": 0.0,
+        "last_activity_source": "",
         "worker_cid": str(lk.get("worker_cid") or "").strip(),
+        "reviewer_subagent_id": str(lk.get("reviewer_subagent_id") or "").strip(),
     }
 
 
@@ -1372,9 +1539,9 @@ def _compute_lock_progress(
     *,
     now_ts: float | None = None,
     threshold_seconds: int | float | None = None,
-    brain_dir: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
 ) -> dict[str, object]:
-    """Compute per-lock progress percentage, compact tag, stalled state, and PR readiness flags."""
+    """Compute per-lock progress percentage, live inactivity semaphore tag, and PR readiness flags."""
     st_u = str(lk.get("status") or "DEVELOPING").upper()
     branch_pushed = bool(lk.get("branch_pushed"))
     has_pr = bool(lk.get("pr_url"))
@@ -1396,16 +1563,21 @@ def _compute_lock_progress(
     )
     is_stalled = bool(stall_info.get("stalled"))
     idle_seconds = int(stall_info.get("idle_seconds") or 0)
-    idle_label = str(stall_info.get("idle_label") or "")
+    idle_label = str(stall_info.get("idle_label") or "0s")
+    elapsed_seconds = int(stall_info.get("elapsed_seconds") or 0)
+    elapsed_label = str(stall_info.get("elapsed_label") or "0s")
+    last_activity_ts = float(stall_info.get("last_activity_ts") or 0.0)
+    last_activity_source = str(stall_info.get("last_activity_source") or "")
+    stage_label = str(lk.get("stage_label") or "").strip()
+    worker_cid = str(stall_info.get("worker_cid") or lk.get("worker_cid") or "").strip()
+    reviewer_subagent_id = str(stall_info.get("reviewer_subagent_id") or lk.get("reviewer_subagent_id") or "").strip()
 
     explicit_pct = lk.get("progress_pct")
+    idle_state = ""
     if is_stalled:
         pct = 0
         tag = f"STALL {idle_label}".strip()
-    elif isinstance(explicit_pct, (int, float)):
-        pct = max(0, min(100, int(round(explicit_pct))))
-        eta_mins = lk.get("eta_minutes")
-        tag = f"~{int(eta_mins)}m" if isinstance(eta_mins, (int, float)) else str(lk.get("stage_label") or "")[:5]
+        idle_state = "stall"
     elif is_human_ready:
         pct, tag = 90, "PR"
     elif is_awaiting_base:
@@ -1414,24 +1586,44 @@ def _compute_lock_progress(
         pct, tag = 70, "rebase"
     elif is_escalated:
         pct, tag = 0, "esc"
-    elif is_iterating:
-        pct, tag = 65, "iter"
-    elif is_agent_review:
-        pct, tag = 75, "rev"
     else:
-        has_dirty, commits_ahead = _inspect_worktree_progress(str(lk.get("worktree_path") or ""))
-        if commits_ahead > 0 and not has_dirty:
-            pct, tag = 60, "~3m"
-        elif commits_ahead > 0 and has_dirty:
-            pct, tag = 50, "~5m"
-        elif has_dirty:
-            pct, tag = 35, "~6m"
+        if isinstance(explicit_pct, (int, float)):
+            pct = max(0, min(100, int(round(explicit_pct))))
+        elif is_agent_review:
+            pct = 75
+        elif is_iterating:
+            pct = 65
         else:
-            pct, tag = 15, "~10m"
+            has_dirty, commits_ahead = _inspect_worktree_progress(str(lk.get("worktree_path") or ""))
+            if commits_ahead > 0 and not has_dirty:
+                pct = 60
+            elif commits_ahead > 0 and has_dirty:
+                pct = 50
+            elif has_dirty:
+                pct = 35
+            else:
+                pct = 15
+
+        if idle_seconds >= IDLE_AMBER_THRESHOLD_SECONDS:
+            tag = f"idle {idle_label}"
+            idle_state = "amber"
+        elif last_activity_ts > 0.0:
+            tag = f"ok·{idle_label or '0s'}"
+            idle_state = "ok"
+        elif is_agent_review:
+            tag = "rev"
+            idle_state = "ok"
+        elif is_iterating:
+            tag = "iter"
+            idle_state = "ok"
+        else:
+            tag = (stage_label[:8] if stage_label else "ok·0s")
+            idle_state = "ok"
 
     return {
         "pct": pct,
         "tag": tag,
+        "idle_state": idle_state,
         "is_human_ready": is_human_ready,
         "is_awaiting_base": is_awaiting_base,
         "is_needs_rebase": is_needs_rebase,
@@ -1440,7 +1632,12 @@ def _compute_lock_progress(
         "is_stalled": is_stalled,
         "idle_seconds": idle_seconds,
         "idle_label": idle_label,
-        "worker_cid": str(stall_info.get("worker_cid") or ""),
+        "elapsed_seconds": elapsed_seconds,
+        "elapsed_label": elapsed_label,
+        "last_activity_source": last_activity_source,
+        "stage_label": stage_label,
+        "worker_cid": worker_cid,
+        "reviewer_subagent_id": reviewer_subagent_id,
     }
 
 
@@ -1450,8 +1647,10 @@ def _compute_item_progress(
     lock_progress_cache: dict[str, dict[str, object]],
     link_state: str = "",
     is_human_pr: bool = False,
+    *,
+    now_ts: float | None = None,
 ) -> dict[str, object] | None:
-    """Compute item progress, rendering full PR-ready bars without averaging unstarted downstream repos."""
+    """Compute item progress, rendering full PR-ready bars, dim `1/2 merged` partial WIP, and live idle semaphore."""
     st = str(it.get("status") or "pending").lower()
     repo_slugs = [str(r) for r in (it.get("repo_slugs") or []) if r]
     merged_set = {str(r) for r in (it.get("merged_repos") or []) if r}
@@ -1479,6 +1678,8 @@ def _compute_item_progress(
     tags: list[str] = []
     any_lock_human_ready = False
     any_lock_stalled = False
+    any_lock_amber = False
+    any_lock_ok = False
     stalled_tag = ""
     stalled_idle_label = ""
 
@@ -1486,7 +1687,7 @@ def _compute_item_progress(
         p_key = _slot_progress_cache_key(slug, lk)
         lp = lock_progress_cache.get(p_key)
         if lp is None:
-            lp = _compute_lock_progress(lk)
+            lp = _compute_lock_progress(lk, now_ts=now_ts)
             lock_progress_cache[p_key] = lp
         if slug not in merged_set:
             per_repo_pct[slug] = int(lp["pct"])  # type: ignore[arg-type]
@@ -1498,13 +1699,17 @@ def _compute_item_progress(
                 any_lock_stalled = True
                 stalled_tag = str(lp.get("tag") or "STALL")
                 stalled_idle_label = str(lp.get("idle_label") or "")
+            elif lp.get("idle_state") == "amber":
+                any_lock_amber = True
+            elif lp.get("idle_state") == "ok":
+                any_lock_ok = True
 
     if is_human_pr or any_lock_human_ready:
         active_idx = min(total_repos, done_repos + 1)
         is_final_repo = (done_repos + 1) >= total_repos
         return {
             "pct": 100,
-            "tag": f"PR {active_idx}/{total_repos}" if total_repos > 1 else "PR listo",
+            "tag": f"PR {active_idx}/{total_repos}" if total_repos > 1 else "PR ready",
             "mode": "pr_final" if is_final_repo else "pr_part",
             "part_idx": active_idx,
             "total_repos": total_repos,
@@ -1515,8 +1720,19 @@ def _compute_item_progress(
             "pct": 0,
             "tag": stalled_tag or f"STALL {stalled_idle_label}".strip(),
             "mode": "stalled",
+            "idle_state": "stall",
             "is_stalled": True,
             "idle_label": stalled_idle_label,
+        }
+
+    avg_pct = int(round(sum(per_repo_pct.values()) / max(1, len(per_repo_pct)))) if per_repo_pct else 0
+    if not linked_locks and 0 < done_repos < total_repos and st not in ("in_progress", "pr_open"):
+        return {
+            "pct": max(0, min(100, avg_pct)),
+            "tag": f"{done_repos}/{total_repos} merged",
+            "mode": "partial_pending",
+            "done_repos": done_repos,
+            "total_repos": total_repos,
         }
 
     if not linked_locks:
@@ -1529,14 +1745,31 @@ def _compute_item_progress(
             for slug in repo_slugs:
                 if slug not in merged_set:
                     per_repo_pct[slug] = 15
-            tags.append("~10m")
+            item_ts = 0.0
+            if _flow_opt is not None and hasattr(_flow_opt, "parse_iso_timestamp"):
+                item_ts = float(
+                    _flow_opt.parse_iso_timestamp(it.get("updated_at") or it.get("added_at"))
+                )
+            if item_ts > 0.0:
+                cur_t = float(now_ts if now_ts is not None else time.time())
+                i_secs = max(0, int(cur_t - item_ts))
+                i_lbl = _format_compact_age(i_secs)
+                if i_secs >= IDLE_AMBER_THRESHOLD_SECONDS:
+                    tags.append(f"idle {i_lbl}")
+                    any_lock_amber = True
+                else:
+                    tags.append(f"ok·{i_lbl}")
+                    any_lock_ok = True
+            else:
+                tags.append("ok·0s")
+                any_lock_ok = True
+        avg_pct = int(round(sum(per_repo_pct.values()) / max(1, len(per_repo_pct)))) if per_repo_pct else 0
 
-    avg_pct = int(round(sum(per_repo_pct.values()) / max(1, len(per_repo_pct)))) if per_repo_pct else 0
     base_tag = tags[0] if tags else ""
     if total_repos > 1:
         active_idx = min(total_repos, done_repos + (1 if linked_locks or st in ("in_progress", "pr_open") else 0))
         if not linked_locks and done_repos > 0 and st == "pending":
-            tag = f"{done_repos}/{total_repos}"
+            tag = f"{done_repos}/{total_repos} merged"
         elif base_tag:
             tag = f"{active_idx}/{total_repos}·{base_tag}"
         else:
@@ -1544,21 +1777,23 @@ def _compute_item_progress(
     else:
         tag = base_tag
 
-    return {"pct": max(0, min(100, avg_pct)), "tag": tag, "mode": "dev"}
+    eff_idle_state = "amber" if any_lock_amber else ("ok" if any_lock_ok else "")
+    return {"pct": max(0, min(100, avg_pct)), "tag": tag, "mode": "dev", "idle_state": eff_idle_state}
 
 
 def _render_inline_progress(progress: dict[str, object] | None, col_w: int, color_on: bool) -> str:
-    """Render an inline progress bar cell using full yellow/green bars for PR-ready and alert style for stalled locks."""
+    """Render an inline progress bar cell with PR-ready bars, dim partial WIP, and live idle/stall semaphore."""
     if progress is None:
         return _pad_visible(_color("—", "2", color_on), col_w)
     pct = max(0, min(100, int(progress.get("pct") or 0)))  # type: ignore[arg-type]
     tag = str(progress.get("tag") or "").strip()
     mode = str(progress.get("mode") or "")
-    bar_cells = 6 if col_w < 21 else 8
+    idle_state = str(progress.get("idle_state") or "")
+    bar_cells_default = 6 if col_w < 22 else 8
 
     if mode == "stalled":
         lbl = tag or "STALL"
-        stall_cells = 4 if (col_w - bar_cells - 1) < len(lbl) and col_w >= 12 else bar_cells
+        stall_cells = 4 if (col_w - bar_cells_default - 1) < _visible_len(lbl) and col_w >= 12 else bar_cells_default
         bar = _color("▓" * stall_cells, "1;31", color_on)
         max_lbl = max(4, col_w - stall_cells - 1)
         lbl_clean = _trunc(lbl, max_lbl)
@@ -1566,18 +1801,42 @@ def _render_inline_progress(progress: dict[str, object] | None, col_w: int, colo
 
     if mode in ("pr_part", "pr_final"):
         bar_code = "1;32" if mode == "pr_final" else "1;33"
-        bar = _color("█" * bar_cells, bar_code, color_on)
-        max_lbl = max(3, col_w - bar_cells - 1)
-        lbl = tag or "PR listo"
-        if "listo" not in lbl and len(f"{lbl} listo") <= max_lbl:
-            lbl = f"{lbl} listo"
+        lbl = tag or "PR ready"
+        if "ready" not in lbl:
+            cand_ready = f"{lbl} ready"
+            pr_cells = 6 if (col_w - bar_cells_default - 1) < _visible_len(cand_ready) else bar_cells_default
+            if _visible_len(cand_ready) <= max(3, col_w - pr_cells - 1):
+                lbl = cand_ready
+                bar_cells_pr = pr_cells
+            else:
+                bar_cells_pr = bar_cells_default
+        else:
+            bar_cells_pr = 6 if (col_w - bar_cells_default - 1) < _visible_len(lbl) else bar_cells_default
+        bar = _color("█" * bar_cells_pr, bar_code, color_on)
+        max_lbl = max(3, col_w - bar_cells_pr - 1)
         lbl_clean = _trunc(lbl, max_lbl)
         return _pad_visible(f"{bar} {_color(lbl_clean, bar_code, color_on)}", col_w)
+
+    if mode == "partial_pending":
+        base_lbl = tag or "1/2 merged"
+        with_pct = f"{base_lbl} ({pct}%)"
+        lbl_clean = with_pct if _visible_len(with_pct) <= col_w else _trunc(base_lbl, col_w)
+        return _pad_visible(_color(lbl_clean, "2", color_on), col_w)
+
+    is_amber_idle = idle_state == "amber" or "idle " in tag
+    is_ok_idle = idle_state == "ok" or tag.startswith("ok·") or "·ok·" in tag
+    tag_vis = _visible_len(tag)
+    if tag_vis > 0:
+        bar_cells = max(3, min(bar_cells_default, col_w - 6 - tag_vis))
+    else:
+        bar_cells = bar_cells_default
 
     filled = int(round((pct / 100.0) * bar_cells))
     empty = max(0, bar_cells - filled)
     if tag in ("stale", "sync!"):
         bar_code = "1;35"
+    elif is_amber_idle:
+        bar_code = "1;33"
     elif pct >= 85:
         bar_code = "1;32"
     elif pct >= 50:
@@ -1588,7 +1847,18 @@ def _render_inline_progress(progress: dict[str, object] | None, col_w: int, colo
     pct_txt = _color(f"{pct:>3}%", bar_code, color_on)
     max_tag = max(0, col_w - bar_cells - 6)
     tag_clean = _trunc(tag, max_tag) if max_tag >= 3 else ""
-    tag_txt = f" {_color(tag_clean, '1;35' if tag in ('stale', 'sync!') else '2', color_on)}" if tag_clean else ""
+    if tag_clean:
+        if tag in ("stale", "sync!"):
+            tag_code = "1;35"
+        elif is_amber_idle:
+            tag_code = "1;33"
+        elif is_ok_idle:
+            tag_code = "0;32"
+        else:
+            tag_code = "2"
+        tag_txt = f" {_color(tag_clean, tag_code, color_on)}"
+    else:
+        tag_txt = ""
     return _pad_visible(f"{bar} {pct_txt}{tag_txt}", col_w)
 
 
@@ -1638,27 +1908,27 @@ def _compact_repos(
         badge = f"({len(done_slugs)}/{len(ordered)}✓)"
         rem_names = [label_map.get(s, s.split("/")[-1]) for s in pending_slugs]
         full_partial = f"{', '.join(rem_names)} {badge}"
-        if len(full_partial) <= max_w:
+        if _visible_len(full_partial) <= max_w:
             return full_partial
         if len(rem_names) > 1:
             multi_suffix = f" +{len(rem_names) - 1} {badge}"
-            if max_w - len(multi_suffix) >= 5:
-                return f"{_trunc(rem_names[0], max_w - len(multi_suffix))}{multi_suffix}"
+            if max_w - _visible_len(multi_suffix) >= 5:
+                return f"{_trunc(rem_names[0], max_w - _visible_len(multi_suffix))}{multi_suffix}"
         suffix = f" {badge}"
-        if max_w - len(suffix) >= 4:
-            return f"{_trunc(rem_names[0], max_w - len(suffix))}{suffix}"
+        if max_w - _visible_len(suffix) >= 4:
+            return f"{_trunc(rem_names[0], max_w - _visible_len(suffix))}{suffix}"
         return _trunc(full_partial, max_w)
 
     parts = [_fmt(s) for s in ordered]
     full = ", ".join(parts)
-    if len(full) <= max_w:
+    if _visible_len(full) <= max_w:
         return full
     if len(parts) > 1:
         suffix = f" +{len(parts) - 1}"
         primary = parts[0]
         if pr_repo_slug and pr_repo_slug in ordered:
             primary = _fmt(pr_repo_slug)
-        first = _trunc(primary, max(6, max_w - len(suffix)))
+        first = _trunc(primary, max(6, max_w - _visible_len(suffix)))
         return f"{first}{suffix}"
     return _trunc(parts[0], max_w)
 
@@ -2064,7 +2334,7 @@ def _write_live_antigravity_board(
                 is_pr = bool(lp.get("is_human_ready"))
                 is_stalled = bool(lp.get("is_stalled"))
                 if is_pr:
-                    tag = "PR listo"
+                    tag = "PR ready"
                 elif is_stalled:
                     tag = str(lp.get("tag") or "STALL")
                 elif lp.get("is_needs_rebase"):
@@ -2077,6 +2347,8 @@ def _write_live_antigravity_board(
                     tag = "agent review"
                 else:
                     tag = f"{int(lp.get('pct') or 0)}%"  # type: ignore[arg-type]
+                if not is_pr and not is_stalled and int(lp.get("idle_seconds") or 0) >= IDLE_AMBER_THRESHOLD_SECONDS:
+                    tag = f"{tag} · idle {lp.get('idle_label') or ''}".strip()
                 s2_lp = lock_progress_cache.get(f"{slug}#slot2")
                 if isinstance(s2_lp, dict):
                     s2_tag = (
@@ -2094,7 +2366,7 @@ def _write_live_antigravity_board(
                 )
                 u_md = _escape_md_url(u) if (is_pr and lock_has_pr) else (_clean_clickable_url(u) or u)
                 link_part = (
-                    f" · [Abrir PR]({u_md})"
+                    f" · [Open PR]({u_md})"
                     if (is_pr and lock_has_pr and u_md)
                     else (f" · [Pulls]({u_md})" if u_md else "")
                 )
@@ -2315,11 +2587,29 @@ def _resolve_orchestrator_liveness(
     return (f"(idle {idle_lbl})", "2")
 
 
+def _extract_lock_telemetry_fields(lp: dict[str, object] | None, lk: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Extract canonical live idle/elapsed/source/worker/reviewer telemetry fields."""
+    prog = lp if isinstance(lp, dict) else {}
+    lock_d = lk if isinstance(lk, dict) else {}
+    return {
+        "idle_seconds": int(prog.get("idle_seconds") or 0),
+        "idle_label": str(prog.get("idle_label") or "0s"),
+        "elapsed_seconds": int(prog.get("elapsed_seconds") or 0),
+        "elapsed_label": str(prog.get("elapsed_label") or "0s"),
+        "last_activity_source": str(prog.get("last_activity_source") or ""),
+        "stage_label": str(prog.get("stage_label") or lock_d.get("stage_label") or ""),
+        "worker_cid": str(prog.get("worker_cid") or lock_d.get("worker_cid") or ""),
+        "reviewer_subagent_id": str(prog.get("reviewer_subagent_id") or lock_d.get("reviewer_subagent_id") or ""),
+        "idle_state": str(prog.get("idle_state") or ""),
+        "is_stalled": bool(prog.get("is_stalled")),
+    }
+
+
 def render(
     args: argparse.Namespace,
     *,
     conv_db_path: Path | str | None = None,
-    brain_dir: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
     is_tty_override: bool | None = None,
     term_width_override: int | None = None,
     now_ts_override: float | None = None,
@@ -2329,6 +2619,8 @@ def render(
     sync_status_badge: str = "",
     force_board_write: bool = False,
     strict_io: bool = False,
+    ndjson_compact: bool = False,
+    ndjson_seq: int | None = None,
 ) -> tuple[
     str,
     dict[int, tuple[str, str]],
@@ -2338,21 +2630,36 @@ def render(
     dict[str, Path],
 ]:
     """Render the single-table Dev Queue dashboard and optionally sync the live Antigravity board."""
-    is_tty = sys.stdout.isatty() if is_tty_override is None else bool(is_tty_override)
-    color_on = is_tty and not bool(args.no_color)
-    use_osc8 = (is_tty if is_tty_override is not None else _supports_osc8()) and not bool(args.plain_urls)
+    debug_on = bool(getattr(args, "debug", False))
+    t_start = time.perf_counter()
+    honor_dumb = is_tty_override is None
+    is_tty = (
+        (bool(getattr(sys.stdout, "isatty", lambda: False)()) and not _is_dumb_terminal())
+        if is_tty_override is None
+        else bool(is_tty_override)
+    )
+    color_on = _should_enable_color(bool(getattr(args, "no_color", False)), is_tty, honor_dumb_term=honor_dumb)
+    use_osc8 = (
+        (is_tty if is_tty_override is not None else _supports_osc8())
+        and not bool(getattr(args, "plain_urls", False))
+        and not (honor_dumb and _is_dumb_terminal())
+    )
     term_w = max(78, term_width_override if term_width_override is not None else shutil.get_terminal_size((124, 40)).columns)
-    bar_w = min(term_w, 140)
+    bar_w = min(term_w, 220)
 
-    state_dir = _resolve_state_dir(args.state_dir)
+    state_dir = _resolve_state_dir(getattr(args, "state_dir", ""))
     queue_data = _load_json(state_dir / "dev_queue.json", strict=strict_io)
     items = queue_data.get("items") or []
     locks, all_locks = _load_locks(state_dir, strict=strict_io)
     repo_web_bases, repo_local_dirs = _discover_repos_cached(
         all_locks,
         items,
-        args.repos_dir,
+        getattr(args, "repos_dir", ""),
         repo_cache,
+    )
+    _debug_log(
+        debug_on,
+        f"snapshot loaded state_dir={state_dir} items={len(items)} active_locks={len(locks)} repos={len(repo_local_dirs)}",
     )
 
     lock_progress_cache: dict[str, dict[str, object]] = {}
@@ -2460,7 +2767,7 @@ def render(
     ag_titles = _load_conversation_titles(all_filtered_cids, db_path=conv_db_path, strict=strict_io)
     managed_list = [s for s in sorted(all_managed_slugs) if not repo_filter or repo_filter in s.lower()]
 
-    if args.json:
+    if getattr(args, "json", False):
         enriched_items: list[dict[str, Any]] = []
         for it in filtered:
             entry = dict(it)
@@ -2468,41 +2775,75 @@ def render(
             entry["effective_status"] = _resolve_effective_item_status(it, locks_by_cid)
             if cid_full in ag_titles:
                 entry["sidebar_title"] = ag_titles[cid_full]
+            _, _, item_is_pr, item_git_state, _ = _resolve_item_human_pr_link(
+                it, locks_by_cid, repo_web_bases, repo_local_dirs
+            )
+            item_prog = _compute_item_progress(
+                it,
+                locks_by_cid,
+                lock_progress_cache,
+                item_git_state,
+                is_human_pr=item_is_pr,
+                now_ts=now_ts_override,
+            )
+            if item_prog is not None:
+                entry["progress"] = item_prog
+            linked_lks = locks_by_cid.get(cid_full) or []
+            if linked_lks:
+                first_slug, first_lk = linked_lks[0]
+                first_lp = lock_progress_cache.get(_slot_progress_cache_key(first_slug, first_lk)) or {}
+                telem = _extract_lock_telemetry_fields(first_lp, first_lk)
+                entry["lock_telemetry"] = telem
+                for tk, tv in telem.items():
+                    entry.setdefault(tk, tv)
             enriched_items.append(entry)
-        active_locks_payload = {
-            slug: {
+        active_locks_payload: dict[str, dict[str, Any]] = {}
+        for slug, lk in locks.items():
+            if repo_filter and repo_filter not in slug.lower():
+                continue
+            lp_primary = lock_progress_cache.get(slug, {})
+            telem_primary = _extract_lock_telemetry_fields(lp_primary, lk)
+            active_locks_payload[slug] = {
                 **lk,
-                "progress": lock_progress_cache.get(slug, {}),
+                **telem_primary,
+                "progress": lp_primary,
                 **(
                     {"slot2_progress": lock_progress_cache[f"{slug}#slot2"]}
                     if f"{slug}#slot2" in lock_progress_cache
                     else {}
                 ),
             }
-            for slug, lk in locks.items()
-            if not repo_filter or repo_filter in slug.lower()
-        }
         stalled_locks_payload = {
             p_key: lp_val
             for p_key, lp_val in lock_progress_cache.items()
             if bool((lp_val or {}).get("is_stalled"))
             and (not repo_filter or repo_filter in p_key.lower())
         }
-        payload = json.dumps(
-            {
-                "state_dir": str(state_dir),
-                "updated_at": queue_data.get("updated_at", ""),
-                "orchestrator_conversation_id": queue_data.get("orchestrator_conversation_id", ""),
-                "counts": counts,
-                "managed_repos": managed_list,
-                "locks": active_locks_payload,
-                "active_locks": active_locks_payload,
-                "stalled_locks": stalled_locks_payload,
-                "opt_hint": opt_hint,
-                "items": enriched_items,
-            },
-            indent=2,
-            ensure_ascii=False,
+        json_obj: dict[str, Any] = {
+            "schema_version": JSON_SCHEMA_VERSION,
+            **(
+                {
+                    "seq": ndjson_seq,
+                    "emitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+                if ndjson_seq is not None
+                else {}
+            ),
+            "state_dir": str(state_dir),
+            "updated_at": queue_data.get("updated_at", ""),
+            "orchestrator_conversation_id": queue_data.get("orchestrator_conversation_id", ""),
+            "counts": counts,
+            "managed_repos": managed_list,
+            "locks": active_locks_payload,
+            "active_locks": active_locks_payload,
+            "stalled_locks": stalled_locks_payload,
+            "opt_hint": opt_hint,
+            "items": enriched_items,
+        }
+        payload = (
+            json.dumps(json_obj, separators=(",", ":"), ensure_ascii=False)
+            if ndjson_compact
+            else json.dumps(json_obj, indent=2, ensure_ascii=False)
         )
         return (payload, {}, {}, None, state_dir, repo_local_dirs)
 
@@ -2583,20 +2924,35 @@ def render(
                 is_rev = bool(lp.get("is_agent_review"))
                 is_esc = bool(lp.get("is_escalated"))
                 if is_human_pr:
-                    tag = "PR"
+                    base_tag = "PR"
                 elif is_stalled:
-                    tag = str(lp.get("tag") or "STALL")
+                    base_tag = str(lp.get("tag") or "STALL")
                 elif is_needs_rebase:
-                    tag = "rebase"
+                    base_tag = "rebase"
                 elif is_awaiting_base:
-                    tag = "await"
+                    base_tag = "await"
                 elif is_esc:
-                    tag = "esc"
+                    base_tag = "esc"
                 elif is_rev:
-                    tag = str(lp.get("tag") or "rev")
+                    base_tag = "rev"
                 else:
-                    tag = f"{int(lp.get('pct') or 0)}%"  # type: ignore[arg-type]
+                    base_tag = f"{int(lp.get('pct') or 0)}%"  # type: ignore[arg-type]
+
+                lp_idle_secs = int(lp.get("idle_seconds") or 0)
+                lp_idle_lbl = str(lp.get("idle_label") or "")
+                is_amber_pill = (
+                    not is_human_pr
+                    and not is_stalled
+                    and not is_awaiting_base
+                    and not is_needs_rebase
+                    and not is_esc
+                    and lp_idle_secs >= IDLE_AMBER_THRESHOLD_SECONDS
+                )
+
                 s2_lp = lock_progress_cache.get(f"{slug}#slot2")
+                s2_suffix_plain = ""
+                s2_is_amber = False
+                s2_idle_lbl = ""
                 if isinstance(s2_lp, dict):
                     if s2_lp.get("is_stalled"):
                         s2_short = str(s2_lp.get("tag") or "STALL")
@@ -2605,13 +2961,22 @@ def render(
                     elif s2_lp.get("is_needs_rebase"):
                         s2_short = "rebase"
                     elif s2_lp.get("is_agent_review"):
-                        s2_short = str(s2_lp.get("tag") or "rev")
+                        s2_short = "rev"
                     else:
                         s2_short = f"{int(s2_lp.get('pct') or 0)}%"  # type: ignore[arg-type]
-                    tag = f"{tag}·S2:{s2_short}"
+                    s2_idle_s = int(s2_lp.get("idle_seconds") or 0)
+                    s2_idle_lbl = str(s2_lp.get("idle_label") or "")
+                    s2_is_amber = (
+                        not bool(s2_lp.get("is_stalled"))
+                        and not bool(s2_lp.get("is_awaiting_base"))
+                        and not bool(s2_lp.get("is_needs_rebase"))
+                        and s2_idle_s >= IDLE_AMBER_THRESHOLD_SECONDS
+                    )
+                    s2_suffix_plain = f"·S2:{s2_short}"
+
                 dot_code = (
                     "1;33"
-                    if is_human_pr
+                    if (is_human_pr or is_amber_pill or s2_is_amber)
                     else ("1;31" if is_stalled else ("1;35" if (is_esc or is_needs_rebase) else "1;36"))
                 )
                 dot = _color("●", dot_code, color_on)
@@ -2625,9 +2990,17 @@ def render(
                 styled_name = _color(lbl, "1;33" if is_human_pr else ("1;31" if is_stalled else "1"), color_on)
                 occ_styled = _color(f"[{occ}]", "1;36" if occ.startswith("2/") else "2", color_on)
                 tag_code = "1;33" if is_human_pr else ("1;35" if (is_stalled or is_needs_rebase) else "2")
+                pill_inner = _color(f"({base_tag}", tag_code, color_on)
+                if is_amber_pill and lp_idle_lbl:
+                    pill_inner += _color(f" · idle {lp_idle_lbl}", "1;33", color_on)
+                if s2_suffix_plain:
+                    pill_inner += _color(s2_suffix_plain, tag_code, color_on)
+                    if s2_is_amber and s2_idle_lbl:
+                        pill_inner += _color(f" · idle {s2_idle_lbl}", "1;33", color_on)
+                pill_inner += _color(")", tag_code, color_on)
                 repo_pills.append(
                     f"{dot} {_osc8_link(styled_name, repo_u, use_osc8)} "
-                    f"{occ_styled} {_color(f'({tag})', tag_code, color_on)}"
+                    f"{occ_styled} {pill_inner}"
                 )
             else:
                 dot = _color("○", "0;32", color_on)
@@ -2659,9 +3032,17 @@ def render(
                     "active_row_lines": [],
                     "middle_row_lines": [],
                     "sticky_footer_lines": sticky_empty,
+                    "row_records": [],
+                    "hitl_count": 0,
                     "all_pr_links": [],
                     "has_active_work": has_active_work,
                     "active_locks": dict(locks),
+                    "all_locks": dict(all_locks),
+                    "items_snapshot": list(effective_items),
+                    "repo_local_dirs": dict(repo_local_dirs),
+                    "color_on": color_on,
+                    "use_osc8": use_osc8,
+                    "bar_w": bar_w,
                 }
             )
         board_path = _resolve_board_artifact_path(state_dir, getattr(args, "write_board", ""))
@@ -2689,8 +3070,8 @@ def render(
         11,
         *(len(_STATUS_STYLES.get(es, ("0", es.upper()))[1]) for es in row_eff_statuses),
     )
-    prog_col = 20 if bar_w >= 112 else 15
-    repo_col = 19 if bar_w >= 112 else 14
+    prog_col = 21 if bar_w >= 116 else (20 if bar_w >= 108 else 16)
+    repo_col = 24 if bar_w >= 160 else (19 if bar_w >= 112 else 14)
     link_col = 9
     fixed = 2 + 1 + 4 + 2 + status_col + 2 + prog_col + 2 + repo_col + 2 + 8 + 2 + 2 + link_col
     title_col = max(14, bar_w - fixed)
@@ -2704,6 +3085,7 @@ def render(
     active_row_lines: list[str] = []
     middle_row_lines: list[str] = []
     sticky_footer_lines: list[str] = []
+    row_records: list[dict[str, Any]] = []
     row_links: dict[int, tuple[str, str]] = {}
     hitl_convs: dict[int, tuple[str, str, str]] = {}
     first_pr_link: tuple[str, str] | None = None
@@ -2741,14 +3123,17 @@ def render(
             lock_progress_cache,
             git_state,
             is_human_pr=is_human_pr,
+            now_ts=now_ts_override,
         )
         prog_cell = _render_inline_progress(prog, prog_col, color_on)
         if prog and str(prog.get("mode") or "") in ("pr_part", "pr_final"):
             total_r = int(prog.get("total_repos") or 1)  # type: ignore[arg-type]
             part_i = int(prog.get("part_idx") or 1)  # type: ignore[arg-type]
-            prog_md = f"PR {part_i}/{total_r} listo" if total_r > 1 else "PR listo"
+            prog_md = f"PR {part_i}/{total_r} ready" if total_r > 1 else "PR ready"
         elif prog and str(prog.get("mode") or "") == "stalled":
             prog_md = str(prog.get("tag") or "STALL")
+        elif prog and str(prog.get("mode") or "") == "partial_pending":
+            prog_md = f"{prog.get('tag', '1/2 merged')} ({int(prog.get('pct') or 0)}%)"  # type: ignore[arg-type]
         else:
             prog_md = f"{int(prog['pct'])}% {prog.get('tag', '')}".strip() if prog else "—"  # type: ignore[arg-type]
         action_md = "—"
@@ -2773,14 +3158,14 @@ def render(
                     for r in repo_slugs_list
                     if r not in merged_set and r != target_slug
                 ]
-                unlock_txt = f" · desbloquea {', '.join(remaining_lbls)}" if remaining_lbls else ""
-                part_meta = f" · parte {part_idx}/{len(repo_slugs_list)}{unlock_txt}"
+                unlock_txt = f" · unlocks {', '.join(remaining_lbls)}" if remaining_lbls else ""
+                part_meta = f" · part {part_idx}/{len(repo_slugs_list)}{unlock_txt}"
             ready_pr_footer.append((idx, repo_lbl, cid_disp, clean_u, full_u, part_meta, has_body))
             pill_raw = f"[{idx}] PR" if idx <= 9 else "[↗ PR]"
             pill_styled = _color(pill_raw, "1;33", color_on)
             action_cell = _pad_visible(_osc8_link(pill_styled, full_u, use_osc8), link_col)
             md_pr_u = _escape_md_url(full_u) or clean_u
-            action_md = f"[Abrir PR]({md_pr_u})"
+            action_md = f"[Open PR]({md_pr_u})"
             if cid_full in ag_titles:
                 action_md += f" · [Chat](conversation://{cid_full})"
         elif link_kind in ("Sync", "Stale"):
@@ -2795,7 +3180,7 @@ def render(
             pill_raw = f"[h{hitl_idx}] Agy"
             pill_styled = _color(pill_raw, "1;35", color_on)
             action_cell = _pad_visible(pill_styled, link_col)
-            action_md = f"[Abrir chat](conversation://{cid_full})" if _is_uuid(cid_full) else "—"
+            action_md = f"[Open chat](conversation://{cid_full})" if _is_uuid(cid_full) else "—"
             prop_mds: list[Path] = []
             seen_prop_names: set[str] = set()
             for b_root in resolved_brain_roots:
@@ -2829,18 +3214,62 @@ def render(
             if cid_full in ag_titles:
                 action_md = f"[Chat](conversation://{cid_full})"
 
+        clean_title_flat = " ".join(title.split())
         row_line = (
             f"{idx:>2} {prio:>4}  {_status_badge(st, color_on, width=status_col)}  {prog_cell}  "
-            f"{repos_str:<{repo_col}}  {_color(f'{cid_disp:<8}', '36', color_on)}  "
-            f"{_trunc(' '.join(title.split()), title_col):<{title_col}}  {action_cell}"
+            f"{_pad_visible(repos_str, repo_col)}  {_color(_pad_visible(cid_disp, 8), '36', color_on)}  "
+            f"{_pad_visible(_trunc(clean_title_flat, title_col), title_col)}  {action_cell}"
         )
-        if (
+        is_active_band = (
             st_lower in ("pr_open", "in_progress", "ready_awaiting_base_merge", "needs_rebase_reverify")
             or bool(locks_by_cid.get(cid_full))
-        ):
+        )
+        if is_active_band:
             active_row_lines.append(row_line)
         else:
             middle_row_lines.append(row_line)
+
+        item_lock_records: list[dict[str, Any]] = []
+        for l_slug, l_dict in locks_by_cid.get(cid_full, []):
+            l_prog = lock_progress_cache.get(_slot_progress_cache_key(l_slug, l_dict)) or {}
+            item_lock_records.append(
+                {
+                    "repo_slug": l_slug,
+                    "slot_id": int(l_dict.get("slot_id") or 1),
+                    "status": str(l_dict.get("status") or ""),
+                    "branch_name": str(l_dict.get("branch_name") or ""),
+                    "worktree_path": str(l_dict.get("worktree_path") or ""),
+                    **_extract_lock_telemetry_fields(l_prog, l_dict),
+                }
+            )
+        search_blob = " ".join(
+            [
+                cid_full,
+                cid_disp,
+                st_lower,
+                clean_title_flat,
+                ag_titles.get(cid_full, ""),
+                " ".join(repo_slugs_list),
+                " ".join(str(b) for b in (it.get("branch_names") or [])),
+                str(it.get("notes") or ""),
+            ]
+        ).lower()
+        row_records.append(
+            {
+                "idx": idx,
+                "band": "active" if is_active_band else "middle",
+                "raw_line": row_line,
+                "item": dict(it),
+                "effective_status": st,
+                "display_id": cid_disp,
+                "sidebar_title": ag_titles.get(cid_full, ""),
+                "repos_str": repos_str,
+                "progress": prog,
+                "linked_locks": item_lock_records,
+                "pr_url": row_links.get(idx, ("", ""))[1] if is_human_pr else "",
+                "search_blob": search_blob,
+            }
+        )
 
         board_rows.append(
             {
@@ -2865,7 +3294,7 @@ def render(
         )
         for idx, repo_lbl, cid_disp, clean_u, full_u, part_meta, has_body in ready_pr_footer:
             verif_badge = (
-                _color(" [+verificaciones]", "0;32", color_on)
+                _color(" [+verified]", "0;32", color_on)
                 if has_body
                 else _color(" [commit fallback]", "2", color_on)
             )
@@ -2873,7 +3302,12 @@ def render(
                 f"  {_color(f'[{idx}]', '1;33', color_on)} {_color(repo_lbl, '1', color_on)} "
                 f"({cid_disp}{part_meta}){verif_badge}:"
             )
-            sticky_footer_lines.append(_osc8_link(clean_u, full_u, use_osc8))
+            if use_osc8:
+                compact_lbl = _compact_osc8_pr_label(full_u, repo_lbl, max_width=max(32, bar_w - 6))
+                styled_lbl = _color(compact_lbl, "4;36", color_on)
+                sticky_footer_lines.append(f"    {_osc8_link(styled_lbl, full_u, True)}")
+            else:
+                sticky_footer_lines.append(clean_u)
 
     if hitl_footer:
         sticky_footer_lines.append(_color("─" * bar_w, "2", color_on))
@@ -2917,9 +3351,17 @@ def render(
                 "active_row_lines": active_row_lines,
                 "middle_row_lines": middle_row_lines,
                 "sticky_footer_lines": sticky_footer_lines,
+                "row_records": row_records,
+                "hitl_count": len(hitl_convs),
                 "all_pr_links": all_pr_links,
                 "has_active_work": has_active_work,
                 "active_locks": dict(locks),
+                "all_locks": dict(all_locks),
+                "items_snapshot": list(effective_items),
+                "repo_local_dirs": dict(repo_local_dirs),
+                "color_on": color_on,
+                "use_osc8": use_osc8,
+                "bar_w": bar_w,
             }
         )
 
@@ -2942,6 +3384,7 @@ def render(
             force_write=force_board_write,
         )
 
+    _debug_log(debug_on, f"render completed in {(time.perf_counter() - t_start) * 1000.0:.2f}ms")
     return ("\n".join(lines), row_links, hitl_convs, first_pr_link, state_dir, repo_local_dirs)
 
 
@@ -3155,9 +3598,10 @@ def _invoke_queue_doctor(
     sync_git: bool = False,
 ) -> dict[str, Any]:
     """Execute `queue-doctor` in-process (or via `pr_remediator.py` subprocess fallback)."""
-    if _queue_doctor is not None and hasattr(_queue_doctor, "run_queue_doctor"):
+    qd_mod = _get_queue_doctor()
+    if qd_mod is not None and hasattr(qd_mod, "run_queue_doctor"):
         return dict(
-            _queue_doctor.run_queue_doctor(
+            qd_mod.run_queue_doctor(
                 state_dir=state_dir,
                 repos_dir=repos_dir or None,
                 sync_git=sync_git,
@@ -3185,8 +3629,9 @@ def _invoke_queue_doctor(
 
 def _format_doctor_report_text(report: dict[str, Any], *, color: bool) -> str:
     """Format `queue-doctor` report dictionary for terminal display."""
-    if _queue_doctor is not None and hasattr(_queue_doctor, "render_doctor_report"):
-        return str(_queue_doctor.render_doctor_report(report, color=color))
+    qd_mod = _get_queue_doctor()
+    if qd_mod is not None and hasattr(qd_mod, "render_doctor_report"):
+        return str(qd_mod.render_doctor_report(report, color=color))
     return json.dumps(report, indent=2, ensure_ascii=False)
 
 
@@ -3311,41 +3756,410 @@ def _build_watch_frame(
     )
 
 
-def _parse_watch_key_sequence(raw: str) -> str:
-    """Normalize raw cbreak key bytes, preserving case for `O`/`R` and recognizing ANSI arrow keys."""
+def _parse_watch_key_sequence(raw: str, *, raw_mode: bool = False) -> str:
+    """Normalize raw cbreak key bytes, recognizing arrows, PgUp/PgDn, Home/End, Enter, Backspace, and Ctrl+L."""
     if not raw:
         return ""
+    if raw in ("\r", "\n"):
+        return "ENTER"
+    if raw in ("\x7f", "\x08"):
+        return "BACKSPACE"
+    if raw == "\x0c":
+        return "CTRL_L"
     if raw.startswith(("\x1b[A", "\x1bOA")):
         return "UP"
     if raw.startswith(("\x1b[B", "\x1bOB")):
         return "DOWN"
+    if raw.startswith("\x1b[5~"):
+        return "PGUP"
+    if raw.startswith("\x1b[6~"):
+        return "PGDN"
+    if raw.startswith(("\x1b[H", "\x1bOH", "\x1b[1~", "\x1b[7~")):
+        return "HOME"
+    if raw.startswith(("\x1b[F", "\x1bOF", "\x1b[4~", "\x1b[8~")):
+        return "END"
     if raw.startswith("\x1b"):
         return "ESC"
     first = raw[0]
-    if first in ("O", "R"):
+    if raw_mode:
+        return first
+    if first in ("O", "R", "G"):
         return first
     return first.lower()
 
 
-def _read_watch_key(tty_fd: int) -> str:
-    """Read a single logical keystroke or ANSI arrow sequence from `tty_fd` without dropping typeahead."""
-    raw_first = os.read(tty_fd, 1)
+_TTY_PUSHBACK_BYTES: dict[int, bytearray] = {}
+
+
+def _has_tty_pushback(tty_fd: int | None) -> bool:
+    return bool(tty_fd is not None and _TTY_PUSHBACK_BYTES.get(tty_fd))
+
+
+def _read_tty_byte(tty_fd: int) -> bytes:
+    buf = _TTY_PUSHBACK_BYTES.get(tty_fd)
+    if buf:
+        b = bytes([buf.pop(0)])
+        if not buf:
+            _TTY_PUSHBACK_BYTES.pop(tty_fd, None)
+        return b
+    return os.read(tty_fd, 1)
+
+
+def _unread_tty_byte(tty_fd: int, b: bytes) -> None:
+    if b:
+        _TTY_PUSHBACK_BYTES.setdefault(tty_fd, bytearray()).extend(b)
+
+
+def _read_watch_key(tty_fd: int, *, raw_mode: bool = False) -> str:
+    """Read a single logical keystroke or CSI escape sequence from `tty_fd` without eating typeahead."""
+    raw_first = _read_tty_byte(tty_fd)
     if not raw_first:
         return ""
     if raw_first == b"\x1b":
-        extra = b""
+        seq = bytearray(raw_first)
         with contextlib.suppress(InterruptedError, OSError):
-            ready_tail, _, _ = select.select([tty_fd], [], [], 0.015)
-            if ready_tail:
-                extra = os.read(tty_fd, 4)
-        return _parse_watch_key_sequence((raw_first + extra).decode("utf-8", errors="ignore"))
-    return _parse_watch_key_sequence(raw_first.decode("utf-8", errors="ignore"))
+            has_next = _has_tty_pushback(tty_fd) or bool(select.select([tty_fd], [], [], 0.015)[0])
+            if has_next:
+                b2 = _read_tty_byte(tty_fd)
+                if b2 in (b"[", b"O"):
+                    seq.extend(b2)
+                    for _ in range(6):
+                        has_csi = _has_tty_pushback(tty_fd) or bool(select.select([tty_fd], [], [], 0.01)[0])
+                        if not has_csi:
+                            break
+                        ch = _read_tty_byte(tty_fd)
+                        if not ch:
+                            break
+                        seq.extend(ch)
+                        if 0x40 <= ch[0] <= 0x7E:
+                            break
+                elif b2:
+                    _unread_tty_byte(tty_fd, b2)
+        return _parse_watch_key_sequence(seq.decode("utf-8", errors="ignore"), raw_mode=raw_mode)
+    if raw_first[0] >= 0xC0:
+        utf_seq = bytearray(raw_first)
+        needed = 1 if raw_first[0] < 0xE0 else (2 if raw_first[0] < 0xF0 else 3)
+        for _ in range(needed):
+            with contextlib.suppress(InterruptedError, OSError):
+                if _has_tty_pushback(tty_fd) or select.select([tty_fd], [], [], 0.01)[0]:
+                    utf_seq.extend(_read_tty_byte(tty_fd))
+        return _parse_watch_key_sequence(utf_seq.decode("utf-8", errors="ignore"), raw_mode=raw_mode)
+    return _parse_watch_key_sequence(raw_first.decode("utf-8", errors="ignore"), raw_mode=raw_mode)
+
+
+def _mark_cursor_on_row_line(line: str, color_on: bool) -> str:
+    """Inject a zero-width-delta `▸` cursor marker right after the 2-char `#` index column."""
+    if len(line) >= 3 and line[2] == " ":
+        marker = _color("▸", "1;36", color_on)
+        return f"{line[:2]}{marker}{line[3:]}"
+    return line
+
+
+def _apply_live_filter_and_cursor(
+    row_records: list[dict[str, Any]],
+    *,
+    live_filter: str,
+    cursor_idx: int,
+    compact_pending: bool,
+    color_on: bool,
+) -> tuple[list[str], list[str], list[dict[str, Any]], int]:
+    """Filter captured `row_records` in `<1ms` pure memory and mark `cursor_idx` without disk/Git I/O."""
+    q = (live_filter or "").strip().lower()
+    matched = [r for r in row_records if (not q or q in str(r.get("search_blob") or ""))]
+    active_recs = [r for r in matched if r.get("band") == "active"]
+    middle_recs = [r for r in matched if r.get("band") != "active"]
+    if compact_pending:
+        kept_mid: list[dict[str, Any]] = []
+        pend_seen = 0
+        for mr in middle_recs:
+            eff_u = str(mr.get("effective_status") or "").upper()
+            if eff_u == "HITL_BLOCK":
+                kept_mid.append(mr)
+            elif eff_u == "PENDING":
+                if pend_seen < 3:
+                    kept_mid.append(mr)
+                    pend_seen += 1
+            else:
+                kept_mid.append(mr)
+        nav_middle_recs = kept_mid
+    else:
+        nav_middle_recs = middle_recs
+
+    nav_records = [*active_recs, *nav_middle_recs]
+    if not nav_records:
+        return ([], [], [], 0)
+
+    eff_cursor = max(0, min(int(cursor_idx), len(nav_records) - 1))
+    selected_obj_id = id(nav_records[eff_cursor])
+
+    act_lines = [
+        _mark_cursor_on_row_line(str(r["raw_line"]), color_on) if id(r) == selected_obj_id else str(r["raw_line"])
+        for r in active_recs
+    ]
+    mid_lines = [
+        _mark_cursor_on_row_line(str(r["raw_line"]), color_on) if id(r) == selected_obj_id else str(r["raw_line"])
+        for r in middle_recs
+    ]
+    return (act_lines, mid_lines, nav_records, eff_cursor)
+
+
+def _render_detail_inspector_lines(
+    rec: dict[str, Any] | None,
+    term_w: int,
+    color_on: bool,
+    use_osc8: bool,
+) -> list[str]:
+    """Render pure in-memory `[Enter]` Detail Inspector panel exposing item & live worker/reviewer telemetry."""
+    bar_w = min(max(78, term_w), 220)
+    lines: list[str] = [
+        _color("═" * bar_w, "2;36", color_on),
+        f"{_color('ITEM DETAIL INSPECTOR', '1;36', color_on)}  "
+        f"{_color('([Enter]/[Esc] close · [j/k/PgUp/PgDn] scroll · [o] open PR)', '2', color_on)}",
+        _color("─" * bar_w, "2", color_on),
+    ]
+    if not rec:
+        lines.append(_color("  No queue item selected.", "2", color_on))
+        lines.append(_color("═" * bar_w, "2;36", color_on))
+        return lines
+
+    it = rec.get("item") if isinstance(rec.get("item"), dict) else {}
+    cid = str(it.get("conversation_id") or "")
+    eff_st = str(rec.get("effective_status") or it.get("status") or "pending").upper()
+    raw_st = str(it.get("status") or "pending").upper()
+    prio = it.get("priority", 99)
+    eff_prio = it.get("effective_priority", prio)
+    inh_from = str(it.get("inherited_priority_from") or "").strip()
+    prio_str = f"P{prio}" + (f" (effective P{eff_prio} via {inh_from[:8]})" if eff_prio != prio or inh_from else "")
+
+    lines.append(f"  {_color('ID:', '1', color_on)}           {cid}")
+    if rec.get("sidebar_title"):
+        lines.append(f"  {_color('Sidebar:', '1', color_on)}      {rec['sidebar_title']}")
+    lines.append(f"  {_color('Title:', '1', color_on)}        {it.get('title') or '-'}")
+    st_txt = eff_st if eff_st == raw_st else f"{eff_st} (queue: {raw_st})"
+    lines.append(f"  {_color('Status:', '1', color_on)}       {st_txt}  ·  {_color('Priority:', '1', color_on)} {prio_str}")
+
+    repos = [str(r) for r in (it.get("repo_slugs") or []) if r]
+    merged = [str(r) for r in (it.get("merged_repos") or []) if r]
+    lines.append(f"  {_color('Target Repos:', '1', color_on)} {', '.join(repos) if repos else '-'}")
+    lines.append(f"  {_color('Merged Repos:', '1', color_on)} {', '.join(merged) if merged else 'none'}")
+
+    deps = [str(d) for d in (it.get("depends_on") or []) if str(d).strip()]
+    if deps:
+        lines.append(f"  {_color('Depends On:', '1', color_on)}   {', '.join(deps)}")
+    branches = [str(b) for b in (it.get("branch_names") or []) if str(b).strip()]
+    if branches:
+        lines.append(f"  {_color('Branches:', '1', color_on)}     {', '.join(branches)}")
+
+    linked_locks = rec.get("linked_locks") if isinstance(rec.get("linked_locks"), list) else []
+    lines.append(_color("─" * bar_w, "2", color_on))
+    lines.append(_color("  LIVE LOCK & WORKER TELEMETRY:", "1;33", color_on))
+    if linked_locks:
+        for lk_rec in linked_locks:
+            idle_s = int(lk_rec.get("idle_seconds") or 0)
+            idle_l = str(lk_rec.get("idle_label") or "0s")
+            elap_s = int(lk_rec.get("elapsed_seconds") or 0)
+            elap_l = str(lk_rec.get("elapsed_label") or "0s")
+            src = str(lk_rec.get("last_activity_source") or "none")
+            stg = str(lk_rec.get("stage_label") or "-")
+            w_cid = str(lk_rec.get("worker_cid") or "-")
+            r_cid = str(lk_rec.get("reviewer_subagent_id") or "-")
+            idle_state = str(lk_rec.get("idle_state") or "")
+            sem_code = "1;31" if lk_rec.get("is_stalled") else ("1;33" if idle_state == "amber" else "0;32")
+            sem_lbl = (
+                f"STALL {idle_l} ({idle_s}s)"
+                if lk_rec.get("is_stalled")
+                else (f"idle {idle_l} ({idle_s}s)" if idle_state == "amber" else f"ok·{idle_l} ({idle_s}s)")
+            )
+            lines.append(
+                f"    • {_color(str(lk_rec.get('repo_slug') or ''), '1', color_on)} "
+                f"[Slot #{lk_rec.get('slot_id', 1)}] status={lk_rec.get('status') or '-'}"
+            )
+            lines.append(
+                f"      inactivity={_color(sem_lbl, sem_code, color_on)}  ·  "
+                f"elapsed={elap_l} ({elap_s}s)  ·  source={src}  ·  stage={stg}"
+            )
+            lines.append(f"      worker_cid={w_cid}  ·  reviewer_subagent_id={r_cid}")
+            if lk_rec.get("worktree_path"):
+                lines.append(f"      worktree={lk_rec['worktree_path']}")
+    else:
+        lines.append(_color("    No active repository lock linked to this item.", "2", color_on))
+
+    tfiles = [str(f) for f in (it.get("target_files") or []) if str(f).strip()]
+    if tfiles:
+        lines.append(_color("─" * bar_w, "2", color_on))
+        lines.append(_color(f"  TARGET FILES ({len(tfiles)}):", "1", color_on))
+        for tf in tfiles[:12]:
+            lines.append(f"    - {tf}")
+        if len(tfiles) > 12:
+            lines.append(f"    … (+{len(tfiles) - 12} more)")
+
+    for label_hdr, field_key in (("RCA / RATIONALE", "rca_summary"), ("PROPOSED FIX", "proposed_fix"), ("NOTES", "notes")):
+        val = str(it.get(field_key) or "").strip()
+        if val:
+            lines.append(_color("─" * bar_w, "2", color_on))
+            lines.append(_color(f"  {label_hdr}:", "1", color_on))
+            lines.append(f"    {_trunc(' '.join(val.split()), max(40, bar_w - 6))}")
+
+    pr_u = str(rec.get("pr_url") or "").strip()
+    if pr_u:
+        lines.append(_color("─" * bar_w, "2", color_on))
+        lines.append(_color("  VERIFIED PR LINK:", "1;32", color_on))
+        disp_u = _compact_osc8_pr_label(pr_u, max_width=max(40, bar_w - 6)) if use_osc8 else (_clean_clickable_url(pr_u) or pr_u)
+        lines.append(f"    {_osc8_link(disp_u, pr_u, use_osc8)}")
+
+    lines.append(_color("═" * bar_w, "2;36", color_on))
+    return lines
+
+
+def _render_optimizer_overlay_lines(
+    analysis: dict[str, Any],
+    term_w: int,
+    color_on: bool,
+) -> list[str]:
+    """Render human-readable `queue-optimize` findings for `[x]` overlay and `agy-queue optimize`."""
+    bar_w = min(max(78, term_w), 220)
+    score = int(analysis.get("health_score") if analysis.get("health_score") is not None else 100)
+    findings = analysis.get("findings") if isinstance(analysis.get("findings"), list) else []
+    score_code = "1;32" if score >= 90 else ("1;33" if score >= 70 else "1;31")
+    lines: list[str] = [
+        _color("═" * bar_w, "2;36", color_on),
+        f"{_color('DEV FLOW OPTIMIZER', '1;36', color_on)}  "
+        f"health={_color(f'{score}/100', score_code, color_on)}  "
+        f"findings={len(findings)}",
+        _color("─" * bar_w, "2", color_on),
+    ]
+    if not findings:
+        lines.append(_color("  ✓ Zero workflow bottlenecks detected — queue flow is healthy.", "0;32", color_on))
+    else:
+        sev_colors = {"critical": "1;31", "high": "1;33", "medium": "1;36", "low": "2"}
+        for idx, f in enumerate(findings, 1):
+            if not isinstance(f, dict):
+                continue
+            sev = str(f.get("severity") or "low").lower()
+            sev_badge = _color(f"[{sev.upper()}]", sev_colors.get(sev, "0"), color_on)
+            title = str(f.get("title") or f.get("code") or "")
+            sav = int(f.get("estimated_savings_min") or 0)
+            sav_txt = f" (~{sav}m saved)" if sav > 0 and f"~{sav}m" not in title else ""
+            lines.append(f"  {idx}. {sev_badge} {_color(title + sav_txt, '1', color_on)}")
+            rec_txt = str(f.get("recommendation") or "").strip()
+            if rec_txt:
+                lines.append(f"     {_trunc(rec_txt, max(40, bar_w - 6))}")
+            hint = str(f.get("auto_action_hint") or "").strip()
+            if hint:
+                lines.append(f"     {_color('→ ' + _trunc(hint, max(40, bar_w - 8)), '2;36', color_on)}")
+    lines.append(_color("═" * bar_w, "2;36", color_on))
+    return lines
+
+
+def _render_help_overlay_lines(term_w: int, color_on: bool) -> list[str]:
+    """Render `[?]` hotkey & inactivity semaphore reference overlay."""
+    bar_w = min(max(78, term_w), 220)
+    return [
+        _color("═" * bar_w, "2;36", color_on),
+        f"{_color('AGY-QUEUE INTERACTIVE HELP & SEMAPHORE LEGEND', '1;36', color_on)}  "
+        f"{_color('([?]/[Esc]/[Enter] close)', '2', color_on)}",
+        _color("─" * bar_w, "2", color_on),
+        _color("  NAVIGATION & INSPECTOR (<1ms zero-I/O viewport repaint):", "1;33", color_on),
+        "    j / ↓ · k / ↑     Move row cursor down / up (auto-scrolls pending queue)",
+        "    PgDn / PgUp       Page down / up across long queues or overlays",
+        "    g / Home · G / End Jump to first / last queue row",
+        "    Enter             Open Detail Inspector (worker/reviewer IDs, idle/elapsed/source, files, RCA)",
+        "    /                 Live substring filter across ID, repo, status, branch, and title (Esc clears)",
+        "    x                 Toggle 0-LLM Dev Flow Optimizer view",
+        "    Ctrl+L            Force full terminal clear and viewport redraw",
+        _color("─" * bar_w, "2", color_on),
+        _color("  ACTIONS & TOGGLES:", "1;33", color_on),
+        "    o / O / 1-9       Open first ready PR / all ready PRs / row #N link in default browser",
+        "    h + 1-9           Copy exact HITL conversation sidebar title & focus Antigravity Desktop",
+        "    d                 Run interactive agy-doctor check ([w] wake · [f] safe fix)",
+        "    p / a             Toggle [compact] pending rows (<=3) / [all] inactive items",
+        "    s / b             Trigger async background Git fetch+reconcile / force-sync board.md",
+        "    r / R / q         Refresh snapshot / safe syntax-checked reload / quit",
+        _color("─" * bar_w, "2", color_on),
+        _color("  LIVE INACTIVITY SEMAPHORE (DEVELOPING · NEEDS_REVISION_ITERATING · AWAITING_AGENT_REVIEW):", "1;33", color_on),
+        f"    {_color('ok·<idle>', '0;32', color_on)}       Active (<3m since newest worker/reviewer transcript, worktree, or heartbeat)",
+        f"    {_color('idle <idle>', '1;33', color_on)}     Early inactivity warning (3m–14m; highlighted in row + REPOS pill)",
+        f"    {_color('STALL <idle>', '1;35', color_on)}    Stalled (>=15m default AGY_DEV_STALL_THRESHOLD_SECONDS; triggers alert)",
+        _color("═" * bar_w, "2;36", color_on),
+    ]
+
+
+def _build_watch_footer(
+    *,
+    interval: float,
+    hitl_count: int,
+    compact_pending: bool,
+    show_all: bool,
+    live_filter: str,
+    filter_input_active: bool,
+    overlay_mode: str,
+    awaiting_hitl_digit: bool,
+    sync_in_flight: bool,
+    status_msg: str,
+) -> str:
+    """Compose compact 1-line watch footer with conditional `[h+#]` and persistent toggle badges."""
+    if filter_input_active:
+        return f"Filter: {live_filter}█  ([Enter] apply · [Esc] clear · [Backspace] edit)"
+    if awaiting_hitl_digit:
+        return "Press HITL number [1-9] -> copy exact title & focus Antigravity App (Esc cancels)…"
+    if overlay_mode in ("detail", "optimizer", "help"):
+        return f"[{overlay_mode.upper()}]  [j/k/PgUp/PgDn/g/G] scroll · [Esc/Enter] back to queue · [q] close"
+
+    toggles: list[str] = []
+    if compact_pending:
+        toggles.append("[compact]")
+    if show_all:
+        toggles.append("[all]")
+    if live_filter:
+        toggles.append(f"[filter:{_trunc(live_filter, 16)}]")
+    toggle_prefix = (" ".join(toggles) + "  ") if toggles else ""
+
+    hitl_seg = " · [h+#] Agy" if hitl_count > 0 else ""
+    core_keys = (
+        f"[Enter] inspect · [o/O] PR · [1-9] open{hitl_seg} · [/] filter · [d] doctor · "
+        f"[x] opt · [j/k] scroll · [p] compact · [a] all · [s] sync · [?] help · [R] reload · [q] quit"
+    )
+    if sync_in_flight and (not status_msg or status_msg == "↻ Syncing…"):
+        return f"↻ Syncing…  |  {toggle_prefix}{core_keys}"
+    if status_msg:
+        return f"{status_msg}  |  {toggle_prefix}{core_keys}"
+    return f"{toggle_prefix}{core_keys} ({interval:g}s)"
+
+
+def _normalize_status_arg(raw: str) -> str:
+    val = str(raw or "").strip().lower()
+    if not val:
+        return ""
+    if val not in VALID_QUEUE_STATUSES:
+        valid_str = ", ".join(VALID_QUEUE_STATUSES)
+        raise argparse.ArgumentTypeError(f"invalid status {raw!r} (choose from: {valid_str})")
+    return val
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    epilog_txt = (
+        "Unified subcommands:\n"
+        "  agy-queue                     Render live multi-repo queue dashboard\n"
+        "  agy-queue watch [SECS]        Flicker-free interactive TUI (--watch)\n"
+        "  agy-queue doctor [FLAGS]      Run 0-LLM orchestrator doctor (--fix/--wake/--heal)\n"
+        "  agy-queue optimize [FLAGS]    Run 0-LLM dev flow bottleneck analyzer\n"
+        "  agy-queue sync [FLAGS]        Fetch origin refs & reconcile merged PRs\n"
+        "  agy-queue list [FLAGS]        List filtered queue items (--status/--repo/--json)\n"
+        "  agy-queue show <ID> [FLAGS]   Inspect single item + live worker/reviewer telemetry\n"
+        "  agy-queue locks [FLAGS]       Inspect per-repo dev_pr_locks & stall semaphore\n"
+        "  agy-queue set-status <ID> <S> Transition queue item status cleanly\n"
+    )
     parser = argparse.ArgumentParser(
         prog="agy-queue",
-        description="Compact zero-hardcode TUI for Antigravity multi-repo dev_queue.json and dev_pr_locks.",
+        description="Compact zero-hardcode CLI & TUI for Antigravity multi-repo dev_queue.json and dev_pr_locks.",
+        epilog=epilog_txt,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {_resolve_cli_version()}",
     )
     parser.add_argument(
         "-w",
@@ -3354,7 +4168,7 @@ def _build_parser() -> argparse.ArgumentParser:
         const=3.0,
         type=float,
         metavar="SECS",
-        help="Auto-refresh dashboard in place every N seconds (default: 3).",
+        help="Auto-refresh dashboard in place every N seconds (default: 3; emits NDJSON with --json).",
     )
     parser.add_argument(
         "-a",
@@ -3363,11 +4177,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Include merged, cleaned, cancelled, and rejected items.",
     )
     parser.add_argument("-r", "--repo", default="", help="Filter by repository substring.")
-    parser.add_argument("-s", "--status", default="", help="Filter by exact status.")
+    parser.add_argument(
+        "-s",
+        "--status",
+        default="",
+        type=_normalize_status_arg,
+        metavar="STATUS",
+        help=f"Filter by exact status ({', '.join(VALID_QUEUE_STATUSES)}).",
+    )
     parser.add_argument(
         "--sync",
         action="store_true",
-        help="Fetch origin refs across managed repos and reconcile merged PRs (offline-safe when AGY_OFFLINE_ONLY=1).",
+        help="Fetch origin refs across managed repos and reconcile merged PRs (status written to stderr).",
     )
     parser.add_argument(
         "--sync-interval",
@@ -3398,9 +4219,66 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repos-dir", default="", help="Optional local parent directory to scan for managed git repos.")
     parser.add_argument("--plain-urls", action="store_true", help="Disable OSC-8 hyperlink escape sequences.")
     parser.add_argument("--no-opt", dest="no_opt", action="store_true", help="Hide compact OPT: flow-optimizer footer hint.")
-    parser.add_argument("--json", action="store_true", help="Output raw JSON.")
-    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color sequences.")
+    parser.add_argument("--json", action="store_true", help="Output structured JSON (NDJSON stream when combined with --watch).")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color sequences (also honors NO_COLOR and TERM=dumb).")
+    parser.add_argument("--debug", action="store_true", help="Emit diagnostic timing and tracebacks to stderr.")
     return parser
+
+
+def _run_watch_json_ndjson_loop(
+    args: argparse.Namespace,
+    *,
+    stream: TextIO | None = None,
+    max_iterations: int | None = None,
+) -> int:
+    """Emit newline-delimited JSON (`NDJSON`) snapshots with `schema_version` for `--watch --json`."""
+    out_stream = stream if stream is not None else sys.stdout
+    interval = max(0.05, float(args.watch if args.watch is not None else 3.0))
+    repo_cache: dict[str, Any] = {"ttl": 60.0}
+    stop = False
+
+    def _handle_stop(_signum: int, _frame: object) -> None:
+        nonlocal stop
+        stop = True
+
+    prev_sigterm: Any = None
+    sigterm_installed = False
+    with contextlib.suppress(ValueError, OSError):
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, _handle_stop)
+        sigterm_installed = True
+
+    seq = 0
+    try:
+        while not stop:
+            seq += 1
+            line_json, _, _, _, st_dir, _ = render(
+                args,
+                is_tty_override=False,
+                repo_cache=repo_cache,
+                ndjson_compact=True,
+                ndjson_seq=seq,
+            )
+            out_stream.write(line_json + "\n")
+            out_stream.flush()
+            if max_iterations is not None and seq >= max_iterations:
+                break
+            locks_cur, _ = _load_locks(st_dir)
+            fp_base = _snapshot_state_fingerprint(st_dir, locks_cur)
+            deadline = time.monotonic() + interval
+            while not stop and time.monotonic() < deadline:
+                if _snapshot_state_fingerprint(st_dir, locks_cur) != fp_base:
+                    break
+                time.sleep(max(0.02, min(0.15, deadline - time.monotonic())))
+    except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:
+        return _silence_broken_pipe_stdout()
+    finally:
+        if sigterm_installed and prev_sigterm is not None:
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(signal.SIGTERM, prev_sigterm)
+    return 0
 
 
 def run_watch_loop(
@@ -3418,7 +4296,10 @@ def run_watch_loop(
     sync_fn: Callable[[Path, dict[str, Path]], str] | None = None,
     raw_argv: list[str] | None = None,
 ) -> int:
-    """Run flicker-free alternate-screen watch mode with auto-reload, async sync, and sticky footers."""
+    """Run flicker-free watch mode separating snapshot I/O from `<1ms` pure viewport repaints & overlays."""
+    if getattr(args, "json", False):
+        return _run_watch_json_ndjson_loop(args, stream=stream, max_iterations=max_iterations)
+
     out_stream = stream if stream is not None else sys.stdout
     stop = False
     sigwinch_received = False
@@ -3450,7 +4331,11 @@ def run_watch_loop(
     interval = max(0.05, float(args.watch if args.watch is not None else 3.0))
     sync_interval = float(getattr(args, "sync_interval", 30.0))
     no_auto_sync = bool(getattr(args, "no_auto_sync", False))
-    use_tty = bool(getattr(out_stream, "isatty", lambda: False)()) if use_tty_override is None else bool(use_tty_override)
+    use_tty = (
+        (bool(getattr(out_stream, "isatty", lambda: False)()) and not _is_dumb_terminal())
+        if use_tty_override is None
+        else bool(use_tty_override)
+    )
     tty_fd: int | None = None
     owns_tty_fd = False
     orig_termios: Any = None
@@ -3496,13 +4381,21 @@ def run_watch_loop(
         status_until = time.monotonic() + 4.0
 
     awaiting_hitl_digit = False
+    filter_input_active = False
+    live_filter = ""
+    overlay_mode = ""  # "" | "detail" | "optimizer" | "help"
+    overlay_scroll = 0
+    cached_opt_analysis: dict[str, Any] | None = None
+    force_clear_screen = False
+    cursor_idx = 0
     scroll_offset = 0
     max_scroll_offset = 0
     compact_pending = False
     iterations = 0
     terminal_cleaned = False
+    data_dirty = True
 
-    st_dir = _resolve_state_dir(args.state_dir)
+    st_dir = _resolve_state_dir(getattr(args, "state_dir", ""))
     local_dirs: dict[str, Path] = {}
     row_links: dict[int, tuple[str, str]] = {}
     hitl_convs: dict[int, tuple[str, str, str]] = {}
@@ -3510,8 +4403,12 @@ def run_watch_loop(
     all_pr_links: list[tuple[str, str]] = []
     has_active_work = False
     active_locks_map: dict[str, dict[str, Any]] = {}
+    layout_data: dict[str, Any] = {}
+    body_lines: list[str] = []
     last_good_layout: dict[str, Any] = {}
     last_good_body_lines: list[str] = []
+    last_state_fp: tuple[tuple[str, int, int, int], ...] = ()
+    deadline = 0.0
 
     def _cleanup_watch_terminal() -> None:
         nonlocal terminal_cleaned, tty_fd
@@ -3524,6 +4421,8 @@ def run_watch_loop(
         if sigwinch_installed and sigwinch_num is not None and prev_sigwinch is not None:
             with contextlib.suppress(ValueError, OSError):
                 signal.signal(sigwinch_num, prev_sigwinch)
+        if tty_fd is not None:
+            _TTY_PUSHBACK_BYTES.pop(tty_fd, None)
         if tty_fd is not None and owns_tty_fd:
             if orig_termios is not None:
                 with contextlib.suppress(Exception):
@@ -3552,70 +4451,125 @@ def run_watch_loop(
             out_stream.flush()
 
         while not stop:
-            completed_sync_msg = sync_ctrl.consume_result()
-            if completed_sync_msg:
-                status_msg = completed_sync_msg
-                status_until = time.monotonic() + 4.0
+            if data_dirty:
+                completed_sync_msg = sync_ctrl.consume_result()
+                if completed_sync_msg:
+                    status_msg = completed_sync_msg
+                    status_until = time.monotonic() + 4.0
 
-            width_arg = term_size_override[0] if term_size_override is not None else None
-            layout_data: dict[str, Any] = {}
-            sync_badge = sync_ctrl.format_badge()
-            try:
-                out, row_links, hitl_convs, first_pr, st_dir, local_dirs = render(
-                    args,
-                    is_tty_override=use_tty,
-                    term_width_override=width_arg,
-                    layout_out=layout_data,
-                    repo_cache=repo_cache,
-                    sync_status_badge=sync_badge,
-                    strict_io=True,
-                )
-                body_lines = out.splitlines()
-                last_good_body_lines = body_lines
-                if layout_data:
-                    last_good_layout = layout_data
-                    all_pr_links = list(layout_data.get("all_pr_links") or [])
-                    has_active_work = bool(layout_data.get("has_active_work"))
-                    active_locks_map = dict(layout_data.get("active_locks") or {})
-            except (OSError, json.JSONDecodeError, sqlite3.Error) as io_err:
-                err_banner = f"⚠ Transient read error ({io_err.__class__.__name__}) — retrying…"
-                status_msg = err_banner
-                status_until = time.monotonic() + 3.0
-                layout_data = dict(last_good_layout) if last_good_layout else {}
-                body_lines = (
-                    list(last_good_body_lines)
-                    if last_good_body_lines
-                    else [err_banner, f"  {io_err}"]
-                )
+                width_arg = term_size_override[0] if term_size_override is not None else None
+                fresh_layout: dict[str, Any] = {}
+                sync_badge = sync_ctrl.format_badge()
+                pre_render_core_fp = _snapshot_state_fingerprint(st_dir, {})
+                try:
+                    out, row_links, hitl_convs, first_pr, st_dir, local_dirs = render(
+                        args,
+                        is_tty_override=use_tty,
+                        term_width_override=width_arg,
+                        layout_out=fresh_layout,
+                        repo_cache=repo_cache,
+                        sync_status_badge=sync_badge,
+                        strict_io=True,
+                    )
+                    body_lines = out.splitlines()
+                    last_good_body_lines = body_lines
+                    if fresh_layout:
+                        layout_data = fresh_layout
+                        last_good_layout = fresh_layout
+                        all_pr_links = list(fresh_layout.get("all_pr_links") or [])
+                        has_active_work = bool(fresh_layout.get("has_active_work"))
+                        active_locks_map = dict(fresh_layout.get("active_locks") or {})
+                        cached_opt_analysis = None
+                except (OSError, json.JSONDecodeError, sqlite3.Error) as io_err:
+                    err_banner = f"⚠ Transient read error ({io_err.__class__.__name__}) — retrying…"
+                    status_msg = err_banner
+                    status_until = time.monotonic() + 3.0
+                    layout_data = dict(last_good_layout) if last_good_layout else {}
+                    body_lines = (
+                        list(last_good_body_lines)
+                        if last_good_body_lines
+                        else [err_banner, f"  {io_err}"]
+                    )
+                if _snapshot_state_fingerprint(st_dir, {}) != pre_render_core_fp:
+                    # State file mutated while render() was in flight -> force immediate next-tick wakeup
+                    last_state_fp = pre_render_core_fp
+                else:
+                    last_state_fp = _snapshot_state_fingerprint(st_dir, active_locks_map)
+                deadline = time.monotonic() + interval
+                data_dirty = False
 
+            t_paint = time.perf_counter()
             now_mono = time.monotonic()
-            if awaiting_hitl_digit:
-                footer = "Press HITL number [1-9] -> copy exact title & focus Antigravity App (Esc cancels)…"
-            elif sync_ctrl.is_in_flight() and (not status_msg or status_msg == "↻ Syncing…"):
-                footer = "↻ Syncing…  |  [o/O] PR(s) · [1-9] open · [h+#] Agy · [d] doctor · [j/k] scroll · [p] compact · [R] reload · [q] quit"
-            elif status_msg and now_mono < status_until:
-                footer = (
-                    f"{status_msg}  |  [o/O] PR · [1-9] open · [h+#] Agy · [d] doctor · "
-                    f"[j/k] scroll · [p] compact · [s] sync · [R] reload · [q] quit"
-                )
-            else:
+            if status_msg and now_mono >= status_until:
                 status_msg = ""
-                footer = (
-                    f"[o/O] PR(s) · [1-9] open · [h+#] Agy · [d] doctor · [j/k] scroll · [p] compact · "
-                    f"[b] board · [s] sync · [a] all · [R] reload · [q] quit ({interval:g}s)"
-                )
+
+            if term_size_override is not None:
+                cols, rows = term_size_override
+            else:
+                tsize = shutil.get_terminal_size((124, 40))
+                cols, rows = tsize.columns, tsize.lines
+
+            hitl_cnt = int(layout_data.get("hitl_count") or len(hitl_convs))
+            footer = _build_watch_footer(
+                interval=interval,
+                hitl_count=hitl_cnt,
+                compact_pending=compact_pending,
+                show_all=bool(getattr(args, "all", False)),
+                live_filter=live_filter,
+                filter_input_active=filter_input_active,
+                overlay_mode=overlay_mode,
+                awaiting_hitl_digit=awaiting_hitl_digit,
+                sync_in_flight=sync_ctrl.is_in_flight(),
+                status_msg=status_msg,
+            )
+
+            color_on = bool(layout_data.get("color_on", False))
+            use_osc8 = bool(layout_data.get("use_osc8", False))
+            raw_recs = list(layout_data.get("row_records") or [])
+            act_lines, mid_lines, nav_records, cursor_idx = _apply_live_filter_and_cursor(
+                raw_recs,
+                live_filter=live_filter,
+                cursor_idx=cursor_idx,
+                compact_pending=compact_pending,
+                color_on=color_on,
+            )
+            nav_total = len(nav_records)
 
             if use_tty:
-                if term_size_override is not None:
-                    cols, rows = term_size_override
-                else:
-                    tsize = shutil.get_terminal_size((124, 40))
-                    cols, rows = tsize.columns, tsize.lines
-                if layout_data:
+                clear_prefix = "\033[2J\033[H" if force_clear_screen else ""
+                force_clear_screen = False
+                if overlay_mode in ("detail", "optimizer", "help"):
+                    if overlay_mode == "detail":
+                        sel_rec = nav_records[cursor_idx] if (0 <= cursor_idx < nav_total) else None
+                        ov_lines = _render_detail_inspector_lines(sel_rec, cols, color_on, use_osc8)
+                    elif overlay_mode == "optimizer":
+                        if cached_opt_analysis is None:
+                            if _flow_opt is not None and hasattr(_flow_opt, "analyze_dev_flow_optimizations"):
+                                cached_opt_analysis = dict(
+                                    _flow_opt.analyze_dev_flow_optimizations(
+                                        lightweight=True,
+                                        preloaded_items=list(layout_data.get("items_snapshot") or []),
+                                        preloaded_active_locks=dict(layout_data.get("active_locks") or {}),
+                                        preloaded_all_locks=dict(layout_data.get("all_locks") or {}),
+                                        preloaded_repo_dirs=dict(layout_data.get("repo_local_dirs") or {}),
+                                    )
+                                )
+                            else:
+                                cached_opt_analysis = {"health_score": 100, "findings": []}
+                        ov_lines = _render_optimizer_overlay_lines(cached_opt_analysis, cols, color_on)
+                    else:
+                        ov_lines = _render_help_overlay_lines(cols, color_on)
+                    max_ov_scroll = max(0, len(ov_lines) - max(3, rows - 2))
+                    overlay_scroll = max(0, min(overlay_scroll, max_ov_scroll))
+                    sliced_ov = ov_lines[overlay_scroll:]
+                    out_stream.write(clear_prefix + _build_watch_frame(sliced_ov, cols, rows, footer))
+                elif layout_data:
+                    if live_filter and not act_lines and not mid_lines:
+                        mid_lines = [_color(f"  No rows matching filter {live_filter!r} (press Esc to clear).", "2", color_on)]
                     vp_lines, scroll_offset, max_scroll_offset = _compose_priority_viewport_with_meta(
                         layout_data.get("header_lines") or [],
-                        layout_data.get("active_row_lines") or [],
-                        layout_data.get("middle_row_lines") or [],
+                        act_lines,
+                        mid_lines,
                         layout_data.get("sticky_footer_lines") or [],
                         cols,
                         rows,
@@ -3624,28 +4578,35 @@ def run_watch_loop(
                         compact_pending=compact_pending,
                     )
                     out_stream.write(
-                        _build_watch_frame(body_lines, cols, rows, footer, preclamped_lines=vp_lines)
+                        clear_prefix + _build_watch_frame(body_lines, cols, rows, footer, preclamped_lines=vp_lines)
                     )
                 else:
-                    out_stream.write(_build_watch_frame(body_lines, cols, rows, footer))
+                    out_stream.write(clear_prefix + _build_watch_frame(body_lines, cols, rows, footer))
             else:
                 out_stream.write("\n".join([*body_lines, footer]) + "\n")
             out_stream.flush()
+            _debug_log(
+                bool(getattr(args, "debug", False)),
+                f"viewport repaint in {(time.perf_counter() - t_paint) * 1000.0:.3f}ms",
+            )
 
             iterations += 1
             if max_iterations is not None and iterations >= max_iterations:
                 break
 
-            last_state_fp = _snapshot_state_fingerprint(st_dir, active_locks_map)
-            deadline = time.monotonic() + interval
-            while not stop and time.monotonic() < deadline:
+            while not stop:
                 cur_mono = time.monotonic()
+                if cur_mono >= deadline:
+                    data_dirty = True
+                    break
 
                 if sigwinch_received:
                     sigwinch_received = False
+                    data_dirty = True
                     break
 
                 if sync_ctrl.has_unconsumed_result():
+                    data_dirty = True
                     break
 
                 cur_script_fp = _snapshot_file_fingerprints(watched_paths)
@@ -3682,26 +4643,51 @@ def run_watch_loop(
                         break
 
                 if _snapshot_state_fingerprint(st_dir, active_locks_map) != last_state_fp:
+                    data_dirty = True
                     break
 
                 remaining = max(0.02, min(0.15, deadline - time.monotonic()))
                 if tty_fd is None:
                     time.sleep(remaining)
                     continue
+                if not _has_tty_pushback(tty_fd):
+                    try:
+                        ready, _, _ = select.select([tty_fd], [], [], remaining)
+                    except (InterruptedError, OSError):
+                        break
+                    if not ready:
+                        continue
                 try:
-                    ready, _, _ = select.select([tty_fd], [], [], remaining)
-                except (InterruptedError, OSError):
-                    break
-                if not ready:
-                    continue
-                try:
-                    key = _read_watch_key(tty_fd)
+                    key = _read_watch_key(tty_fd, raw_mode=filter_input_active)
                 except OSError:
                     continue
                 if not key:
                     if tty_fd_override is not None:
                         tty_fd = None
                     continue
+
+                if filter_input_active:
+                    if key == "ENTER":
+                        filter_input_active = False
+                        cursor_idx = 0
+                        scroll_offset = 0
+                    elif key == "ESC":
+                        filter_input_active = False
+                        live_filter = ""
+                        cursor_idx = 0
+                        scroll_offset = 0
+                    elif key == "BACKSPACE":
+                        live_filter = live_filter[:-1]
+                        cursor_idx = 0
+                        scroll_offset = 0
+                    elif key == "CTRL_L":
+                        force_clear_screen = True
+                    elif len(key) == 1 and key.isprintable():
+                        live_filter += key
+                        cursor_idx = 0
+                        scroll_offset = 0
+                    break
+
                 if awaiting_hitl_digit:
                     awaiting_hitl_digit = False
                     if key.isdigit() and key != "0":
@@ -3722,8 +4708,66 @@ def run_watch_loop(
                     status_msg = "Cancelled"
                     status_until = time.monotonic() + 1.5
                     break
+
+                if overlay_mode:
+                    page_step = max(3, rows - 6)
+                    if key in ("ESC", "ENTER", "q") or (overlay_mode == "optimizer" and key == "x") or (overlay_mode == "help" and key == "?"):
+                        overlay_mode = ""
+                        overlay_scroll = 0
+                    elif key in ("j", "DOWN"):
+                        overlay_scroll += 1
+                    elif key in ("k", "UP"):
+                        overlay_scroll = max(0, overlay_scroll - 1)
+                    elif key == "PGDN":
+                        overlay_scroll += page_step
+                    elif key == "PGUP":
+                        overlay_scroll = max(0, overlay_scroll - page_step)
+                    elif key in ("g", "HOME"):
+                        overlay_scroll = 0
+                    elif key in ("G", "END"):
+                        overlay_scroll = 9999
+                    elif key == "CTRL_L":
+                        force_clear_screen = True
+                    elif overlay_mode == "detail" and key == "o":
+                        sel_rec = nav_records[cursor_idx] if (0 <= cursor_idx < nav_total) else None
+                        pr_target = str((sel_rec or {}).get("pr_url") or "") or (first_pr[1] if first_pr else "")
+                        if pr_target:
+                            ok = _open_url_in_browser(pr_target)
+                            status_msg = "✓ Opening PR" if ok else "✗ Failed opening PR"
+                        else:
+                            status_msg = "No human-ready PR on selected item"
+                        status_until = time.monotonic() + 3.0
+                        overlay_mode = ""
+                    break
+
                 if key == "q":
                     stop = True
+                    break
+                if key == "ESC":
+                    if live_filter:
+                        live_filter = ""
+                        cursor_idx = 0
+                        scroll_offset = 0
+                        status_msg = "Filter cleared"
+                        status_until = time.monotonic() + 2.0
+                    break
+                if key == "CTRL_L":
+                    force_clear_screen = True
+                    break
+                if key == "/":
+                    filter_input_active = True
+                    break
+                if key == "ENTER":
+                    overlay_mode = "detail"
+                    overlay_scroll = 0
+                    break
+                if key == "x":
+                    overlay_mode = "optimizer"
+                    overlay_scroll = 0
+                    break
+                if key == "?":
+                    overlay_mode = "help"
+                    overlay_scroll = 0
                     break
                 if key == "h":
                     if not hitl_convs:
@@ -3735,6 +4779,7 @@ def run_watch_loop(
                 if key == "b":
                     status_msg = _handle_board_hotkey(args, st_dir)
                     status_until = time.monotonic() + 3.5
+                    data_dirty = True
                     break
                 if key == "d":
                     status_msg = _handle_doctor_hotkey(
@@ -3746,10 +4791,12 @@ def run_watch_loop(
                         orig_termios=orig_termios,
                     )
                     status_until = time.monotonic() + 4.5
+                    data_dirty = True
                     break
                 if key == "r":
                     status_msg = "↻ Refreshed"
                     status_until = time.monotonic() + 2.0
+                    data_dirty = True
                     break
                 if key == "R":
                     reloaded, err_txt = _attempt_safe_reload()
@@ -3769,21 +4816,52 @@ def run_watch_loop(
                     break
                 if key == "a":
                     args.all = not args.all
+                    cursor_idx = 0
                     scroll_offset = 0
                     status_msg = f"Merged view: {'ON' if args.all else 'OFF'}"
                     status_until = time.monotonic() + 2.5
+                    data_dirty = True
                     break
                 if key == "p":
                     compact_pending = not compact_pending
+                    cursor_idx = 0
                     scroll_offset = 0
                     status_msg = f"Pending view: {'COMPACT' if compact_pending else 'FULL'}"
                     status_until = time.monotonic() + 2.5
                     break
                 if key in ("j", "DOWN"):
-                    scroll_offset = min(max_scroll_offset, scroll_offset + 1)
+                    if nav_total > 0:
+                        cursor_idx = min(nav_total - 1, cursor_idx + 1)
+                    scroll_offset = min(max_scroll_offset, scroll_offset + 1) if cursor_idx >= len(act_lines) else scroll_offset
                     break
                 if key in ("k", "UP"):
-                    scroll_offset = max(0, scroll_offset - 1)
+                    if nav_total > 0:
+                        cursor_idx = max(0, cursor_idx - 1)
+                    if cursor_idx < len(act_lines):
+                        scroll_offset = 0
+                    else:
+                        scroll_offset = max(0, scroll_offset - 1)
+                    break
+                if key == "PGDN":
+                    p_step = max(3, rows // 2)
+                    if nav_total > 0:
+                        cursor_idx = min(nav_total - 1, cursor_idx + p_step)
+                    scroll_offset = min(max_scroll_offset, scroll_offset + p_step)
+                    break
+                if key == "PGUP":
+                    p_step = max(3, rows // 2)
+                    if nav_total > 0:
+                        cursor_idx = max(0, cursor_idx - p_step)
+                    scroll_offset = max(0, scroll_offset - p_step)
+                    break
+                if key in ("g", "HOME"):
+                    cursor_idx = 0
+                    scroll_offset = 0
+                    break
+                if key in ("G", "END"):
+                    if nav_total > 0:
+                        cursor_idx = nav_total - 1
+                    scroll_offset = max_scroll_offset
                     break
                 if key == "o":
                     if first_pr:
@@ -3824,51 +4902,414 @@ def run_watch_loop(
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    """CLI entrypoint for `dev_queue_tui.py` / `agy-queue`."""
-    raw_cli_argv = list(sys.argv[1:] if argv is None else argv)
-    if raw_cli_argv and raw_cli_argv[0] == "doctor":
-        if _dev_common is not None and hasattr(_dev_common, "run_dev_queue_doctor_cli"):
-            return int(_dev_common.run_dev_queue_doctor_cli(raw_cli_argv[1:]))
-        pr_rem = _resolve_pr_remediator_script()
-        proc = subprocess.run([sys.executable, str(pr_rem), "queue-doctor", *raw_cli_argv[1:]], check=False)
-        return int(proc.returncode)
+def _run_subcommand_optimize(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agy-queue optimize", description="Run 0-LLM dev flow bottleneck analyzer.")
+    parser.add_argument("--state-dir", default="", help="Override state directory.")
+    parser.add_argument("--repos-dir", default="", help="Optional parent directory for managed git repos.")
+    parser.add_argument("--orchestrator-id", default="", help="Optional orchestrator conversation ID.")
+    parser.add_argument("--stall-seconds", type=int, default=None, help="Override stalled-worker threshold in seconds.")
+    parser.add_argument("--json", action="store_true", help="Output structured JSON.")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
+    parser.add_argument("--debug", action="store_true", help="Emit debug diagnostics to stderr.")
+    args = parser.parse_args(argv)
 
+    st_dir = _resolve_state_dir(args.state_dir)
+    q_data = _load_json(st_dir / "dev_queue.json")
+    locks, all_locks = _load_locks(st_dir)
+    _, local_dirs = _discover_repos(all_locks, q_data.get("items") or [], args.repos_dir)
+    orch_cid = args.orchestrator_id or str(q_data.get("orchestrator_conversation_id") or "")
+
+    if _flow_opt is not None and hasattr(_flow_opt, "analyze_dev_flow_optimizations"):
+        report = dict(
+            _flow_opt.analyze_dev_flow_optimizations(
+                repos_dir=args.repos_dir or None,
+                orchestrator_cid=orch_cid,
+                stall_threshold_seconds=args.stall_seconds,
+                preloaded_items=q_data.get("items") or [],
+                preloaded_active_locks=locks,
+                preloaded_all_locks=all_locks,
+                preloaded_repo_dirs=local_dirs,
+            )
+        )
+    else:
+        pr_rem = _resolve_pr_remediator_script()
+        cmd = [sys.executable, str(pr_rem), "queue-optimize"]
+        if args.repos_dir:
+            cmd.extend(["--repos-dir", args.repos_dir])
+        if orch_cid:
+            cmd.extend(["--orchestrator-id", orch_cid])
+        if args.stall_seconds is not None:
+            cmd.extend(["--stall-seconds", str(args.stall_seconds)])
+        proc = subprocess.run(
+            cmd,
+            env={**os.environ, "AGY_DEV_STATE_DIR": str(st_dir)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        report = json.loads(proc.stdout or "{}") if proc.returncode == 0 else {"status": "error", "findings": []}
+
+    report.setdefault("schema_version", JSON_SCHEMA_VERSION)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+        return 0
+    color_on = _should_enable_color(args.no_color, sys.stdout.isatty())
+    term_w = shutil.get_terminal_size((124, 40)).columns
+    print("\n".join(_render_optimizer_overlay_lines(report, term_w, color_on)))
+    return 0
+
+
+def _run_subcommand_sync(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agy-queue sync", description="Fetch origin refs and reconcile merged PRs.")
+    parser.add_argument("--state-dir", default="", help="Override state directory.")
+    parser.add_argument("--repos-dir", default="", help="Optional parent directory for managed git repos.")
+    parser.add_argument("--offline", action="store_true", help="Reconcile using local Git refs without network fetch.")
+    parser.add_argument("--json", action="store_true", help="Output structured JSON.")
+    parser.add_argument("--debug", action="store_true", help="Emit debug diagnostics to stderr.")
+    args = parser.parse_args(argv)
+
+    st_dir = _resolve_state_dir(args.state_dir)
+    q_data = _load_json(st_dir / "dev_queue.json")
+    _, all_locks = _load_locks(st_dir)
+    _, local_dirs = _discover_repos(all_locks, q_data.get("items") or [], args.repos_dir)
+    offline_opt = True if args.offline else None
+    msg = _run_live_sync(st_dir, local_dirs, offline=offline_opt)
+    if args.json:
+        print(
+            json.dumps(
+                {"schema_version": JSON_SCHEMA_VERSION, "status": "ok", "state_dir": str(st_dir), "message": msg},
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+    else:
+        print(msg)
+    return 0
+
+
+def _run_subcommand_show(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agy-queue show", description="Inspect a single queue item and live worker telemetry.")
+    parser.add_argument("item_id", help="Conversation ID, short ID prefix, or 1-based row number.")
+    parser.add_argument("--state-dir", default="", help="Override state directory.")
+    parser.add_argument("--repos-dir", default="", help="Optional parent directory for managed git repos.")
+    parser.add_argument("--json", action="store_true", help="Output structured JSON.")
+    parser.add_argument("--plain-urls", action="store_true", help="Disable OSC-8 hyperlinks.")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
+    parser.add_argument("--debug", action="store_true", help="Emit debug diagnostics to stderr.")
+    args = parser.parse_args(argv)
+
+    render_ns = argparse.Namespace(
+        watch=None,
+        all=True,
+        repo="",
+        status="",
+        sync=False,
+        write_board="",
+        open_hitl="",
+        state_dir=args.state_dir,
+        repos_dir=args.repos_dir,
+        plain_urls=args.plain_urls,
+        no_opt=True,
+        json=False,
+        no_color=args.no_color,
+        debug=args.debug,
+    )
+    layout: dict[str, Any] = {}
+    render(render_ns, layout_out=layout)
+    records = list(layout.get("row_records") or [])
+    needle = args.item_id.strip().lower()
+
+    matched_rec: dict[str, Any] | None = None
+    if needle.isdigit():
+        idx_num = int(needle)
+        matched_rec = next((r for r in records if int(r.get("idx") or 0) == idx_num), None)
+    if matched_rec is None:
+        exact = [
+            r
+            for r in records
+            if str((r.get("item") or {}).get("conversation_id") or "").lower() == needle
+            or str(r.get("display_id") or "").lower() == needle
+        ]
+        if exact:
+            matched_rec = exact[0]
+        else:
+            pref = [
+                r
+                for r in records
+                if str((r.get("item") or {}).get("conversation_id") or "").lower().startswith(needle)
+            ]
+            if len(pref) == 1:
+                matched_rec = pref[0]
+            elif len(pref) > 1:
+                print(f"[agy-queue show] Ambiguous ID prefix '{args.item_id}' ({len(pref)} matches).", file=sys.stderr)
+                return 1
+
+    if matched_rec is None:
+        print(f"[agy-queue show] No queue item found matching '{args.item_id}'.", file=sys.stderr)
+        return 1
+
+    if args.json:
+        item_dict = dict(matched_rec.get("item") or {})
+        linked = list(matched_rec.get("linked_locks") or [])
+        telem = _extract_lock_telemetry_fields(linked[0] if linked else None, linked[0] if linked else None)
+        payload = {
+            "schema_version": JSON_SCHEMA_VERSION,
+            "status": "ok",
+            "effective_status": matched_rec.get("effective_status", ""),
+            "sidebar_title": matched_rec.get("sidebar_title", ""),
+            "progress": matched_rec.get("progress"),
+            "lock_telemetry": telem,
+            **telem,
+            "linked_locks": linked,
+            "item": item_dict,
+        }
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    color_on = _should_enable_color(args.no_color, sys.stdout.isatty())
+    use_osc8 = _supports_osc8() and not args.plain_urls
+    term_w = shutil.get_terminal_size((124, 40)).columns
+    print("\n".join(_render_detail_inspector_lines(matched_rec, term_w, color_on, use_osc8)))
+    return 0
+
+
+def _run_subcommand_locks(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agy-queue locks", description="Inspect active per-repository dev_pr_locks.")
+    parser.add_argument("-r", "--repo", default="", help="Filter by repository substring.")
+    parser.add_argument("--sync-git", action="store_true", help="Reconcile lock state against origin before displaying.")
+    parser.add_argument("--state-dir", default="", help="Override state directory.")
+    parser.add_argument("--repos-dir", default="", help="Optional parent directory for managed git repos.")
+    parser.add_argument("--stall-seconds", type=int, default=None, help="Override stall threshold in seconds.")
+    parser.add_argument("--json", action="store_true", help="Output structured JSON.")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
+    parser.add_argument("--debug", action="store_true", help="Emit debug diagnostics to stderr.")
+    args = parser.parse_args(argv)
+
+    st_dir = _resolve_state_dir(args.state_dir)
+    if args.sync_git:
+        pr_rem = _resolve_pr_remediator_script()
+        if pr_rem.is_file():
+            subprocess.run(
+                [sys.executable, str(pr_rem), "lock-status", "--all", "--sync-git"],
+                env={**os.environ, "AGY_DEV_STATE_DIR": str(st_dir)},
+                capture_output=True,
+                text=True,
+                timeout=20.0,
+                check=False,
+            )
+
+    locks, _ = _load_locks(st_dir)
+    repo_f = args.repo.strip().lower()
+    out_locks: dict[str, dict[str, Any]] = {}
+    for slug, repo_lk in sorted(locks.items()):
+        if repo_f and repo_f not in slug.lower():
+            continue
+        slots_out: list[dict[str, Any]] = []
+        for slot_entry in _iter_active_lock_slots(repo_lk):
+            lp = _compute_lock_progress(slot_entry, threshold_seconds=args.stall_seconds)
+            telem = _extract_lock_telemetry_fields(lp, slot_entry)
+            slots_out.append({**slot_entry, **telem, "progress": lp})
+        primary_telem = _extract_lock_telemetry_fields(
+            slots_out[0]["progress"] if slots_out else None,
+            slots_out[0] if slots_out else repo_lk,
+        )
+        out_locks[slug] = {**repo_lk, **primary_telem, "active_slots": slots_out}
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema_version": JSON_SCHEMA_VERSION,
+                    "status": "ok",
+                    "state_dir": str(st_dir),
+                    "active_count": len(out_locks),
+                    "locks": out_locks,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        )
+        return 0
+
+    color_on = _should_enable_color(args.no_color, sys.stdout.isatty())
+    if not out_locks:
+        print(_color("No active repository locks.", "0;32", color_on))
+        return 0
+
+    bar_w = min(shutil.get_terminal_size((124, 40)).columns, 220)
+    lines = [_color("═" * bar_w, "2;36", color_on), _color(f"ACTIVE REPOSITORY LOCKS ({len(out_locks)})", "1;36", color_on)]
+    for slug, info in out_locks.items():
+        occ = str(info.get("slot_occupancy") or "1/2")
+        lines.append(_color("─" * bar_w, "2", color_on))
+        lines.append(f"  {_color(slug, '1;33', color_on)}  [{occ}]")
+        for s_item in info.get("active_slots") or []:
+            st_s = str(s_item.get("status") or "DEVELOPING")
+            br_s = str(s_item.get("branch_name") or "-")
+            cid_s = str(s_item.get("conversation_id") or "-")[:8]
+            idle_l = str(s_item.get("idle_label") or "0s")
+            elap_l = str(s_item.get("elapsed_label") or "0s")
+            src_s = str(s_item.get("last_activity_source") or "none")
+            idle_st = str(s_item.get("idle_state") or "")
+            sem_c = "1;31" if s_item.get("is_stalled") else ("1;33" if idle_st == "amber" else "0;32")
+            sem_t = (
+                f"STALL {idle_l}"
+                if s_item.get("is_stalled")
+                else (f"idle {idle_l}" if idle_st == "amber" else f"ok·{idle_l}")
+            )
+            lines.append(
+                f"    Slot #{s_item.get('slot_id', 1)}  {st_s}  cid:{cid_s}  "
+                f"{_color(sem_t, sem_c, color_on)}  elapsed:{elap_l}  src:{src_s}  branch:{br_s}"
+            )
+    lines.append(_color("═" * bar_w, "2;36", color_on))
+    print("\n".join(lines))
+    return 0
+
+
+def _run_subcommand_set_status(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="agy-queue set-status", description="Transition a queue item status cleanly.")
+    parser.add_argument("pos_id", nargs="?", default="", help="Conversation ID or unambiguous prefix.")
+    parser.add_argument("pos_status", nargs="?", default="", help="Target queue status.")
+    parser.add_argument("--id", dest="flag_id", default="", help="Conversation ID (alternative to positional).")
+    parser.add_argument("--status", dest="flag_status", default="", help="Target status (alternative to positional).")
+    parser.add_argument("--notes", default="", help="Optional transition notes.")
+    parser.add_argument("--branches", nargs="*", default=[], help="Optional branch names.")
+    parser.add_argument("--pr-urls", nargs="*", default=[], help="Optional PR URLs.")
+    parser.add_argument("--orchestrator-id", default="", help="Optional orchestrator conversation ID.")
+    parser.add_argument("--state-dir", default="", help="Override state directory.")
+    parser.add_argument("--json", action="store_true", help="Output structured JSON.")
+    args = parser.parse_args(argv)
+
+    raw_id = (args.flag_id or args.pos_id).strip()
+    raw_status = (args.flag_status or args.pos_status).strip().lower()
+    if not raw_id or not raw_status:
+        parser.error("both <id> and <status> are required (positional or via --id / --status).")
+    if raw_status not in VALID_QUEUE_STATUSES:
+        parser.error(f"invalid status {raw_status!r} (choose from: {', '.join(VALID_QUEUE_STATUSES)}).")
+
+    st_dir = _resolve_state_dir(args.state_dir)
+    q_items = _load_json(st_dir / "dev_queue.json").get("items") or []
+    resolved_id = raw_id
+    exact_matches = [str(it.get("conversation_id") or "") for it in q_items if str(it.get("conversation_id") or "").lower() == raw_id.lower()]
+    if exact_matches:
+        resolved_id = exact_matches[0]
+    else:
+        pref_matches = [str(it.get("conversation_id") or "") for it in q_items if str(it.get("conversation_id") or "").lower().startswith(raw_id.lower())]
+        if len(pref_matches) == 1:
+            resolved_id = pref_matches[0]
+        elif len(pref_matches) > 1:
+            print(f"[agy-queue set-status] Ambiguous ID prefix '{raw_id}' ({len(pref_matches)} matches).", file=sys.stderr)
+            return 1
+
+    pr_rem = _resolve_pr_remediator_script()
+    cmd = [sys.executable, str(pr_rem), "queue-set-status", "--id", resolved_id, "--status", raw_status]
+    if args.notes:
+        cmd.extend(["--notes", args.notes])
+    if args.branches:
+        cmd.extend(["--branches", *args.branches])
+    if args.pr_urls:
+        cmd.extend(["--pr-urls", *args.pr_urls])
+    if args.orchestrator_id:
+        cmd.extend(["--orchestrator-id", args.orchestrator_id])
+
+    proc = subprocess.run(
+        cmd,
+        env={**os.environ, "AGY_DEV_STATE_DIR": str(st_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr or proc.stdout or "[agy-queue set-status] Failed updating item.\n")
+        return int(proc.returncode)
+    if args.json:
+        print((proc.stdout or "{}").strip())
+    else:
+        print(f"✓ Updated {resolved_id[:8]} -> {raw_status}")
+    return 0
+
+
+def _dispatch_subcommand(subcmd: str, rest: list[str], raw_cli_argv: list[str]) -> int:
+    """Dispatch unified `agy-queue` subcommands while keeping full legacy flag compatibility."""
+    if subcmd == "doctor":
+        if _dev_common is not None and hasattr(_dev_common, "run_dev_queue_doctor_cli"):
+            return int(_dev_common.run_dev_queue_doctor_cli(rest))
+        pr_rem = _resolve_pr_remediator_script()
+        proc = subprocess.run([sys.executable, str(pr_rem), "queue-doctor", *rest], check=False)
+        return int(proc.returncode)
+    if subcmd == "watch":
+        if rest and not rest[0].startswith("-"):
+            with contextlib.suppress(ValueError):
+                float(rest[0])
+                return _main_dashboard(["--watch", rest[0], *rest[1:]], raw_cli_argv)
+        return _main_dashboard(["--watch", *rest], raw_cli_argv)
+    if subcmd == "list":
+        return _main_dashboard(rest, raw_cli_argv)
+    if subcmd == "optimize":
+        return _run_subcommand_optimize(rest)
+    if subcmd == "sync":
+        return _run_subcommand_sync(rest)
+    if subcmd == "show":
+        return _run_subcommand_show(rest)
+    if subcmd == "locks":
+        return _run_subcommand_locks(rest)
+    if subcmd == "set-status":
+        return _run_subcommand_set_status(rest)
+    return 1
+
+
+def _main_dashboard(argv: list[str], raw_cli_argv: list[str]) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     args._raw_argv = raw_cli_argv
 
-    if args.open_hitl:
-        _, _, hitl_convs, _, _, _ = render(args)
-        key_clean = args.open_hitl.strip().lower().lstrip("h")
-        entry = hitl_convs.get(int(key_clean)) if key_clean.isdigit() else None
-        if not entry:
-            print(f"No HITL item found for '{args.open_hitl}'.", file=sys.stderr)
-            return 1
-        cid_disp, _cid_full, ag_title = entry
-        _copy_to_clipboard(ag_title)
-        _focus_antigravity_app()
-        print(
-            f"✓ Copied '{ag_title}' ({cid_disp}) & focused Antigravity Desktop "
-            "(paste in sidebar search or open dev_queue_board.md)"
-        )
-        return 0
+    try:
+        if args.open_hitl:
+            _, _, hitl_convs, _, _, _ = render(args)
+            key_clean = args.open_hitl.strip().lower().lstrip("h")
+            entry = hitl_convs.get(int(key_clean)) if key_clean.isdigit() else None
+            if not entry:
+                print(f"No HITL item found for '{args.open_hitl}'.", file=sys.stderr)
+                return 1
+            cid_disp, _cid_full, ag_title = entry
+            _copy_to_clipboard(ag_title)
+            _focus_antigravity_app()
+            print(
+                f"✓ Copied '{ag_title}' ({cid_disp}) & focused Antigravity Desktop "
+                "(paste in sidebar search or open dev_queue_board.md)"
+            )
+            return 0
 
-    if args.sync:
-        st_dir = _resolve_state_dir(args.state_dir)
-        q_data = _load_json(st_dir / "dev_queue.json")
-        _, all_locks = _load_locks(st_dir)
-        _, local_dirs = _discover_repos(all_locks, q_data.get("items") or [], args.repos_dir)
-        msg = _run_live_sync(st_dir, local_dirs)
-        if args.watch is None and not args.json:
-            print(msg)
+        if args.sync:
+            st_dir = _resolve_state_dir(args.state_dir)
+            q_data = _load_json(st_dir / "dev_queue.json")
+            _, all_locks = _load_locks(st_dir)
+            _, local_dirs = _discover_repos(all_locks, q_data.get("items") or [], args.repos_dir)
+            msg = _run_live_sync(st_dir, local_dirs)
+            if args.watch is None:
+                print(msg, file=sys.stderr)
 
-    if args.watch is None:
-        out, _, _, _, _, _ = render(args)
-        print(out)
-        return 0
+        if args.watch is None:
+            out, _, _, _, _, _ = render(args)
+            print(out)
+            return 0
 
-    return run_watch_loop(args, raw_argv=raw_cli_argv)
+        return run_watch_loop(args, raw_argv=raw_cli_argv)
+    except Exception:
+        if getattr(args, "debug", False):
+            traceback.print_exc(file=sys.stderr)
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for `dev_queue_tui.py` / `agy-queue`."""
+    _install_sigpipe_hygiene()
+    raw_cli_argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if raw_cli_argv and raw_cli_argv[0] in AGY_QUEUE_SUBCOMMANDS:
+            return _dispatch_subcommand(raw_cli_argv[0], raw_cli_argv[1:], raw_cli_argv)
+        return _main_dashboard(raw_cli_argv, raw_cli_argv)
+    except BrokenPipeError:
+        return _silence_broken_pipe_stdout()
 
 
 if __name__ == "__main__":

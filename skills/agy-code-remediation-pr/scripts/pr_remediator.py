@@ -54,6 +54,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -4030,7 +4031,7 @@ def _temporarily_index_untracked_files(
 def run_local_validation_suite(
     workdir: Path | str | None = None,
     test_targets: list[str] | None = None,
-    timeout: float = 180.0,
+    timeout: float = 480.0,
     *,
     portfolio_dir: Path | str | None = None,
     run_pre_commit: bool = False,
@@ -9648,8 +9649,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _silence_broken_pipe_stdout() -> int:
+    """Redirect stdout fd to `/dev/null` on `BrokenPipeError` so pipe consumers (`head`, `jq`) never trigger tracebacks."""
+    with contextlib.suppress(OSError, ValueError):
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_fd, sys.stdout.fileno())
+        finally:
+            os.close(devnull_fd)
+    return 0
+
+
+def _install_sigpipe_hygiene() -> None:
+    """Ensure `SIGPIPE` raises `BrokenPipeError` cleanly (never crashing with unhandled signal tracebacks)."""
+    sigpipe = getattr(signal, "SIGPIPE", None)
+    if sigpipe is not None:
+        with contextlib.suppress(OSError, ValueError):
+            signal.signal(sigpipe, signal.SIG_IGN)
+
+
 def main(argv: list[str] | None = None) -> int:
-    """CLI entrypoint for `pr_remediator.py`."""
+    """CLI entrypoint for `pr_remediator.py` with `SIGPIPE`/`BrokenPipeError` hygiene."""
+    _install_sigpipe_hygiene()
+    try:
+        return _main_impl(argv)
+    except BrokenPipeError:
+        return _silence_broken_pipe_stdout()
+
+
+def _main_impl(argv: list[str] | None = None) -> int:
+    """Internal CLI dispatcher for `pr_remediator.py`."""
     args = parse_args(argv)
 
     if args.subcommand == "lock-status":

@@ -7,12 +7,19 @@
 #
 # Usage:
 #   1. Direct execution / symlinks (`~/.local/bin/agy-queue` & `agy-doctor`):
-#        agy-queue [--watch [SECS]] [--sync] [--help]
+#        agy-queue [--watch [SECS]] [--sync] [--json] [--version] [--help]
+#        agy-queue watch [SECS] [--sync-interval SECS] [--no-auto-sync]
 #        agy-queue doctor [--fix] [--wake] [--heal] [--check-only] [--json]
+#        agy-queue optimize [--json] [--repos-dir DIR] [--stall-seconds N]
+#        agy-queue sync [--offline] [--json]
+#        agy-queue list [--status STATUS] [--repo SLUG] [--all] [--json]
+#        agy-queue show <ID> [--json]
+#        agy-queue locks [--sync-git] [--repo SLUG] [--json]
+#        agy-queue set-status <ID> <STATUS> [--notes "..."]
 #        agy-doctor [--fix] [--wake] [--heal] [--check-only] [--json]
 #   2. Shell profile sourcing (Bash or Zsh):
 #        source "$HOME/.gemini/config/plugins/agy-dev-plugin/shell/agy_dev_queue.sh"
-#        agy-queue [--watch [SECS]]
+#        agy-queue [watch|doctor|optimize|sync|list|show|locks|set-status] ...
 #        agy-doctor [--heal]
 # ==============================================================================
 

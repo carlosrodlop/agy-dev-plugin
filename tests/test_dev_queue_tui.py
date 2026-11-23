@@ -107,7 +107,7 @@ class TestDevQueueTui(unittest.TestCase):
     """Hermetic unit tests using synthetic `acme/repo-a` and `acme/repo-b` fixtures."""
 
     def test_multi_repo_pr_ready_bars_never_average_with_unstarted_downstream_repos(self) -> None:
-        """PR 1/2 renders full bright-yellow bar (`PR 1/2 listo`), PR 2/2 and 1/1 render bright-green, never 45% cyan."""
+        """PR 1/2 renders full bright-yellow bar (`PR 1/2 ready`), PR 2/2 and 1/1 render bright-green, never 45% cyan."""
         item_part = {
             "conversation_id": "aaaa1111-2222-4333-8444-555555555555",
             "priority": 10,
@@ -132,7 +132,7 @@ class TestDevQueueTui(unittest.TestCase):
         self.assertEqual(prog_part["tag"], "PR 1/2")
 
         rendered_part = tui._render_inline_progress(prog_part, 20, color_on=True)
-        self.assertIn("PR 1/2 listo", rendered_part)
+        self.assertIn("PR 1/2 ready", rendered_part)
         self.assertIn("\033[1;33m", rendered_part)
         self.assertNotIn("45%", rendered_part)
         self.assertNotIn("\033[1;36m", rendered_part)
@@ -148,20 +148,20 @@ class TestDevQueueTui(unittest.TestCase):
         assert prog_final is not None
         self.assertEqual(prog_final["mode"], "pr_final")
         rendered_final = tui._render_inline_progress(prog_final, 20, color_on=True)
-        self.assertIn("PR 2/2 listo", rendered_final)
+        self.assertIn("PR 2/2 ready", rendered_final)
         self.assertIn("\033[1;32m", rendered_final)
 
-        # Single-repo PR ready -> bright green "PR listo"
+        # Single-repo PR ready -> bright green "PR ready"
         item_single = {**item_part, "repo_slugs": ["acme/repo-a"]}
         prog_single = tui._compute_item_progress(item_single, locks_by_cid, {}, is_human_pr=True)
         self.assertIsNotNone(prog_single)
         assert prog_single is not None
         self.assertEqual(prog_single["mode"], "pr_final")
         rendered_single = tui._render_inline_progress(prog_single, 20, color_on=True)
-        self.assertIn("PR listo", rendered_single)
+        self.assertIn("PR ready", rendered_single)
         self.assertIn("\033[1;32m", rendered_single)
 
-        # Active IN_PROGRESS development keeps numeric percentage + ETA
+        # Active IN_PROGRESS development keeps numeric percentage + live inactivity semaphore
         item_dev = {
             "conversation_id": "bbbb1111-2222-4333-8444-555555555555",
             "priority": 20,
@@ -170,12 +170,13 @@ class TestDevQueueTui(unittest.TestCase):
             "merged_repos": [],
             "title": "Active coding task",
         }
+        now_ts_dev = tui._flow_opt.parse_iso_timestamp("2026-11-20T19:00:45Z")
         lock_dev = {
             "active": True,
             "status": "DEVELOPING",
             "pr_gate_ready": False,
             "progress_pct": 35,
-            "eta_minutes": 6,
+            "last_activity_at": "2026-11-20T19:00:00Z",
             "conversation_id": item_dev["conversation_id"],
         }
         prog_dev = tui._compute_item_progress(
@@ -183,14 +184,15 @@ class TestDevQueueTui(unittest.TestCase):
             {item_dev["conversation_id"]: [("acme/repo-a", lock_dev)]},
             {},
             is_human_pr=False,
+            now_ts=now_ts_dev,
         )
         self.assertIsNotNone(prog_dev)
         assert prog_dev is not None
         self.assertEqual(prog_dev["mode"], "dev")
         rendered_dev = tui._render_inline_progress(prog_dev, 20, color_on=True)
         self.assertIn("35%", rendered_dev)
-        self.assertIn("~6m", rendered_dev)
-        self.assertNotIn("PR listo", rendered_dev)
+        self.assertIn("ok·45s", rendered_dev)
+        self.assertNotIn("PR ready", rendered_dev)
 
     def test_pr_repo_star_attribution_truncation_and_unlock_footer(self) -> None:
         """PR-ready repo gets `★`, stays first on truncation (`+N`), and footer prints unlock sequencing."""
@@ -252,8 +254,8 @@ class TestDevQueueTui(unittest.TestCase):
                 term_width_override=124,
             )
             self.assertIn("repo-a★, repo-b", out)
-            self.assertIn("PR 1/2 listo", out)
-            self.assertIn("[1] repo-a (cccc1111 · parte 1/2 · desbloquea repo-b) [+verificaciones]:", out)
+            self.assertIn("PR 1/2 ready", out)
+            self.assertIn("[1] repo-a (cccc1111 · part 1/2 · unlocks repo-b) [+verified]:", out)
             self.assertEqual(row_links[1][1], rich_url)
             self.assertIsNotNone(first_pr)
             assert first_pr is not None
@@ -407,8 +409,18 @@ class TestDevQueueTui(unittest.TestCase):
                 term_width_override=124,
             )
 
-            # OSC-8 hyperlink preserves FULL URL while showing compact display URL
-            self.assertIn(f"\033]8;;{full_url}\007{short_display}\033]8;;\007", out)
+            # OSC-8 hyperlink preserves FULL URL while showing compact non-wrapping label
+            self.assertIn(f"\033]8;;{full_url}\007", out)
+            self.assertIn("↗ Open PR · repo-a (main...fix/20261120-tui-eeee1111)", out)
+            # Plain-URL fallback emits raw clean_u
+            out_plain, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, no_color=True, plain_urls=True),
+                conv_db_path=db_path,
+                brain_dir=brain_dir,
+                is_tty_override=False,
+                term_width_override=124,
+            )
+            self.assertIn(short_display, out_plain)
             # Hotkey targets keep FULL URL intact
             self.assertEqual(row_links[1][1], full_url)
             self.assertIsNotNone(first_pr)
@@ -429,7 +441,7 @@ class TestDevQueueTui(unittest.TestCase):
                 "https://github.com/acme/repo-a/compare/main...fix/20261120-tui-eeee1111"
                 "?expand=1&title=feat%28tui%29:+board&body=Automated+Verification+%28PASS+98/100%29"
             )
-            self.assertIn(f"[Abrir PR]({escaped_expected})", board_md)
+            self.assertIn(f"[Open PR]({escaped_expected})", board_md)
             self.assertIn(f"[Approve Zero-Hardcode TUI Design Contract](conversation://{hitl_cid})", board_md)
             self.assertIn("[design_proposal.md](file://", board_md)
 
@@ -491,7 +503,7 @@ class TestDevQueueTui(unittest.TestCase):
             self.assertIsNone(first_pr)
             self.assertEqual(row_links, {})
             self.assertNotIn("[1] PR", out)
-            self.assertNotIn("PR listo", out)
+            self.assertNotIn("PR ready", out)
             self.assertNotIn(leaked_url, out)
             self.assertIn("(rev)", out)
 
@@ -786,6 +798,8 @@ class TestDevQueueTui(unittest.TestCase):
             deployed_sh = fake_home / ".gemini" / "config" / "plugins" / "acme-dev-plugin" / "shell" / "agy_dev_queue.sh"
             self.assertTrue(deployed_sh.is_file())
             self.assertEqual(deployed_sh.stat().st_mode & 0o777, 0o755)
+            self.assertTrue((fake_home / ".local" / "bin" / "agy-queue").is_symlink())
+            self.assertTrue((fake_home / ".local" / "bin" / "agy-doctor").is_symlink())
 
     def test_live_sync_delegates_to_queue_sync_and_never_prematurely_merges_partial_multi_repo_item(self) -> None:
         """`_run_live_sync()` delegates to `pr_remediator.py queue-sync` and never falsely merges an unstarted 2nd repo."""
@@ -1126,7 +1140,7 @@ class TestDevQueueTui(unittest.TestCase):
             # Every Markdown table row must have balanced unescaped column separators and no raw newlines
             self.assertTrue(any("Line one Line two / pipe" in ln for ln in table_rows))
             self.assertTrue(any("Option A / Option B Second line detail" in ln for ln in table_rows))
-            self.assertTrue(any(f"[Abrir PR]({escaped})" in ln for ln in table_rows))
+            self.assertTrue(any(f"[Open PR]({escaped})" in ln for ln in table_rows))
 
             # Wrapped footer budget inside _clamp_lines_to_viewport
             long_footer = "[o] PR · [1-9] open · [h+#] Agy · [b] board · [s] sync · [a] merged · [q] quit (3s) EXTRA TEXT"
@@ -1293,7 +1307,7 @@ class TestDevQueueTui(unittest.TestCase):
             self.assertIn("STALLED WORKER:", out_no_opt)
             self.assertNotIn("OPT:", out_no_opt)
 
-            # 5. Fresh dirty DEVELOPING lock still reports 35% ~6m (not stalled)
+            # 5. Fresh dirty DEVELOPING lock reports 35% ok·2m (not stalled, zero fake ~6m ETA)
             fresh_iso = "2027-01-15T09:58:00Z"
             lp_fresh = tui._compute_lock_progress(
                 {
@@ -1308,7 +1322,7 @@ class TestDevQueueTui(unittest.TestCase):
             )
             self.assertFalse(lp_fresh["is_stalled"])
             self.assertEqual(lp_fresh["pct"], 35)
-            self.assertEqual(lp_fresh["tag"], "~6m")
+            self.assertEqual(lp_fresh["tag"], "ok·2m")
 
     def test_untracked_ad_hoc_locks_synthesized_and_phantom_pr_open_never_hallucinates_pulls(self) -> None:
         """Untracked active ad-hoc locks surface in table/counters/PR footer; phantom `pr_open` renders Stale (never fake `/pulls` PR)."""
@@ -1384,10 +1398,10 @@ class TestDevQueueTui(unittest.TestCase):
             assert first_pr is not None
             self.assertEqual(first_pr[1], real_pr_url)
             self.assertEqual(row_links[1][1], real_pr_url)
-            self.assertIn("[+verificaciones]", out_txt)
-            # Phantom pr_open row MUST render `[↻ Stale]` and NEVER `PR 2/2 listo` or `[commit fallback]`
+            self.assertIn("[+verified]", out_txt)
+            # Phantom pr_open row MUST render `[↻ Stale]` and NEVER `PR 2/2 ready` or `[commit fallback]`
             self.assertIn("[↻ Stale]", out_txt)
-            self.assertNotIn("PR 2/2 listo", out_txt)
+            self.assertNotIn("PR 2/2 ready", out_txt)
             self.assertNotIn("[commit fallback]", out_txt)
             # Board artifact includes the real ad-hoc PR link
             board_md = board_file.read_text(encoding="utf-8")

@@ -41,7 +41,9 @@ import parallel_scope as _parallel_scope  # noqa: E402
 
 DEFAULT_STALL_THRESHOLD_SECONDS = 900
 DEFAULT_MAX_PARTIAL_WIP = 3
-STALL_ELIGIBLE_LOCK_STATUSES: frozenset[str] = frozenset({"DEVELOPING", "NEEDS_REVISION_ITERATING"})
+STALL_ELIGIBLE_LOCK_STATUSES: frozenset[str] = frozenset(
+    {"DEVELOPING", "NEEDS_REVISION_ITERATING", "AWAITING_AGENT_REVIEW"}
+)
 OPEN_QUEUE_STATUSES: frozenset[str] = frozenset(
     {
         "pending",
@@ -186,11 +188,10 @@ def detect_stalled_lock(
     brain_dir: Path | str | Sequence[Path | str] | None = None,
     home_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Detect whether an active `DEVELOPING` / `NEEDS_REVISION_ITERATING` lock has gone stalled.
+    """Detect whether an active `DEVELOPING` / `NEEDS_REVISION_ITERATING` / `AWAITING_AGENT_REVIEW` lock is stalled.
 
-    Computes the latest observed activity timestamp across `last_activity_at`, `updated_at`,
-    `acquired_at`, newest non-`.git` file `mtime` in `worktree_path`, and optional `worker_cid`
-    transcript `mtime` under `brain_dir`.
+    Computes the latest observed activity timestamp and source (`transcript`, `reviewer_transcript`,
+    `worktree`, `heartbeat`, or `lock_meta`) alongside total `elapsed_seconds` from `acquired_at`.
     """
     thresh = resolve_stall_threshold_seconds(threshold_seconds)
     if not isinstance(lock_info, dict):
@@ -198,21 +199,35 @@ def detect_stalled_lock(
             "stalled": False,
             "idle_seconds": 0,
             "idle_label": "0s",
+            "elapsed_seconds": 0,
+            "elapsed_label": "0s",
             "threshold_seconds": thresh,
             "last_activity_ts": 0.0,
+            "last_activity_source": "",
             "worker_cid": "",
+            "reviewer_subagent_id": "",
         }
 
     worker_cid = str(lock_info.get("worker_cid") or "").strip()
+    reviewer_subagent_id = str(lock_info.get("reviewer_subagent_id") or "").strip()
     if lock_info.get("active") is False:
         return {
             "stalled": False,
             "idle_seconds": 0,
             "idle_label": "0s",
+            "elapsed_seconds": 0,
+            "elapsed_label": "0s",
             "threshold_seconds": thresh,
             "last_activity_ts": 0.0,
+            "last_activity_source": "",
             "worker_cid": worker_cid,
+            "reviewer_subagent_id": reviewer_subagent_id,
         }
+
+    cur_ts = float(now_ts if now_ts is not None else time.time())
+    acq_ts = parse_iso_timestamp(lock_info.get("acquired_at"))
+    elapsed_seconds = max(0, int(cur_ts - acq_ts)) if acq_ts > 0.0 else 0
+    elapsed_label = format_idle_duration(elapsed_seconds)
 
     status_u = str(lock_info.get("status") or "").strip().upper()
     if status_u not in STALL_ELIGIBLE_LOCK_STATUSES or bool(lock_info.get("pr_gate_ready")):
@@ -220,44 +235,73 @@ def detect_stalled_lock(
             "stalled": False,
             "idle_seconds": 0,
             "idle_label": "0s",
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed_label": elapsed_label,
             "threshold_seconds": thresh,
             "last_activity_ts": 0.0,
+            "last_activity_source": "",
             "worker_cid": worker_cid,
+            "reviewer_subagent_id": reviewer_subagent_id,
         }
 
-    cur_ts = float(now_ts if now_ts is not None else time.time())
-    candidates: list[float] = [
-        parse_iso_timestamp(lock_info.get("last_activity_at")),
-        parse_iso_timestamp(lock_info.get("updated_at")),
-        parse_iso_timestamp(lock_info.get("acquired_at")),
-        _newest_worktree_mtime(str(lock_info.get("worktree_path") or "")),
-    ]
+    hb_ts = parse_iso_timestamp(lock_info.get("last_activity_at"))
+    upd_ts = parse_iso_timestamp(lock_info.get("updated_at"))
+    wt_ts = _newest_worktree_mtime(str(lock_info.get("worktree_path") or ""))
+    has_stage = bool(str(lock_info.get("stage_label") or "").strip())
+
+    # Each candidate is (timestamp, tie_break_priority, source_name)
+    source_candidates: list[tuple[float, int, str]] = []
+    meta_ts = max(upd_ts, acq_ts, hb_ts)
+    if meta_ts > 0.0:
+        source_candidates.append((meta_ts, 1, "lock_meta"))
+    if hb_ts > 0.0 and (has_stage or hb_ts > acq_ts or (upd_ts == 0.0 and acq_ts == 0.0)):
+        source_candidates.append((hb_ts, 2, "heartbeat"))
+    if wt_ts > 0.0:
+        source_candidates.append((wt_ts, 3, "worktree"))
 
     if worker_cid:
         tpath = dev_common.resolve_transcript_path(worker_cid, brain_dir, home_dir=home_dir)
         if tpath is not None:
             with contextlib.suppress(OSError):
-                candidates.append(float(tpath.stat().st_mtime))
+                w_mtime = float(tpath.stat().st_mtime)
+                if w_mtime > 0.0:
+                    source_candidates.append((w_mtime, 4, "transcript"))
 
-    last_activity_ts = max(candidates, default=0.0)
-    if last_activity_ts <= 0.0:
+    if reviewer_subagent_id:
+        rpath = dev_common.resolve_transcript_path(reviewer_subagent_id, brain_dir, home_dir=home_dir)
+        if rpath is not None:
+            with contextlib.suppress(OSError):
+                r_mtime = float(rpath.stat().st_mtime)
+                if r_mtime > 0.0:
+                    source_candidates.append((r_mtime, 5, "reviewer_transcript"))
+
+    if not source_candidates:
         return {
             "stalled": False,
             "idle_seconds": 0,
             "idle_label": "0s",
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed_label": elapsed_label,
             "threshold_seconds": thresh,
             "last_activity_ts": 0.0,
+            "last_activity_source": "",
             "worker_cid": worker_cid,
+            "reviewer_subagent_id": reviewer_subagent_id,
         }
 
+    last_activity_ts, _, last_activity_source = max(source_candidates, key=lambda item: (item[0], item[1]))
     idle_seconds = max(0, int(cur_ts - last_activity_ts))
     return {
         "stalled": idle_seconds >= thresh,
         "idle_seconds": idle_seconds,
         "idle_label": format_idle_duration(idle_seconds),
+        "elapsed_seconds": elapsed_seconds,
+        "elapsed_label": elapsed_label,
         "threshold_seconds": thresh,
         "last_activity_ts": last_activity_ts,
+        "last_activity_source": last_activity_source,
         "worker_cid": worker_cid,
+        "reviewer_subagent_id": reviewer_subagent_id,
     }
 
 
@@ -706,8 +750,12 @@ def _detect_stalled_workers(
                         "status": str(lk.get("status") or ""),
                         "conversation_id": str(lk.get("conversation_id") or ""),
                         "worker_cid": str(st.get("worker_cid") or ""),
+                        "reviewer_subagent_id": str(st.get("reviewer_subagent_id") or ""),
                         "idle_seconds": int(st.get("idle_seconds") or 0),
                         "idle_label": idle_lbl,
+                        "elapsed_seconds": int(st.get("elapsed_seconds") or 0),
+                        "elapsed_label": str(st.get("elapsed_label") or "0s"),
+                        "last_activity_source": str(st.get("last_activity_source") or ""),
                         "threshold_seconds": int(st.get("threshold_seconds") or DEFAULT_STALL_THRESHOLD_SECONDS),
                     },
                     recommendation=(

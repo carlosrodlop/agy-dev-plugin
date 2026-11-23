@@ -65,13 +65,26 @@ setup() {
   run "${REPO_ROOT}/shell/agy_dev_queue.sh" --help
   [ "$status" -eq 0 ]
   [[ "$output" == *"dev_queue.json"* ]]
+  [[ "$output" == *"optimize"* ]]
+  [[ "$output" == *"set-status"* ]]
+  run "${REPO_ROOT}/shell/agy_dev_queue.sh" --version
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"agy-queue"* ]]
   run "${REPO_ROOT}/shell/agy_dev_queue.sh" doctor --help
   [ "$status" -eq 0 ]
   [[ "$output" == *"queue-doctor"* ]]
+  run "${REPO_ROOT}/shell/agy_dev_queue.sh" optimize --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--stall-seconds"* ]]
+  run "${REPO_ROOT}/shell/agy_dev_queue.sh" locks --help
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--sync-git"* ]]
   run bash -c "source '${REPO_ROOT}/shell/agy_dev_queue.sh' && agy_queue --help && agy_doctor --help"
   [ "$status" -eq 0 ]
   [[ "$output" == *"dev_queue.json"* ]]
   [[ "$output" == *"queue-doctor"* ]]
+  run bash -o pipefail -c "'${REPO_ROOT}/shell/agy_dev_queue.sh' --help | head -n 2"
+  [ "$status" -eq 0 ]
 }
 
 @test "core CLIs respond cleanly to --help" {

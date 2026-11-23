@@ -1900,8 +1900,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+AGY_QUEUE_SUBCOMMANDS: tuple[str, ...] = (
+    "watch",
+    "doctor",
+    "optimize",
+    "sync",
+    "list",
+    "show",
+    "locks",
+    "set-status",
+)
+
+
+def _silence_broken_pipe() -> int:
+    """Redirect stdout fd to `/dev/null` when a downstream pipe reader closes early (`SIGPIPE` / `BrokenPipeError`)."""
+    with contextlib.suppress(OSError, ValueError):
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_fd, sys.stdout.fileno())
+        finally:
+            os.close(devnull_fd)
+    return 0
+
+
 def run_dev_queue_tui_cli(argv: list[str] | None = None) -> int:
-    """Console entrypoint (`agy-queue`) delegating to `dev_queue_tui.py`."""
+    """Console entrypoint (`agy-queue`) delegating unified subcommands and dashboard flags to `dev_queue_tui.py`."""
+    forwarded = list(sys.argv[1:] if argv is None else argv)
+    if forwarded and forwarded[0] == "doctor":
+        return run_dev_queue_doctor_cli(forwarded[1:])
     candidates = (
         resolve_plugin_root() / "skills" / "agy-dev-queue-orchestrator" / "scripts" / "dev_queue_tui.py",
         Path.home()
@@ -1917,7 +1943,10 @@ def run_dev_queue_tui_cli(argv: list[str] | None = None) -> int:
     for script_path in candidates:
         mod = _load_optional_module(script_path, "_agy_dev_queue_tui_cli")
         if mod is not None and hasattr(mod, "main"):
-            return int(mod.main(argv))
+            try:
+                return int(mod.main(forwarded))
+            except BrokenPipeError:
+                return _silence_broken_pipe()
     sys.stderr.write("[agy-queue] Error: dev_queue_tui.py not found. Run ./install.sh to deploy agy-dev-plugin.\n")
     return 1
 
@@ -1940,7 +1969,10 @@ def run_dev_queue_doctor_cli(argv: list[str] | None = None) -> int:
     for script_path in candidates:
         mod = _load_optional_module(script_path, "pr_remediator")
         if mod is not None and hasattr(mod, "main"):
-            return int(mod.main(["queue-doctor", *forwarded]))
+            try:
+                return int(mod.main(["queue-doctor", *forwarded]))
+            except BrokenPipeError:
+                return _silence_broken_pipe()
     sys.stderr.write("[agy-doctor] Error: pr_remediator.py not found. Run ./install.sh to deploy agy-dev-plugin.\n")
     return 1
 
