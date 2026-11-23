@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -3787,6 +3788,613 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
                 wait_execs[0],
                 (sys.executable, [sys.executable, str(fake_entry.resolve()), "wait-for-unlock", "--interval", "15"]),
             )
+
+    @staticmethod
+    def _write_agy2_artifacts(
+        app_root: pathlib.Path,
+        cid: str,
+        *,
+        include_brain: bool = True,
+        include_db: bool = True,
+        include_wal_shm: bool = True,
+        include_pb: bool = False,
+        include_annotations: bool = True,
+        include_presence: bool = True,
+        mtime: float = 1700000000.0,
+        steps: list[dict[str, object]] | None = None,
+    ) -> int:
+        """Seed Antigravity 2.0 `.db`/`.db-wal`/`.db-shm`, optional `.pb`, `brain/`, `annotations/`, and `presence/` stubs."""
+        written: list[pathlib.Path] = []
+        if include_brain:
+            logs_dir = app_root / "brain" / cid / ".system_generated" / "logs"
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            tpath = logs_dir / "transcript.jsonl"
+            lines = [
+                json.dumps(s)
+                for s in (steps or [{"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "ok"}])
+            ]
+            tpath.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            written.append(tpath)
+        convs_dir = app_root / "conversations"
+        convs_dir.mkdir(parents=True, exist_ok=True)
+        if include_db:
+            db_p = convs_dir / f"{cid}.db"
+            db_p.write_bytes(b"SQLite-stub-" + (cid.encode("utf-8") * 4))
+            written.append(db_p)
+        if include_wal_shm:
+            for ext in (".db-wal", ".db-shm"):
+                wp = convs_dir / f"{cid}{ext}"
+                wp.write_bytes(b"wal-shm-stub-" + cid.encode("utf-8"))
+                written.append(wp)
+        if include_pb:
+            pb_p = convs_dir / f"{cid}.pb"
+            pb_p.write_bytes(b"pb-stub-" + cid.encode("utf-8"))
+            written.append(pb_p)
+        if include_annotations:
+            ann_dir = app_root / "annotations"
+            ann_dir.mkdir(parents=True, exist_ok=True)
+            ap = ann_dir / f"{cid}.pbtxt"
+            ap.write_text(f'conversation_id: "{cid}"\n', encoding="utf-8")
+            written.append(ap)
+        if include_presence:
+            pres_dir = app_root / "presence"
+            pres_dir.mkdir(parents=True, exist_ok=True)
+            lp = pres_dir / f"{cid}.lock"
+            lp.write_bytes(b"lock-" + cid.encode("utf-8"))
+            written.append(lp)
+        total = 0
+        for p in written:
+            os.utime(p, (mtime, mtime))
+            total += p.stat().st_size
+        return total
+
+    @staticmethod
+    def _seed_summaries_db(
+        db_path: pathlib.Path,
+        rows: list[tuple[str, str, str, str, str]],
+        *,
+        wal_without_shm: bool = False,
+    ) -> None:
+        """Create a synthetic `conversation_summaries.db` with `(cid, status, parent_cid, last_modified_time, title)`."""
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path))
+        if wal_without_shm:
+            conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS conversation_summaries ("
+            "conversation_id TEXT PRIMARY KEY, "
+            "status TEXT NOT NULL DEFAULT '', "
+            "parent_conversation_id TEXT NOT NULL DEFAULT '', "
+            "last_modified_time TEXT NOT NULL DEFAULT '', "
+            "title TEXT NOT NULL DEFAULT ''"
+            ")"
+        )
+        conn.executemany(
+            "INSERT OR REPLACE INTO conversation_summaries "
+            "(conversation_id, status, parent_conversation_id, last_modified_time, title) "
+            "VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+        if wal_without_shm:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+        if wal_without_shm:
+            for ext in ("-shm", "-wal"):
+                cand = pathlib.Path(f"{db_path}{ext}")
+                if cand.exists():
+                    cand.unlink()
+
+    def test_cleanup_agy2_sqlite_db_wal_shm_annotations_presence_across_desktop_and_cli(self) -> None:
+        """Verify `.db`/`.db-wal`/`.db-shm`, `.pb`, `annotations/`, and `presence/` cleanup & idle checks across Desktop and CLI."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            desktop_root = troot / ".gemini" / "antigravity"
+            cli_root = troot / ".gemini" / "antigravity-cli"
+            pdir.mkdir(parents=True, exist_ok=True)
+
+            now_ts = 1_800_000_000.0
+            old_ts = now_ts - 3600.0
+            merged_desktop_cid = "10101010-1111-4111-8111-101010101010"
+            merged_cli_child = "20202020-2222-4222-8222-202020202020"
+            unrelated_neighbor = "30303030-3333-4333-8333-303030303030"
+
+            d_bytes = self._write_agy2_artifacts(
+                desktop_root,
+                merged_desktop_cid,
+                include_pb=True,
+                mtime=old_ts,
+                steps=[
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "tool_calls": [{"name": "invoke_subagent", "result": {"conversationId": merged_cli_child}}],
+                    }
+                ],
+            )
+            c_bytes = self._write_agy2_artifacts(
+                cli_root,
+                merged_cli_child,
+                include_pb=False,
+                mtime=old_ts,
+            )
+            self._write_agy2_artifacts(desktop_root, unrelated_neighbor, mtime=old_ts)
+
+            # Touch ONLY `.db-wal` on merged_cli_child within min_idle_seconds -> must report not_fully_idle!
+            wal_path = cli_root / "conversations" / f"{merged_cli_child}.db-wal"
+            os.utime(wal_path, (now_ts - 5.0, now_ts - 5.0))
+            idle_ok, idle_reason = prs.is_conversation_fully_idle(
+                merged_cli_child,
+                antigravity_dirs=[desktop_root, cli_root],
+                min_idle_seconds=60.0,
+                now_ts=now_ts,
+            )
+            self.assertFalse(idle_ok)
+            self.assertIn("not_fully_idle:recent_activity", idle_reason)
+
+            # Restore old mtime on `.db-wal` and touch `presence/<cid>.lock` -> must also block idle check!
+            os.utime(wal_path, (old_ts, old_ts))
+            pres_lock = desktop_root / "presence" / f"{merged_desktop_cid}.lock"
+            os.utime(pres_lock, (now_ts - 3.0, now_ts - 3.0))
+            idle_pres_ok, idle_pres_reason = prs.is_conversation_fully_idle(
+                merged_desktop_cid,
+                antigravity_dirs=[desktop_root, cli_root],
+                min_idle_seconds=60.0,
+                now_ts=now_ts,
+            )
+            self.assertFalse(idle_pres_ok)
+            self.assertIn("not_fully_idle:recent_activity", idle_pres_reason)
+            os.utime(pres_lock, (old_ts, old_ts))
+
+            prs.enqueue_dev_queue_item(
+                conversation_id=merged_desktop_cid,
+                title="Acme Antigravity 2.0 SQLite cleanup",
+                status="merged",
+                portfolio_dir=pdir,
+            )
+            res = prs.cleanup_merged_conversations(
+                conversation_ids=[merged_desktop_cid],
+                confirm_merged=True,
+                include_unaudited_check=False,
+                portfolio_dir=pdir,
+                antigravity_dirs=[desktop_root, cli_root],
+                now_ts=now_ts,
+            )
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(set(res["deleted"]), {merged_desktop_cid, merged_cli_child})
+            self.assertEqual(res["freed_bytes"], d_bytes + c_bytes)
+            self.assertEqual(res["breakdown"]["by_runtime"]["desktop"]["bytes"], d_bytes)
+            self.assertEqual(res["breakdown"]["by_runtime"]["cli"]["bytes"], c_bytes)
+            self.assertGreater(res["breakdown"]["by_artifact"]["conversations_db"]["bytes"], 0)
+            self.assertGreater(res["breakdown"]["by_artifact"]["annotations"]["bytes"], 0)
+            self.assertGreater(res["breakdown"]["by_artifact"]["presence"]["bytes"], 0)
+
+            # Verify every .db/.db-wal/.db-shm/.pb/brain/annotations/presence file for deleted CIDs is gone
+            for root_p, cid_p in ((desktop_root, merged_desktop_cid), (cli_root, merged_cli_child)):
+                self.assertFalse((root_p / "brain" / cid_p).exists())
+                for sfx in (".db", ".db-wal", ".db-shm", ".pb"):
+                    self.assertFalse((root_p / "conversations" / f"{cid_p}{sfx}").exists())
+                self.assertFalse((root_p / "annotations" / f"{cid_p}.pbtxt").exists())
+                self.assertFalse((root_p / "presence" / f"{cid_p}.lock").exists())
+
+            # Unrelated neighbor remains completely intact
+            self.assertTrue((desktop_root / "conversations" / f"{unrelated_neighbor}.db").is_file())
+            self.assertTrue((desktop_root / "annotations" / f"{unrelated_neighbor}.pbtxt").is_file())
+            self.assertTrue((desktop_root / "presence" / f"{unrelated_neighbor}.lock").is_file())
+
+    def test_cleanup_summaries_db_running_upward_ancestors_downward_orphans_and_corrupt_db(self) -> None:
+        """Verify read-only `conversation_summaries.db` RUNNING guard, upward ancestor walk, downward orphan discovery, and corrupt DB safety."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            desktop_root = troot / ".gemini" / "antigravity"
+            cli_root = troot / ".gemini" / "antigravity-cli"
+            pdir.mkdir(parents=True, exist_ok=True)
+            cli_root.mkdir(parents=True, exist_ok=True)
+
+            now_ts = 1_800_000_000.0
+            old_ts = now_ts - 7200.0
+
+            grandparent_cid = "a1111111-1111-4111-8111-111111111111"
+            parent_orch_cid = "a2222222-2222-4222-8222-222222222222"
+            running_sub_cid = "a3333333-3333-4333-8333-333333333333"
+
+            brainless_merged_root = "b1111111-1111-4111-8111-111111111111"
+            orphan_child_cid = "b2222222-2222-4222-8222-222222222222"
+            orphan_grandchild_cid = "b3333333-3333-4333-8333-333333333333"
+
+            # Seed cycle pair to prove upward/downward cycle safety (`c1 <-> c2`)
+            cycle_running_a = "c1111111-1111-4111-8111-111111111111"
+            cycle_anc_b = "c2222222-2222-4222-8222-222222222222"
+
+            for cid in (
+                grandparent_cid,
+                parent_orch_cid,
+                running_sub_cid,
+                cycle_running_a,
+                cycle_anc_b,
+            ):
+                self._write_agy2_artifacts(desktop_root, cid, mtime=old_ts)
+
+            # Merged root had its `brain/` directory deleted earlier — ONLY `.db` files remain for root + orphan descendants!
+            for cid in (brainless_merged_root, orphan_child_cid, orphan_grandchild_cid):
+                self._write_agy2_artifacts(desktop_root, cid, include_brain=False, mtime=old_ts)
+            self.assertFalse((desktop_root / "brain" / brainless_merged_root).exists())
+
+            # Seed Desktop `conversation_summaries.db` in WAL mode with `-shm` removed (exercises `immutable=1` read-only fallback!)
+            desktop_sum_db = desktop_root / "conversation_summaries.db"
+            self._seed_summaries_db(
+                desktop_sum_db,
+                [
+                    (grandparent_cid, "CASCADE_RUN_STATUS_IDLE", "", "2026-11-01 10:00:00+00:00", "Root Chat"),
+                    (parent_orch_cid, "CASCADE_RUN_STATUS_IDLE", grandparent_cid, "2026-11-01 10:05:00+00:00", "Orchestrator"),
+                    (running_sub_cid, "CASCADE_RUN_STATUS_RUNNING", parent_orch_cid, "2026-11-01 10:10:00+00:00", "Active Subagent"),
+                    (brainless_merged_root, "CASCADE_RUN_STATUS_IDLE", "", "2026-11-01 08:00:00+00:00", "Merged Task"),
+                    (orphan_child_cid, "CASCADE_RUN_STATUS_IDLE", brainless_merged_root, "2026-11-01 08:05:00+00:00", "Dev Subagent"),
+                    (orphan_grandchild_cid, "CASCADE_RUN_STATUS_IDLE", orphan_child_cid, "2026-11-01 08:10:00+00:00", "Reviewer Subagent"),
+                    (cycle_running_a, "CASCADE_RUN_STATUS_RUNNING", cycle_anc_b, "2026-11-01 09:00:00+00:00", "Cycle A"),
+                    (cycle_anc_b, "CASCADE_RUN_STATUS_IDLE", cycle_running_a, "2026-11-01 09:01:00+00:00", "Cycle B"),
+                ],
+                wal_without_shm=True,
+            )
+            # Seed CORRUPT `conversation_summaries.db` in CLI root to prove graceful resilience
+            (cli_root / "conversation_summaries.db").write_bytes(b"corrupt-sqlite-header-bytes")
+
+            idle_run, reason_run = prs.is_conversation_fully_idle(
+                running_sub_cid,
+                antigravity_dirs=[desktop_root, cli_root],
+                min_idle_seconds=60.0,
+                now_ts=now_ts,
+            )
+            self.assertFalse(idle_run)
+            self.assertEqual(reason_run, "not_fully_idle:cascade_run_status_running")
+
+            # Downward subagent discovery finds orphan child & grandchild even with `brain/` absent
+            spawned_from_db = prs.extract_spawned_subagent_ids(
+                brainless_merged_root,
+                antigravity_dirs=[desktop_root, cli_root],
+            )
+            self.assertEqual(spawned_from_db, [orphan_child_cid, orphan_grandchild_cid])
+
+            res = prs.cleanup_merged_conversations(
+                conversation_ids=[
+                    grandparent_cid,
+                    parent_orch_cid,
+                    running_sub_cid,
+                    cycle_running_a,
+                    cycle_anc_b,
+                    brainless_merged_root,
+                ],
+                confirm_merged=True,
+                include_unaudited_check=False,
+                portfolio_dir=pdir,
+                antigravity_dirs=[desktop_root, cli_root],
+                now_ts=now_ts,
+            )
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(
+                set(res["deleted"]),
+                {brainless_merged_root, orphan_child_cid, orphan_grandchild_cid},
+            )
+            skipped_by_cid = {row["conversation_id"]: row["reasons"] for row in res["skipped"]}
+            self.assertIn("summary_db:CASCADE_RUN_STATUS_RUNNING", skipped_by_cid[running_sub_cid])
+            self.assertIn("ancestor_of_active_conversation", skipped_by_cid[parent_orch_cid])
+            self.assertIn("ancestor_of_active_conversation", skipped_by_cid[grandparent_cid])
+            self.assertIn("ancestor_of_active_conversation", skipped_by_cid[cycle_anc_b])
+
+            # Read-only DB query must NOT have created -shm or -wal sidecar files next to conversation_summaries.db
+            self.assertFalse(pathlib.Path(f"{desktop_sum_db}-shm").exists())
+            self.assertFalse(pathlib.Path(f"{desktop_sum_db}-wal").exists())
+
+            # When a live WAL writer leaves uncommitted-to-main frames in `-wal`, `mode=ro` must still read them
+            live_wal_cid = "a4444444-4444-4444-8444-444444444444"
+            live_writer = sqlite3.connect(str(desktop_sum_db))
+            try:
+                live_writer.execute("PRAGMA journal_mode=WAL")
+                live_writer.execute("PRAGMA wal_autocheckpoint=0")
+                live_writer.execute(
+                    "INSERT INTO conversation_summaries "
+                    "(conversation_id, status, parent_conversation_id, last_modified_time, title) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (live_wal_cid, "CASCADE_RUN_STATUS_RUNNING", "", "2026-11-01 10:15:00+00:00", "Live WAL Runner"),
+                )
+                live_writer.commit()
+                live_graph = prs._load_conversation_summaries_graph(
+                    prs._resolve_antigravity_roots(antigravity_dirs=[desktop_root]),
+                )
+                self.assertIn(live_wal_cid, live_graph["running_cids"])
+            finally:
+                live_writer.close()
+
+            # Protected ancestor & running `.db` files remain intact while brainless merged + orphans are gone
+            for kept_cid in (grandparent_cid, parent_orch_cid, running_sub_cid, cycle_running_a, cycle_anc_b):
+                self.assertTrue((desktop_root / "conversations" / f"{kept_cid}.db").is_file())
+            for gone_cid in (brainless_merged_root, orphan_child_cid, orphan_grandchild_cid):
+                self.assertFalse((desktop_root / "conversations" / f"{gone_cid}.db").exists())
+
+    def test_cleanup_protects_8char_prefix_against_nondone_synthetic_queue_items(self) -> None:
+        """Protect split multi-PR root conversations when any 8-char prefix synthetic queue item is non-done."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            desktop_root = troot / ".gemini" / "antigravity"
+            pdir.mkdir(parents=True, exist_ok=True)
+
+            now_ts = 1_800_000_000.0
+            old_ts = now_ts - 3600.0
+
+            root_557 = "557e5713-1111-4111-8111-111111111111"
+            root_e46 = "e467567e-2222-4222-8222-222222222222"
+            root_444 = "444cef60-3333-4333-8333-333333333333"
+            root_326 = "326676b9-4444-4444-8444-444444444444"
+
+            for cid in (root_557, root_e46, root_444, root_326):
+                self._write_agy2_artifacts(desktop_root, cid, mtime=old_ts)
+
+            # 557e5713: p1 is merged, p2 is STILL pending -> root_557 MUST stay protected!
+            prs.enqueue_dev_queue_item("557e5713-p1", title="Split P1", status="merged", portfolio_dir=pdir)
+            prs.enqueue_dev_queue_item("557e5713-p2", title="Split P2", status="pending", portfolio_dir=pdir)
+            # e467567e: adoption-delta-first is cancelled, p19 batch is pending -> root_e46 MUST stay protected!
+            prs.enqueue_dev_queue_item(
+                "e467567e-adoption-delta-first",
+                title="Delta first",
+                status="cancelled",
+                notes="Consolidated into single P19 UI Polish Batch (e467567e-p19-ui-polish-batch)",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item("e467567e-p19-ui-polish-batch", title="P19 batch", status="pending", portfolio_dir=pdir)
+            # 444cef60: hitl_blocked -> root_444 MUST stay protected!
+            prs.enqueue_dev_queue_item("444cef60-p25-ui-polish-batch", title="P25 batch", status="hitl_blocked", portfolio_dir=pdir)
+            # 326676b9: BOTH synthetic items are merged -> root_326 CAN be cleaned and both synthetic items move to cleaned!
+            prs.enqueue_dev_queue_item("326676b9-fix-preview", title="Preview fix", status="merged", portfolio_dir=pdir)
+            prs.enqueue_dev_queue_item("326676b9-fix-splitbrain", title="Splitbrain fix", status="merged", portfolio_dir=pdir)
+
+            res = prs.cleanup_merged_conversations(
+                all_merged=True,
+                include_unaudited_check=False,
+                portfolio_dir=pdir,
+                antigravity_dirs=[desktop_root],
+                now_ts=now_ts,
+            )
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(res["deleted"], [root_326])
+            for protected_root in (root_557, root_e46, root_444):
+                self.assertTrue((desktop_root / "conversations" / f"{protected_root}.db").is_file())
+            self.assertFalse((desktop_root / "conversations" / f"{root_326}.db").exists())
+
+            skipped_map = {s["conversation_id"]: s["reasons"] for s in res["skipped"]}
+            self.assertIn("dev_queue_prefix:pending:557e5713-p2", skipped_map[root_557])
+
+            q_after = {it["conversation_id"]: it["status"] for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+            self.assertEqual(q_after["326676b9-fix-preview"], "cleaned")
+            self.assertEqual(q_after["326676b9-fix-splitbrain"], "cleaned")
+            self.assertEqual(q_after["557e5713-p1"], "merged")
+
+    def test_cleanup_all_merged_superseded_cancelled_noop_actions_and_dry_run_mb_breakdown(self) -> None:
+        """Verify `--all-merged` + `--include-noop-actions --older-than-days` discovery, `--dry-run` MB breakdown, and CLI execution."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            desktop_root = troot / ".gemini" / "antigravity"
+            cli_root = troot / ".gemini" / "antigravity-cli"
+            pdir.mkdir(parents=True, exist_ok=True)
+            _, clone = _init_bare_and_clone_repo(troot, name="acme-plugin")
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(clone)})
+
+            now_ts = 1_800_000_000.0
+            ten_days_ago = now_ts - (10 * 86400.0)
+            two_days_ago = now_ts - (2 * 86400.0)
+
+            merged_cid = "d1111111-1111-4111-8111-111111111111"
+            merged_sub = "d1222222-2222-4222-8222-222222222222"
+            cleaned_leaked_cid = "d2222222-2222-4222-8222-222222222222"
+            superseded_done_cid = "d3333333-3333-4333-8333-333333333333"
+            superseded_pending_cid = "d4444444-4444-4444-8444-444444444444"
+            pending_batch_cid = "d5555555-5555-4555-8555-555555555555"
+            plain_cancelled_cid = "d6666666-6666-4666-8666-666666666666"
+            unmerged_branch_cid = "d7777777-7777-4777-8777-777777777777"
+
+            noop_old_cid = "e1111111-1111-4111-8111-111111111111"
+            noop_recent_cid = "e2222222-2222-4222-8222-222222222222"
+            deliv_old_cid = "e3333333-3333-4333-8333-333333333333"
+            error_old_cid = "e4444444-4444-4444-8444-444444444444"
+
+            for cid, ts_val in (
+                (merged_cid, ten_days_ago),
+                (cleaned_leaked_cid, ten_days_ago),
+                (superseded_done_cid, ten_days_ago),
+                (superseded_pending_cid, ten_days_ago),
+                (pending_batch_cid, ten_days_ago),
+                (plain_cancelled_cid, ten_days_ago),
+                (unmerged_branch_cid, ten_days_ago),
+                (noop_old_cid, ten_days_ago),
+                (noop_recent_cid, two_days_ago),
+                (deliv_old_cid, ten_days_ago),
+                (error_old_cid, ten_days_ago),
+            ):
+                self._write_agy2_artifacts(desktop_root, cid, mtime=ts_val)
+            self._write_agy2_artifacts(cli_root, merged_sub, mtime=ten_days_ago)
+
+            # Create an unmerged local branch on `clone` for `unmerged_branch_cid`
+            unmerged_br = "fix/20261123-010000-unmerged-d7777777"
+            subprocess.run(["git", "-C", str(clone), "checkout", "-b", unmerged_br], check=True, capture_output=True)
+            (clone / "unmerged.txt").write_text("still unmerged\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(clone), "add", "unmerged.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(clone), "commit", "-m", "feat: unmerged"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(clone), "checkout", "main"], check=True, capture_output=True)
+
+            prs.enqueue_dev_queue_item(
+                merged_cid,
+                title="Merged root",
+                status="merged",
+                subagent_conversation_ids=[merged_sub],
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                cleaned_leaked_cid,
+                title="Previously cleaned root that leaked .db",
+                status="cleaned",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                superseded_done_cid,
+                title="Superseded into merged_cid",
+                status="cancelled",
+                notes=f"Consolidated into merged batch ({merged_cid})",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                pending_batch_cid,
+                title="Pending replacement batch",
+                status="pending",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                superseded_pending_cid,
+                title="Superseded into still-pending batch",
+                status="cancelled",
+                notes=f"Consolidated into pending batch ({pending_batch_cid})",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                plain_cancelled_cid,
+                title="Plain cancelled item",
+                status="cancelled",
+                notes="Cancelled per user decision without replacement",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                unmerged_branch_cid,
+                title="Marked merged prematurely while branch unmerged",
+                status="merged",
+                branch_names=[f"{clone}::{unmerged_br}"],
+                portfolio_dir=pdir,
+            )
+
+            # Seed `actions_ledger.db` with scheduled NO_OP, DELIVERABLE, and ERROR runs
+            ledger_db = pdir / "actions_ledger.db"
+            lconn = sqlite3.connect(str(ledger_db))
+            lconn.execute(
+                "CREATE TABLE transcript_parse_cache ("
+                "conversation_id TEXT NOT NULL, is_scheduled_action INTEGER NOT NULL, "
+                "mtime_ns INTEGER NOT NULL, file_size INTEGER NOT NULL, "
+                "actions_log_doc_id TEXT NOT NULL, schema_version INTEGER NOT NULL, "
+                "parsed_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (conversation_id, is_scheduled_action))"
+            )
+            lconn.executemany(
+                "INSERT INTO transcript_parse_cache VALUES (?, 1, ?, 128, '', 1, ?, ?)",
+                [
+                    (
+                        noop_old_cid,
+                        int(ten_days_ago * 1_000_000_000),
+                        json.dumps({"detected_action": "customer-sync-prep", "total_steps": 5, "step_errors": [], "deliverable_urls": []}),
+                        "2026-11-01T10:00:00Z",
+                    ),
+                    (
+                        noop_recent_cid,
+                        int(two_days_ago * 1_000_000_000),
+                        json.dumps({"detected_action": "customer-sync-prep", "total_steps": 4, "step_errors": [], "deliverable_urls": []}),
+                        "2026-11-21T10:00:00Z",
+                    ),
+                    (
+                        deliv_old_cid,
+                        int(ten_days_ago * 1_000_000_000),
+                        json.dumps({"detected_action": "customer-sync-prep", "total_steps": 18, "action_deliverable_op": True, "deliverable_urls": ["https://docs.google.com/document/d/acme123"]}),
+                        "2026-11-01T10:00:00Z",
+                    ),
+                    (
+                        error_old_cid,
+                        int(ten_days_ago * 1_000_000_000),
+                        json.dumps({"detected_action": "task-health-check", "total_steps": 5, "step_errors": ["boom"], "last_step_status": "ERROR"}),
+                        "2026-11-01T10:00:00Z",
+                    ),
+                ],
+            )
+            lconn.commit()
+            lconn.close()
+
+            dry = prs.cleanup_merged_conversations(
+                all_merged=True,
+                include_noop_actions=True,
+                older_than_days=7.0,
+                dry_run=True,
+                include_unaudited_check=False,
+                portfolio_dir=pdir,
+                antigravity_dirs=[desktop_root, cli_root],
+                git_client=vcs,
+                now_ts=now_ts,
+            )
+            self.assertEqual(dry["status"], "ok")
+            self.assertTrue(dry["dry_run"])
+            expected_deleted = {merged_cid, merged_sub, cleaned_leaked_cid, superseded_done_cid, noop_old_cid}
+            self.assertEqual(set(dry["deleted"]), expected_deleted)
+            self.assertGreater(dry["freed_bytes"], 0)
+            bd = dry["breakdown"]
+            self.assertEqual(bd["total_bytes"], dry["freed_bytes"])
+            self.assertEqual(bd["noop_older_than_days"], 7.0)
+            self.assertEqual(bd["by_category"]["merged_roots"]["count"], 1)
+            self.assertEqual(bd["by_category"]["cleaned_leaked_roots"]["count"], 1)
+            self.assertEqual(bd["by_category"]["superseded_cancelled_roots"]["count"], 1)
+            self.assertEqual(bd["by_category"]["subagents"]["count"], 1)
+            self.assertEqual(bd["by_category"]["noop_actions"]["count"], 1)
+            self.assertEqual(bd["by_runtime"]["desktop"]["count"], 4)
+            self.assertEqual(bd["by_runtime"]["cli"]["count"], 1)
+            # Dry-run leaves all files intact
+            self.assertTrue((desktop_root / "conversations" / f"{merged_cid}.db").is_file())
+            self.assertTrue((cli_root / "conversations" / f"{merged_sub}.db").is_file())
+
+            # Execute via CLI `main(...)` with env overrides and verify live deletion + preserved items
+            stdout_buf = io.StringIO()
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "AGY_DEV_STATE_DIR": str(pdir),
+                        "AGY_ANTIGRAVITY_DIR": str(desktop_root),
+                        "AGY_ANTIGRAVITY_CLI_DIR": str(cli_root),
+                        "AGY_CONF_REPO_DIR": str(clone),
+                    },
+                ),
+                mock.patch("time.time", return_value=now_ts),
+                contextlib.redirect_stdout(stdout_buf),
+            ):
+                rc = prs.main(
+                    [
+                        "cleanup-merged-conversations",
+                        "--all-merged",
+                        "--include-noop-actions",
+                        "--older-than-days",
+                        "7",
+                        "--skip-unaudited-check",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            cli_payload = json.loads(stdout_buf.getvalue())
+            self.assertEqual(set(cli_payload["deleted"]), expected_deleted)
+
+            # Deleted items are gone; protected/recent/deliverable/error/unmerged-branch items remain
+            for gone_id in (merged_cid, cleaned_leaked_cid, superseded_done_cid, noop_old_cid):
+                self.assertFalse((desktop_root / "conversations" / f"{gone_id}.db").exists())
+            self.assertFalse((cli_root / "conversations" / f"{merged_sub}.db").exists())
+            for kept_id in (
+                superseded_pending_cid,
+                pending_batch_cid,
+                plain_cancelled_cid,
+                unmerged_branch_cid,
+                noop_recent_cid,
+                deliv_old_cid,
+                error_old_cid,
+            ):
+                self.assertTrue((desktop_root / "conversations" / f"{kept_id}.db").is_file())
+
+            # Superseded cancelled item keeps status="cancelled", while merged_cid transitions to "cleaned"
+            q_final = {it["conversation_id"]: it["status"] for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
+            self.assertEqual(q_final[merged_cid], "cleaned")
+            self.assertEqual(q_final[superseded_done_cid], "cancelled")
+            self.assertEqual(q_final[unmerged_branch_cid], "merged")
 
 
 if __name__ == "__main__":
