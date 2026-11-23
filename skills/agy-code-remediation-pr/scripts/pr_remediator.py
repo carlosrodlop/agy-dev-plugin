@@ -45,7 +45,6 @@ import argparse
 import ast
 from collections.abc import Callable, Iterator, Mapping, Sequence
 import contextlib
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -8348,7 +8347,7 @@ def _collect_conversation_disk_artifacts(
 
 
 def _open_sqlite_readonly(db_path: Path) -> sqlite3.Connection | None:
-    """Open a SQLite database strictly read-only (`mode=ro`, falling back to `immutable=1` for shm-less WAL DBs)."""
+    """Open a SQLite database strictly read-only without creating `-shm`/`-wal` sidecars on Linux or macOS."""
     try:
         if not db_path.is_file() or db_path.stat().st_size == 0:
             return None
@@ -8356,8 +8355,20 @@ def _open_sqlite_readonly(db_path: Path) -> sqlite3.Connection | None:
     except OSError:
         return None
 
+    has_live_wal_sidecar = False
+    for sidecar_sfx in ("-wal", "-shm"):
+        with contextlib.suppress(OSError):
+            if Path(f"{resolved}{sidecar_sfx}").exists():
+                has_live_wal_sidecar = True
+                break
+
+    # When neither `-wal` nor `-shm` exists (quiesced WAL DB or rollback-journal DB), open with
+    # `immutable=1` first so Linux POSIX SQLite never materializes fresh `-shm`/`-wal` sidecars
+    # inside a writable directory on `mode=ro`. When live WAL sidecars exist, prefer `mode=ro`
+    # first so active WAL frames remain visible, falling back to `immutable=1` if `-shm` is restricted.
+    queries = ("mode=ro", "mode=ro&immutable=1") if has_live_wal_sidecar else ("mode=ro&immutable=1", "mode=ro")
     quoted = urllib.parse.quote(str(resolved), safe="/:")
-    for query in ("mode=ro", "mode=ro&immutable=1"):
+    for query in queries:
         conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(f"file:{quoted}?{query}", uri=True, timeout=1.5)

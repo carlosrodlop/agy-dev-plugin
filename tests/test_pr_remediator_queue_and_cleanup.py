@@ -3876,6 +3876,8 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             rows,
         )
         conn.commit()
+        if wal_without_shm:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.close()
         if wal_without_shm:
             for ext in ("-shm", "-wal"):
@@ -4085,6 +4087,26 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             # Read-only DB query must NOT have created -shm or -wal sidecar files next to conversation_summaries.db
             self.assertFalse(pathlib.Path(f"{desktop_sum_db}-shm").exists())
             self.assertFalse(pathlib.Path(f"{desktop_sum_db}-wal").exists())
+
+            # When a live WAL writer leaves uncommitted-to-main frames in `-wal`, `mode=ro` must still read them
+            live_wal_cid = "a4444444-4444-4444-8444-444444444444"
+            live_writer = sqlite3.connect(str(desktop_sum_db))
+            try:
+                live_writer.execute("PRAGMA journal_mode=WAL")
+                live_writer.execute("PRAGMA wal_autocheckpoint=0")
+                live_writer.execute(
+                    "INSERT INTO conversation_summaries "
+                    "(conversation_id, status, parent_conversation_id, last_modified_time, title) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (live_wal_cid, "CASCADE_RUN_STATUS_RUNNING", "", "2026-11-01 10:15:00+00:00", "Live WAL Runner"),
+                )
+                live_writer.commit()
+                live_graph = prs._load_conversation_summaries_graph(
+                    prs._resolve_antigravity_roots(antigravity_dirs=[desktop_root]),
+                )
+                self.assertIn(live_wal_cid, live_graph["running_cids"])
+            finally:
+                live_writer.close()
 
             # Protected ancestor & running `.db` files remain intact while brainless merged + orphans are gone
             for kept_cid in (grandparent_cid, parent_orch_cid, running_sub_cid, cycle_running_a, cycle_anc_b):
