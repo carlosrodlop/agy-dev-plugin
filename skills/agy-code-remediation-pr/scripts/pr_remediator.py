@@ -752,7 +752,7 @@ def _sync_lock_slots_structure(lock_obj: dict[str, Any], *, repo_slug: str = "")
     slot1 = _build_slot_dict_from_mapping(out, 1)
     if isinstance(raw_slots.get("1"), dict):
         # Preserve additive slot-1 keys (`base_sha`, `overlap_tier`, `landing_order`) when top-level omitted them
-        for add_k in ("base_sha", "overlap_tier", "landing_order", "section_anchors", "review_approved", "approved_head_sha", "deferred_send_email"):
+        for add_k in ("base_sha", "overlap_tier", "landing_order", "section_anchors", "review_approved", "approved_head_sha"):
             if not slot1.get(add_k) and raw_slots["1"].get(add_k):
                 slot1[add_k] = raw_slots["1"][add_k]
     slot1["slot_id"] = 1
@@ -1240,7 +1240,7 @@ def acquire_dev_pr_lock(
                         "pr_gate_ready": False,
                         "review_approved": bool(prev_s2.get("review_approved")) if same_conv_slot2 else False,
                         "approved_head_sha": str(prev_s2.get("approved_head_sha") or "") if same_conv_slot2 else "",
-                        "deferred_send_email": bool(prev_s2.get("deferred_send_email")) if same_conv_slot2 else False,
+                        "deferred_send_email": False,
                         "reviewed_head_sha": str(prev_s2.get("reviewed_head_sha") or "") if same_conv_slot2 else "",
                         "staged_head_sha": str(prev_s2.get("staged_head_sha") or "") if same_conv_slot2 else "",
                         "head_sha": str(prev_s2.get("head_sha") or "") if same_conv_slot2 else "",
@@ -4367,7 +4367,7 @@ def build_pr_reviewer_subagent_plan(
         f"   - Criterion B (25 pts): Unit Test Coverage — Are new or updated deterministic unit tests included in `tests/`?\n"
         f"   - Criterion C (20 pts): Security & Zero-PII Guardrails — Zero hardcoded customer names, emails, `/Users/<user>/` paths, or secrets.\n"
         f"   - Criterion D (15 pts): Code Style, Typing & Documentation — Clean English docstrings, type hints, and plugin / `$HOME` parity.\n"
-        f"3. Record your structured verdict via `record-review` (which publishes `origin/<branch>`, starts `watch-pr-merge`, and dispatches `[🟩]` email ONLY if `PASS` and `score > 90`; otherwise keeps the branch local and returns `developer_remediation_plan` for auto-iteration up to {MAX_PR_REVIEW_ITERATIONS} rounds):\n"
+        f"3. Record your structured verdict via `record-review` (which publishes `origin/<branch>`, starts `watch-pr-merge`, and surfaces `manual_pr_url` ONLY if `PASS` and `score > 90` with zero PR Ready emails; otherwise keeps the branch local and returns `developer_remediation_plan` for auto-iteration up to {MAX_PR_REVIEW_ITERATIONS} rounds, dispatching a `[🟥]` KO escalation alert only at round >= {MAX_PR_REVIEW_ITERATIONS} when `--send-email` is passed):\n"
         f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review --branch <BRANCH_NAME>{wd_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary \"...\" --send-email`\n"
         f"4. Return the JSON evaluation summary (`ready_for_human_pr`, `needs_reiteration`, `manual_pr_url` only when `ready_for_human_pr == true`, or `developer_remediation_plan` otherwise)."
     )
@@ -5418,7 +5418,9 @@ def record_pr_review_evaluation(
     - On `PASS` (`score >= 91`): resolves the active worktree via `git worktree list --porcelain`, amends HEAD commit
       with preserved Executive Summary + deterministic `## 🧪 Automated Verification Checks` + `## 🤖 Independent PR Review`,
       pushes to `origin/<branch>` (failing loudly on any amend or push error), sets `pr_gate_ready=True`,
-      publishes rich `manual_pr_url`, transitions queue to `pr_open`, spawns `watch-pr-merge`, and sends `[🟩]` email.
+      publishes rich `manual_pr_url`, transitions queue to `pr_open`, spawns `watch-pr-merge`, and never sends
+      `status='OK'` PR Ready for Validation emails (`notification_email_sent=False`; `--send-email` is retained
+      strictly for Round-3 `[🟥]` KO circuit-breaker escalations).
     """
     vcs = git_client or GitVcsIntegrationClient()
     score_int = int(score)
@@ -5829,8 +5831,8 @@ def record_pr_review_evaluation(
             valid_vr = {**valid_vr, "head_sha": amended_head_sha, "dirty": False}
 
         # MAX 1 OPEN GITHUB PR PER REPOSITORY INVARIANT:
-        # When Slot #2 passes review while Slot #1 is still active on the repo, DO NOT push to origin,
-        # DO NOT surface `manual_pr_url`, and DO NOT email until Slot #1 merges + rebase-reverify passes!
+        # When Slot #2 passes review while Slot #1 is still active on the repo, DO NOT push to origin
+        # and DO NOT surface `manual_pr_url` until Slot #1 merges + rebase-reverify passes (`deferred_send_email=False`).
         if is_slot2_branch:
             head_sha = amended_head_sha
             review_entry["head_sha"] = head_sha
@@ -5873,7 +5875,7 @@ def record_pr_review_evaluation(
                     "approved_head_sha": head_sha,
                     "reviewed_head_sha": head_sha,
                     "staged_head_sha": head_sha,
-                    "deferred_send_email": bool(send_email),
+                    "deferred_send_email": False,
                     "head_sha": head_sha,
                     "repo_branches": updated_rb,
                     "manual_pr_url": "",
@@ -6195,50 +6197,14 @@ def record_pr_review_evaluation(
         repo_slug=resolved_repo_slug,
     )
 
+    # PR Ready for Validation (status='OK') emails are permanently disabled; readiness is surfaced
+    # exclusively via dev_queue.json (`pr_open`), `agy-queue` TUI, `dev_queue_board.md`, and `manual_pr_url`.
+    # (`--send-email` is retained strictly for Round-3 `[🟥]` KO circuit-breaker escalations above.)
+    _ = send_email
     email_sent = False
     email_subject = (
         f"PR Ready for Validation [{repo_name}]: {summary_or_branch} ({norm_verdict} {score_int}/100)"
     )
-
-    if send_email:
-        email_body = (
-            f"# 🌿 New Branch Validated & Published by `{PR_DEVELOPER_SUBAGENT_NAME}` / `{PR_REVIEWER_SUBAGENT_NAME}`: `{resolved_branch}` (`{resolved_ts}`)\n\n"
-            f"A **new timestamped Git branch** **`{resolved_branch}`** (`{resolved_ts}`) passed independent review and has been published via native Git "
-            f"(`git_client.py` — never merged directly into `main`) following implementation by **`{PR_DEVELOPER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL})`** "
-            f"and independent review by **`{PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL})`**:\n\n"
-            f"- **Branch Action**: **NEW BRANCH CREATED (`origin/{resolved_branch}`)**\n"
-            f"- **New Branch Created**: `{resolved_branch}`"
-            + (f" (`{head_sha[:8]}`)" if head_sha else "")
-            + "\n"
-            f"- **Branch Timestamp**: `{resolved_ts}`\n"
-            f"- **Created & Validated By**: `{created_by_label}`\n"
-            f"- **Compare with `main` & Create Manual PR**: [{resolved_branch}]({manual_pr_url})\n"
-            f"- **Conversation ID**: `{cid_clean}`\n"
-            + (f"- **Root Cause (RCA)**: {rca_summary}\n" if rca_summary else "")
-            + (f"- **Proposed Solution**: {proposed_fix}\n" if proposed_fix else "")
-            + f"- **Review Verdict (`{PR_REVIEWER_SUBAGENT_NAME}`)**: **{badge} ({score_int}/100 · Round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS})**\n"
-            f"- **Evaluation Details**: {summary.strip()}\n"
-            f"- **Concurrency Lock (`dev_pr_lock`)**: `ACTIVE (PENDING_HUMAN_PR_VALIDATION)` — "
-            f"No other code changes are permitted in `{resolved_repo_slug}` until you evaluate this newly created branch.\n\n"
-            f"{canonical_pr_body}\n"
-            f"## 🚀 How to Compare with `main`, Create the Manual Pull Request & Release the Lock\n"
-            f"1. Compare the newly created branch against `main` and create the Pull Request manually at [{manual_pr_url}]({manual_pr_url}) (or run `git fetch origin && git diff origin/main...origin/{resolved_branch}`).\n"
-            f"2. To approve the branch after creating/merging the PR and unlock new changes:\n"
-            f"   `pr_remediator.py evaluate-branch --branch \"{resolved_branch}\" --decision approve --comment \"Manual PR created and validated\"`\n"
-            f"3. To reject the branch (deletes `origin/{resolved_branch}` with `git push origin --delete` and releases the lock):\n"
-            f"   `pr_remediator.py evaluate-branch --branch \"{resolved_branch}\" --decision reject --comment \"Branch rejected\"`"
-        )
-        notify_res = dev_common.try_send_branch_review_notification(
-            status="OK",
-            subject=email_subject,
-            body=email_body,
-            conversation_id=cid_clean or resolved_ts,
-            validator=validator_banner_label,
-            branch_name=resolved_branch,
-            target_url=notification_target_url,
-            errors_only_override=False,
-        )
-        email_sent = bool(notify_res.get("sent"))
 
     ask_question_prompt = {
         "question": (
@@ -9201,6 +9167,7 @@ def run_slot_rebase_reverify(
                     "head_sha": final_head_sha,
                     "reviewed_head_sha": final_head_sha,
                     "approved_head_sha": final_head_sha,
+                    "deferred_send_email": False,
                     "branch_pushed": True,
                     "pr_gate_ready": True,
                     "needs_base_rebase": False,
@@ -9229,28 +9196,9 @@ def run_slot_rebase_reverify(
                         portfolio_dir=portfolio_dir,
                     )
 
+            # PR Ready for Validation (status='OK') emails are permanently disabled on 0-LLM Slot #2 promotion.
+            _ = send_email
             email_sent = False
-            if send_email or bool(lock_info.get("deferred_send_email")):
-                repo_name = resolved_slug.split("/")[-1] if resolved_slug and resolved_slug != "default" else eff_push_dir.name
-                subj_sum = _format_pr_notification_subject_summary(proposal_title, exec_summary, resolved_branch)
-                email_subj = f"PR Ready for Validation [{repo_name}]: {subj_sum} (PASS {rev_score}/100)"
-                notif_url = _git_client.build_vcs_pr_notification_url(
-                    branch_name=resolved_branch,
-                    base_branch=base_branch,
-                    pr_url=manual_pr_url,
-                    repo_slug=resolved_slug,
-                )
-                n_res = dev_common.try_send_branch_review_notification(
-                    status="OK",
-                    subject=email_subj,
-                    body=canonical_body,
-                    conversation_id=cid_clean or resolved_ts,
-                    validator=f"{PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL}) [PASS {rev_score}/100 · 0-LLM Rebase Promoted]",
-                    branch_name=resolved_branch,
-                    target_url=notif_url,
-                    errors_only_override=False,
-                )
-                email_sent = bool(n_res.get("sent"))
 
             watcher_res = spawn_pr_merge_watcher_daemon(portfolio_dir=portfolio_dir)
             return {
@@ -9523,7 +9471,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     p_rev = sub.add_parser(
         "record-review",
-        help="Record Agent 2 (agy-code-pr-reviewer) evaluation for the pushed branch and send the notification email with matching timestamp.",
+        help="Record Agent 2 (agy-code-pr-reviewer) evaluation and enforce the PASS>90 PR readiness gate (zero PR Ready emails).",
     )
     p_rev.add_argument("--branch", default="", help="Timestamped branch name (defaults to locked branch_name).")
     p_rev.add_argument("--workdir", default="", help="Optional worktree or target repository directory.")
@@ -9534,7 +9482,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_rev.add_argument("--summary", required=True, help="Detailed review evaluation summary.")
     p_rev.add_argument("--executive-summary", default="", help="Optional Executive Summary override.")
     p_rev.add_argument("--subagent-id", default="", help="Reviewer subagent conversationId.")
-    p_rev.add_argument("--send-email", action="store_true", help="Dispatch a branch-review notification with the branch timestamp when configured.")
+    p_rev.add_argument(
+        "--send-email",
+        action="store_true",
+        help="Dispatch Round-3 [🟥] KO escalation alert if review circuit-breaker trips (deprecated no-op on PASS; PR Ready emails are disabled).",
+    )
 
     p_watch = sub.add_parser(
         "watch-pr-merge",
@@ -9680,7 +9632,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_rbr.add_argument("--branch", default="", help="Optional branch name (defaults to locked slot branch).")
     p_rbr.add_argument("--base", default="main", help="Base branch name (default: main).")
     p_rbr.add_argument("--fetch", action="store_true", help="Fetch origin before rebasing.")
-    p_rbr.add_argument("--send-email", action="store_true", help="Send Ready-for-PR notification email when auto-promoted to Slot #1 human PR.")
+    p_rbr.add_argument(
+        "--send-email",
+        action="store_true",
+        help="Retained for backward CLI compatibility (deprecated no-op; PR Ready emails are disabled).",
+    )
 
     return parser.parse_args(argv)
 

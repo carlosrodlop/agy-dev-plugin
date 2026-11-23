@@ -1868,15 +1868,13 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertTrue(rev_pass["pr_gate_ready"])
             self.assertTrue(rev_pass["branch_pushed"])
             self.assertEqual(rev_pass["review_iteration"], 3)
-            self.assertTrue(rev_pass["notification_email_sent"])
-            mock_notify_pass.assert_called_once()
-            self.assertEqual(mock_notify_pass.call_args.kwargs.get("status"), "OK")
+            self.assertFalse(rev_pass["notification_email_sent"])
+            mock_notify_pass.assert_not_called()
             expected_clean_target_url = f"https://github.com/acme/repo-a/compare/main...{branch_name}?expand=1"
             self.assertEqual(
-                mock_notify_pass.call_args.kwargs.get("subject"),
+                rev_pass["email_subject"],
                 "PR Ready for Validation [repo-a]: feat(pr-gate): enforce local-first review (PASS 96/100)",
             )
-            self.assertEqual(mock_notify_pass.call_args.kwargs.get("target_url"), expected_clean_target_url)
             self.assertEqual(rev_pass["notification_target_url"], expected_clean_target_url)
             self.assertNotIn("title=", rev_pass["notification_target_url"])
             self.assertNotIn("body=", rev_pass["notification_target_url"])
@@ -2293,6 +2291,164 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
                 )
             self.assertEqual(rej_ok["status"], "ok")
             self.assertTrue(rej_ok["lock_released"])
+
+    def test_slot2_record_review_and_rebase_reverify_send_email_dispatches_zero_pr_ready_emails(self) -> None:
+        """Verify Slot #2 record-review(send_email=True) + rebase-reverify(send_email=True) dispatch zero PR Ready emails."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            remotes_org = troot / "remotes" / "acme"
+            remotes_org.mkdir(parents=True, exist_ok=True)
+            checkouts_dir = troot / "checkouts"
+            checkouts_dir.mkdir(parents=True, exist_ok=True)
+
+            bare_a, repo_a = _init_org_bare_and_clone_repo(remotes_org, checkouts_dir, "repo-slot2-no-email")
+            vcs_a = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(repo_a)})
+
+            cid_s1 = "61616161-1111-4111-8111-616161616161"
+            cid_s2 = "62626262-2222-4222-8222-626262626262"
+
+            # 1. Acquire Slot #1 on src_a.py, review PASS with send_email=True -> pushed, zero emails
+            s1 = prs.start_remediation_branch_and_lock(
+                conversation_id=cid_s1,
+                action_id="slot1-feat",
+                rca_summary="Slot 1 change",
+                proposed_fix="Add src_a.py",
+                target_files=["src_a.py"],
+                create_worktree=True,
+                branch_timestamp="20261123-090000",
+                workdir=repo_a,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(s1["slot_id"], 1)
+            wt1 = pathlib.Path(s1["worktree_path"])
+            br1 = s1["branch_name"]
+            (wt1 / "src_a.py").write_text("A = 1\n", encoding="utf-8")
+            prs.push_remediation_branch_and_build_reviewer_plan(
+                title="feat(slot1): add src_a",
+                executive_summary="Add src_a module.",
+                workdir=wt1,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+
+            # 2. Acquire disjoint Slot #2 on src_b.py (--allow-slot2)
+            s2 = prs.start_remediation_branch_and_lock(
+                conversation_id=cid_s2,
+                action_id="slot2-feat",
+                rca_summary="Slot 2 disjoint change",
+                proposed_fix="Add src_b.py",
+                target_files=["src_b.py"],
+                allow_slot2=True,
+                create_worktree=True,
+                branch_timestamp="20261123-090500",
+                workdir=repo_a,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(s2["status"], "ok")
+            self.assertEqual(s2["slot_id"], 2)
+            wt2 = pathlib.Path(s2["worktree_path"])
+            br2 = s2["branch_name"]
+            (wt2 / "src_b.py").write_text("B = 2\n", encoding="utf-8")
+            prs.push_remediation_branch_and_build_reviewer_plan(
+                title="feat(slot2): add src_b",
+                executive_summary="Add src_b module.",
+                head_branch=br2,
+                workdir=wt2,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+
+            with (
+                mock.patch.object(
+                    prs.dev_common,
+                    "try_send_branch_review_notification",
+                    return_value={"sent": True, "transport": "mock"},
+                ) as mock_notify,
+                mock.patch.object(prs, "spawn_pr_merge_watcher_daemon", return_value={"status": "skipped", "spawned": False}),
+            ):
+                rev1 = prs.record_pr_review_evaluation(
+                    branch_name=br1,
+                    verdict="PASS",
+                    score=97,
+                    summary="Slot 1 approved.",
+                    send_email=True,
+                    workdir=wt1,
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                )
+                self.assertTrue(rev1["ready_for_human_pr"])
+                self.assertFalse(rev1["notification_email_sent"])
+
+                rev2 = prs.record_pr_review_evaluation(
+                    branch_name=br2,
+                    verdict="PASS",
+                    score=96,
+                    summary="Slot 2 approved locally.",
+                    send_email=True,
+                    workdir=wt2,
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                )
+                self.assertEqual(rev2["status"], "ok")
+                self.assertEqual(rev2["slot_id"], 2)
+                self.assertEqual(rev2["lock_status"], prs.SLOT_STATUS_READY_AWAITING_BASE_MERGE)
+                self.assertFalse(rev2["notification_email_sent"])
+                mock_notify.assert_not_called()
+
+                s2_lock = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt2, branch_name=br2)
+                self.assertFalse(s2_lock.get("deferred_send_email"))
+
+                # 3. Merge Slot #1 into origin/main and sync lock to promote Slot #2 -> Slot #1 (NEEDS_REBASE_REVERIFY)
+                merger = troot / "merger"
+                subprocess.run(["git", "clone", f"file://{bare_a}", str(merger)], check=True, capture_output=True, text=True)
+                subprocess.run(["git", "-C", str(merger), "config", "user.name", "Test Bot"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(merger), "config", "user.email", "bot@example.com"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(merger), "merge", "--no-ff", f"origin/{br1}", "-m", "Merge Slot 1"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(merger), "push", "origin", "main"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(merger), "push", "origin", f":{br1}"], check=True, capture_output=True)
+
+                prs.sync_dev_pr_lock_with_git(portfolio_dir=pdir, workdir=repo_a, git_client=vcs_a)
+                promoted = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt2)
+                self.assertEqual(promoted["slot_id"], 1)
+                self.assertEqual(promoted["branch_name"], br2)
+                self.assertEqual(promoted["status"], prs.SLOT_STATUS_NEEDS_REBASE_REVERIFY)
+
+                # Even if a legacy lock carried deferred_send_email=True AND caller passes send_email=True, zero emails!
+                prs.update_dev_pr_lock(
+                    {"deferred_send_email": True},
+                    portfolio_dir=pdir,
+                    workdir=wt2,
+                    branch_name=br2,
+                    slot_id=1,
+                )
+                rbr = prs.run_slot_rebase_reverify(
+                    workdir=wt2,
+                    branch_name=br2,
+                    fetch=True,
+                    send_email=True,
+                    portfolio_dir=pdir,
+                    git_client=vcs_a,
+                    verify_fn=lambda _wd, _files: {"passed": True, "summary": "union ok"},
+                )
+                self.assertEqual(rbr["outcome"], prs.OUTCOME_AUTO_PROMOTED)
+                self.assertTrue(rbr["promoted_to_human_pr"])
+                self.assertTrue(rbr["ready_for_human_pr"])
+                self.assertTrue(rbr["pr_gate_ready"])
+                self.assertTrue(rbr["branch_pushed"])
+                self.assertIn(br2, rbr["manual_pr_url"])
+                self.assertFalse(rbr["notification_email_sent"])
+                mock_notify.assert_not_called()
+
+                final_lock = prs.get_dev_pr_lock(portfolio_dir=pdir, workdir=wt2)
+                self.assertEqual(final_lock["status"], "PENDING_HUMAN_PR_VALIDATION")
+                self.assertFalse(final_lock.get("deferred_send_email"))
+
+            prs.cleanup_worktree(wt1, repo_dir=repo_a)
+            prs.cleanup_worktree(wt2, repo_dir=repo_a)
 
     def test_detect_stalled_lock_and_lock_heartbeat_cli(self) -> None:
         """Verify stalled-worker detection across timestamps/worktree/transcript and `lock-heartbeat` CLI."""
