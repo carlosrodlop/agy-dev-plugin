@@ -864,12 +864,75 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
             ["skills/agy-code-remediation-pr/scripts/parallel_scope.py"],
             ["skills/agy-code-remediation-pr/scripts/rebase_gate.py"],
             ["skills/agy-code-remediation-pr/scripts/pr_remediator.py"],
+            ["skills/agy-code-remediation-pr/scripts/lock_store.py"],
+            ["skills/agy-code-remediation-pr/scripts/queue_store.py"],
+            ["skills/agy-code-remediation-pr/scripts/worktree_ops.py"],
+            ["skills/agy-code-remediation-pr/scripts/review_gate.py"],
+            ["skills/agy-code-remediation-pr/scripts/merge_watcher.py"],
         ):
             selected = srunner.select_test_modules(changed)
             self.assertIn("tests.test_parallel_subagent_orchestration", selected)
             self.assertIn("tests.test_pr_remediator_queue_and_cleanup", selected)
+            if not changed[0].endswith(("parallel_scope.py", "rebase_gate.py")):
+                self.assertTrue(srunner.should_run_bats(changed))
         tui_selected = srunner.select_test_modules(["skills/agy-code-remediation-pr/scripts/pr_remediator.py"])
         self.assertIn("tests.test_dev_queue_tui", tui_selected)
+        self.assertIn("tests.test_dev_queue_doctor", srunner.select_test_modules(["skills/agy-code-remediation-pr/scripts/lock_store.py"]))
+        self.assertIn("tests.test_dev_queue_tui", srunner.select_test_modules(["skills/agy-code-remediation-pr/scripts/queue_store.py"]))
+        self.assertIn("tests.test_pr_remediator_preview_staging", srunner.select_test_modules(["skills/agy-code-remediation-pr/scripts/worktree_ops.py"]))
+        self.assertIn("tests.test_pr_remediator_preview_staging", srunner.select_test_modules(["skills/agy-code-remediation-pr/scripts/review_gate.py"]))
+        self.assertIn("tests.test_dev_queue_doctor", srunner.select_test_modules(["skills/agy-code-remediation-pr/scripts/merge_watcher.py"]))
+
+    def test_pr_remediator_modular_facade_size_reexports_and_cli_contract(self) -> None:
+        """Verify `pr_remediator.py` stays <25 KB while preserving 100% of module re-exports and CLI subcommands."""
+        facade_path = PR_REM_DIR / "pr_remediator.py"
+        self.assertLess(facade_path.stat().st_size, 25_000)
+
+        for mod_name in ("lock_store.py", "queue_store.py", "worktree_ops.py", "review_gate.py", "merge_watcher.py"):
+            mod_path = PR_REM_DIR / mod_name
+            self.assertTrue(mod_path.is_file(), msg=f"Missing extracted module {mod_name}")
+            self.assertTrue(os.access(mod_path, os.X_OK), msg=f"Extracted module {mod_name} must be executable")
+
+        expected_exports = (
+            "get_all_dev_pr_locks",
+            "get_dev_pr_lock",
+            "acquire_dev_pr_lock",
+            "update_dev_pr_lock",
+            "record_dev_pr_lock_heartbeat",
+            "release_dev_pr_lock",
+            "sync_dev_pr_lock_with_git",
+            "load_dev_queue",
+            "enqueue_dev_queue_item",
+            "update_dev_queue_item_status",
+            "get_next_dev_queue_item",
+            "reconcile_dev_queue_with_git",
+            "compute_effective_priorities",
+            "start_remediation_branch_and_lock",
+            "prepare_isolated_worktree",
+            "run_local_validation_suite",
+            "push_remediation_branch_and_build_reviewer_plan",
+            "get_branch_diff_with_verification_gate",
+            "record_pr_review_evaluation",
+            "evaluate_branch_and_release_lock",
+            "analyze_queue_or_tasks_overlap",
+            "run_slot_rebase_reverify",
+            "run_pr_merge_watcher_loop",
+            "spawn_pr_merge_watcher_daemon",
+            "wait_for_unlock_or_actionable_event",
+            "cleanup_merged_conversations",
+            "parse_args",
+            "main",
+        )
+        for sym in expected_exports:
+            self.assertTrue(hasattr(prs, sym), msg=f"pr_remediator facade missing re-export '{sym}'")
+
+        self.assertEqual(prs.parse_args(["lock-status", "--all"]).subcommand, "lock-status")
+        self.assertEqual(prs.parse_args(["queue-next", "--unlocked"]).subcommand, "queue-next")
+        self.assertEqual(prs.parse_args(["test-local", "--ci-parity"]).subcommand, "test-local")
+        self.assertEqual(prs.parse_args(["prepare-review", "--title", "fix(test): ok"]).subcommand, "prepare-review")
+        self.assertEqual(prs.parse_args(["wait-for-unlock", "--interval", "5"]).subcommand, "wait-for-unlock")
+        self.assertEqual(prs.parse_args(["analyze-overlap", "--files-a", "a.py", "--files-b", "b.py"]).subcommand, "analyze-overlap")
+        self.assertEqual(prs.parse_args(["rebase-reverify", "--fetch"]).subcommand, "rebase-reverify")
 
     def test_two_slot_lock_serialization_queue_lookahead_and_zero_llm_promotion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
