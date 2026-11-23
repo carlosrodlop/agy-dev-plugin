@@ -383,16 +383,21 @@ def _make_finding(
     }
 
 
+_HEX8_CID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
 def _cids_match(cid_a: str, cid_b: str) -> bool:
-    """Return True when two conversation IDs match exactly or share an 8-char UUID prefix."""
+    """Return True on exact match or when one side is an 8-char hex short ID prefix of the other."""
     a = str(cid_a or "").strip().lower()
     b = str(cid_b or "").strip().lower()
     if not a or not b:
         return False
     if a == b:
         return True
-    if len(a) >= 8 and len(b) >= 8 and a[:8] == b[:8]:
-        return a.startswith(b) or b.startswith(a)
+    if _HEX8_CID_RE.fullmatch(a) and b.startswith(a):
+        return True
+    if _HEX8_CID_RE.fullmatch(b) and a.startswith(b):
+        return True
     return False
 
 
@@ -1155,13 +1160,14 @@ def _detect_parallel_lookahead_opportunity(
 
         s1_targets = [str(f).strip() for f in (slot1.get("target_files") or []) if str(f).strip()]
         if not s1_targets and not slot1.get("section_anchors"):
-            wt_raw = str(slot1.get("worktree_path") or "").replace("$HOME", str(Path.home())).strip()
-            wt_dir = Path(wt_raw).expanduser() if wt_raw else r_dir
+            s1_wt_raw = str(slot1.get("worktree_path") or "").strip()
+            wt_dir = Path(s1_wt_raw.replace("$HOME", str(Path.home()))).expanduser() if s1_wt_raw else r_dir
             if wt_dir is not None and (wt_dir / ".git").exists():
                 s1_targets = _parallel_scope.collect_git_changed_files(
-                    wt_dir,
-                    base_ref=str(slot1.get("base_sha") or "origin/main"),
-                    head_ref=str(slot1.get("branch_name") or "HEAD"),
+                    r_dir or wt_dir,
+                    branch_name=str(slot1.get("branch_name") or ""),
+                    base_sha=str(slot1.get("base_sha") or ""),
+                    worktree_path=s1_wt_raw,
                 )
         s1_spec = _parallel_scope.TaskAnchorSpec.from_mapping({**slot1, "target_files": s1_targets})
         if not s1_spec.target_files and not s1_spec.section_anchors:

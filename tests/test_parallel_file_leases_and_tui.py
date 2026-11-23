@@ -729,6 +729,87 @@ class TestOptimizerLookaheadStaleFollowerAndSpecContracts(unittest.TestCase):
             self.assertIn("rebase-reverify follower-repo", hint_rebase)
             self.assertIn("slot2 lookahead repo", hint_rebase)
 
+    def test_parallel_lookahead_opportunity_git_fallback_when_slot1_targets_empty(self) -> None:
+        """Regression test: `_detect_parallel_lookahead_opportunity` must invoke `collect_git_changed_files` with valid kwargs."""
+        import subprocess
+
+        def _git(cwd: pathlib.Path, *args: str) -> str:
+            proc = subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return (proc.stdout or "").strip()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            repo_dir = root / "acme-repo"
+            repo_dir.mkdir(parents=True)
+            _git(repo_dir, "init", "-b", "main")
+            _git(repo_dir, "config", "user.email", "ci@example.com")
+            _git(repo_dir, "config", "user.name", "CI Bot")
+            (repo_dir / "src").mkdir(parents=True)
+            (repo_dir / "src" / "alpha.py").write_text("def alpha() -> int:\n    return 1\n", encoding="utf-8")
+            (repo_dir / "src" / "beta.py").write_text("def beta() -> int:\n    return 2\n", encoding="utf-8")
+            _git(repo_dir, "add", "src")
+            _git(repo_dir, "commit", "-m", "feat: seed repo")
+            base_sha = _git(repo_dir, "rev-parse", "HEAD")
+
+            wt_dir = root / "pr-worktree-acme-repo-alpha"
+            _git(repo_dir, "worktree", "add", "-b", "fix/20261123-alpha-1111aaaa", str(wt_dir), "main")
+            (wt_dir / "src" / "alpha.py").write_text("def alpha() -> int:\n    return 42\n", encoding="utf-8")
+            _git(wt_dir, "add", "src/alpha.py")
+            _git(wt_dir, "commit", "-m", "fix: modify alpha only")
+
+            items = [
+                {
+                    "conversation_id": "2222bbbb-0000-4000-8000-000000000002",
+                    "title": "Colliding alpha task",
+                    "priority": 10,
+                    "status": "pending",
+                    "repo_slugs": ["acme/repo"],
+                    "target_files": ["src/alpha.py"],
+                },
+                {
+                    "conversation_id": "3333cccc-0000-4000-8000-000000000003",
+                    "title": "Disjoint beta task",
+                    "priority": 15,
+                    "status": "pending",
+                    "repo_slugs": ["acme/repo"],
+                    "target_files": ["src/beta.py"],
+                },
+            ]
+            active_locks = {
+                "acme/repo": {
+                    "active": True,
+                    "repo_slug": "acme/repo",
+                    "max_slots": 2,
+                    "conversation_id": "1111aaaa-0000-4000-8000-000000000001",
+                    "branch_name": "fix/20261123-alpha-1111aaaa",
+                    "base_sha": base_sha,
+                    "worktree_path": str(wt_dir),
+                    "status": "PENDING_HUMAN_PR_VALIDATION",
+                    "pr_gate_ready": True,
+                    "target_files": [],
+                    "section_anchors": [],
+                }
+            }
+
+            report = flow_opt.analyze_dev_flow_optimizations(
+                lightweight=True,
+                preloaded_items=items,
+                preloaded_active_locks=active_locks,
+                preloaded_all_locks=active_locks,
+                preloaded_repo_dirs={"acme/repo": repo_dir},
+            )
+            by_code = {f["code"]: f for f in report["findings"]}
+            self.assertIn("parallel_lookahead_opportunity", by_code)
+            ev = by_code["parallel_lookahead_opportunity"]["evidence"]
+            self.assertEqual(ev["top_candidate_id"], "3333cccc-0000-4000-8000-000000000003")
+            self.assertEqual(ev["top_overlap_tier"], "NONE")
+            self.assertEqual(ev["opportunities"][0]["candidate_count"], 1)
+
     def test_agent_and_skill_specs_strictly_under_24kb_and_selective_runner_integrity(self) -> None:
         spec_contracts: dict[pathlib.Path, tuple[str, ...]] = {
             REPO_ROOT / "agents" / "agy-dev-orchestrator.md": (

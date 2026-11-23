@@ -351,16 +351,22 @@ def _slugify_section(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", str(title or "").strip().lower()).strip("-")
 
 
+_HEX8_CID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
 def _matches_cid(cand: str, ref: str) -> bool:
-    """Return True when two conversation IDs match exactly or share a >=8-char prefix."""
+    """Return True when two conversation IDs match exactly or one is an 8-char hex short prefix of the other."""
     a = str(cand or "").strip().lower()
     b = str(ref or "").strip().lower()
     if not a or not b:
         return False
     if a == b:
         return True
-    short = min(len(a), len(b))
-    return short >= 8 and (a.startswith(b) or b.startswith(a))
+    if _HEX8_CID_RE.fullmatch(a) and b.startswith(a):
+        return True
+    if _HEX8_CID_RE.fullmatch(b) and a.startswith(b):
+        return True
+    return False
 
 
 @dataclass(frozen=True)
