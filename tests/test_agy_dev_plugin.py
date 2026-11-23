@@ -1666,7 +1666,22 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
             "shell-standards.md": ("glob", ("set -euo pipefail", "BASH_SOURCE", "Santa Lockdown", "bats")),
             "web-frontend-standards.md": (
                 "glob",
-                ("Vanilla-First", "Santa Lockdown", "Don't Reinvent the Wheel", "Web Platform APIs", "escapeHtml", "noopener noreferrer", "chrome-devtools-plugin"),
+                (
+                    "Vanilla-First",
+                    "Santa Lockdown",
+                    "Don't Reinvent the Wheel",
+                    "Web Platform APIs",
+                    "escapeHtml",
+                    "noopener noreferrer",
+                    "chrome-devtools-plugin",
+                    "Data-Table Badges",
+                    ".data-table tbody td:not(:first-child)",
+                    "border-color: transparent",
+                    "var(--bg-badge-neutral)",
+                    "td:first-child",
+                    ":focus-visible",
+                    ".merlin-ai-agent-dot",
+                ),
             ),
             "git-and-pr-workflow.md": ("glob", ("**/*.js", "**/*.html", "**/*.css")),
         }
