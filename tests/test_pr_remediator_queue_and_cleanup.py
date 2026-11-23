@@ -3508,6 +3508,129 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
                 self.assertEqual(len(bats_seen), 3)
                 self.assertEqual(res_cfg["verification_results"]["bats"]["status"], "pass")
 
+    def test_watch_pr_merge_and_wait_for_unlock_ast_execv_auto_reload_and_syntax_guard(self) -> None:
+        """Verify `watch-pr-merge` & `wait-for-unlock` watch companion modules, guard `ast.parse` syntax, release `flock`, and `os.execv` cleanly."""
+        import fcntl
+
+        watched_real = prs._collect_watched_script_paths()
+        self.assertGreaterEqual(len(watched_real), 4)
+        self.assertEqual(watched_real[0], pathlib.Path(prs.__file__).resolve())
+        watched_names = {p.name for p in watched_real}
+        self.assertTrue(
+            {"pr_remediator.py", "git_client.py", "parallel_scope.py", "dev_flow_optimizer.py"}.issubset(watched_names)
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            pdir.mkdir(parents=True, exist_ok=True)
+            fake_entry = troot / "pr_remediator.py"
+            fake_companion = troot / "git_client.py"
+            fake_entry.write_text("VALUE = 1\n", encoding="utf-8")
+            fake_companion.write_text("COMPANION = 1\n", encoding="utf-8")
+
+            # 1. `watch-pr-merge`: broken syntax logs non-fatal warning and continues without crashing; valid companion edit releases lock & execs
+            watch_calls = {"n": 0}
+            watch_execs: list[tuple[str, list[str], bool]] = []
+            warn_buf_watch = io.StringIO()
+            watcher_lock_path = pdir / "tmp" / "pr_merge_watcher.lock"
+
+            def _fake_watch_sync(**_kw: object) -> dict[str, object]:
+                watch_calls["n"] += 1
+                if watch_calls["n"] == 1:
+                    # Broken syntax on companion module -> must warn, NOT exec, and NOT crash
+                    fake_companion.write_text("def broken(:\n", encoding="utf-8")
+                elif watch_calls["n"] == 2:
+                    # Valid syntax fix on companion module -> must release flock and execv
+                    fake_companion.write_text("COMPANION = 2\n", encoding="utf-8")
+                return {"status": "ok", "active": True, "released": False}
+
+            def _fake_watch_exec(exe: str, argv: list[str]) -> None:
+                # Verify pr_merge_watcher.lock is already unlocked before os.execv
+                can_lock = False
+                with open(watcher_lock_path, "a+", encoding="utf-8") as probe_fd:
+                    try:
+                        fcntl.flock(probe_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        can_lock = True
+                        fcntl.flock(probe_fd.fileno(), fcntl.LOCK_UN)
+                    except OSError:
+                        can_lock = False
+                watch_execs.append((exe, list(argv), can_lock))
+
+            with mock.patch.object(prs, "sync_dev_pr_lock_with_git", side_effect=_fake_watch_sync):
+                res_watch = prs.run_pr_merge_watcher_loop(
+                    poll_interval_seconds=0.05,
+                    max_iterations=4,
+                    portfolio_dir=pdir,
+                    exec_fn=_fake_watch_exec,
+                    watched_paths_override=[fake_entry, fake_companion],
+                    raw_argv=["watch-pr-merge", "--interval", "15"],
+                    warn_stream=warn_buf_watch,
+                )
+            self.assertEqual(res_watch["status"], "ok")
+            self.assertTrue(res_watch["reloaded"])
+            self.assertEqual(res_watch["reason"], "auto_reloaded")
+            self.assertIn("Reload skipped (git_client.py: SyntaxError)", warn_buf_watch.getvalue())
+            self.assertEqual(len(watch_execs), 1)
+            self.assertEqual(
+                watch_execs[0][:2],
+                (sys.executable, [sys.executable, str(fake_entry.resolve()), "watch-pr-merge", "--interval", "15"]),
+            )
+            self.assertTrue(watch_execs[0][2])
+
+            # 2. `wait-for-unlock`: broken syntax logs non-fatal warning and keeps waiting; valid update triggers `auto_reloaded`
+            _, repo_hold = _init_bare_and_clone_repo(troot, name="hold-repo")
+            prs.acquire_dev_pr_lock(
+                conversation_id="88880000-aaaa-4111-8111-000000000001",
+                action_id="hold-reload",
+                branch_name="fix/20261123-070000-hold-88880000",
+                summary="Hold lock",
+                proposed_fix="Hold lock",
+                target_repo_dir=str(repo_hold),
+                repo_slug="acme/hold-repo",
+                portfolio_dir=pdir,
+            )
+            prs.update_dev_pr_lock(
+                {"status": "PENDING_HUMAN_PR_VALIDATION", "pr_gate_ready": True},
+                repo_slug="acme/hold-repo",
+                portfolio_dir=pdir,
+            )
+
+            wait_calls = {"n": 0}
+            wait_execs: list[tuple[str, list[str]]] = []
+            warn_buf_wait = io.StringIO()
+
+            def _fake_wait_sync(**_kw: object) -> dict[str, object]:
+                wait_calls["n"] += 1
+                if wait_calls["n"] == 1:
+                    fake_entry.write_text("if True print('oops')\n", encoding="utf-8")
+                elif wait_calls["n"] == 2:
+                    fake_entry.write_text("VALUE = 2\n", encoding="utf-8")
+                return {"status": "ok", "active": True, "released": False}
+
+            def _fake_wait_exec(exe: str, argv: list[str]) -> None:
+                wait_execs.append((exe, list(argv)))
+
+            with mock.patch.object(prs, "sync_dev_pr_lock_with_git", side_effect=_fake_wait_sync):
+                res_wait = prs.wait_for_unlock_or_actionable_event(
+                    poll_interval_seconds=0.05,
+                    max_iterations=4,
+                    portfolio_dir=pdir,
+                    exec_fn=_fake_wait_exec,
+                    watched_paths_override=[fake_entry, fake_companion],
+                    raw_argv=["wait-for-unlock", "--interval", "15"],
+                    warn_stream=warn_buf_wait,
+                )
+            self.assertEqual(res_wait["status"], "ok")
+            self.assertEqual(res_wait["event"], "auto_reloaded")
+            self.assertTrue(res_wait["reloaded"])
+            self.assertIn("Reload skipped (pr_remediator.py: SyntaxError)", warn_buf_wait.getvalue())
+            self.assertEqual(len(wait_execs), 1)
+            self.assertEqual(
+                wait_execs[0],
+                (sys.executable, [sys.executable, str(fake_entry.resolve()), "wait-for-unlock", "--interval", "15"]),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -875,10 +876,13 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
             root = pathlib.Path(tmp)
             state_dir = root / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
+            fake_home = root / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
             bare, clone = self._seed_two_module_repo(root)
             slug = "acme-org/acme-service"
 
             env_patch = {
+                "HOME": str(fake_home),
                 "AGY_DEV_STATE_DIR": str(state_dir),
                 "AGY_CONF_REPO_DIR": str(clone),
                 "AGY_REPOS_ROOT": str(clone.parent),
@@ -1164,10 +1168,13 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
             root = pathlib.Path(tmp)
             state_dir = root / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
+            fake_home = root / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
             bare, clone = self._seed_two_module_repo(root)
             slug = "acme-org/acme-service"
 
             env_patch = {
+                "HOME": str(fake_home),
                 "AGY_DEV_STATE_DIR": str(state_dir),
                 "AGY_CONF_REPO_DIR": str(clone),
                 "AGY_REPOS_ROOT": str(clone.parent),
@@ -1230,10 +1237,13 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
             root = pathlib.Path(tmp)
             state_dir = root / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
+            fake_home = root / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
             bare, clone = self._seed_two_module_repo(root)
             slug = "acme-org/acme-service"
 
             env_patch = {
+                "HOME": str(fake_home),
                 "AGY_DEV_STATE_DIR": str(state_dir),
                 "AGY_CONF_REPO_DIR": str(clone),
                 "AGY_REPOS_ROOT": str(clone.parent),
@@ -1509,6 +1519,8 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
             root = pathlib.Path(tmp)
             state_dir = root / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
+            fake_home = root / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
             bare, clone = _init_org_bare_and_clone(root, repo_name="agy-dev-plugin", org_name="acme-org")
             slug = "acme-org/agy-dev-plugin"
 
@@ -1525,6 +1537,7 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
             _git(clone, "push", "origin", "main")
 
             env_patch = {
+                "HOME": str(fake_home),
                 "AGY_DEV_STATE_DIR": str(state_dir),
                 "AGY_CONF_REPO_DIR": str(clone),
                 "AGY_REPOS_ROOT": str(clone.parent),
@@ -1686,6 +1699,8 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
             root = pathlib.Path(tmp)
             state_dir = root / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
+            fake_home = root / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
             _, clone = _init_org_bare_and_clone(root, repo_name="g-control-tower", org_name="acme-org")
             slug = "acme-org/g-control-tower"
             (clone / "src").mkdir(parents=True, exist_ok=True)
@@ -1700,6 +1715,7 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
             shared_ts = "20261123-055813"
 
             env_patch = {
+                "HOME": str(fake_home),
                 "AGY_DEV_STATE_DIR": str(state_dir),
                 "AGY_CONF_REPO_DIR": str(clone),
                 "AGY_REPOS_ROOT": str(clone.parent),
@@ -1783,6 +1799,106 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
                 self.assertEqual(reacq["slot_id"], 1)
                 self.assertEqual(reacq["lock"]["conversation_id"], cid_slot1)
                 self.assertEqual(reacq["lock"]["lock_id"], s1_lock_id)
+
+    def test_deploy_repo_to_home_unittest_real_home_guard_and_reexec_self_update(self) -> None:
+        """Verify `deploy_repo_to_home()` blocks unisolated `unittest` real-`$HOME` writes and re-execs once (`AGY_DEPLOY_REEXEC=1`) when updating `clients/git_client.py`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, src_repo = _init_org_bare_and_clone(root, repo_name="acme-hermetic-guard", org_name="acme-org")
+            fake_home = root / "fake-home"
+            fake_home.mkdir(parents=True, exist_ok=True)
+
+            (src_repo / "plugin.json").write_text(
+                json.dumps({"name": "acme-hermetic-guard", "version": "1.0.0"}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            (src_repo / "clients").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(CLIENTS_DIR / "dev_common.py", src_repo / "clients" / "dev_common.py")
+            shutil.copy2(CLIENTS_DIR / "git_client.py", src_repo / "clients" / "git_client.py")
+            sidecar_dir = src_repo / "sidecars" / "dev-queue-watchdog"
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            (sidecar_dir / "sidecar.json").write_text(
+                '{"command": "python3", "args": ["$HOME/watchdog.py"]}\n',
+                encoding="utf-8",
+            )
+            (sidecar_dir / "watchdog.py").write_text("#!/usr/bin/env python3\nprint('ok')\n", encoding="utf-8")
+            _git(
+                src_repo,
+                "add",
+                "plugin.json",
+                "clients/dev_common.py",
+                "clients/git_client.py",
+                "sidecars/dev-queue-watchdog/sidecar.json",
+                "sidecars/dev-queue-watchdog/watchdog.py",
+            )
+            _git(src_repo, "commit", "-m", "feat: add git_client and sidecars")
+
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(src_repo)})
+            real_os_home = git_client._resolve_real_os_home()
+
+            # 1. Unisolated `unittest` targeting real `$HOME` (home_dir=None, HOME=real_os_home) MUST be blocked!
+            with mock.patch.dict(os.environ, {"HOME": str(real_os_home)}, clear=False):
+                os.environ.pop("AGY_ALLOW_TEST_REAL_HOME_DEPLOY", None)
+                blocked_res = vcs.deploy_repo_to_home(repo_dir=src_repo, home_dir=None)
+            self.assertEqual(blocked_res["status"], "skipped")
+            self.assertFalse(blocked_res["deployed"])
+            self.assertEqual(blocked_res["reason"], "blocked_unisolated_test_real_home")
+            self.assertFalse((real_os_home / ".gemini" / "config" / "plugins" / "acme-hermetic-guard").exists())
+
+            # 2. Isolated `HOME` (home_dir=None with patched HOME=fake_home) is allowed and stays inside `fake_home`
+            with mock.patch.dict(os.environ, {"HOME": str(fake_home), "AGY_DEPLOY_REEXEC": "1"}, clear=False):
+                iso_res = vcs.deploy_repo_to_home(repo_dir=src_repo, home_dir=None)
+            self.assertEqual(iso_res["status"], "ok")
+            self.assertTrue(iso_res["deployed"])
+            self.assertFalse(iso_res.get("reexec_pass", False))
+            self.assertTrue(
+                (fake_home / ".gemini" / "config" / "plugins" / "acme-hermetic-guard" / "sidecars" / "dev-queue-watchdog" / "watchdog.py").is_file()
+            )
+
+            # 3. Simulate stale in-memory `deploy_repo_to_home()` missing `sidecars/` while on-disk `clients/git_client.py` supports it:
+            #    updating `clients/git_client.py` triggers ONE fresh `AGY_DEPLOY_REEXEC=1` subprocess pass so `sidecars/` deploys
+            #    atomically without stale `prune_orphans` wiping it!
+            fake_home_reexec = root / "fake-home-reexec"
+            fake_home_reexec.mkdir(parents=True, exist_ok=True)
+            stale_sidecar_dir = (
+                fake_home_reexec
+                / ".gemini"
+                / "config"
+                / "plugins"
+                / "acme-hermetic-guard"
+                / "sidecars"
+                / "dev-queue-watchdog"
+            )
+            stale_sidecar_dir.mkdir(parents=True, exist_ok=True)
+            (stale_sidecar_dir / "sidecar.json").write_text("stale", encoding="utf-8")
+            (stale_sidecar_dir / "watchdog.py").write_text("stale", encoding="utf-8")
+
+            orig_map = git_client.GitVcsIntegrationClient._map_plugin_rel_to_home
+
+            def _stale_parent_map(rel_str: str, plugin_name: str = "wiz-tam-plugin") -> str:
+                if rel_str.startswith("sidecars/"):
+                    return ""
+                return orig_map(rel_str, plugin_name=plugin_name)
+
+            with (
+                mock.patch.dict(os.environ, {"HOME": str(fake_home_reexec)}, clear=False),
+                mock.patch.object(
+                    git_client.GitVcsIntegrationClient,
+                    "_map_plugin_rel_to_home",
+                    staticmethod(_stale_parent_map),
+                ),
+            ):
+                os.environ.pop("AGY_DEPLOY_REEXEC", None)
+                reexec_res = vcs.deploy_repo_to_home(repo_dir=src_repo, home_dir=fake_home_reexec)
+            self.assertEqual(reexec_res["status"], "ok")
+            self.assertTrue(reexec_res["deployed"])
+            self.assertTrue(reexec_res.get("reexec_pass"))
+            self.assertTrue((stale_sidecar_dir / "watchdog.py").is_file())
+            self.assertIn(str(fake_home_reexec), (stale_sidecar_dir / "sidecar.json").read_text(encoding="utf-8"))
+            self.assertNotIn(
+                ".gemini/config/plugins/acme-hermetic-guard/sidecars/dev-queue-watchdog/watchdog.py",
+                reexec_res.get("pruned_orphans", []),
+            )
 
 
 if __name__ == "__main__":

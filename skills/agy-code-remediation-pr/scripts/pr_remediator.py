@@ -42,7 +42,8 @@ if __name__ != "__main__":
 
 
 import argparse
-from collections.abc import Iterator, Mapping, Sequence
+import ast
+from collections.abc import Callable, Iterator, Mapping, Sequence
 import contextlib
 from datetime import datetime, timezone
 import fcntl
@@ -56,7 +57,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, TextIO
 import urllib.parse
 
 import dev_common  # noqa: E402
@@ -2454,20 +2455,150 @@ def sync_dev_pr_lock_with_git(
     }
 
 
+def _collect_watched_script_paths() -> list[Path]:
+    """Collect resolved Python module paths whose updates should auto-reload long-lived watcher loops."""
+    collected: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(cand: Path | str | None) -> None:
+        if not cand:
+            return
+        with contextlib.suppress(OSError):
+            p = Path(str(cand)).expanduser().resolve()
+            if p.is_file() and p not in seen:
+                seen.add(p)
+                collected.append(p)
+
+    _add(Path(__file__))
+    for mod in (_git_client, _dev_common, _flow_opt, _queue_doctor, _parallel_scope, _rebase_gate):
+        mod_file = getattr(mod, "__file__", None) if mod is not None else None
+        if mod_file:
+            _add(mod_file)
+
+    script_plugin_root = Path(__file__).resolve().parents[3]
+    installed_plugin_root = Path.home() / ".gemini" / "config" / "plugins" / "agy-dev-plugin"
+    for root in (script_plugin_root, installed_plugin_root):
+        _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "pr_remediator.py")
+        _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "dev_flow_optimizer.py")
+        _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "dev_queue_doctor.py")
+        _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "parallel_scope.py")
+        _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "rebase_gate.py")
+        _add(root / "clients" / "dev_common.py")
+        _add(root / "clients" / "git_client.py")
+    return collected
+
+
+def _snapshot_file_fingerprints(
+    paths: Sequence[Path],
+) -> dict[Path, tuple[int, int, int]]:
+    """Capture `(st_ino, st_mtime_ns, st_size)` for watched Python scripts."""
+    snap: dict[Path, tuple[int, int, int]] = {}
+    for p in paths:
+        try:
+            st = p.stat()
+            snap[p] = (int(st.st_ino), int(st.st_mtime_ns), int(st.st_size))
+        except OSError:
+            snap[p] = (0, 0, -1)
+    return snap
+
+
+def _validate_python_syntax(paths: Sequence[Path]) -> tuple[bool, str]:
+    """Verify every watched Python file parses cleanly via `ast.parse` before `os.execv`."""
+    if not paths:
+        return (False, "Reload skipped (no script paths)")
+    for idx, p in enumerate(paths):
+        try:
+            src = p.read_text(encoding="utf-8")
+            if idx == 0 and not src.strip():
+                return (False, f"Reload skipped ({p.name}: empty file)")
+            ast.parse(src, filename=str(p))
+        except (OSError, UnicodeDecodeError, SyntaxError, ValueError) as exc:
+            return (False, f"Reload skipped ({p.name}: {exc.__class__.__name__})")
+    return (True, "")
+
+
+def _build_reload_exec_argv(
+    script_path: Path | None = None,
+    raw_argv: Sequence[str] | None = None,
+) -> list[str]:
+    """Build `[sys.executable, resolved_script, *cli_args]` for `os.execv`."""
+    resolved_script = str((script_path or Path(__file__)).resolve())
+    preserved = list(sys.argv[1:] if raw_argv is None else raw_argv)
+    return [sys.executable, resolved_script, *preserved]
+
+
+def _maybe_auto_reload_process(
+    watched_paths: Sequence[Path],
+    baseline_fp: dict[Path, tuple[int, int, int]],
+    *,
+    exec_fn: Callable[[str, list[str]], Any] | None = None,
+    raw_argv: Sequence[str] | None = None,
+    before_exec_cb: Callable[[], None] | None = None,
+    warn_stream: TextIO | None = None,
+) -> tuple[bool, dict[Path, tuple[int, int, int]], str]:
+    """Compare script fingerprints and safely `os.execv` when watched Python files update cleanly."""
+    cur_fp = _snapshot_file_fingerprints(watched_paths)
+    if cur_fp == baseline_fp:
+        return (False, baseline_fp, "")
+
+    syntax_ok, syntax_err = _validate_python_syntax(watched_paths)
+    out_err = warn_stream if warn_stream is not None else sys.stderr
+    if not syntax_ok:
+        with contextlib.suppress(OSError):
+            out_err.write(f"[pr_remediator] WARNING: {syntax_err}\n")
+            out_err.flush()
+        return (False, cur_fp, syntax_err)
+
+    script_target = watched_paths[0] if watched_paths else Path(__file__).resolve()
+    exec_argv = _build_reload_exec_argv(script_target, raw_argv)
+    if before_exec_cb is not None:
+        before_exec_cb()
+    effective_exec_fn = exec_fn if exec_fn is not None else os.execv
+    try:
+        effective_exec_fn(sys.executable, exec_argv)
+        return (True, cur_fp, "")
+    except OSError as exc:
+        err_msg = f"Reload failed ({script_target.name}: {exc.__class__.__name__})"
+        with contextlib.suppress(OSError):
+            out_err.write(f"[pr_remediator] WARNING: {err_msg}\n")
+            out_err.flush()
+        return (False, cur_fp, err_msg)
+
+
 def run_pr_merge_watcher_loop(
     poll_interval_seconds: float = 15.0,
     max_duration_seconds: float = 14400.0,
     max_iterations: int | None = None,
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
+    *,
+    exec_fn: Callable[[str, list[str]], Any] | None = None,
+    watched_paths_override: Sequence[Path] | None = None,
+    raw_argv: Sequence[str] | None = None,
+    warn_stream: TextIO | None = None,
 ) -> dict[str, Any]:
-    """Poll `sync_dev_pr_lock_with_git()` until `dev_pr_lock` is released (PR merged into `main` or remote branch deleted), fast-forwarding local `main`, pruning the local `fix/*` branch, and self-terminating."""
+    """Poll `sync_dev_pr_lock_with_git()` until `dev_pr_lock` is released (PR merged into `main` or remote branch deleted), auto-reloading on clean script updates, fast-forwarding local `main`, pruning the local `fix/*` branch, and self-terminating."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
     tmp_dir = p_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
     watcher_lock_path = tmp_dir / "pr_merge_watcher.lock"
 
+    watched_paths = (
+        list(watched_paths_override)
+        if watched_paths_override is not None
+        else _collect_watched_script_paths()
+    )
+    baseline_fp = _snapshot_file_fingerprints(watched_paths)
+
     lock_fd = open(watcher_lock_path, "a+", encoding="utf-8")
+
+    def _release_watcher_lock() -> None:
+        if not lock_fd.closed:
+            with contextlib.suppress(OSError, ValueError):
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                lock_fd.close()
+
     try:
         try:
             fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -2490,6 +2621,25 @@ def run_pr_merge_watcher_loop(
         last_sync: dict[str, Any] = {}
 
         while True:
+            reloaded, baseline_fp, _ = _maybe_auto_reload_process(
+                watched_paths,
+                baseline_fp,
+                exec_fn=exec_fn,
+                raw_argv=raw_argv,
+                before_exec_cb=_release_watcher_lock,
+                warn_stream=warn_stream,
+            )
+            if reloaded:
+                return {
+                    "status": "ok",
+                    "already_running": False,
+                    "terminated": False,
+                    "reloaded": True,
+                    "reason": "auto_reloaded",
+                    "iterations": iterations,
+                    "last_sync": last_sync,
+                }
+
             iterations += 1
             last_sync = sync_dev_pr_lock_with_git(portfolio_dir=portfolio_dir, git_client=git_client)
             if not last_sync.get("active"):
@@ -2522,17 +2672,27 @@ def run_pr_merge_watcher_loop(
                     "iterations": iterations,
                     "last_sync": last_sync,
                 }
+            reloaded, baseline_fp, _ = _maybe_auto_reload_process(
+                watched_paths,
+                baseline_fp,
+                exec_fn=exec_fn,
+                raw_argv=raw_argv,
+                before_exec_cb=_release_watcher_lock,
+                warn_stream=warn_stream,
+            )
+            if reloaded:
+                return {
+                    "status": "ok",
+                    "already_running": False,
+                    "terminated": False,
+                    "reloaded": True,
+                    "reason": "auto_reloaded",
+                    "iterations": iterations,
+                    "last_sync": last_sync,
+                }
             time.sleep(max(0.05, float(poll_interval_seconds)))
     finally:
-        if not lock_fd.closed:
-            try:
-                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
-            except (OSError, ValueError):
-                pass
-            try:
-                lock_fd.close()
-            except OSError:
-                pass
+        _release_watcher_lock()
 
 
 def spawn_pr_merge_watcher_daemon(
@@ -2621,8 +2781,13 @@ def wait_for_unlock_or_actionable_event(
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
     brain_dir: Path | str | None = None,
+    *,
+    exec_fn: Callable[[str, list[str]], Any] | None = None,
+    watched_paths_override: Sequence[Path] | None = None,
+    raw_argv: Sequence[str] | None = None,
+    warn_stream: TextIO | None = None,
 ) -> dict[str, Any]:
-    """0-LLM reactive watcher that polls `sync_dev_pr_lock_with_git()` and exits the moment a repo unlocks, runnable work appears, or a worker stalls."""
+    """0-LLM reactive watcher that polls `sync_dev_pr_lock_with_git()`, auto-reloads on clean script updates, and exits the moment a repo unlocks, runnable work appears, or a worker stalls."""
     initial_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
     initial_locked_repos = set(initial_locks.keys())
     initial_lock_ids = {slug: str(lk.get("lock_id") or "") for slug, lk in initial_locks.items()}
@@ -2632,10 +2797,34 @@ def wait_for_unlock_or_actionable_event(
         # Keep isolated test/custom portfolio directories hermetic from ~/.gemini/antigravity/brain
         effective_brain = ""
 
+    watched_paths = (
+        list(watched_paths_override)
+        if watched_paths_override is not None
+        else _collect_watched_script_paths()
+    )
+    baseline_fp = _snapshot_file_fingerprints(watched_paths)
+
     start_mono = time.monotonic()
     iterations = 0
 
     while True:
+        reloaded, baseline_fp, _ = _maybe_auto_reload_process(
+            watched_paths,
+            baseline_fp,
+            exec_fn=exec_fn,
+            raw_argv=raw_argv,
+            warn_stream=warn_stream,
+        )
+        if reloaded:
+            return {
+                "status": "ok",
+                "event": "auto_reloaded",
+                "reloaded": True,
+                "iterations": iterations,
+                "elapsed_seconds": round(max(0.0, time.monotonic() - start_mono), 2),
+                "rearm_recommended": False,
+            }
+
         iterations += 1
         sync_res = sync_dev_pr_lock_with_git(portfolio_dir=portfolio_dir, git_client=git_client)
         current_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
@@ -2742,6 +2931,23 @@ def wait_for_unlock_or_actionable_event(
             return _payload("max_iterations", rearm=bool(current_locks or open_active_count > 0))
         if (time.monotonic() - start_mono) >= max_duration_seconds:
             return _payload("timeout", rearm=bool(current_locks or open_active_count > 0))
+
+        reloaded, baseline_fp, _ = _maybe_auto_reload_process(
+            watched_paths,
+            baseline_fp,
+            exec_fn=exec_fn,
+            raw_argv=raw_argv,
+            warn_stream=warn_stream,
+        )
+        if reloaded:
+            return {
+                "status": "ok",
+                "event": "auto_reloaded",
+                "reloaded": True,
+                "iterations": iterations,
+                "elapsed_seconds": round(max(0.0, time.monotonic() - start_mono), 2),
+                "rearm_recommended": False,
+            }
 
         time.sleep(max(0.05, float(poll_interval_seconds)))
 
@@ -9597,6 +9803,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res.get("status") == "ok" else 1
 
     if args.subcommand == "watch-pr-merge":
+        raw_cli_argv = list(sys.argv[1:]) if argv is None else list(argv)
         if getattr(args, "daemon", False):
             res = spawn_pr_merge_watcher_daemon(
                 poll_interval_seconds=args.interval,
@@ -9608,11 +9815,13 @@ def main(argv: list[str] | None = None) -> int:
                 poll_interval_seconds=args.interval,
                 max_duration_seconds=args.max_duration,
                 max_iterations=args.max_iterations,
+                raw_argv=raw_cli_argv,
             )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") in ("ok", "skipped") else 1
 
     if args.subcommand == "wait-for-unlock":
+        raw_cli_argv = list(sys.argv[1:]) if argv is None else list(argv)
         res = wait_for_unlock_or_actionable_event(
             poll_interval_seconds=args.interval,
             max_duration_seconds=args.max_duration,
@@ -9620,6 +9829,7 @@ def main(argv: list[str] | None = None) -> int:
             stall_threshold_seconds=getattr(args, "stall_seconds", None),
             orchestrator_conversation_id=getattr(args, "orchestrator_id", ""),
             brain_dir=getattr(args, "brain_dir", None),
+            raw_argv=raw_cli_argv,
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
