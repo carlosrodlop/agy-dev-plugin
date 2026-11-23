@@ -43,6 +43,7 @@ import tty
 from typing import Any, TextIO
 import unicodedata
 from urllib.parse import parse_qs, unquote, urlsplit
+import uuid
 import webbrowser
 
 _SCRIPT_PLUGIN_ROOT = Path(__file__).resolve().parents[3]
@@ -2252,6 +2253,211 @@ def _resolve_board_artifact_path(state_dir: Path, explicit: str = "") -> Path | 
     return None
 
 
+NAV_INTENT_FILENAME = "dev_queue_nav_intent.json"
+NAV_INTENT_LOCK_FILENAME = ".dev_queue_nav_intent.lock"
+DEFAULT_NAV_INTENT_TTL_SECONDS = 60
+DEFAULT_NAV_INTENT_ACK_WAIT_SECONDS = 0.12
+
+
+def _resolve_nav_intent_path(state_dir: Path) -> Path:
+    """Return `<state_dir>/dev_queue_nav_intent.json` path."""
+    return Path(state_dir).expanduser().resolve() / NAV_INTENT_FILENAME
+
+
+@contextlib.contextmanager
+def _nav_intent_lock(state_dir: Path) -> Any:
+    """Acquire exclusive file lock for `dev_queue_nav_intent.json` mutations when available."""
+    lock_file = Path(state_dir).expanduser().resolve() / NAV_INTENT_LOCK_FILENAME
+    if _dev_common is not None and hasattr(_dev_common, "file_lock"):
+        with _dev_common.file_lock(lock_file, timeout_seconds=3.0):
+            yield
+        return
+    yield
+
+
+def _atomic_write_json_0600(target: Path, payload: dict[str, Any]) -> Path:
+    """Atomically write `payload` to `target` with strict `0600` POSIX permissions."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f".{target.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    encoded = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, encoded)
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.chmod(tmp_path, 0o600)
+    os.replace(tmp_path, target)
+    with contextlib.suppress(OSError):
+        os.chmod(target, 0o600)
+    return target
+
+
+def write_nav_intent(
+    state_dir: Path | str,
+    *,
+    conversation_id: str,
+    display_id: str = "",
+    sidebar_title: str = "",
+    hotkey: str = "",
+    action: str = "toggle_conversation",
+    ttl_seconds: int = DEFAULT_NAV_INTENT_TTL_SECONDS,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Atomically write `0600` `dev_queue_nav_intent.json` for Sidecar UI Panel navigation."""
+    st_dir = Path(state_dir).expanduser().resolve()
+    nav_path = _resolve_nav_intent_path(st_dir)
+    epoch = float(now_ts if now_ts is not None else time.time())
+    created_iso = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    clean_cid = str(conversation_id or "").strip()
+    clean_disp = str(display_id or clean_cid[:8]).strip()
+    clean_title = " ".join(str(sidebar_title or "").split())
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "intent_id": str(uuid.uuid4()),
+        "action": str(action or "toggle_conversation").strip(),
+        "conversation_id": clean_cid,
+        "display_id": clean_disp,
+        "sidebar_title": clean_title,
+        "hotkey": str(hotkey or "").strip(),
+        "source": "dev_queue_tui",
+        "created_at": created_iso,
+        "created_at_epoch": round(epoch, 3),
+        "ttl_seconds": max(5, int(ttl_seconds)),
+        "acknowledged": False,
+        "acknowledged_at": "",
+    }
+    with _nav_intent_lock(st_dir):
+        _atomic_write_json_0600(nav_path, payload)
+    return payload
+
+
+def read_active_nav_intent(
+    state_dir: Path | str,
+    *,
+    now_ts: float | None = None,
+    include_acknowledged: bool = False,
+) -> dict[str, Any] | None:
+    """Read `dev_queue_nav_intent.json` and return it when unacknowledged and within TTL."""
+    st_dir = Path(state_dir).expanduser().resolve()
+    nav_path = _resolve_nav_intent_path(st_dir)
+    data = _load_json(nav_path)
+    if not data or not isinstance(data, dict):
+        return None
+    intent_id = str(data.get("intent_id") or "").strip()
+    conv_id = str(data.get("conversation_id") or "").strip()
+    if not intent_id or not conv_id:
+        return None
+    acked = bool(data.get("acknowledged"))
+    if acked and not include_acknowledged:
+        return None
+    try:
+        created_epoch = float(data.get("created_at_epoch") or 0.0)
+        ttl_s = max(5, int(data.get("ttl_seconds") or DEFAULT_NAV_INTENT_TTL_SECONDS))
+    except (TypeError, ValueError):
+        return None
+    epoch = float(now_ts if now_ts is not None else time.time())
+    if created_epoch <= 0.0 or (epoch - created_epoch) > float(ttl_s):
+        return None
+    return dict(data)
+
+
+def acknowledge_nav_intent(
+    state_dir: Path | str,
+    intent_id: str,
+    *,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Atomically mark matching `intent_id` in `dev_queue_nav_intent.json` as acknowledged (`0600`)."""
+    clean_id = str(intent_id or "").strip()
+    if not clean_id:
+        return {"ok": False, "acknowledged": False, "error": "missing_intent_id"}
+    st_dir = Path(state_dir).expanduser().resolve()
+    nav_path = _resolve_nav_intent_path(st_dir)
+    epoch = float(now_ts if now_ts is not None else time.time())
+    ack_iso = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _nav_intent_lock(st_dir):
+        cur = _load_json(nav_path)
+        if not cur or str(cur.get("intent_id") or "").strip() != clean_id:
+            return {"ok": False, "acknowledged": False, "intent_id": clean_id, "error": "intent_mismatch"}
+        updated = dict(cur)
+        updated["acknowledged"] = True
+        updated["acknowledged_at"] = ack_iso
+        _atomic_write_json_0600(nav_path, updated)
+    return {"ok": True, "acknowledged": True, "intent_id": clean_id, "acknowledged_at": ack_iso}
+
+
+def _resolve_nav_intent_ack_wait_seconds(explicit: float | None = None) -> float:
+    """Resolve optional short ack poll window before running clipboard fallback."""
+    if explicit is not None:
+        return max(0.0, float(explicit))
+    raw_env = str(os.environ.get("AGY_NAV_INTENT_ACK_WAIT_SECONDS") or "").strip()
+    if raw_env:
+        with contextlib.suppress(TypeError, ValueError):
+            return max(0.0, min(2.0, float(raw_env)))
+    if os.environ.get("PRE_COMMIT_HOOK") == "1" or os.environ.get("AGY_OFFLINE_ONLY") == "1":
+        return 0.0
+    return DEFAULT_NAV_INTENT_ACK_WAIT_SECONDS
+
+
+def _wait_for_nav_intent_ack(state_dir: Path, intent_id: str, timeout_seconds: float) -> bool:
+    """Poll `dev_queue_nav_intent.json` up to `timeout_seconds` for Sidecar UI Panel acknowledgment."""
+    nav_path = _resolve_nav_intent_path(state_dir)
+    cur = _load_json(nav_path)
+    if cur and str(cur.get("intent_id") or "") == intent_id and bool(cur.get("acknowledged")):
+        return True
+    if timeout_seconds <= 0.0:
+        return False
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        time.sleep(min(0.025, max(0.005, deadline - time.monotonic())))
+        cur = _load_json(nav_path)
+        if cur and str(cur.get("intent_id") or "") == intent_id and bool(cur.get("acknowledged")):
+            return True
+    return False
+
+
+def _trigger_hitl_navigation(
+    state_dir: Path,
+    *,
+    index: int,
+    cid_disp: str,
+    cid_full: str,
+    ag_title: str,
+    ack_wait_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Write `0600` `dev_queue_nav_intent.json` for the Sidecar UI Panel and preserve clipboard+focus fallback."""
+    intent_written = False
+    intent_id = ""
+    if cid_full:
+        try:
+            intent_obj = write_nav_intent(
+                state_dir,
+                conversation_id=cid_full,
+                display_id=cid_disp,
+                sidebar_title=ag_title,
+                hotkey=f"h{index}",
+            )
+            intent_written = True
+            intent_id = str(intent_obj.get("intent_id") or "")
+        except OSError:
+            intent_written = False
+
+    focused = _focus_antigravity_app()
+    wait_s = _resolve_nav_intent_ack_wait_seconds(ack_wait_seconds)
+    acknowledged = bool(intent_written and intent_id and _wait_for_nav_intent_ack(state_dir, intent_id, wait_s))
+    copied = False
+    if not acknowledged:
+        copied = _copy_to_clipboard(ag_title)
+    return {
+        "intent_written": intent_written,
+        "intent_id": intent_id,
+        "acknowledged": acknowledged,
+        "copied": copied,
+        "focused": focused,
+    }
+
+
 def _collect_lock_extra_urls(
     lk: dict[str, Any],
     item_urls_by_cid: dict[str, list[str]],
@@ -3313,7 +3519,7 @@ def render(
         sticky_footer_lines.append(_color("─" * bar_w, "2", color_on))
         sticky_footer_lines.append(
             f"{_color('HITL — ANTIGRAVITY APP VALIDATION', '1;35', color_on)} "
-            f"{_color('(press h + number: copy title & focus Antigravity · or run /hitl-review / open dev_queue_board.md):', '2', color_on)}"
+            f"{_color('(press h + number: jump via Dev Queue Panel or copy title & focus Antigravity · /hitl-review):', '2', color_on)}"
         )
         for h_i, cid_disp, ag_t in hitl_footer:
             sticky_footer_lines.append(
@@ -4070,7 +4276,7 @@ def _render_help_overlay_lines(term_w: int, color_on: bool) -> list[str]:
         _color("─" * bar_w, "2", color_on),
         _color("  ACTIONS & TOGGLES:", "1;33", color_on),
         "    o / O / 1-9       Open first ready PR / all ready PRs / row #N link in default browser",
-        "    h + 1-9           Copy exact HITL conversation sidebar title & focus Antigravity Desktop",
+        "    h + 1-9           Jump via Dev Queue Sidecar Panel (nav_intent) + clipboard/focus fallback",
         "    d                 Run interactive agy-doctor check ([w] wake · [f] safe fix)",
         "    p / a             Toggle [compact] pending rows (<=3) / [all] inactive items",
         "    s / b             Trigger async background Git fetch+reconcile / force-sync board.md",
@@ -4691,16 +4897,25 @@ def run_watch_loop(
                 if awaiting_hitl_digit:
                     awaiting_hitl_digit = False
                     if key.isdigit() and key != "0":
-                        entry = hitl_convs.get(int(key))
+                        h_idx = int(key)
+                        entry = hitl_convs.get(h_idx)
                         if entry:
-                            cid_disp, _cid_full, ag_title = entry
-                            copied = _copy_to_clipboard(ag_title)
-                            _focus_antigravity_app()
-                            status_msg = (
-                                f"✓ Antigravity focused · copied '{_trunc(ag_title, 34)}' ({cid_disp})"
-                                if copied
-                                else f"✓ Antigravity focused ({cid_disp})"
+                            cid_disp, cid_full, ag_title = entry
+                            nav_res = _trigger_hitl_navigation(
+                                st_dir,
+                                index=h_idx,
+                                cid_disp=cid_disp,
+                                cid_full=cid_full,
+                                ag_title=ag_title,
                             )
+                            if nav_res.get("acknowledged"):
+                                status_msg = f"✓ Dev Queue Panel switched to '{_trunc(ag_title, 34)}' ({cid_disp})"
+                            elif nav_res.get("copied"):
+                                status_msg = (
+                                    f"✓ nav_intent + Antigravity focused · copied '{_trunc(ag_title, 30)}' ({cid_disp})"
+                                )
+                            else:
+                                status_msg = f"✓ nav_intent + Antigravity focused ({cid_disp})"
                         else:
                             status_msg = f"No [h{key}] item"
                         status_until = time.monotonic() + 4.0
@@ -5264,19 +5479,30 @@ def _main_dashboard(argv: list[str], raw_cli_argv: list[str]) -> int:
 
     try:
         if args.open_hitl:
-            _, _, hitl_convs, _, _, _ = render(args)
+            _, _, hitl_convs, _, open_state_dir, _ = render(args)
             key_clean = args.open_hitl.strip().lower().lstrip("h")
-            entry = hitl_convs.get(int(key_clean)) if key_clean.isdigit() else None
+            h_idx = int(key_clean) if key_clean.isdigit() else 0
+            entry = hitl_convs.get(h_idx) if h_idx > 0 else None
             if not entry:
                 print(f"No HITL item found for '{args.open_hitl}'.", file=sys.stderr)
                 return 1
-            cid_disp, _cid_full, ag_title = entry
-            _copy_to_clipboard(ag_title)
-            _focus_antigravity_app()
-            print(
-                f"✓ Copied '{ag_title}' ({cid_disp}) & focused Antigravity Desktop "
-                "(paste in sidebar search or open dev_queue_board.md)"
+            cid_disp, cid_full, ag_title = entry
+            nav_res = _trigger_hitl_navigation(
+                open_state_dir,
+                index=h_idx,
+                cid_disp=cid_disp,
+                cid_full=cid_full,
+                ag_title=ag_title,
             )
+            if nav_res.get("acknowledged"):
+                print(
+                    f"✓ Dev Queue Panel opened '{ag_title}' ({cid_disp}) in Antigravity Desktop"
+                )
+            else:
+                print(
+                    f"✓ Wrote nav_intent, copied '{ag_title}' ({cid_disp}) & focused Antigravity Desktop "
+                    "(Dev Queue Panel auto-switches when open, or paste in sidebar search)"
+                )
             return 0
 
         if args.sync:

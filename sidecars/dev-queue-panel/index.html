@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dev Queue</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="dq-root" class="dq-shell">
+    <header class="dq-header">
+      <div class="dq-header-top">
+        <div class="dq-brand">
+          <h1 class="dq-title">Dev Queue</h1>
+          <span id="dq-live-pill" class="dq-live-pill" role="status" aria-live="polite">
+            <span class="dq-live-dot" aria-hidden="true"></span>
+            <span id="dq-live-text">Connecting…</span>
+          </span>
+        </div>
+        <div class="dq-header-actions">
+          <button id="dq-orch-btn" type="button" class="dq-chip-btn dq-hidden" title="Switch to active orchestrator conversation"></button>
+          <button id="dq-board-btn" type="button" class="dq-chip-btn dq-hidden" data-action="open-board" title="Open dev_queue_board.md in File View">Board .md</button>
+          <button id="dq-refresh-btn" type="button" class="dq-icon-btn" data-action="refresh" aria-label="Refresh queue snapshot" title="Refresh snapshot">↻</button>
+        </div>
+      </div>
+
+      <nav class="dq-kpi-bar" aria-label="Queue summary filters">
+        <button id="dq-kpi-all" type="button" class="dq-kpi active" data-section-filter="all">
+          <span class="dq-kpi-label">All</span>
+          <span id="dq-count-all" class="dq-kpi-num">0</span>
+        </button>
+        <button id="dq-kpi-hitl" type="button" class="dq-kpi dq-kpi-hitl" data-section-filter="hitl_blocked">
+          <span class="dq-kpi-label">HITL</span>
+          <span id="dq-count-hitl" class="dq-kpi-num">0</span>
+        </button>
+        <button id="dq-kpi-pr" type="button" class="dq-kpi dq-kpi-pr" data-section-filter="pr_open">
+          <span class="dq-kpi-label">PR Ready</span>
+          <span id="dq-count-pr" class="dq-kpi-num">0</span>
+        </button>
+        <button id="dq-kpi-run" type="button" class="dq-kpi dq-kpi-run" data-section-filter="in_progress">
+          <span class="dq-kpi-label">Active</span>
+          <span id="dq-count-run" class="dq-kpi-num">0</span>
+        </button>
+        <button id="dq-kpi-pending" type="button" class="dq-kpi" data-section-filter="pending">
+          <span class="dq-kpi-label">Pending</span>
+          <span id="dq-count-pending" class="dq-kpi-num">0</span>
+        </button>
+      </nav>
+
+      <div class="dq-search-row">
+        <label for="dq-filter" class="dq-sr-only">Filter queue items and repositories</label>
+        <input
+          id="dq-filter"
+          type="search"
+          class="dq-search-input"
+          placeholder="Filter by ID, title, repo, branch, or [h#]…"
+          aria-label="Filter queue items and repositories"
+          autocomplete="off"
+        >
+      </div>
+    </header>
+
+    <div id="dq-toast" class="dq-toast dq-hidden" role="status" aria-live="polite"></div>
+    <div id="dq-error" class="dq-error dq-hidden" role="alert"></div>
+
+    <main id="dq-main" class="dq-main">
+      <section id="dq-sec-hitl" class="dq-section dq-section-hitl dq-hidden" aria-labelledby="dq-h-hitl">
+        <div class="dq-section-head">
+          <h2 id="dq-h-hitl" class="dq-section-title">HITL Action Required</h2>
+          <span id="dq-badge-hitl" class="dq-section-count">0</span>
+        </div>
+        <div id="dq-list-hitl" class="dq-card-list"></div>
+      </section>
+
+      <section id="dq-sec-repos" class="dq-section dq-hidden" aria-labelledby="dq-h-repos">
+        <div class="dq-section-head">
+          <h2 id="dq-h-repos" class="dq-section-title">Repositories &amp; Locks</h2>
+          <span id="dq-badge-repos" class="dq-section-count">0</span>
+        </div>
+        <div id="dq-list-repos" class="dq-repo-grid"></div>
+      </section>
+
+      <section id="dq-sec-pr" class="dq-section dq-hidden" aria-labelledby="dq-h-pr">
+        <div class="dq-section-head">
+          <h2 id="dq-h-pr" class="dq-section-title">PRs Ready for Merge</h2>
+          <span id="dq-badge-pr" class="dq-section-count">0</span>
+        </div>
+        <div id="dq-list-pr" class="dq-card-list"></div>
+      </section>
+
+      <section id="dq-sec-active" class="dq-section dq-hidden" aria-labelledby="dq-h-active">
+        <div class="dq-section-head">
+          <h2 id="dq-h-active" class="dq-section-title">In Progress &amp; Review</h2>
+          <span id="dq-badge-active" class="dq-section-count">0</span>
+        </div>
+        <div id="dq-list-active" class="dq-card-list"></div>
+      </section>
+
+      <section id="dq-sec-pending" class="dq-section dq-hidden" aria-labelledby="dq-h-pending">
+        <div class="dq-section-head">
+          <h2 id="dq-h-pending" class="dq-section-title">Queued &amp; Standby</h2>
+          <span id="dq-badge-pending" class="dq-section-count">0</span>
+        </div>
+        <div id="dq-list-pending" class="dq-card-list"></div>
+      </section>
+
+      <section id="dq-empty" class="dq-empty dq-hidden" aria-labelledby="dq-h-empty">
+        <h2 id="dq-h-empty" class="dq-empty-title">No matching queue items</h2>
+        <p id="dq-empty-sub" class="dq-empty-sub">All repositories are unlocked and no open tasks match the active filter.</p>
+      </section>
+    </main>
+
+    <footer id="dq-footer" class="dq-footer">
+      <span id="dq-opt-hint" class="dq-opt-hint">Read-only navigator · [h#] terminal hotkeys auto-switch here</span>
+      <span id="dq-updated-at" class="dq-updated-at"></span>
+    </footer>
+  </div>
+</body>
+</html>
