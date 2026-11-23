@@ -1666,6 +1666,124 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
                 self.assertEqual(ok_s2["slot_id"], 2)
                 self.assertEqual(ok_s2["overlap_tier"], pscope.OVERLAP_NONE)
 
+    def test_slot2_shared_cid8_planner_suffixes_do_not_hijack_slot1_and_preserve_short_id(self) -> None:
+        """Verify suffixed queue IDs sharing `cid[:8]` allocate Slot #2 cleanly with unique `lock_id` without hijacking Slot #1."""
+        # Unit check on exact-or-true-short-prefix helper (never matches two distinct suffixed IDs)
+        self.assertFalse(
+            prs._is_same_conversation_id(
+                "6d655e83-gct-daemon-port-lock",
+                "6d655e83-gct-modularize-p1-core",
+            )
+        )
+        self.assertFalse(prs._is_same_conversation_id("6d655e83-gct", "6d655e83-gct-2"))
+        self.assertTrue(prs._is_same_conversation_id("6d655e83", "6d655e83-gct-daemon-port-lock"))
+        self.assertTrue(prs._is_same_conversation_id("6d655e83-gct-daemon-port-lock", "6d655e83"))
+        self.assertTrue(prs._is_same_conversation_id("6D655E83", "6d655e83-gct-daemon-port-lock"))
+        self.assertFalse(pscope._matches_cid("6d655e83-gct", "6d655e83-gct-2"))
+        self.assertTrue(pscope._matches_cid("6d655e83", "6d655e83-gct-daemon-port-lock"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            _, clone = _init_org_bare_and_clone(root, repo_name="g-control-tower", org_name="acme-org")
+            slug = "acme-org/g-control-tower"
+            (clone / "src").mkdir(parents=True, exist_ok=True)
+            (clone / "src" / "alpha.py").write_text("ALPHA = 1\n", encoding="utf-8")
+            (clone / "src" / "beta.py").write_text("BETA = 2\n", encoding="utf-8")
+            _git(clone, "add", "src")
+            _git(clone, "commit", "-m", "feat: seed alpha and beta")
+            _git(clone, "push", "origin", "main")
+
+            cid_slot1 = "6d655e83-gct-daemon-port-lock"
+            cid_slot2 = "6d655e83-gct-modularize-p1-core"
+            shared_ts = "20261123-055813"
+
+            env_patch = {
+                "AGY_DEV_STATE_DIR": str(state_dir),
+                "AGY_CONF_REPO_DIR": str(clone),
+                "AGY_REPOS_ROOT": str(clone.parent),
+            }
+            with mock.patch.dict(os.environ, env_patch, clear=False):
+                vcs = git_client.GitVcsIntegrationClient(
+                    env_overrides={"AGY_CONF_REPO_DIR": str(clone), "AGY_DEV_STATE_DIR": str(state_dir)}
+                )
+                s1 = prs.start_remediation_branch_and_lock(
+                    conversation_id=cid_slot1,
+                    action_id="gct-daemon-port-lock",
+                    rca_summary="Slot 1 daemon port lock",
+                    proposed_fix="Edit src/alpha.py",
+                    target_files=["src/alpha.py"],
+                    create_worktree=True,
+                    branch_timestamp=shared_ts,
+                    portfolio_dir=state_dir,
+                    workdir=clone,
+                    git_client=vcs,
+                )
+                self.assertEqual(s1["status"], "ok")
+                self.assertEqual(s1["slot_id"], 1)
+                s1_branch = s1["branch_name"]
+                s1_lock_id = s1["lock"]["lock_id"]
+                s1_wt = pathlib.Path(s1["worktree_path"])
+
+                # Add a commit in Slot #1 so `_find_existing_repo_branch_for_conversation` sees an ahead `fix/*-6d655e83` branch
+                (s1_wt / "src" / "alpha.py").write_text("ALPHA = 2\n", encoding="utf-8")
+                _git(s1_wt, "add", "src/alpha.py")
+                _git(s1_wt, "commit", "-m", "fix: slot 1 alpha change")
+
+                # Acquiring Slot #2 with a distinct suffixed ID sharing the same 8-char prefix & timestamp
+                # MUST allocate Slot #2 with a distinct branch and distinct `lock_id`, never hijacking Slot #1!
+                s2 = prs.start_remediation_branch_and_lock(
+                    conversation_id=cid_slot2,
+                    action_id="gct-modularize-p1-core",
+                    rca_summary="Slot 2 modularize core",
+                    proposed_fix="Edit src/beta.py",
+                    target_files=["src/beta.py"],
+                    allow_slot2=True,
+                    create_worktree=True,
+                    branch_timestamp=shared_ts,
+                    portfolio_dir=state_dir,
+                    workdir=clone,
+                    git_client=vcs,
+                )
+                self.assertEqual(s2["status"], "ok")
+                self.assertEqual(s2["slot_id"], 2)
+                self.assertNotEqual(s2["branch_name"], s1_branch)
+                self.assertNotEqual(s2["worktree_path"], s1["worktree_path"])
+                s2_lock_id = s2["lock"]["lock_id"]
+                self.assertNotEqual(s2_lock_id, s1_lock_id)
+                self.assertIn("-s2", s2_lock_id)
+
+                # Slot #1 metadata MUST remain completely intact
+                slot1_after = prs.get_dev_pr_lock(portfolio_dir=state_dir, repo_slug=slug, slot_id=1)
+                self.assertEqual(slot1_after["conversation_id"], cid_slot1)
+                self.assertEqual(slot1_after["branch_name"], s1_branch)
+                self.assertEqual(slot1_after["lock_id"], s1_lock_id)
+                self.assertEqual(slot1_after["target_files"], ["src/alpha.py"])
+                self.assertEqual(slot1_after["active_slots_count"], 2)
+
+                slot2_after = prs.get_dev_pr_lock(portfolio_dir=state_dir, repo_slug=slug, slot_id=2)
+                self.assertEqual(slot2_after["conversation_id"], cid_slot2)
+                self.assertEqual(slot2_after["branch_name"], s2["branch_name"])
+                self.assertEqual(slot2_after["lock_id"], s2_lock_id)
+                self.assertEqual(slot2_after["target_files"], ["src/beta.py"])
+
+                # True 8-char hex short ID (`6d655e83`) MUST still match Slot #1 via `acquire_dev_pr_lock` without truncating CID
+                reacq = prs.acquire_dev_pr_lock(
+                    conversation_id="6d655e83",
+                    action_id="gct-daemon-port-lock",
+                    branch_timestamp=shared_ts,
+                    target_files=["src/alpha.py"],
+                    reuse_active_branch=True,
+                    portfolio_dir=state_dir,
+                    repo_slug=slug,
+                    workdir=s1_wt,
+                )
+                self.assertEqual(reacq["status"], "ok")
+                self.assertEqual(reacq["slot_id"], 1)
+                self.assertEqual(reacq["lock"]["conversation_id"], cid_slot1)
+                self.assertEqual(reacq["lock"]["lock_id"], s1_lock_id)
+
 
 if __name__ == "__main__":
     unittest.main()

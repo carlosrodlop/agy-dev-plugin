@@ -229,6 +229,55 @@ def format_timestamped_branch_name(
 # Per-Repository Cross-Conversation Pending-Branch Lock State Machine
 # ==============================================================================
 
+_HEX8_CID_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _is_same_conversation_id(cid_a: str, cid_b: str) -> bool:
+    """Return True on exact match or when one side is an 8-char hex short ID prefix of the other."""
+    a = str(cid_a or "").strip().lower()
+    b = str(cid_b or "").strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if _HEX8_CID_RE.fullmatch(a) and b.startswith(a):
+        return True
+    if _HEX8_CID_RE.fullmatch(b) and a.startswith(b):
+        return True
+    return False
+
+
+def _build_slot_lock_id(
+    cid_clean: str,
+    branch_timestamp: str,
+    *,
+    slot_id: int = 1,
+    action_id: str = "",
+    existing_lock_ids: set[str] | None = None,
+) -> str:
+    """Build a unique `lock_id` (`lock-<cid8>-<ts>[-s2[-<scope>]]`) across slots sharing `cid[:8]`."""
+    cid8 = cid_clean[:8] or "lock"
+    base_id = f"lock-{cid8}-{branch_timestamp}"
+    taken = {str(x).strip() for x in (existing_lock_ids or set()) if str(x).strip()}
+    if slot_id <= 1 and base_id not in taken:
+        return base_id
+    act_slug = _slugify_branch_token(action_id, max_len=16) if action_id.strip() else ""
+    if slot_id > 1:
+        cand = f"{base_id}-s{slot_id}"
+        if cand in taken or any(ex.startswith(f"lock-{cid8}-") for ex in taken):
+            if act_slug:
+                cand = f"{base_id}-s{slot_id}-{act_slug}"
+            if cand in taken or any(ex == cand for ex in taken):
+                digest = hashlib.sha256(cid_clean.encode("utf-8")).hexdigest()[:6]
+                cand = f"{base_id}-s{slot_id}-{digest}"
+        return cand
+    if act_slug:
+        cand = f"{base_id}-{act_slug}"
+        if cand not in taken:
+            return cand
+    digest = hashlib.sha256(cid_clean.encode("utf-8")).hexdigest()[:6]
+    return f"{base_id}-{digest}"
+
 
 def _resolve_main_git_repo_root(repo_or_wt: Path) -> Path:
     """Resolve the persistent primary repository root from either a checkout or an isolated git worktree."""
@@ -1084,10 +1133,8 @@ def acquire_dev_pr_lock(
             existing_siblings = [str(s).strip() for s in (norm_existing.get("sibling_conversation_ids") or [])]
             same_conv_slot1 = bool(
                 not holder_cid
-                or holder_cid == cid_clean
-                or cid_clean.startswith(holder_cid[:8])
-                or holder_cid.startswith(cid_clean[:8])
-                or cid_clean in existing_siblings
+                or _is_same_conversation_id(holder_cid, cid_clean)
+                or any(_is_same_conversation_id(s, cid_clean) for s in existing_siblings)
             )
             slot2_existing = slots_existing.get("2")
             same_conv_slot2 = False
@@ -1097,10 +1144,8 @@ def acquire_dev_pr_lock(
                 same_conv_slot2 = bool(
                     s2_holder
                     and (
-                        s2_holder == cid_clean
-                        or cid_clean.startswith(s2_holder[:8])
-                        or s2_holder.startswith(cid_clean[:8])
-                        or cid_clean in s2_sibs
+                        _is_same_conversation_id(s2_holder, cid_clean)
+                        or any(_is_same_conversation_id(s, cid_clean) for s in s2_sibs)
                     )
                 )
 
@@ -1156,10 +1201,29 @@ def acquire_dev_pr_lock(
                         if (same_conv_slot2 and (reuse_active_branch or not branch_name.strip()))
                         else default_branch
                     )
+                    slot1_lock_ids = {
+                        str(norm_existing.get("lock_id") or "").strip(),
+                        (
+                            str((slots_existing.get("1") or {}).get("lock_id") or "").strip()
+                            if isinstance(slots_existing.get("1"), dict)
+                            else ""
+                        ),
+                    }
+                    s2_lock_id = (
+                        str(prev_s2.get("lock_id") or "").strip()
+                        if (same_conv_slot2 and reuse_active_branch and str(prev_s2.get("lock_id") or "").strip())
+                        else _build_slot_lock_id(
+                            cid_clean,
+                            s2_ts,
+                            slot_id=2,
+                            action_id=str(action_id or prev_s2.get("action_id") or ""),
+                            existing_lock_ids=slot1_lock_ids,
+                        )
+                    )
                     slot2_obj: dict[str, Any] = {
                         "slot_id": 2,
                         "active": True,
-                        "lock_id": f"lock-{cid_clean[:8]}-{s2_ts}",
+                        "lock_id": s2_lock_id,
                         "conversation_id": cid_clean,
                         "sibling_conversation_ids": clean_siblings,
                         "action_id": str(action_id or prev_s2.get("action_id") or "").strip(),
@@ -1295,12 +1359,36 @@ def acquire_dev_pr_lock(
             "updated_at": now_iso,
         }
 
-        same_prev = isinstance(existing_lock, dict) and existing_lock.get("conversation_id") == cid_clean
+        same_prev = isinstance(existing_lock, dict) and _is_same_conversation_id(
+            str(existing_lock.get("conversation_id") or ""),
+            cid_clean,
+        )
         prev_gate_ready = bool(existing_lock.get("pr_gate_ready")) if (same_prev and not reuse_active_branch) else False
         preserved_slot2 = (
             existing_lock.get("slots", {}).get("2")
             if isinstance(existing_lock, dict) and isinstance(existing_lock.get("slots"), dict)
             else None
+        )
+        existing_s2_lock_ids = (
+            {str(preserved_slot2.get("lock_id") or "").strip()}
+            if isinstance(preserved_slot2, dict) and bool(preserved_slot2.get("active", True))
+            else set()
+        )
+        s1_lock_id = (
+            str(existing_lock.get("lock_id") or "").strip()
+            if (same_prev and reuse_active_branch and str(existing_lock.get("lock_id") or "").strip())
+            else _build_slot_lock_id(
+                cid_clean,
+                resolved_ts,
+                slot_id=1,
+                action_id=str(action_id or ""),
+                existing_lock_ids=existing_s2_lock_ids,
+            )
+        )
+        s1_cid_recorded = (
+            str(existing_lock.get("conversation_id") or "").strip()
+            if (same_prev and len(str(existing_lock.get("conversation_id") or "").strip()) > len(cid_clean))
+            else cid_clean
         )
         new_lock_raw: dict[str, Any] = {
             "active": True,
@@ -1311,10 +1399,10 @@ def acquire_dev_pr_lock(
             "max_slots": eff_max_slots,
             "base_sha": resolved_base_sha or (str(existing_lock.get("base_sha") or "") if same_prev else ""),
             "overlap_tier": (overlap_tier or "").strip() or (str(existing_lock.get("overlap_tier") or "") if same_prev else ""),
-            "landing_order": list(landing_order or ([cid_clean] if not same_prev else (existing_lock.get("landing_order") or [cid_clean]))),
+            "landing_order": list(landing_order or ([s1_cid_recorded] if not same_prev else (existing_lock.get("landing_order") or [s1_cid_recorded]))),
             "section_anchors": clean_anchors or (list(existing_lock.get("section_anchors") or []) if same_prev else []),
-            "lock_id": f"lock-{cid_clean[:8]}-{resolved_ts}",
-            "conversation_id": cid_clean,
+            "lock_id": s1_lock_id,
+            "conversation_id": s1_cid_recorded,
             "sibling_conversation_ids": clean_siblings,
             "action_id": str(action_id or "").strip(),
             "notification_source": "Ad-Hoc",
@@ -1484,15 +1572,7 @@ def update_dev_pr_lock(
         if req_branch and existing_branch and not slot1_matches_req:
             req_cid = str(updates.get("conversation_id") or "").strip()
             holder_cid = str(norm_cand.get("conversation_id") or "").strip()
-            same_conv = bool(
-                req_cid
-                and holder_cid
-                and (
-                    req_cid == holder_cid
-                    or req_cid.startswith(holder_cid[:8])
-                    or holder_cid.startswith(req_cid[:8])
-                )
-            )
+            same_conv = _is_same_conversation_id(req_cid, holder_cid)
             if not same_conv:
                 return {
                     "status": "error",
@@ -2795,12 +2875,18 @@ def prepare_isolated_worktree(
     }
 
 
+_UUID_FULL_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
 def _find_existing_repo_branch_for_conversation(
     repo_dir: Path,
     cid_clean: str,
     existing_lock: dict[str, Any],
     repo_slug: str = "",
     same_conv: bool = False,
+    *,
+    action_id: str = "",
+    excluded_branches: set[str] | None = None,
 ) -> tuple[str, str]:
     """Return `(existing_branch_name, existing_branch_timestamp)` if `repo_dir` already has an active branch for `cid_clean`."""
     if same_conv and isinstance(existing_lock, dict) and existing_lock.get("active"):
@@ -2844,11 +2930,19 @@ def _find_existing_repo_branch_for_conversation(
     if proc_refs.returncode != 0:
         return "", ""
 
+    excluded = {str(b).strip() for b in (excluded_branches or set()) if str(b).strip()}
+    is_suffixed_cid = len(cid_clean) > 8 and not _HEX8_CID_RE.fullmatch(cid_clean.lower()) and not _UUID_FULL_RE.fullmatch(cid_clean.lower())
+    act_slug = _slugify_branch_token(action_id) if action_id.strip() else ""
+
     candidates: list[str] = []
     for raw_ref in (proc_refs.stdout or "").splitlines():
         ref_clean = raw_ref.strip()
         if ref_clean.startswith("origin/"):
             ref_clean = ref_clean[len("origin/") :]
+        if ref_clean in excluded:
+            continue
+        if is_suffixed_cid and act_slug and f"-{act_slug}-{cid8}" not in ref_clean:
+            continue
         if ref_clean.startswith("fix/") and ref_clean not in candidates:
             candidates.append(ref_clean)
     if not candidates:
@@ -2926,10 +3020,8 @@ def start_remediation_branch_and_lock(
     existing_siblings = [str(s).strip() for s in (existing_lock.get("sibling_conversation_ids") or [])]
     same_conv = bool(
         not holder_cid
-        or holder_cid == cid_clean
-        or cid_clean.startswith(holder_cid[:8])
-        or holder_cid.startswith(cid_clean[:8])
-        or cid_clean in existing_siblings
+        or _is_same_conversation_id(holder_cid, cid_clean)
+        or any(_is_same_conversation_id(s, cid_clean) for s in existing_siblings)
     )
     slots_existing = existing_lock.get("slots") if isinstance(existing_lock.get("slots"), dict) else {}
     slot2_existing = slots_existing.get("2") if isinstance(slots_existing.get("2"), dict) else {}
@@ -2940,10 +3032,8 @@ def start_remediation_branch_and_lock(
         same_conv_slot2 = bool(
             s2_cid
             and (
-                s2_cid == cid_clean
-                or cid_clean.startswith(s2_cid[:8])
-                or s2_cid.startswith(cid_clean[:8])
-                or cid_clean in s2_sibs
+                _is_same_conversation_id(s2_cid, cid_clean)
+                or any(_is_same_conversation_id(s, cid_clean) for s in s2_sibs)
             )
         )
 
@@ -3066,12 +3156,30 @@ def start_remediation_branch_and_lock(
     rca_summary = _sanitize_home_paths(rca_summary.strip()) or f"Code/configuration change in conversation {cid_clean}"
     proposed_fix = _sanitize_home_paths(proposed_fix.strip()) or "Apply code/skill change on timestamped branch and add unit test coverage."
 
+    excluded_branches: set[str] = set()
+    if existing_lock.get("active"):
+        if not same_conv:
+            s1_br_ex = str(existing_lock.get("branch_name") or "").strip()
+            if s1_br_ex:
+                excluded_branches.add(s1_br_ex)
+            for rb_k, rb_v in (existing_lock.get("repo_branches") or {}).items():
+                if not _is_slot_scoped_rb_key(str(rb_k)) and isinstance(rb_v, dict):
+                    rb_br_ex = str(rb_v.get("branch_name") or "").strip()
+                    if rb_br_ex:
+                        excluded_branches.add(rb_br_ex)
+        if not same_conv_slot2 and isinstance(slot2_existing, dict) and bool(slot2_existing.get("active", True)):
+            s2_br_ex = str(slot2_existing.get("branch_name") or "").strip()
+            if s2_br_ex:
+                excluded_branches.add(s2_br_ex)
+
     reused_repo_branch, reused_repo_ts = _find_existing_repo_branch_for_conversation(
         repo_dir=target_repo_dir,
         cid_clean=cid_clean,
         existing_lock=lock_for_reuse if (same_conv or same_conv_slot2) else {},
         repo_slug=repo_slug,
         same_conv=bool(same_conv or same_conv_slot2),
+        action_id=action_id,
+        excluded_branches=excluded_branches,
     )
     resolved_ts = (
         branch_timestamp.strip()
@@ -6235,15 +6343,8 @@ def _normalize_str_list(values: list[str] | tuple[str, ...] | None) -> list[str]
 
 
 def _matches_cid(cand: str, ref: str) -> bool:
-    """Return True if two conversation IDs match exactly or share a unique >=8-char prefix."""
-    c = str(cand or "").strip().lower()
-    r = str(ref or "").strip().lower()
-    if not c or not r:
-        return False
-    if c == r:
-        return True
-    short = min(len(c), len(r))
-    return short >= 8 and (c.startswith(r) or r.startswith(c))
+    """Return True if two conversation IDs match exactly or one is an 8-char hex short prefix of the other."""
+    return _is_same_conversation_id(cand, ref)
 
 
 def get_dev_queue_path(portfolio_dir: Path | str | None = None) -> Path:
