@@ -636,7 +636,7 @@ class TestGitClientAndRemediation(unittest.TestCase):
             self.assertFalse(staged["pr_gate_ready"])
             self.assertEqual(staged["manual_pr_url"], "")
 
-            # Create fake notify hook script to verify end-to-end AGY_DEV_NOTIFY_CMD dispatch
+            # Create fake notify hook script to verify PASS review NEVER dispatches PR-ready notifications
             notify_log = troot / "notify.log"
             notify_sh = troot / "notify.sh"
             notify_sh.write_text(f"#!/usr/bin/env bash\necho \"$*\" > \"{notify_log}\"\n", encoding="utf-8")
@@ -656,12 +656,8 @@ class TestGitClientAndRemediation(unittest.TestCase):
             self.assertTrue(rev["ready_for_human_pr"])
             self.assertTrue(rev["pr_gate_ready"])
             self.assertTrue(rev["branch_pushed"])
-            self.assertTrue(rev["notification_email_sent"])
-            self.assertTrue(notify_log.is_file())
-            logged_args = notify_log.read_text(encoding="utf-8")
-            self.assertIn(branch_name, logged_args)
-            self.assertIn("--target-url", logged_args)
-            self.assertIn(rev["notification_target_url"], logged_args)
+            self.assertFalse(rev["notification_email_sent"])
+            self.assertFalse(notify_log.exists())
             self.assertNotIn("title=", rev["notification_target_url"])
             self.assertNotIn("body=", rev["notification_target_url"])
             self.assertTrue(rev["email_subject"].startswith("PR Ready for Validation ["))
@@ -803,7 +799,7 @@ class TestGitClientAndRemediation(unittest.TestCase):
                 self.assertIn("--target-url", custom_argv)
                 self.assertEqual(custom_argv[custom_argv.index("--target-url") + 1], sample_target_url)
 
-            # 3. record_pr_review_evaluation(send_email=True) explicitly passes errors_only_override=False
+            # 3. record_pr_review_evaluation(send_email=True) on PASS suppresses PR-ready email while preserving metadata
             pdir = troot / "state"
             pdir.mkdir(parents=True, exist_ok=True)
             _, clone = _create_bare_and_clone(troot, name="notify-repo")
@@ -812,7 +808,7 @@ class TestGitClientAndRemediation(unittest.TestCase):
                 conversation_id="55555555-5555-4555-8555-555555555555",
                 action_id="notify-check",
                 rca_summary="Notify suppressed",
-                proposed_fix="Pass errors_only_override=False",
+                proposed_fix="Suppress PASS PR-ready email",
                 checkout_branch=True,
                 branch_timestamp="20261120-111000",
                 portfolio_dir=pdir,
@@ -820,8 +816,8 @@ class TestGitClientAndRemediation(unittest.TestCase):
             )
             (clone / "notify_fix.py").write_text("NOTIFY_OK = True\n", encoding="utf-8")
             staged_notify = pr_remediator.push_remediation_branch_and_build_reviewer_plan(
-                title="fix(notify-check): pass errors_only_override=False",
-                executive_summary="Forward errors_only_override=False on PASS review email.",
+                title="fix(notify-check): suppress PASS PR-ready email",
+                executive_summary="Suppress PASS review email while preserving PR metadata.",
                 workdir=clone,
                 portfolio_dir=pdir,
                 git_client=vcs,
@@ -836,25 +832,25 @@ class TestGitClientAndRemediation(unittest.TestCase):
                     branch_name=start["branch_name"],
                     verdict="PASS",
                     score=98,
-                    summary="Verified notify override.",
+                    summary="Verified PASS email suppression.",
                     send_email=True,
                     portfolio_dir=pdir,
                     git_client=vcs,
                 )
             self.assertEqual(rev["status"], "ok")
             self.assertTrue(rev["ready_for_human_pr"])
-            self.assertTrue(rev["notification_email_sent"])
-            mock_notify.assert_called_once()
-            self.assertIs(mock_notify.call_args.kwargs.get("errors_only_override"), False)
+            self.assertTrue(rev["pr_gate_ready"])
+            self.assertTrue(rev["branch_pushed"])
+            self.assertFalse(rev["notification_email_sent"])
+            mock_notify.assert_not_called()
             self.assertEqual(
-                mock_notify.call_args.kwargs.get("subject"),
-                "PR Ready for Validation [agy-dev-plugin]: fix(notify-check): pass errors_only_override=False (PASS 98/100)",
+                rev["email_subject"],
+                "PR Ready for Validation [agy-dev-plugin]: fix(notify-check): suppress PASS PR-ready email (PASS 98/100)",
             )
             self.assertEqual(
-                mock_notify.call_args.kwargs.get("target_url"),
+                rev["notification_target_url"],
                 f"https://github.com/carlosrodlop/agy-dev-plugin/compare/main...{start['branch_name']}?expand=1",
             )
-            self.assertEqual(rev["notification_target_url"], mock_notify.call_args.kwargs.get("target_url"))
 
     def test_record_pr_review_evaluation_standardizes_subject_and_clean_target_url_for_github_remote(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -904,6 +900,8 @@ class TestGitClientAndRemediation(unittest.TestCase):
                     repo_slug="acme-org/widget-core",
                 )
             self.assertTrue(rev["ready_for_human_pr"])
+            self.assertFalse(rev["notification_email_sent"])
+            mock_notify.assert_not_called()
             subj = rev["email_subject"]
             self.assertTrue(subj.startswith("PR Ready for Validation [widget-core]: "))
             self.assertTrue(subj.endswith(" (PASS 95/100)"))
@@ -913,8 +911,6 @@ class TestGitClientAndRemediation(unittest.TestCase):
             self.assertNotIn("  ", inner_summary)
             expected_url = f"https://github.com/acme-org/widget-core/compare/main...{start['branch_name']}?expand=1"
             self.assertEqual(rev["notification_target_url"], expected_url)
-            self.assertEqual(mock_notify.call_args.kwargs.get("target_url"), expected_url)
-            self.assertEqual(mock_notify.call_args.kwargs.get("subject"), subj)
 
 
 class TestProjectAuditAndPluginContracts(unittest.TestCase):
