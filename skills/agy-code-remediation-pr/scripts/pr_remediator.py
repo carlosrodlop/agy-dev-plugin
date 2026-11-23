@@ -35,12 +35,14 @@ for _cand_clients in (
         break
 import dev_common as _dev_common  # noqa: F401, E402
 if __name__ != "__main__":
-    _sys.modules.setdefault("pr_remediator", _sys.modules[__name__])
-    _sys.modules["pr_remediator"] = _sys.modules[__name__]
+    _current_mod = _sys.modules.get(__name__)
+    if _current_mod is not None:
+        _sys.modules.setdefault("pr_remediator", _current_mod)
+        _sys.modules["pr_remediator"] = _current_mod
 
 
 import argparse
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 import contextlib
 from datetime import datetime, timezone
 import fcntl

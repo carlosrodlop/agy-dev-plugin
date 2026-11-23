@@ -9,7 +9,8 @@ Provides zero-dependency stdlib primitives for `agy-dev-plugin` scripts:
   - Optional soft bridges to companion Antigravity plugins/services when present on disk
   - Deterministic SDLC lifecycle guardrails (`DevLifecycleGuardrailEvaluator`) for
     `PreToolUse` (`direct-main-push`, `proprietary-vcs-cli`, `santa-lockdown-binary`,
-    `dotenv-write-protection`) and `SessionStart` (`dev-pr-lock-context`)
+    `dotenv-write-protection`, `unvalidated-branch-push`, `parallel-file-lease`,
+    `parallel-worker-deploy-home`) and multi-slot `SessionStart` (`dev-pr-lock-context`)
 """
 
 from __future__ import annotations
@@ -91,13 +92,52 @@ DETERMINISTIC_DEV_PRETOOL_CHECKS: tuple[dict[str, str], ...] = (
         "decision": "deny",
         "description": "Blocks direct 'git push' commands targeting an active locked branch before agy-code-pr-reviewer passes (>90/100) and sets pr_gate_ready=True.",
     },
+    {
+        "check_id": "pretool:parallel-file-lease",
+        "event": "PreToolUse",
+        "title": "Parallel Multi-Slot File Lease Write Blocker",
+        "target": "write_file | edit_file | run_command (target_files leased by sibling slot)",
+        "decision": "deny",
+        "description": "Blocks writes to non-monolith files currently leased (target_files) by a sibling active slot in the same repository while allowing own-slot and disjoint file edits.",
+    },
+    {
+        "check_id": "pretool:parallel-worker-deploy-home",
+        "event": "PreToolUse",
+        "title": "Parallel Worktree $HOME Deployment Blocker",
+        "target": "run_command (install.sh | deploy-home inside pr-worktree-*)",
+        "decision": "deny",
+        "description": "Blocks './install.sh' and 'git_client.py deploy-home' execution inside isolated 'pr-worktree-*' directories so parallel workers never race $HOME deployment mid-flight.",
+    },
 )
+
+PARALLEL_MONOLITH_MIN_LINES = 250
+PARALLEL_KNOWN_MONOLITH_BASENAMES: frozenset[str] = frozenset(
+    {
+        "pr_remediator.py",
+        "dashboard.js",
+        "portfolio.py",
+        "styles.css",
+        "index.html",
+        "wiz_common.py",
+        "dev_common.py",
+        "git_client.py",
+    }
+)
+_LEASE_LINE_RANGE_RE = re.compile(r"^L?\d+(?:\s*-\s*L?\d+)?$", re.IGNORECASE)
+_LEASE_REPO_PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]{2,}(?:/[A-Za-z0-9_.-]+)?$")
+_LEASE_SINGLE_COLON_RE = re.compile(r"(?<!:):(?!:)")
+_SHELL_WRITE_REDIRECT_RE = re.compile(r"(?:^|[^0-9&])>>?\|?\s*(?!&|\s*$)(?:'([^']+)'|\"([^\"]+)\"|([^\s;|&>]+))")
+_SHELL_TEE_TARGET_RE = re.compile(r"\btee\s+(?:-[a-zA-Z]+\s+)*(?:'([^']+)'|\"([^\"]+)\"|([^\s;|&>-][^\s;|&>]*))")
 
 UNREADY_PR_GATE_LOCK_STATUSES: frozenset[str] = frozenset(
     {
         "AWAITING_AGENT_REVIEW",
         "NEEDS_REVISION_ITERATING",
         "ESCALATED_MAX_REVIEW_ITERATIONS",
+        "READY_AWAITING_BASE_MERGE",
+        "NEEDS_REBASE_REVERIFY",
+        "NEEDS_AGENT_SEMANTIC_FIX",
+        "NEEDS_AGENT_CONFLICT_RESOLUTION",
     }
 )
 
@@ -305,14 +345,20 @@ def _load_optional_module(module_path: Path, mod_name: str) -> Any | None:
     mod_dir = str(module_path.parent)
     if mod_dir not in sys.path:
         sys.path.insert(0, mod_dir)
+    previous = sys.modules.get(mod_name)
     try:
         spec = importlib.util.spec_from_file_location(mod_name, str(module_path))
         if spec is None or spec.loader is None:
             return None
         mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
         spec.loader.exec_module(mod)
         return mod
     except Exception:
+        if previous is None:
+            sys.modules.pop(mod_name, None)
+        else:
+            sys.modules[mod_name] = previous
         return None
 
 
@@ -556,48 +602,59 @@ def get_active_dev_pr_lock_protections(
     state_dir: Path | str | None = None,
     home_dir: Path | None = None,
 ) -> tuple[set[str], set[str]]:
-    """Return `(active_branches, active_worktree_paths)` held by any active `dev_pr_locks` or legacy `dev_pr_lock` entry."""
+    """Return `(active_branches, active_worktree_paths)` held by any active `dev_pr_locks` (including all `slots`) or legacy `dev_pr_lock`."""
     p_dir = resolve_state_dir(state_dir, home_dir=home_dir)
-    state_obj = atomic_read_json(p_dir / "actions_state.json", default={})
-    if not isinstance(state_obj, dict):
-        return set(), set()
-    audit_state = state_obj.get("actions_log_audit_state")
-    if not isinstance(audit_state, dict):
-        return set(), set()
-
     entries: list[dict[str, Any]] = []
-    raw_locks = audit_state.get("dev_pr_locks")
-    if isinstance(raw_locks, dict):
-        entries.extend(v for v in raw_locks.values() if isinstance(v, dict))
-    legacy = audit_state.get("dev_pr_lock")
-    if isinstance(legacy, dict):
-        entries.append(legacy)
+
+    lock_file_obj = atomic_read_json(p_dir / "dev_pr_lock.json", default={})
+    if isinstance(lock_file_obj, dict):
+        raw_nested = lock_file_obj.get("dev_pr_locks") or lock_file_obj.get("locks")
+        if isinstance(raw_nested, dict):
+            entries.extend(v for v in raw_nested.values() if isinstance(v, dict))
+        elif lock_file_obj.get("active"):
+            entries.append(lock_file_obj)
+
+    state_obj = atomic_read_json(p_dir / "actions_state.json", default={})
+    if isinstance(state_obj, dict):
+        audit_state = state_obj.get("actions_log_audit_state")
+        if isinstance(audit_state, dict):
+            raw_locks = audit_state.get("dev_pr_locks")
+            if isinstance(raw_locks, dict):
+                entries.extend(v for v in raw_locks.values() if isinstance(v, dict))
+            legacy = audit_state.get("dev_pr_lock")
+            if isinstance(legacy, dict):
+                entries.append(legacy)
+
+    if not entries:
+        return set(), set()
 
     base_home = str((Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()))
     active_branches: set[str] = set()
     active_worktrees: set[str] = set()
-    for entry in entries:
-        if not bool(entry.get("active")):
-            continue
-        main_br = str(entry.get("branch_name") or "").strip().removeprefix("refs/heads/")
-        if main_br:
-            active_branches.add(main_br)
-        raw_wt = str(entry.get("worktree_path") or "").strip()
+
+    def _record_branch_and_wt(item: dict[str, Any]) -> None:
+        br = str(item.get("branch_name") or "").strip().removeprefix("refs/heads/")
+        if br:
+            active_branches.add(br)
+        raw_wt = str(item.get("worktree_path") or "").strip()
         if raw_wt:
             with contextlib.suppress(OSError):
                 active_worktrees.add(str(Path(raw_wt.replace("$HOME", base_home)).expanduser().resolve()))
+
+    for entry in entries:
+        if not bool(entry.get("active")):
+            continue
+        _record_branch_and_wt(entry)
+        slots_map = entry.get("slots")
+        if isinstance(slots_map, dict):
+            for slot_item in slots_map.values():
+                if isinstance(slot_item, dict) and bool(slot_item.get("active", True)):
+                    _record_branch_and_wt(slot_item)
         rb_map = entry.get("repo_branches")
         if isinstance(rb_map, dict):
             for rb_item in rb_map.values():
-                if not isinstance(rb_item, dict):
-                    continue
-                rb_br = str(rb_item.get("branch_name") or "").strip().removeprefix("refs/heads/")
-                if rb_br:
-                    active_branches.add(rb_br)
-                rb_wt = str(rb_item.get("worktree_path") or "").strip()
-                if rb_wt:
-                    with contextlib.suppress(OSError):
-                        active_worktrees.add(str(Path(rb_wt.replace("$HOME", base_home)).expanduser().resolve()))
+                if isinstance(rb_item, dict):
+                    _record_branch_and_wt(rb_item)
     return active_branches, active_worktrees
 
 
@@ -900,10 +957,18 @@ class DevLifecycleGuardrailEvaluator:
             if unvalidated_push_deny is not None:
                 return unvalidated_push_deny
 
+            deploy_home_deny = self._check_parallel_worker_deploy_home(cmd_line, payload, args)
+            if deploy_home_deny is not None:
+                return deploy_home_deny
+
+            shell_lease_deny = self._check_parallel_shell_redirect_leases(cmd_line, payload, args)
+            if shell_lease_deny is not None:
+                return shell_lease_deny
+
         elif tool_name in ("write_file", "edit_file", "replace_file_content", "multi_replace_file_content"):
             raw_target = str(args.get("Path") or args.get("TargetFile") or args.get("path") or "").strip()
             if raw_target:
-                expanded = Path(raw_target).expanduser()
+                expanded = Path(raw_target.replace("$HOME", str(self.home_dir))).expanduser()
                 try:
                     resolved = expanded.resolve()
                 except OSError:
@@ -917,6 +982,9 @@ class DevLifecycleGuardrailEvaluator:
                             "are blocked. Parameterize mock placeholders in '.env.example' instead."
                         ),
                     }
+                lease_deny = self._check_parallel_file_lease_path(raw_target, payload, args)
+                if lease_deny is not None:
+                    return lease_deny
 
         return {"decision": "allow"}
 
@@ -972,6 +1040,451 @@ class DevLifecycleGuardrailEvaluator:
                 break
         return True
 
+    @staticmethod
+    def _extract_active_slots_from_lock(lock_data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Return ordered active slot dicts (`slot_id` 1, 2, ...) from multi-slot or legacy flat `lock_data`."""
+        if not isinstance(lock_data, dict) or not bool(lock_data.get("active")):
+            return []
+        raw_slots = lock_data.get("slots")
+        collected: dict[int, dict[str, Any]] = {}
+        if isinstance(raw_slots, dict):
+            for raw_k, raw_v in raw_slots.items():
+                if not isinstance(raw_v, dict) or not bool(raw_v.get("active", True)):
+                    continue
+                try:
+                    s_id = int(raw_v.get("slot_id") or raw_k)
+                except (TypeError, ValueError):
+                    continue
+                if s_id < 1:
+                    continue
+                merged = dict(raw_v)
+                merged["slot_id"] = s_id
+                merged.setdefault("target_repo_dir", str(lock_data.get("target_repo_dir") or ""))
+                collected[s_id] = merged
+        if 1 not in collected and (
+            not isinstance(raw_slots, dict)
+            or not raw_slots
+            or str(lock_data.get("branch_name") or "").strip()
+            or str(lock_data.get("conversation_id") or "").strip()
+        ):
+            top_slot = {k: v for k, v in lock_data.items() if k != "slots"}
+            top_slot["slot_id"] = int(lock_data.get("slot_id") or 1)
+            collected.setdefault(top_slot["slot_id"], top_slot)
+        return [collected[k] for k in sorted(collected)]
+
+    @staticmethod
+    def _cid_matches_slot(cid: str, slot_data: dict[str, Any]) -> bool:
+        """Return True when `cid` matches a slot's `conversation_id`, `worker_cid`, or `sibling_conversation_ids`."""
+        clean = str(cid or "").strip().lower()
+        if not clean:
+            return False
+        cands = [
+            str(slot_data.get("conversation_id") or "").strip().lower(),
+            str(slot_data.get("worker_cid") or "").strip().lower(),
+            *(str(s or "").strip().lower() for s in (slot_data.get("sibling_conversation_ids") or [])),
+        ]
+        for cand in cands:
+            if not cand:
+                continue
+            if clean == cand:
+                return True
+            if len(clean) >= 8 and len(cand) >= 8 and clean[:8] == cand[:8] and (
+                clean.startswith(cand) or cand.startswith(clean)
+            ):
+                return True
+        return False
+
+    def _resolve_expanded_path(self, raw_path: str, base_dir: Path | None = None) -> Path | None:
+        """Expand `$HOME` / `~` and resolve `raw_path` (relative to `base_dir` if relative)."""
+        cleaned = str(raw_path or "").strip()
+        if not cleaned:
+            return None
+        expanded = Path(cleaned.replace("$HOME", str(self.home_dir))).expanduser()
+        if not expanded.is_absolute():
+            if base_dir is None:
+                return None
+            expanded = base_dir / expanded
+        with contextlib.suppress(OSError):
+            return expanded.resolve()
+        return expanded
+
+    @staticmethod
+    def _path_is_within(child: Path, parent: Path) -> bool:
+        """Return True when `child` equals `parent` or resides inside `parent`."""
+        return child == parent or parent in child.parents
+
+    def _is_parallel_worktree_dir(self, cand: Path | None, active_worktrees: set[Path] | None = None) -> bool:
+        """Return True when `cand` is inside an isolated `pr-worktree-*` or active lock `worktree_path`."""
+        if cand is None:
+            return False
+        resolved = cand
+        with contextlib.suppress(OSError):
+            resolved = cand.resolve()
+        if any(part.startswith("pr-worktree-") for part in resolved.parts):
+            return True
+        if active_worktrees:
+            for wt in active_worktrees:
+                if self._path_is_within(resolved, wt):
+                    return True
+        return False
+
+    def _check_parallel_worker_deploy_home(
+        self,
+        cmd_line: str,
+        payload: dict[str, Any],
+        args: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Block `install.sh` / `deploy-home` inside `pr-worktree-*` directories (`pretool:parallel-worker-deploy-home`)."""
+        if (
+            "install.sh" not in cmd_line
+            and "deploy-home" not in cmd_line
+            and "deploy_repo_to_home" not in cmd_line
+        ):
+            return None
+
+        active_worktrees: set[Path] = set()
+        active_map = self._read_active_locks_map()
+        for ldata in active_map.values():
+            main_td = self._resolve_expanded_path(str(ldata.get("target_repo_dir") or ""))
+            for slot in self._extract_active_slots_from_lock(ldata):
+                wt_p = self._resolve_expanded_path(str(slot.get("worktree_path") or ""))
+                if wt_p is not None and (main_td is None or wt_p != main_td):
+                    active_worktrees.add(wt_p)
+
+        raw_cwd = str(args.get("Cwd") or args.get("cwd") or payload.get("cwd") or "").strip()
+        if not raw_cwd:
+            ws_paths = payload.get("workspacePaths")
+            if isinstance(ws_paths, list) and len(ws_paths) == 1 and str(ws_paths[0] or "").strip():
+                raw_cwd = str(ws_paths[0]).strip()
+        current_dir = self._resolve_expanded_path(raw_cwd) if raw_cwd else None
+
+        segments = re.split(r"(?:&&|\|\||[;|\n])", cmd_line)
+        for seg in segments:
+            seg_clean = seg.strip()
+            if not seg_clean:
+                continue
+            try:
+                tokens = shlex.split(seg_clean)
+            except ValueError:
+                tokens = seg_clean.split()
+            if not tokens:
+                continue
+
+            if tokens[0] == "cd" and len(tokens) >= 2:
+                next_dir = self._resolve_expanded_path(tokens[1], base_dir=current_dir)
+                if next_dir is not None:
+                    current_dir = next_dir
+                continue
+
+            idx = 0
+            if idx < len(tokens) and tokens[idx] == "env":
+                idx += 1
+            while idx < len(tokens) and "=" in tokens[idx] and not tokens[idx].startswith("-"):
+                idx += 1
+            if idx >= len(tokens):
+                continue
+
+            cmd_tokens = tokens[idx:]
+            exe_raw = cmd_tokens[0]
+            exe_base = Path(exe_raw).name
+            is_deploy_invocation = False
+            explicit_target_dirs: list[Path] = []
+
+            if exe_base == "install.sh":
+                is_deploy_invocation = True
+                script_p = self._resolve_expanded_path(exe_raw, base_dir=current_dir)
+                if script_p is not None:
+                    explicit_target_dirs.append(script_p.parent)
+            elif exe_base in ("sh", "bash", "zsh", "dash", "ksh"):
+                for tok in cmd_tokens[1:]:
+                    if tok.startswith("-"):
+                        continue
+                    if Path(tok).name == "install.sh":
+                        is_deploy_invocation = True
+                        script_p = self._resolve_expanded_path(tok, base_dir=current_dir)
+                        if script_p is not None:
+                            explicit_target_dirs.append(script_p.parent)
+                    break
+            elif exe_base.startswith("python") or exe_base == "git_client.py":
+                has_git_client = exe_base == "git_client.py" or any(
+                    Path(t).name == "git_client.py" for t in cmd_tokens[1:]
+                )
+                if has_git_client and "deploy-home" in cmd_tokens[1:]:
+                    is_deploy_invocation = True
+                elif "-c" in cmd_tokens[1:] and "deploy_repo_to_home" in seg_clean:
+                    is_deploy_invocation = True
+
+            if not is_deploy_invocation:
+                continue
+
+            for t_idx, tok in enumerate(cmd_tokens):
+                if tok in ("--workdir", "--repo-dir", "-C") and t_idx + 1 < len(cmd_tokens):
+                    opt_dir = self._resolve_expanded_path(cmd_tokens[t_idx + 1], base_dir=current_dir)
+                    if opt_dir is not None:
+                        explicit_target_dirs.append(opt_dir)
+                elif tok.startswith(("--workdir=", "--repo-dir=")):
+                    opt_val = tok.split("=", 1)[1]
+                    opt_dir = self._resolve_expanded_path(opt_val, base_dir=current_dir)
+                    if opt_dir is not None:
+                        explicit_target_dirs.append(opt_dir)
+
+            dirs_to_check = [*explicit_target_dirs]
+            if current_dir is not None:
+                dirs_to_check.append(current_dir)
+            for cand_dir in dirs_to_check:
+                if self._is_parallel_worktree_dir(cand_dir, active_worktrees):
+                    return {
+                        "decision": "deny",
+                        "check_id": "pretool:parallel-worker-deploy-home",
+                        "reason": (
+                            f"Guardrail violation (Parallel Worktree Deploy Protection — pretool:parallel-worker-deploy-home): "
+                            f"running './install.sh' or 'deploy-home' from parallel worktree '{cand_dir.name}' is blocked "
+                            f"so concurrent workers never race live $HOME plugin deployment. Deploy to $HOME exclusively "
+                            f"from the primary main checkout after PR merge."
+                        ),
+                    }
+        return None
+
+    @staticmethod
+    def _normalize_leased_rel_path(
+        raw_spec: str,
+        repo_slug: str = "",
+        repo_roots: Sequence[Path] = (),
+        home_dir: Path | None = None,
+    ) -> str:
+        """Normalize a slot `target_files` entry into a clean repo-relative POSIX path (empty if foreign repo)."""
+        text = str(raw_spec or "").strip()
+        if not text or text.startswith("#"):
+            return ""
+        if not text.startswith((".", "/", "~", "$")):
+            m_col = _LEASE_SINGLE_COLON_RE.search(text)
+            if m_col:
+                pref = text[: m_col.start()].strip()
+                rest = text[m_col.end() :].strip()
+                if (
+                    pref
+                    and rest
+                    and not rest.startswith("//")
+                    and not _LEASE_LINE_RANGE_RE.match(rest)
+                    and _LEASE_REPO_PREFIX_RE.match(pref)
+                    and not any(pref.lower().endswith(ext) for ext in (".py", ".js", ".html", ".css", ".sh", ".md", ".json", ".yaml", ".yml", ".toml", ".bats"))
+                ):
+                    if repo_slug:
+                        p_low = pref.strip("/").removesuffix(".git").lower()
+                        s_low = repo_slug.strip("/").removesuffix(".git").lower()
+                        match_ok = (p_low == s_low) if ("/" in p_low and "/" in s_low) else (p_low.rsplit("/", 1)[-1] == s_low.rsplit("/", 1)[-1])
+                        if not match_ok:
+                            return ""
+                    text = rest
+        if "::" in text:
+            text = text.split("::", 1)[0]
+        elif "#" in text:
+            text = text.split("#", 1)[0]
+        elif ":" in text:
+            left, right = text.rsplit(":", 1)
+            if left.strip() and _LEASE_LINE_RANGE_RE.match(right.strip()):
+                text = left
+        cleaned = text.strip().replace("\\", "/")
+        if not cleaned:
+            return ""
+        if cleaned.startswith(("/", "~", "$HOME")):
+            base_h = str(home_dir) if home_dir is not None else str(Path.home())
+            cand_p = Path(cleaned.replace("$HOME", base_h)).expanduser()
+            with contextlib.suppress(OSError):
+                cand_p = cand_p.resolve()
+            for root in repo_roots:
+                with contextlib.suppress(ValueError):
+                    return cand_p.relative_to(root).as_posix()
+            return ""
+        while cleaned.startswith("./"):
+            cleaned = cleaned[2:]
+        return cleaned.strip("/")
+
+    @staticmethod
+    def _is_monolith_target_file(rel_path: str, candidate_roots: Sequence[Path]) -> bool:
+        """Return True (`<0.5ms`) when `rel_path` is a known monolith basename or `>= 250` lines on disk."""
+        if not rel_path:
+            return False
+        if Path(rel_path).name in PARALLEL_KNOWN_MONOLITH_BASENAMES:
+            return True
+        for root in candidate_roots:
+            fpath = root / rel_path
+            if fpath.is_file():
+                with contextlib.suppress(OSError):
+                    data = fpath.read_bytes()
+                    line_count = data.count(b"\n") + (1 if data and not data.endswith(b"\n") else 0)
+                    return line_count >= PARALLEL_MONOLITH_MIN_LINES
+        return False
+
+    def _check_parallel_file_lease_path(
+        self,
+        raw_target: str,
+        payload: dict[str, Any],
+        args: dict[str, Any],
+        *,
+        effective_cwd: Path | None = None,
+    ) -> dict[str, Any] | None:
+        """Block writes to non-monolith files leased (`target_files`) by a sibling active slot (`pretool:parallel-file-lease`)."""
+        clean_raw = str(raw_target or "").strip()
+        if not clean_raw or clean_raw.startswith("/dev/"):
+            return None
+
+        active_map = self._read_active_locks_map()
+        if not active_map:
+            return None
+
+        base_cwd = effective_cwd
+        if base_cwd is None:
+            raw_cwd = str(args.get("Cwd") or args.get("cwd") or payload.get("cwd") or "").strip()
+            if raw_cwd:
+                base_cwd = self._resolve_expanded_path(raw_cwd)
+        target_abs = self._resolve_expanded_path(clean_raw, base_dir=base_cwd)
+        if target_abs is None:
+            return None
+
+        caller_cid = str(
+            payload.get("conversationId")
+            or payload.get("conversation_id")
+            or payload.get("worker_cid")
+            or args.get("conversation_id")
+            or ""
+        ).strip()
+
+        for slug, lock_data in active_map.items():
+            active_slots = self._extract_active_slots_from_lock(lock_data)
+            if not active_slots:
+                continue
+
+            slot_wts: dict[int, Path] = {}
+            repo_roots: list[Path] = []
+            for slot in active_slots:
+                s_id = int(slot.get("slot_id") or 1)
+                wt_p = self._resolve_expanded_path(str(slot.get("worktree_path") or ""))
+                if wt_p is not None:
+                    slot_wts[s_id] = wt_p
+                    if wt_p not in repo_roots:
+                        repo_roots.append(wt_p)
+            for td_raw in (
+                str(lock_data.get("target_repo_dir") or ""),
+                *(str(s.get("target_repo_dir") or "") for s in active_slots),
+            ):
+                td_p = self._resolve_expanded_path(td_raw)
+                if td_p is not None and td_p not in repo_roots:
+                    repo_roots.append(td_p)
+
+            rel_path = ""
+            target_owner_slot: int | None = None
+            for s_id, wt_p in slot_wts.items():
+                if self._path_is_within(target_abs, wt_p):
+                    with contextlib.suppress(ValueError):
+                        rel_path = target_abs.relative_to(wt_p).as_posix()
+                        target_owner_slot = s_id
+                    break
+            if not rel_path:
+                for root_p in repo_roots:
+                    if self._path_is_within(target_abs, root_p):
+                        with contextlib.suppress(ValueError):
+                            rel_path = target_abs.relative_to(root_p).as_posix()
+                        break
+            if not rel_path:
+                continue
+
+            caller_slot_id: int | None = None
+            if caller_cid:
+                for slot in active_slots:
+                    if self._cid_matches_slot(caller_cid, slot):
+                        caller_slot_id = int(slot["slot_id"])
+                        break
+            if caller_slot_id is None and base_cwd is not None:
+                for s_id, wt_p in slot_wts.items():
+                    if self._path_is_within(base_cwd, wt_p):
+                        caller_slot_id = s_id
+                        break
+            if caller_slot_id is None and target_owner_slot is not None:
+                caller_slot_id = target_owner_slot
+
+            if caller_slot_id is None and len(active_slots) < 2 and not caller_cid:
+                continue
+
+            for sib_slot in active_slots:
+                sib_id = int(sib_slot.get("slot_id") or 1)
+                if caller_slot_id is not None and sib_id == caller_slot_id:
+                    continue
+                if caller_slot_id is None and caller_cid and self._cid_matches_slot(caller_cid, sib_slot):
+                    continue
+                sib_targets = sib_slot.get("target_files") or []
+                if not isinstance(sib_targets, (list, tuple, set)) or not sib_targets:
+                    continue
+                leased_paths = {
+                    norm_p
+                    for raw_t in sib_targets
+                    for norm_p in [
+                        self._normalize_leased_rel_path(
+                            str(raw_t),
+                            repo_slug=slug,
+                            repo_roots=repo_roots,
+                            home_dir=self.home_dir,
+                        )
+                    ]
+                    if norm_p
+                }
+                if rel_path not in leased_paths:
+                    continue
+                if self._is_monolith_target_file(rel_path, repo_roots):
+                    continue
+                sib_br = str(sib_slot.get("branch_name") or "").strip()
+                sib_cid = str(sib_slot.get("conversation_id") or "").strip()
+                return {
+                    "decision": "deny",
+                    "check_id": "pretool:parallel-file-lease",
+                    "reason": (
+                        f"Guardrail violation (Parallel Multi-Slot File Lease — pretool:parallel-file-lease): "
+                        f"write to non-monolith file '{rel_path}' in repo '{slug}' is blocked because it is "
+                        f"currently leased in target_files by sibling Slot #{sib_id} "
+                        f"(branch '{sib_br}', cid '{sib_cid[:8]}'). Restrict edits to files leased by your own "
+                        f"slot or disjoint non-overlapping files."
+                    ),
+                }
+        return None
+
+    def _check_parallel_shell_redirect_leases(
+        self,
+        cmd_line: str,
+        payload: dict[str, Any],
+        args: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Check shell output redirects (`>`, `>>`, `>|`, `tee`) against sibling slot file leases."""
+        if ">" not in cmd_line and "tee " not in cmd_line:
+            return None
+        raw_cwd = str(args.get("Cwd") or args.get("cwd") or payload.get("cwd") or "").strip()
+        current_dir = self._resolve_expanded_path(raw_cwd) if raw_cwd else None
+        for seg in re.split(r"(?:&&|\|\||[;|\n])", cmd_line):
+            seg_clean = seg.strip()
+            if not seg_clean:
+                continue
+            if seg_clean.startswith("cd "):
+                with contextlib.suppress(ValueError):
+                    toks = shlex.split(seg_clean)
+                    if len(toks) >= 2:
+                        nxt = self._resolve_expanded_path(toks[1], base_dir=current_dir)
+                        if nxt is not None:
+                            current_dir = nxt
+                continue
+            targets: list[str] = []
+            for m_red in _SHELL_WRITE_REDIRECT_RE.finditer(seg_clean):
+                cand = m_red.group(1) or m_red.group(2) or m_red.group(3) or ""
+                if cand and not cand.startswith("/dev/"):
+                    targets.append(cand)
+            for m_tee in _SHELL_TEE_TARGET_RE.finditer(seg_clean):
+                cand = m_tee.group(1) or m_tee.group(2) or m_tee.group(3) or ""
+                if cand and not cand.startswith("/dev/"):
+                    targets.append(cand)
+            for t_raw in targets:
+                deny = self._check_parallel_file_lease_path(t_raw, payload, args, effective_cwd=current_dir)
+                if deny is not None:
+                    return deny
+        return None
+
     def _check_unvalidated_branch_push(
         self,
         cmd_line: str,
@@ -985,11 +1498,11 @@ class DevLifecycleGuardrailEvaluator:
         if not active_map:
             return None
 
-        unvalidated_locks: list[tuple[str, dict[str, Any]]] = [
-            (slug, ldata)
-            for slug, ldata in active_map.items()
-            if str(ldata.get("branch_name") or "").strip() and not self._is_lock_pr_gate_ready(ldata)
-        ]
+        unvalidated_locks: list[tuple[str, dict[str, Any]]] = []
+        for slug, ldata in active_map.items():
+            for slot_entry in self._extract_active_slots_from_lock(ldata):
+                if str(slot_entry.get("branch_name") or "").strip() and not self._is_lock_pr_gate_ready(slot_entry):
+                    unvalidated_locks.append((slug, slot_entry))
         if not unvalidated_locks:
             return None
 
@@ -1099,7 +1612,7 @@ class DevLifecycleGuardrailEvaluator:
                 if not matched and targets_head_or_implicit:
                     if eff_branch and eff_branch == lock_branch:
                         matched = True
-                    elif eff_dir_resolved is not None:
+                    elif not eff_branch and eff_dir_resolved is not None:
                         for pkey in ("worktree_path", "target_repo_dir"):
                             raw_lp = str(lock_data.get(pkey) or "").strip()
                             if not raw_lp:
@@ -1224,34 +1737,81 @@ class DevLifecycleGuardrailEvaluator:
                 if warn_msg not in unready_warnings:
                     unready_warnings.append(warn_msg)
 
+        def _format_repo_lock_notice(slug_key: str, lock_data: dict[str, Any], *, with_workdir_flag: bool) -> str:
+            active_slots = self._extract_active_slots_from_lock(lock_data)
+            if not active_slots:
+                return ""
+            try:
+                raw_max = int(lock_data.get("max_slots") or 2)
+            except (TypeError, ValueError):
+                raw_max = 2
+            max_slots = max(len(active_slots), raw_max, 2)
+            occ_txt = f"{len(active_slots)}/{max_slots} slots active"
+
+            owned_slot = next((s for s in active_slots if current_cid and self._cid_matches_slot(current_cid, s)), None)
+            for s_entry in active_slots:
+                _append_unready_warning(slug_key, s_entry)
+
+            repo_lbl = f"repo '{slug_key}'" if with_workdir_flag else f"'{slug_key}'"
+            reuse_hint = "--reuse-active --workdir ..." if with_workdir_flag else "--reuse-active"
+            if owned_slot is not None:
+                o_br = str(owned_slot.get("branch_name") or "").strip()
+                o_cid = str(owned_slot.get("conversation_id") or current_cid).strip()
+                o_sid = int(owned_slot.get("slot_id") or 1)
+                if not o_br:
+                    return ""
+                sib_bits = [
+                    f"Slot #{int(s.get('slot_id') or 1)} '{s.get('branch_name')}' (cid {str(s.get('conversation_id') or '')[:8]})"
+                    for s in active_slots
+                    if int(s.get("slot_id") or 1) != o_sid and str(s.get("branch_name") or "").strip()
+                ]
+                sib_suffix = f" Concurrent sibling {', '.join(sib_bits)}." if sib_bits else ""
+                return (
+                    f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`, {occ_txt}, Slot #{o_sid}) "
+                    f"for {repo_lbl} owned by this conversation ({o_cid[:8]}) on branch '{o_br}'. "
+                    f"Reuse this branch ({reuse_hint}) for follow-up commits.{sib_suffix}"
+                )
+
+            primary_slot = active_slots[0]
+            branch_name = str(primary_slot.get("branch_name") or lock_data.get("branch_name") or "").strip()
+            owner_cid = str(primary_slot.get("conversation_id") or lock_data.get("conversation_id") or "").strip()
+            if not branch_name:
+                return ""
+            extra_slots = [
+                f"Slot #{int(s.get('slot_id') or 2)} '{s.get('branch_name')}' (cid {str(s.get('conversation_id') or '')[:8]})"
+                for s in active_slots[1:]
+                if str(s.get("branch_name") or "").strip()
+            ]
+            extra_txt = f" (+ {', '.join(extra_slots)})" if extra_slots else ""
+            slot2_hint = (
+                " (parallel Slot #2 available via --allow-slot2 when blast-radius overlap is NONE/TRANSITIVE)"
+                if len(active_slots) < max_slots
+                else " (all parallel slots occupied)"
+            )
+            return (
+                f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`, {occ_txt}) for {repo_lbl} "
+                f"held by conversation '{owner_cid[:8]}' on branch '{branch_name}'{extra_txt}{slot2_hint}. "
+                f"Do not start a new branch or modify tracked repository files in '{slug_key}' from another conversation "
+                f"until that branch is merged into main or evaluated."
+            )
+
         if workspace_repos:
             matched_repos = [r for r in workspace_repos if r in active_map]
             free_repos = [r for r in workspace_repos if r not in active_map]
             for r in matched_repos:
-                lock_data = active_map[r]
-                branch_name = str(lock_data.get("branch_name") or "").strip()
-                owner_cid = str(lock_data.get("conversation_id") or "").strip()
-                if not branch_name:
-                    continue
-                if current_cid and current_cid == owner_cid:
-                    messages.append(
-                        f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) for repo '{r}' "
-                        f"owned by this conversation ({owner_cid[:8]}) on branch '{branch_name}'. "
-                        f"Reuse this branch (--reuse-active --workdir ...) for follow-up commits."
-                    )
-                else:
-                    messages.append(
-                        f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) for repo '{r}' "
-                        f"held by conversation '{owner_cid[:8]}' on branch '{branch_name}'. Do not start a new branch "
-                        f"or modify tracked repository files in '{r}' from another conversation until that branch is merged into main or evaluated."
-                    )
-                _append_unready_warning(r, lock_data)
+                notice = _format_repo_lock_notice(r, active_map[r], with_workdir_flag=True)
+                if notice:
+                    messages.append(notice)
             for slug, lock_data in active_map.items():
-                if slug not in workspace_repos and lock_data.get("branch_name"):
-                    other_locked.append(
-                        f"{slug}: '{lock_data.get('branch_name')}' (cid {str(lock_data.get('conversation_id') or '')[:8]})"
-                    )
-                    _append_unready_warning(slug, lock_data)
+                if slug not in workspace_repos:
+                    active_slots = self._extract_active_slots_from_lock(lock_data)
+                    max_slots = max(len(active_slots), int(lock_data.get("max_slots") or 2), 2)
+                    if active_slots and str(active_slots[0].get("branch_name") or lock_data.get("branch_name") or "").strip():
+                        br0 = str(active_slots[0].get("branch_name") or lock_data.get("branch_name") or "")
+                        cid0 = str(active_slots[0].get("conversation_id") or lock_data.get("conversation_id") or "")[:8]
+                        other_locked.append(f"{slug} [{len(active_slots)}/{max_slots}]: '{br0}' (cid {cid0})")
+                    for s_entry in active_slots:
+                        _append_unready_warning(slug, s_entry)
             if free_repos and other_locked:
                 messages.append(
                     f"[Antigravity Dev Guardrail] Active workspace repository {', '.join(free_repos)} is UNLOCKED "
@@ -1259,23 +1819,9 @@ class DevLifecycleGuardrailEvaluator:
                 )
         else:
             for slug, lock_data in active_map.items():
-                branch_name = str(lock_data.get("branch_name") or "").strip()
-                owner_cid = str(lock_data.get("conversation_id") or "").strip()
-                if not branch_name:
-                    continue
-                if current_cid and current_cid == owner_cid:
-                    messages.append(
-                        f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) for '{slug}' "
-                        f"owned by this conversation ({owner_cid[:8]}) on branch '{branch_name}'. "
-                        f"Reuse this branch (--reuse-active) for follow-up commits."
-                    )
-                else:
-                    messages.append(
-                        f"[Antigravity Dev Guardrail] Active PR Development Lock (`dev_pr_lock`) for '{slug}' "
-                        f"held by conversation '{owner_cid[:8]}' on branch '{branch_name}'. Do not start a new branch "
-                        f"or modify tracked repository files in '{slug}' from another conversation until that branch is merged into main or evaluated."
-                    )
-                _append_unready_warning(slug, lock_data)
+                notice = _format_repo_lock_notice(slug, lock_data, with_workdir_flag=False)
+                if notice:
+                    messages.append(notice)
 
         messages.extend(unready_warnings)
 

@@ -103,9 +103,9 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
 
     def test_deterministic_checks_catalog_and_pre_tool_use_blocks(self) -> None:
         all_checks = dev_common.get_deterministic_dev_checks()
-        self.assertEqual(len(all_checks), 6)
+        self.assertEqual(len(all_checks), 8)
         pre_checks = dev_common.get_deterministic_dev_checks("PreToolUse")
-        self.assertEqual(len(pre_checks), 5)
+        self.assertEqual(len(pre_checks), 7)
         self.assertEqual(
             {c["check_id"] for c in pre_checks},
             {
@@ -114,6 +114,8 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
                 "pretool:santa-lockdown-binary",
                 "pretool:dotenv-write-protection",
                 "pretool:unvalidated-branch-push",
+                "pretool:parallel-file-lease",
+                "pretool:parallel-worker-deploy-home",
             },
         )
 
@@ -2220,7 +2222,7 @@ class TestGitClientDevCommonAndRunnerCoverage(unittest.TestCase):
             out_json = io.StringIO()
             with contextlib.redirect_stdout(out_json):
                 self.assertEqual(dev_common.main(["checks", "--format", "json"]), 0)
-            self.assertEqual(json.loads(out_json.getvalue())["count"], 6)
+            self.assertEqual(json.loads(out_json.getvalue())["count"], 8)
 
             out_txt = io.StringIO()
             with contextlib.redirect_stdout(out_txt):
@@ -2368,6 +2370,74 @@ class TestGitClientDevCommonAndRunnerCoverage(unittest.TestCase):
                 mock.patch("selective_test_runner.shutil.which", return_value="/usr/bin/bats"),
             ):
                 self.assertEqual(selective_test_runner.main(["clients/git_client.py"]), 2)
+
+    def test_load_optional_module_cold_process_and_pr_remediator_type_hints(self) -> None:
+        """`_load_optional_module` pre-registers `sys.modules` (fixing cold `agy-doctor`) and `Sequence` resolves."""
+        import typing
+
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+
+            # 1. Dynamic module referencing sys.modules[__name__] loads cleanly on cold sys.modules
+            ok_mod_path = troot / "self_ref_mod.py"
+            ok_mod_path.write_text(
+                "import sys\nSELF_MOD = sys.modules[__name__]\nVALUE = 42\n",
+                encoding="utf-8",
+            )
+            cold_name = "_agy_test_cold_self_ref_mod"
+            sys.modules.pop(cold_name, None)
+            try:
+                loaded = dev_common._load_optional_module(ok_mod_path, cold_name)
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded.VALUE, 42)
+                self.assertIs(loaded.SELF_MOD, loaded)
+                self.assertIs(sys.modules.get(cold_name), loaded)
+            finally:
+                sys.modules.pop(cold_name, None)
+
+            # 2. Failed module execution rolls back sys.modules cleanly (no broken residue, restores previous)
+            bad_mod_path = troot / "broken_mod.py"
+            bad_mod_path.write_text("raise RuntimeError('boom')\n", encoding="utf-8")
+            fail_name = "_agy_test_failed_optional_mod"
+            sys.modules.pop(fail_name, None)
+            self.assertIsNone(dev_common._load_optional_module(bad_mod_path, fail_name))
+            self.assertNotIn(fail_name, sys.modules)
+
+            sentinel = object()
+            sys.modules[fail_name] = sentinel  # type: ignore[assignment]
+            try:
+                self.assertIsNone(dev_common._load_optional_module(bad_mod_path, fail_name))
+                self.assertIs(sys.modules.get(fail_name), sentinel)
+            finally:
+                sys.modules.pop(fail_name, None)
+
+        # 3. Cold-process `agy-doctor --help` (no pre-imported pr_remediator) exits 0 cleanly
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(REPO_ROOT / "clients")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys, dev_common; sys.argv=['agy-doctor', '--help']; dev_common.run_dev_queue_doctor_cli()",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=f"stderr={proc.stderr!r}")
+        self.assertIn("queue-doctor", proc.stdout)
+
+        # 4. `pr_remediator.compute_effective_priorities` annotations resolve (`Sequence` imported)
+        pr_mod = dev_common._load_optional_module(
+            REPO_ROOT / "skills" / "agy-code-remediation-pr" / "scripts" / "pr_remediator.py",
+            "pr_remediator",
+        )
+        self.assertIsNotNone(pr_mod)
+        hints = typing.get_type_hints(pr_mod.compute_effective_priorities)
+        self.assertIn("items", hints)
+        self.assertIn("return", hints)
 
 
 if __name__ == "__main__":

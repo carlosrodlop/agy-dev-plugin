@@ -19,6 +19,7 @@ ALL_TEST_MODULES = [
     "tests.test_dev_queue_doctor",
     "tests.test_dev_queue_tui",
     "tests.test_orchestration_wip_and_wake_fixes",
+    "tests.test_parallel_file_leases_and_tui",
     "tests.test_parallel_subagent_orchestration",
     "tests.test_pr_remediator_queue_and_cleanup",
 ]
@@ -70,6 +71,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_dev_queue_doctor.py": "tests.test_dev_queue_doctor",
     "tests/test_dev_queue_tui.py": "tests.test_dev_queue_tui",
     "tests/test_orchestration_wip_and_wake_fixes.py": "tests.test_orchestration_wip_and_wake_fixes",
+    "tests/test_parallel_file_leases_and_tui.py": "tests.test_parallel_file_leases_and_tui",
     "tests/test_parallel_subagent_orchestration.py": "tests.test_parallel_subagent_orchestration",
     "tests/test_pr_remediator_queue_and_cleanup.py": "tests.test_pr_remediator_queue_and_cleanup",
 }
@@ -163,6 +165,24 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         if is_docs_only_path(norm):
             has_docs = True
             continue
+
+        if (
+            norm.endswith(
+                (
+                    "dev_common.py",
+                    "dev_queue_tui.py",
+                    "dev_flow_optimizer.py",
+                    "parallel_scope.py",
+                    "rebase_gate.py",
+                    "pr_remediator.py",
+                    "test_parallel_file_leases_and_tui.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith(("agents/", "skills/agy-code-remediation-pr/", "skills/agy-dev-queue-orchestrator/"))
+        ):
+            if "tests.test_parallel_file_leases_and_tui" not in selected:
+                selected.append("tests.test_parallel_file_leases_and_tui")
 
         if norm.endswith(
             (
