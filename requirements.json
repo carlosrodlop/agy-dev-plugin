@@ -1,0 +1,150 @@
+{
+  "description": "Declarative connector, Python client, and Santa Lockdown safe OS/asdf runtime binary requirements for agy-dev-plugin.",
+  "plugin_display_name": "Antigravity Dev & SDLC Plugin",
+  "plugin_id": "agy-dev-plugin",
+  "requirements": [
+    {
+      "auth_and_profiles": "Native Git & OpenSSH (~/.ssh/id_ed25519 + SSH_AUTH_SOCK — Zero VCS REST API)",
+      "client_script": "clients/git_client.py",
+      "description": "VCS-interoperable (GitHub, GitLab, Bitbucket, Gitea) pure native /usr/bin/git and /usr/bin/ssh client supporting timestamped branch creation, unified branch diffs, protected branch pushes, remote branch merge/deletion inspection, atomic $HOME plugin deployment, and manual Pull/Merge Request compare URLs.",
+      "env_vars": [
+        "AGY_DEV_STATE_DIR",
+        "AGY_CONF_REPO_DIR"
+      ],
+      "id": "git_client",
+      "mechanism": "python_client",
+      "name": "VCS-Interoperable Native Git & SSH Client",
+      "provider_plugin_id": "agy-dev-plugin",
+      "required_by_plugins": [
+        "agy-dev-plugin",
+        "wiz-tam-plugin"
+      ],
+      "required_by_skills": [
+        "agy-code-remediation-pr",
+        "agy-dev-queue-orchestrator",
+        "git-commit-configuration"
+      ],
+      "target_service": "VCS-Interoperable Native Git & SSH (/usr/bin/git + /usr/bin/ssh)"
+    },
+    {
+      "binary": "git",
+      "description": "Native OS-signed Git CLI (/usr/bin/git) powering timestamped branch worktrees, unified diffs, protected branch pushes, and atomic git ls-files $HOME plugin deployment.",
+      "env_vars": [],
+      "id": "git",
+      "mechanism": "system_binary",
+      "name": "Git CLI (/usr/bin/git)",
+      "provider_plugin_id": "system",
+      "required_by_plugins": [
+        "agy-dev-plugin"
+      ],
+      "required_by_skills": [
+        "agy-code-remediation-pr",
+        "agy-dev-queue-orchestrator",
+        "agy-project-standards",
+        "git-commit-configuration"
+      ]
+    },
+    {
+      "binary": "ssh",
+      "description": "Native OpenSSH client (/usr/bin/ssh) authenticating remote Git operations over SSH_AUTH_SOCK without proprietary VCS REST tokens.",
+      "env_vars": [],
+      "id": "ssh",
+      "mechanism": "system_binary",
+      "name": "OpenSSH Client (/usr/bin/ssh)",
+      "provider_plugin_id": "system",
+      "required_by_plugins": [
+        "agy-dev-plugin"
+      ],
+      "required_by_skills": [
+        "agy-code-remediation-pr",
+        "git-commit-configuration"
+      ]
+    },
+    {
+      "binary": "python3",
+      "description": "Python 3.11+ runtime executing pure-Python stdlib clients, SDLC guardrails, static 5-language AST auditors, selective unit test runners, and dev queue orchestration.",
+      "env_vars": [],
+      "id": "python3",
+      "mechanism": "system_binary",
+      "name": "Python 3.11+ Runtime",
+      "provider_plugin_id": "system",
+      "required_by_plugins": [
+        "agy-dev-plugin"
+      ],
+      "required_by_skills": [
+        "agy-code-design-refactor",
+        "agy-code-remediation-pr",
+        "agy-dev-queue-orchestrator",
+        "agy-project-standards",
+        "agy-web-ui-architecture",
+        "git-commit-configuration"
+      ]
+    },
+    {
+      "binary": "bash",
+      "description": "POSIX/Bash shell interpreter running install.sh, shell/agy_dev_queue.sh, bash -n syntax gates, and BATS test suites.",
+      "env_vars": [],
+      "id": "bash",
+      "mechanism": "system_binary",
+      "name": "GNU / macOS Bash Shell",
+      "provider_plugin_id": "system",
+      "required_by_plugins": [
+        "agy-dev-plugin"
+      ],
+      "required_by_skills": [
+        "agy-dev-queue-orchestrator",
+        "agy-project-standards",
+        "git-commit-configuration"
+      ]
+    },
+    {
+      "binary": "jq",
+      "description": "OS-signed jq JSON processor declared as 'jq system' in .tool-versions for Santa Lockdown safe JSON inspection.",
+      "env_vars": [],
+      "id": "jq",
+      "mechanism": "system_binary",
+      "name": "jq System JSON Processor",
+      "provider_plugin_id": "system",
+      "required_by_plugins": [
+        "agy-dev-plugin"
+      ],
+      "required_by_skills": [
+        "agy-project-standards"
+      ]
+    },
+    {
+      "binary": "pre-commit",
+      "description": "Pure-Python pre-commit framework running AST, JSON/YAML/TOML, secret-detection, static QA, and selective offline test hooks.",
+      "env_vars": [],
+      "id": "pre-commit",
+      "mechanism": "system_binary",
+      "name": "pre-commit Hook Runner",
+      "provider_plugin_id": "asdf",
+      "required_by_plugins": [
+        "agy-dev-plugin"
+      ],
+      "required_by_skills": [
+        "agy-code-remediation-pr",
+        "agy-project-standards",
+        "git-commit-configuration"
+      ]
+    },
+    {
+      "binary": "bats",
+      "description": "Pure-Bash Automated Testing System (BATS) executing hermetic shell installer and CLI wrapper verification suites.",
+      "env_vars": [],
+      "id": "bats",
+      "mechanism": "system_binary",
+      "name": "BATS Shell Test Runner",
+      "provider_plugin_id": "asdf",
+      "required_by_plugins": [
+        "agy-dev-plugin"
+      ],
+      "required_by_skills": [
+        "agy-code-remediation-pr",
+        "agy-project-standards"
+      ]
+    }
+  ],
+  "schema_version": "1.0"
+}

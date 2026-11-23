@@ -41,7 +41,7 @@ fi
 mkdir -p "${CONFIG_ROOT}/plugins" "${PLUGIN_DEST}" "${STATE_DIR}"
 chmod 700 "${STATE_DIR}" || true
 
-for item in plugin.json pyproject.toml README.md assets rules agents skills clients shell sidecars; do
+for item in plugin.json requirements.json pyproject.toml README.md assets rules agents skills clients shell sidecars; do
   if [[ -e "${SCRIPT_DIR}/${item}" ]]; then
     rm -rf "${PLUGIN_DEST:?}/${item}"
     cp -R "${SCRIPT_DIR}/${item}" "${PLUGIN_DEST}/${item}"
@@ -54,15 +54,17 @@ for cfg_file in .tool-versions .tool-plugins .env.example; do
   fi
 done
 
-if [[ -f "${SCRIPT_DIR}/hooks.json" ]]; then
-  python3 - "${SCRIPT_DIR}/hooks.json" "${PLUGIN_DEST}/hooks.json" "${HOME}" <<'PYEOF'
+for json_manifest in hooks.json requirements.json; do
+  if [[ -f "${SCRIPT_DIR}/${json_manifest}" ]]; then
+    python3 - "${SCRIPT_DIR}/${json_manifest}" "${PLUGIN_DEST}/${json_manifest}" "${HOME}" <<'PYEOF'
 import json, pathlib, sys
 src, dst, home_str = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]), sys.argv[3]
 expanded = src.read_text(encoding="utf-8").replace("$HOME/", f"{home_str}/")
 json.loads(expanded)
 dst.write_text(expanded, encoding="utf-8")
 PYEOF
-fi
+  fi
+done
 
 if [[ -f "${PLUGIN_DEST}/plugin.json" && -f "${PLUGIN_DEST}/clients/git_client.py" ]]; then
   python3 - "${SCRIPT_DIR}" "${PLUGIN_DEST}/plugin.json" "${PLUGIN_DEST}/clients" <<'PYEOF' || true

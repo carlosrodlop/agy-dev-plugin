@@ -1796,7 +1796,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         """Map a root-level Antigravity plugin relative path to its `$HOME` target path."""
         clean_name = (plugin_name or "wiz-tam-plugin").strip().strip("/")
         if (
-            rel_str in ("plugin.json", "hooks.json", "mcp_config.json")
+            rel_str in ("plugin.json", "hooks.json", "mcp_config.json", "requirements.json")
             or rel_str.startswith(("skills/", "clients/", "agents/", "rules/", "assets/", "shell/", "sidecars/"))
         ):
             return f".gemini/config/plugins/{clean_name}/{rel_str}"
@@ -1852,7 +1852,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
           - Refuses to deploy to `$HOME` if `repo_dir` is checked out on an unmerged `fix/*` branch (`require_base_branch="main"`).
           - Refuses unisolated `unittest`/`pytest` runs targeting real `$HOME` unless explicitly opted in.
           - Re-execs a single fresh subprocess pass (`AGY_DEPLOY_REEXEC=1`) when `clients/git_client.py` itself is updated so newly added tracked roots deploy atomically without stale `prune_orphans` deletion.
-          - Expands `$HOME/` in `.gemini/config/mcp_config.json`, `.gemini/config/hooks.json`, plugin manifests, and `.gemini/config/sidecars/*.json`.
+          - Expands `$HOME/` in `.gemini/config/mcp_config.json`, `.gemini/config/hooks.json`, plugin manifests (`hooks.json`, `mcp_config.json`, `requirements.json`), and `.gemini/config/sidecars/*.json`.
           - Stamps the live `HEAD` `<short_sha>-<YYYYMMDD>` into `.gemini/config/plugins/<plugin_name>/plugin.json`.
           - Applies deterministic permissions (`0755` for scripts/clients/bin, `0600` for `.ssh/*`, `0644` otherwise).
           - Prunes orphaned files in managed customization subdirectories of `$HOME` so rejected branch edits never linger.
@@ -1931,6 +1931,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     "plugin.json",
                     "hooks.json",
                     "mcp_config.json",
+                    "requirements.json",
                     ".env.example",
                     ".tool-versions",
                     ".tool-plugins",
@@ -2007,11 +2008,17 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                 in (
                     ".gemini/config/mcp_config.json",
                     ".gemini/config/hooks.json",
+                    ".gemini/config/requirements.json",
                 )
                 or (
                     plugin_prefix
                     and (
-                        rel_str in (f"{plugin_prefix}/hooks.json", f"{plugin_prefix}/mcp_config.json")
+                        rel_str
+                        in (
+                            f"{plugin_prefix}/hooks.json",
+                            f"{plugin_prefix}/mcp_config.json",
+                            f"{plugin_prefix}/requirements.json",
+                        )
                         or (rel_str.startswith(f"{plugin_prefix}/sidecars/") and rel_str.endswith(".json"))
                     )
                 )
