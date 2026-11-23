@@ -345,14 +345,20 @@ def _load_optional_module(module_path: Path, mod_name: str) -> Any | None:
     mod_dir = str(module_path.parent)
     if mod_dir not in sys.path:
         sys.path.insert(0, mod_dir)
+    previous = sys.modules.get(mod_name)
     try:
         spec = importlib.util.spec_from_file_location(mod_name, str(module_path))
         if spec is None or spec.loader is None:
             return None
         mod = importlib.util.module_from_spec(spec)
+        sys.modules[mod_name] = mod
         spec.loader.exec_module(mod)
         return mod
     except Exception:
+        if previous is None:
+            sys.modules.pop(mod_name, None)
+        else:
+            sys.modules[mod_name] = previous
         return None
 
 
