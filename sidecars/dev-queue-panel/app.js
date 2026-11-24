@@ -7,6 +7,7 @@
   const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const POLL_INTERVAL_MS = 1500;
   const FETCH_TIMEOUT_MS = 6000;
+  const CLEANUP_FETCH_TIMEOUT_MS = 30000;
   const MAX_CONSUMED_INTENTS = 64;
   const DEFAULT_MAX_REPO_SLOTS = 3;
   const MAX_REPO_SLOTS_CAP = 4;
@@ -138,11 +139,13 @@
     typeof window !== "undefined" ? new URLSearchParams(window.location.search).get("token") || "" : "";
 
   async function apiFetch(path, options = {}) {
+    const { timeoutMs: rawTimeoutMs, ...fetchOpts } = options || {};
+    const timeoutMs = Number(rawTimeoutMs) > 0 ? Number(rawTimeoutMs) : FETCH_TIMEOUT_MS;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const headers = new Headers(options.headers || {});
-      if (options.body && !headers.has("Content-Type")) {
+      const headers = new Headers(fetchOpts.headers || {});
+      if (fetchOpts.body && !headers.has("Content-Type")) {
         headers.set("Content-Type", "application/json");
       }
       if (queryToken && !headers.has("X-Sidecar-Token")) {
@@ -153,7 +156,7 @@
           ? window.sidecar.fetch.bind(window.sidecar)
           : fetch;
       const response = await fetcher(path, {
-        ...options,
+        ...fetchOpts,
         headers,
         signal: controller.signal,
       });
@@ -164,12 +167,22 @@
         data = null;
       }
       if (!response.ok) {
-        const msg = (data && data.error) || `HTTP ${response.status}`;
+        const msg =
+          (data && (data.blocked_message || data.error || data.reason)) ||
+          `HTTP ${response.status}`;
         const err = new Error(String(msg));
         err.status = response.status;
+        err.data = data;
         throw err;
       }
       return data || {};
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        const timeoutErr = new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s`);
+        timeoutErr.name = "AbortError";
+        throw timeoutErr;
+      }
+      throw err;
     } finally {
       clearTimeout(timer);
     }
@@ -420,7 +433,11 @@
     query: "",
     inFlight: false,
     pauseBusy: false,
+    cleanupOpen: false,
     cleanupBusy: false,
+    cleanupLoading: false,
+    cleanupError: "",
+    cleanupRequestSeq: 0,
     cleanupPreview: null,
     ghostBusy: false,
     ghostConfirmRestart: false,
@@ -647,6 +664,7 @@
       const res = await apiFetch("/api/cleanup/ghosts/arm", {
         method: "POST",
         body: JSON.stringify({ mode }),
+        timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
       });
       uiState.ghostConfirmRestart = false;
       applyGhostPurgeResponse(res);
@@ -654,6 +672,9 @@
       uiState.etag = "";
       await pollState(true);
     } catch (err) {
+      if (err && err.data) {
+        applyGhostPurgeResponse(err.data);
+      }
       showToast(`Ghost purge blocked: ${err.message || "conflict"}`);
       uiState.ghostConfirmRestart = false;
     } finally {
@@ -673,6 +694,7 @@
       const res = await apiFetch("/api/cleanup/ghosts/cancel", {
         method: "POST",
         body: JSON.stringify({}),
+        timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
       });
       applyGhostPurgeResponse(res);
       showToast("Ghost purge disarmed");
@@ -696,6 +718,7 @@
       const res = await apiFetch("/api/cleanup/ghosts/ack-result", {
         method: "POST",
         body: JSON.stringify({}),
+        timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
       });
       applyGhostPurgeResponse(res);
       uiState.etag = "";
@@ -708,6 +731,20 @@
     }
   }
 
+  function closeCleanupDrawer() {
+    if (uiState.cleanupBusy && !uiState.cleanupLoading) {
+      return;
+    }
+    uiState.cleanupRequestSeq += 1;
+    uiState.cleanupOpen = false;
+    uiState.cleanupBusy = false;
+    uiState.cleanupLoading = false;
+    uiState.cleanupError = "";
+    uiState.cleanupPreview = null;
+    uiState.ghostConfirmRestart = false;
+    renderCleanupPreview();
+  }
+
   function renderCleanupPreview() {
     const panel = document.getElementById("dq-cleanup-panel");
     const cleanBtn = document.getElementById("dq-clean-btn");
@@ -717,13 +754,17 @@
     const breakdownEl = document.getElementById("dq-cleanup-breakdown");
     if (cleanBtn) {
       cleanBtn.disabled = Boolean(uiState.cleanupBusy);
-      cleanBtn.textContent = uiState.cleanupBusy ? "Cleaning…" : "🧹 Clean";
+      cleanBtn.setAttribute("aria-expanded", uiState.cleanupOpen ? "true" : "false");
+      if (uiState.cleanupBusy) {
+        cleanBtn.textContent = uiState.cleanupLoading ? "Scanning…" : "Cleaning…";
+      } else {
+        cleanBtn.textContent = "🧹 Clean";
+      }
     }
     if (!panel || !summaryEl || !breakdownEl) {
       return;
     }
-    const preview = uiState.cleanupPreview;
-    if (!preview) {
+    if (!uiState.cleanupOpen) {
       panel.classList.add("dq-hidden");
       breakdownEl.replaceChildren();
       summaryEl.textContent = "";
@@ -731,6 +772,32 @@
       return;
     }
     panel.classList.remove("dq-hidden");
+    const preview = uiState.cleanupPreview;
+    if (!preview) {
+      if (uiState.cleanupLoading) {
+        summaryEl.textContent = "Scanning workspace…";
+        breakdownEl.replaceChildren(
+          el("span", "dq-card-sub", "Inspecting merged chats, scheduled actions, sidecar events & orphan artifacts…"),
+        );
+      } else if (uiState.cleanupError) {
+        summaryEl.textContent = `Preview failed: ${uiState.cleanupError}`;
+        breakdownEl.replaceChildren(
+          el("span", "dq-card-sub", "Cleanup preview failed. Sidebar Ghost Purge below remains available."),
+        );
+      } else {
+        summaryEl.textContent = "Ready to scan workspace";
+        breakdownEl.replaceChildren();
+      }
+      if (confirmBtn) {
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Confirm Clean";
+      }
+      if (cancelBtn) {
+        cancelBtn.disabled = false;
+      }
+      renderGhostPurgeControls();
+      return;
+    }
     const bd = preview.breakdown && typeof preview.breakdown === "object" ? preview.breakdown : {};
     const byCat = bd.by_category && typeof bd.by_category === "object" ? bd.by_category : {};
     const totalItems =
@@ -746,10 +813,10 @@
 
     if (confirmBtn) {
       confirmBtn.disabled = Boolean(uiState.cleanupBusy) || totalItems === 0;
-      confirmBtn.textContent = uiState.cleanupBusy ? "Cleaning…" : "Confirm Clean";
+      confirmBtn.textContent = uiState.cleanupBusy ? (uiState.cleanupLoading ? "Scanning…" : "Cleaning…") : "Confirm Clean";
     }
     if (cancelBtn) {
-      cancelBtn.disabled = Boolean(uiState.cleanupBusy);
+      cancelBtn.disabled = Boolean(uiState.cleanupBusy) && !uiState.cleanupLoading;
     }
 
     const frag = document.createDocumentFragment();
@@ -772,23 +839,48 @@
     renderGhostPurgeControls();
   }
 
+  async function toggleCleanupDrawer() {
+    if (uiState.cleanupOpen && !uiState.cleanupBusy) {
+      closeCleanupDrawer();
+      return;
+    }
+    await previewCleanup();
+  }
+
   async function previewCleanup() {
     if (uiState.cleanupBusy) {
       return;
     }
+    const reqSeq = ++uiState.cleanupRequestSeq;
+    uiState.cleanupOpen = true;
     uiState.cleanupBusy = true;
+    uiState.cleanupLoading = true;
+    uiState.cleanupError = "";
     renderCleanupPreview();
     try {
       const res = await apiFetch("/api/cleanup/preview", {
         method: "POST",
         body: JSON.stringify({}),
+        timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
       });
+      if (reqSeq !== uiState.cleanupRequestSeq) {
+        return;
+      }
       uiState.cleanupPreview = res;
+      uiState.cleanupError = "";
+      applyGhostPurgeResponse(res);
     } catch (err) {
-      showToast(`Unable to preview cleanup: ${err.message || "error"}`);
+      if (reqSeq !== uiState.cleanupRequestSeq) {
+        return;
+      }
+      uiState.cleanupError = String((err && err.message) || "error");
+      showToast(`Unable to preview cleanup: ${uiState.cleanupError}`);
     } finally {
-      uiState.cleanupBusy = false;
-      renderCleanupPreview();
+      if (reqSeq === uiState.cleanupRequestSeq) {
+        uiState.cleanupBusy = false;
+        uiState.cleanupLoading = false;
+        renderCleanupPreview();
+      }
     }
   }
 
@@ -796,26 +888,50 @@
     if (uiState.cleanupBusy) {
       return;
     }
+    uiState.cleanupOpen = true;
     uiState.cleanupBusy = true;
+    uiState.cleanupLoading = false;
+    uiState.cleanupError = "";
     renderCleanupPreview();
     try {
       const res = await apiFetch("/api/cleanup/execute", {
         method: "POST",
         body: JSON.stringify({}),
+        timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
       });
       const totalCleaned =
         Number(res.deleted_count || 0) +
         Number(res.sidecar_events_pruned_count || 0) +
         Number(res.orphan_artifacts_pruned_count || 0);
       const freedLabel = formatBytesCompact(res.freed_bytes || 0);
-      uiState.cleanupPreview = null;
+      applyGhostPurgeResponse(res);
       showToast(`🧹 Cleaned ${totalCleaned} item${totalCleaned === 1 ? "" : "s"} (${freedLabel} freed)`);
       uiState.etag = "";
+      try {
+        const refreshed = await apiFetch("/api/cleanup/preview", {
+          method: "POST",
+          body: JSON.stringify({}),
+          timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
+        });
+        uiState.cleanupPreview = refreshed;
+        applyGhostPurgeResponse(refreshed);
+      } catch (_refreshErr) {
+        uiState.cleanupPreview = {
+          ok: true,
+          deleted_count: 0,
+          sidecar_events_pruned_count: 0,
+          orphan_artifacts_pruned_count: 0,
+          freed_bytes: 0,
+          breakdown: { by_category: {}, total_bytes: 0 },
+          ghost_purge: res.ghost_purge || getEffectiveGhostPurge(),
+        };
+      }
       await pollState(true);
     } catch (err) {
       showToast(`Unable to execute cleanup: ${err.message || "error"}`);
     } finally {
       uiState.cleanupBusy = false;
+      uiState.cleanupLoading = false;
       renderCleanupPreview();
     }
   }
@@ -1601,13 +1717,11 @@
       } else if (action === "resume-dev") {
         setOrchestrationPaused(false);
       } else if (action === "cleanup-preview") {
-        previewCleanup();
+        toggleCleanupDrawer();
       } else if (action === "cleanup-execute") {
         executeCleanup();
       } else if (action === "cleanup-cancel") {
-        uiState.cleanupPreview = null;
-        uiState.ghostConfirmRestart = false;
-        renderCleanupPreview();
+        closeCleanupDrawer();
       } else if (action === "ghost-arm") {
         armGhostPurge("on_quit");
       } else if (action === "ghost-cancel") {
@@ -1695,6 +1809,8 @@
       renderPlanningView,
       formatPauseMeta,
       setOrchestrationPaused,
+      toggleCleanupDrawer,
+      closeCleanupDrawer,
       previewCleanup,
       executeCleanup,
       armGhostPurge,
