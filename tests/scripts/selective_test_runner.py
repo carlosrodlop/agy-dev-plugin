@@ -20,6 +20,7 @@ ALL_TEST_MODULES = [
     "tests.test_dev_queue_doctor",
     "tests.test_dev_queue_sidecar_panel",
     "tests.test_dev_queue_tui",
+    "tests.test_model_quota_fallback",
     "tests.test_orchestration_pause_resume",
     "tests.test_orchestration_wip_and_wake_fixes",
     "tests.test_parallel_file_leases_and_tui",
@@ -82,6 +83,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_dev_queue_doctor.py": "tests.test_dev_queue_doctor",
     "tests/test_dev_queue_sidecar_panel.py": "tests.test_dev_queue_sidecar_panel",
     "tests/test_dev_queue_tui.py": "tests.test_dev_queue_tui",
+    "tests/test_model_quota_fallback.py": "tests.test_model_quota_fallback",
     "tests/test_orchestration_pause_resume.py": "tests.test_orchestration_pause_resume",
     "tests/test_orchestration_wip_and_wake_fixes.py": "tests.test_orchestration_wip_and_wake_fixes",
     "tests/test_parallel_file_leases_and_tui.py": "tests.test_parallel_file_leases_and_tui",
@@ -365,6 +367,25 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_orchestration_wip_and_wake_fixes" not in selected:
                 selected.append("tests.test_orchestration_wip_and_wake_fixes")
+
+        if (
+            norm.endswith(
+                (
+                    "model_quota.py",
+                    "dev_common.py",
+                    "lock_store.py",
+                    "review_gate.py",
+                    "dev_queue_doctor.py",
+                    "merge_watcher.py",
+                    "dev_flow_optimizer.py",
+                    "test_model_quota_fallback.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith(("agents/", "sidecars/dev-queue-watchdog/", "skills/agy-dev-queue-orchestrator/"))
+        ):
+            if "tests.test_model_quota_fallback" not in selected:
+                selected.append("tests.test_model_quota_fallback")
 
         if norm not in ISOLATED_TEST_FILE_MODULES and "tests.test_agy_dev_plugin" not in selected:
             selected.append("tests.test_agy_dev_plugin")

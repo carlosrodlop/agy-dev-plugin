@@ -41,6 +41,7 @@ import parallel_scope as _parallel_scope  # noqa: E402
 
 DEFAULT_STALL_THRESHOLD_SECONDS = 900
 DEFAULT_MAX_PARTIAL_WIP = 3
+DEFAULT_MAX_ORCHESTRATOR_STEPS = 150
 STALL_ELIGIBLE_LOCK_STATUSES: frozenset[str] = frozenset(
     {"DEVELOPING", "NEEDS_REVISION_ITERATING", "AWAITING_AGENT_REVIEW"}
 )
@@ -116,6 +117,22 @@ def resolve_stall_threshold_seconds(threshold_seconds: int | float | None = None
             if val > 0:
                 return val
     return DEFAULT_STALL_THRESHOLD_SECONDS
+
+
+def resolve_max_orchestrator_steps(max_steps: int | float | None = None) -> int:
+    """Resolve orchestrator context rotation threshold in steps (default `150`, env `AGY_DEV_MAX_ORCHESTRATOR_STEPS`, clamped `>= 30`)."""
+    if max_steps is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            val = int(round(float(max_steps)))
+            if val > 0:
+                return max(30, val)
+    env_raw = str(os.environ.get("AGY_DEV_MAX_ORCHESTRATOR_STEPS") or "").strip()
+    if env_raw:
+        with contextlib.suppress(TypeError, ValueError):
+            val = int(round(float(env_raw)))
+            if val > 0:
+                return max(30, val)
+    return DEFAULT_MAX_ORCHESTRATOR_STEPS
 
 
 def parse_iso_timestamp(ts_val: Any) -> float:
@@ -1651,21 +1668,23 @@ def _detect_telemetry_efficiency_anomalies(
             )
         dev_models.extend(metrics["dev_invocations"])
 
-    if orch_clean and orch_steps >= 300:
+    max_orch_steps = resolve_max_orchestrator_steps()
+    if orch_clean and orch_steps >= max_orch_steps:
         findings.append(
             _make_finding(
                 code="bloated_orchestrator_session",
                 severity="medium",
                 category="telemetry",
-                title=f"Orchestrator session {orch_clean[:8]} has {orch_steps} steps (>=300)",
+                title=f"Orchestrator session {orch_clean[:8]} has {orch_steps} steps (>={max_orch_steps})",
                 evidence={
                     "orchestrator_cid": orch_clean,
                     "step_count": orch_steps,
-                    "threshold": 300,
+                    "threshold": max_orch_steps,
                 },
                 recommendation=(
-                    "Rotate to a fresh `agy-dev-orchestrator` conversation (after ~250-300 steps or 8-10 PRs) "
-                    "and register it via `pr_remediator.py queue-next --unlocked --orchestrator-id <NEW_CID>`."
+                    f"Rotate to a fresh `agy-dev-orchestrator` conversation (every ~{max_orch_steps} steps or 5-8 PRs; "
+                    "configurable via `AGY_DEV_MAX_ORCHESTRATOR_STEPS`) and register it via "
+                    "`pr_remediator.py queue-next --unlocked --orchestrator-id <NEW_CID>` to cut per-turn context tokens."
                 ),
                 auto_action_hint="Start a fresh agy-dev-orchestrator conversation and transfer orchestrator ID.",
                 estimated_savings_min=15,

@@ -89,6 +89,8 @@ _ANOMALY_CODES_OWNED_BY_DOCTOR: frozenset[str] = frozenset(
         "missing_wait_for_unlock",
         "phantom_pr_open",
         "wake_process_crash",
+        "stale_follower_needs_rebase",
+        "quota_exhausted",
     }
 )
 
@@ -216,6 +218,60 @@ def resolve_agentapi_cli(
     """Resolve Antigravity Desktop `agentapi` binary path, returning `""` when unavailable."""
     cmd_prefix = resolve_agentapi_cmd(env=env, home_dir=home_dir, which_fn=which_fn)
     return cmd_prefix[0] if cmd_prefix else ""
+
+
+def discover_agy_cli_models(
+    agy_bin: str = "agy",
+    *,
+    env: Mapping[str, str] | None = None,
+    runner: Callable[[list[str]], str] | None = None,
+) -> list[str]:
+    """Optionally discover available CLI model IDs via `agy models` (offline-safe, returns `[]` on error)."""
+    eff_env = os.environ if env is None else env
+    raw_out = ""
+    if runner is not None:
+        with contextlib.suppress(Exception):
+            raw_out = str(runner([agy_bin, "models"]) or "")
+    else:
+        if str(eff_env.get("AGY_OFFLINE_ONLY") or "").strip() == "1":
+            return []
+        try:
+            proc = subprocess.run(
+                [agy_bin, "models"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                env=dict(eff_env),
+            )
+            if proc.returncode == 0:
+                raw_out = proc.stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            return []
+
+    if not raw_out.strip():
+        return []
+    # Support both JSON list/object output and line-oriented `agy models` output
+    with contextlib.suppress(json.JSONDecodeError):
+        parsed = json.loads(raw_out)
+        if isinstance(parsed, dict) and isinstance(parsed.get("models"), list):
+            return dev_common.parse_model_list(parsed["models"])
+        if isinstance(parsed, list):
+            return dev_common.parse_model_list(parsed)
+
+    discovered: list[str] = []
+    seen: set[str] = set()
+    for line in raw_out.splitlines():
+        clean = line.strip()
+        if not clean or clean.startswith(("#", "-", "=")) or clean.lower().startswith(("model", "available")):
+            continue
+        first_tok = clean.split()[0].strip(",:*`")
+        if first_tok and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,63}", first_tok):
+            low = first_tok.lower()
+            if low not in seen:
+                seen.add(low)
+                discovered.append(first_tok)
+    return discovered
 
 
 def _strip_prompt_tokens(cmd: str, *, _depth: int = 0) -> tuple[str, list[str]]:
@@ -432,8 +488,9 @@ def inspect_transcript_tail(
     max_bytes: int = TRANSCRIPT_TAIL_MAX_BYTES,
     home_dir: Path | None = None,
     explicit_state_dir: bool = False,
+    default_model: str = "pro",
 ) -> dict[str, Any]:
-    """Inspect a conversation's `transcript.jsonl` tail (read-only, Zero-PII) for restart & liveness state."""
+    """Inspect a conversation's `transcript.jsonl` tail (read-only, Zero-PII) for restart, liveness & 429 quota state."""
     cid = str(conversation_id or "").strip()
     brain_dirs = dev_common.resolve_antigravity_brain_dirs(
         brain_dir,
@@ -450,6 +507,11 @@ def inspect_transcript_tail(
             "last_step_type": "",
             "restart_notice_seen": False,
             "restart_interrupted": False,
+            "quota_exhausted": False,
+            "exhausted_model": "",
+            "quota_resets_at": "",
+            "quota_resets_in_seconds": 0,
+            "quota_snippet": "",
             "tail_lines_scanned": 0,
         }
 
@@ -464,6 +526,11 @@ def inspect_transcript_tail(
             "last_step_type": "",
             "restart_notice_seen": False,
             "restart_interrupted": False,
+            "quota_exhausted": False,
+            "exhausted_model": "",
+            "quota_resets_at": "",
+            "quota_resets_in_seconds": 0,
+            "quota_snippet": "",
             "tail_lines_scanned": 0,
         }
 
@@ -481,6 +548,11 @@ def inspect_transcript_tail(
             "last_step_type": "",
             "restart_notice_seen": False,
             "restart_interrupted": False,
+            "quota_exhausted": False,
+            "exhausted_model": "",
+            "quota_resets_at": "",
+            "quota_resets_in_seconds": 0,
+            "quota_snippet": "",
             "tail_lines_scanned": 0,
         }
 
@@ -510,6 +582,12 @@ def inspect_transcript_tail(
 
     restart_notice_seen = last_restart_idx >= 0
     restart_interrupted = bool(restart_notice_seen and last_recovery_idx < last_restart_idx)
+    quota_info = dev_common.detect_quota_exhaustion_in_lines(
+        lines,
+        default_model=default_model,
+        now_ts=cur_ts,
+        recovery_line_index=last_recovery_idx,
+    )
 
     return {
         "conversation_id": cid,
@@ -520,6 +598,11 @@ def inspect_transcript_tail(
         "last_step_type": last_step_type,
         "restart_notice_seen": restart_notice_seen,
         "restart_interrupted": restart_interrupted,
+        "quota_exhausted": bool(quota_info.get("quota_exhausted")),
+        "exhausted_model": str(quota_info.get("exhausted_model") or ""),
+        "quota_resets_at": str(quota_info.get("resets_at") or ""),
+        "quota_resets_in_seconds": int(quota_info.get("resets_in_seconds") or 0),
+        "quota_snippet": _sanitize_path(str(quota_info.get("snippet") or "")),
         "tail_lines_scanned": len(lines),
     }
 
@@ -791,14 +874,28 @@ def diagnose_orchestrator(
     )
 
     worker_transcripts: dict[str, dict[str, Any]] = {}
-    for _slug, lk in sorted(active_locks.items()):
-        w_cid = str(lk.get("worker_cid") or "").strip()
-        if w_cid and w_cid not in worker_transcripts:
-            worker_transcripts[w_cid] = inspect_transcript_tail(
-                w_cid,
-                resolved_brain_dirs,
-                now_ts=cur_ts,
-            )
+    reviewer_transcripts: dict[str, dict[str, Any]] = {}
+    active_lock_slots: list[tuple[str, int, dict[str, Any]]] = []
+    for slug, lk in sorted(active_locks.items()):
+        for slot_lk in dev_flow_optimizer._iter_active_lock_slots(lk):
+            slot_num = int(slot_lk.get("slot_id") or 1)
+            active_lock_slots.append((slug, slot_num, slot_lk))
+            w_cid = str(slot_lk.get("worker_cid") or "").strip()
+            if w_cid and w_cid not in worker_transcripts:
+                worker_transcripts[w_cid] = inspect_transcript_tail(
+                    w_cid,
+                    resolved_brain_dirs,
+                    now_ts=cur_ts,
+                    default_model="flash",
+                )
+            r_cid = str(slot_lk.get("reviewer_subagent_id") or "").strip()
+            if r_cid and r_cid not in reviewer_transcripts:
+                reviewer_transcripts[r_cid] = inspect_transcript_tail(
+                    r_cid,
+                    resolved_brain_dirs,
+                    now_ts=cur_ts,
+                    default_model="pro",
+                )
 
     open_items = [
         it for it in items if str(it.get("status") or "pending").strip().lower() in OPEN_QUEUE_STATUSES
@@ -816,20 +913,24 @@ def diagnose_orchestrator(
 
     anomalies: list[dict[str, Any]] = []
 
-    # 1. Server restart interruption (orchestrator or active worker transcripts)
-    interrupted_workers: list[dict[str, str]] = []
-    for slug, lk in sorted(active_locks.items()):
-        st_u = str(lk.get("status") or "").strip().upper()
+    # 1. Server restart interruption (orchestrator or active worker/reviewer transcripts across all slots)
+    interrupted_workers: list[dict[str, Any]] = []
+    for slug, slot_num, slot_lk in active_lock_slots:
+        st_u = str(slot_lk.get("status") or "").strip().upper()
         if st_u not in ("DEVELOPING", "NEEDS_REVISION_ITERATING", "AWAITING_AGENT_REVIEW"):
             continue
-        w_cid = str(lk.get("worker_cid") or "").strip()
+        w_cid = str(slot_lk.get("worker_cid") or "").strip()
+        r_cid = str(slot_lk.get("reviewer_subagent_id") or "").strip()
         wt_info = worker_transcripts.get(w_cid) or {}
-        if wt_info.get("restart_interrupted"):
+        rt_info = reviewer_transcripts.get(r_cid) or {}
+        if wt_info.get("restart_interrupted") or rt_info.get("restart_interrupted"):
             interrupted_workers.append(
                 {
                     "repo_slug": slug,
+                    "slot_id": slot_num,
                     "worker_cid": w_cid,
-                    "branch_name": str(lk.get("branch_name") or ""),
+                    "reviewer_subagent_id": r_cid,
+                    "branch_name": str(slot_lk.get("branch_name") or ""),
                 }
             )
 
@@ -854,53 +955,165 @@ def diagnose_orchestrator(
             )
         )
 
-    # 2. Stalled workers (idle >= threshold OR stopped/failed worker transcript)
-    for slug, lk in sorted(active_locks.items()):
-        st_u = str(lk.get("status") or "").strip().upper()
-        if st_u not in ("DEVELOPING", "NEEDS_REVISION_ITERATING") or bool(lk.get("pr_gate_ready")):
+    # 2. Stalled workers & reviewers across Slot #1 and Slot #2 (including AWAITING_AGENT_REVIEW)
+    for slug, slot_num, slot_lk in active_lock_slots:
+        st_u = str(slot_lk.get("status") or "").strip().upper()
+        if st_u not in ("DEVELOPING", "NEEDS_REVISION_ITERATING", "AWAITING_AGENT_REVIEW") or bool(
+            slot_lk.get("pr_gate_ready")
+        ):
             continue
         st_info = detect_stalled_lock(
-            lk,
+            slot_lk,
             now_ts=cur_ts,
             threshold_seconds=stall_thresh,
             brain_dir=resolved_brain_dirs,
             home_dir=home_dir,
         )
-        w_cid = str(lk.get("worker_cid") or "").strip()
+        w_cid = str(slot_lk.get("worker_cid") or "").strip()
+        r_cid = str(slot_lk.get("reviewer_subagent_id") or "").strip()
         wt_info = worker_transcripts.get(w_cid) or {}
+        rt_info = reviewer_transcripts.get(r_cid) or {}
         wt_last_status = str(wt_info.get("last_step_status") or "").upper()
+        rt_last_status = str(rt_info.get("last_step_status") or "").upper()
+        active_tr_info = rt_info if (st_u == "AWAITING_AGENT_REVIEW" and r_cid) else wt_info
+        active_last_status = rt_last_status if (st_u == "AWAITING_AGENT_REVIEW" and r_cid) else wt_last_status
         worker_stopped = bool(
-            wt_info.get("restart_interrupted") or wt_last_status in _TERMINAL_FAILURE_STATUSES
+            wt_info.get("restart_interrupted")
+            or rt_info.get("restart_interrupted")
+            or wt_info.get("quota_exhausted")
+            or rt_info.get("quota_exhausted")
+            or wt_last_status in _TERMINAL_FAILURE_STATUSES
+            or rt_last_status in _TERMINAL_FAILURE_STATUSES
         )
         if not st_info.get("stalled") and not worker_stopped:
             continue
 
-        idle_lbl = str(st_info.get("idle_label") or wt_info.get("idle_label") or "0s")
-        wt_clean = _sanitize_path(str(lk.get("worktree_path") or lk.get("target_repo_dir") or ""))
-        reason_detail = (
-            f"worker transcript interrupted/stopped ({wt_last_status or 'server_restart'})"
-            if worker_stopped and not st_info.get("stalled")
-            else f"no lock/worktree/transcript activity for {idle_lbl} (threshold {stall_thresh}s)"
-        )
+        idle_lbl = str(st_info.get("idle_label") or active_tr_info.get("idle_label") or "0s")
+        wt_clean = _sanitize_path(str(slot_lk.get("worktree_path") or slot_lk.get("target_repo_dir") or ""))
+        slot_suffix = f" [slot {slot_num}]" if slot_num > 1 else ""
+        if rt_info.get("quota_exhausted") or wt_info.get("quota_exhausted"):
+            q_src = rt_info if rt_info.get("quota_exhausted") else wt_info
+            reason_detail = (
+                f"429 quota exhausted on {q_src.get('exhausted_model') or 'pro'} "
+                f"(resets {q_src.get('quota_resets_at') or 'later'})"
+            )
+        elif worker_stopped and not st_info.get("stalled"):
+            reason_detail = f"worker/reviewer transcript interrupted/stopped ({active_last_status or 'server_restart'})"
+        else:
+            reason_detail = f"no lock/worktree/transcript activity for {idle_lbl} (threshold {stall_thresh}s)"
         anomalies.append(
             _make_anomaly(
                 code="stalled_worker",
                 severity="critical",
-                title=f"Stalled worker on {slug} ({reason_detail})",
-                cause=f"Active {st_u} lock on {slug} has stalled ({reason_detail}).",
+                title=f"Stalled {st_u} on {slug}{slot_suffix} ({reason_detail})",
+                cause=f"Active {st_u} lock on {slug}{slot_suffix} has stalled ({reason_detail}).",
                 evidence={
                     "repo_slug": slug,
-                    "branch_name": str(lk.get("branch_name") or ""),
+                    "slot_id": slot_num,
+                    "branch_name": str(slot_lk.get("branch_name") or ""),
                     "worktree_path": wt_clean,
                     "status": st_u,
-                    "conversation_id": str(lk.get("conversation_id") or ""),
+                    "conversation_id": str(slot_lk.get("conversation_id") or ""),
                     "worker_cid": w_cid,
+                    "reviewer_subagent_id": r_cid,
                     "idle_seconds": int(st_info.get("idle_seconds") or 0),
                     "idle_label": idle_lbl,
                     "worker_last_step_status": wt_last_status,
+                    "reviewer_last_step_status": rt_last_status,
                 },
                 safe_fix_action="agy-doctor --wake",
                 requires_wake=True,
+                auto_fixable=False,
+            )
+        )
+
+    # 2b. Quota exhaustion (`429 RESOURCE_EXHAUSTED`) detection across orchestrator, workers, and reviewers
+    detected_quota_cooldowns: list[dict[str, Any]] = []
+    quota_overlay: dict[str, dict[str, Any]] = {}
+    seen_quota_pairs: set[tuple[str, str]] = set()
+
+    def _collect_quota_hit(role_lbl: str, cid_val: str, tr_info: dict[str, Any], repo_lbl: str = "") -> None:
+        if not tr_info.get("quota_exhausted"):
+            return
+        m_id = str(tr_info.get("exhausted_model") or "pro").strip()
+        pair = (cid_val, m_id.lower())
+        if pair in seen_quota_pairs:
+            return
+        seen_quota_pairs.add(pair)
+        resets_at = str(tr_info.get("quota_resets_at") or "")
+        resets_in = int(tr_info.get("quota_resets_in_seconds") or 0)
+        entry = {
+            "role": role_lbl,
+            "conversation_id": cid_val,
+            "repo_slug": repo_lbl,
+            "model": m_id,
+            "resets_at": resets_at,
+            "resets_in_seconds": resets_in,
+            "snippet": str(tr_info.get("quota_snippet") or ""),
+        }
+        detected_quota_cooldowns.append(entry)
+        quota_overlay[m_id.lower()] = {
+            "model": m_id,
+            "resets_at": resets_at,
+            "reason": "429 RESOURCE_EXHAUSTED",
+            "source": "transcript",
+        }
+
+    _collect_quota_hit("orchestrator", eff_orch_cid, orch_transcript)
+    for slug, _slot_num, slot_lk in active_lock_slots:
+        w_cid = str(slot_lk.get("worker_cid") or "").strip()
+        r_cid = str(slot_lk.get("reviewer_subagent_id") or "").strip()
+        if w_cid and w_cid in worker_transcripts:
+            _collect_quota_hit("developer", w_cid, worker_transcripts[w_cid], repo_lbl=slug)
+        if r_cid and r_cid in reviewer_transcripts:
+            _collect_quota_hit("reviewer", r_cid, reviewer_transcripts[r_cid], repo_lbl=slug)
+
+    if detected_quota_cooldowns:
+        fallback_sel = dev_common.select_next_optimal_model(
+            role="wake",
+            extra_cooldowns=quota_overlay,
+            state_dir=resolved_state,
+            now_ts=cur_ts,
+            home_dir=home_dir,
+        )
+        all_exhausted = bool(fallback_sel.get("all_exhausted"))
+        rec_fallback = str(fallback_sel.get("selected_model") or "")
+        models_hit = sorted({str(q["model"]) for q in detected_quota_cooldowns})
+        next_reset = str(
+            fallback_sel.get("next_reset_at")
+            or detected_quota_cooldowns[0].get("resets_at")
+            or ""
+        )
+        anomalies.append(
+            _make_anomaly(
+                code="quota_exhausted",
+                severity="critical" if all_exhausted else "high",
+                title=(
+                    f"429 quota exhausted on {', '.join(models_hit)} "
+                    + (
+                        f"(all fallback models exhausted until {next_reset or 'reset'})"
+                        if all_exhausted
+                        else f"(fallback ready: {rec_fallback})"
+                    )
+                ),
+                cause=(
+                    f"Transcript tail recorded unrecovered 429 RESOURCE_EXHAUSTED on {', '.join(models_hit)} "
+                    f"(resets {next_reset or 'later'})."
+                ),
+                evidence={
+                    "exhausted_models": models_hit,
+                    "events": detected_quota_cooldowns,
+                    "fallback_model": rec_fallback,
+                    "fallback_mode": str(fallback_sel.get("mode") or ""),
+                    "all_models_exhausted": all_exhausted,
+                    "next_reset_at": next_reset,
+                },
+                safe_fix_action=(
+                    f"Wait until {next_reset} (all fallback pools exhausted)"
+                    if all_exhausted
+                    else "agy-doctor --wake"
+                ),
+                requires_wake=not all_exhausted,
                 auto_fixable=False,
             )
         )
@@ -1011,26 +1224,82 @@ def diagnose_orchestrator(
             )
         )
 
-    # 5. Phantom `pr_open` items (stuck in `pr_open` with zero active locks and zero `pr_urls`)
+    # 5. Phantom `pr_open` items & stale followers needing 0-LLM rebase-reverify
     for f in flow_report.get("findings") or []:
-        if not isinstance(f, dict) or str(f.get("code") or "") != "phantom_pr_open":
+        if not isinstance(f, dict):
             continue
+        f_code = str(f.get("code") or "")
         ev = dict(f.get("evidence") or {})
-        anomalies.append(
-            _make_anomaly(
-                code="phantom_pr_open",
-                severity="high",
-                title=str(f.get("title") or "Phantom pr_open item(s) without active locks or PR URLs"),
-                cause=(
-                    "Queue item(s) remain marked `pr_open` despite zero active locks and zero open PR URLs "
-                    "(typically after partial multi-repo merges)."
-                ),
-                evidence=ev,
-                safe_fix_action="agy-doctor --fix",
-                requires_wake=False,
-                auto_fixable=True,
+        if f_code == "phantom_pr_open":
+            anomalies.append(
+                _make_anomaly(
+                    code="phantom_pr_open",
+                    severity="high",
+                    title=str(f.get("title") or "Phantom pr_open item(s) without active locks or PR URLs"),
+                    cause=(
+                        "Queue item(s) remain marked `pr_open` despite zero active locks and zero open PR URLs "
+                        "(typically after partial multi-repo merges)."
+                    ),
+                    evidence=ev,
+                    safe_fix_action="agy-doctor --fix",
+                    requires_wake=False,
+                    auto_fixable=True,
+                )
             )
-        )
+        elif f_code == "stale_follower_needs_rebase":
+            anomalies.append(
+                _make_anomaly(
+                    code="stale_follower_needs_rebase",
+                    severity="high",
+                    title=str(f.get("title") or "Stale follower lock needs 0-LLM rebase-reverify"),
+                    cause=(
+                        "Active promoted/follower lock has `NEEDS_REBASE_REVERIFY`, `needs_base_rebase=True`, or "
+                        "`base_stale=True` and can be auto-rebased & re-verified with 0 LLM tokens."
+                    ),
+                    evidence=ev,
+                    safe_fix_action="agy-doctor --fix",
+                    requires_wake=False,
+                    auto_fixable=True,
+                )
+            )
+
+    if not any(a.get("code") == "stale_follower_needs_rebase" for a in anomalies):
+        direct_stale: list[dict[str, Any]] = []
+        for slug, slot_num, slot_lk in active_lock_slots:
+            st_u = str(slot_lk.get("status") or "").strip().upper()
+            if (
+                st_u == "NEEDS_REBASE_REVERIFY"
+                or bool(slot_lk.get("needs_base_rebase"))
+                or bool(slot_lk.get("base_stale"))
+            ):
+                direct_stale.append(
+                    {
+                        "repo_slug": slug,
+                        "slot_id": slot_num,
+                        "status": st_u,
+                        "branch_name": str(slot_lk.get("branch_name") or ""),
+                        "conversation_id": str(slot_lk.get("conversation_id") or ""),
+                        "worktree_path": _sanitize_path(
+                            str(slot_lk.get("worktree_path") or slot_lk.get("target_repo_dir") or "")
+                        ),
+                    }
+                )
+        if direct_stale:
+            anomalies.append(
+                _make_anomaly(
+                    code="stale_follower_needs_rebase",
+                    severity="high",
+                    title=f"{len(direct_stale)} stale follower lock(s) need 0-LLM rebase-reverify",
+                    cause=(
+                        "Active promoted/follower lock has `NEEDS_REBASE_REVERIFY`, `needs_base_rebase=True`, or "
+                        "`base_stale=True` and can be auto-rebased & re-verified with 0 LLM tokens."
+                    ),
+                    evidence={"locks": direct_stale, "count": len(direct_stale)},
+                    safe_fix_action="agy-doctor --fix",
+                    requires_wake=False,
+                    auto_fixable=True,
+                )
+            )
 
     # 6. Recent wake process crash signatures (`SIGABRT`, stdin metadata failure, non-zero exit)
     wake_log_audit = inspect_wake_logs(resolved_state)
@@ -1153,6 +1422,7 @@ def diagnose_orchestrator(
             "runnable_items": runnable_summary,
         },
         "git_sync": git_sync_summary,
+        "detected_quota_cooldowns": detected_quota_cooldowns,
         "anomalies": anomalies,
         "improvements": improvements,
     }
@@ -1164,12 +1434,45 @@ def apply_safe_fixes(
     portfolio_dir: Path | str | None = None,
     sync_git: bool = False,
     git_client: Any | None = None,
+    detected_quota_cooldowns: Sequence[Mapping[str, Any]] | None = None,
+    now_ts: float | None = None,
+    home_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Apply strictly safe runtime-state reconciliations (never editing tracked source files or pushing to `main`)."""
     pr_rem = _load_pr_remediator()
-    resolved_state = dev_common.resolve_state_dir(state_dir if state_dir is not None else portfolio_dir)
+    resolved_state = dev_common.resolve_state_dir(
+        state_dir if state_dir is not None else portfolio_dir,
+        home_dir=home_dir,
+    )
     is_offline = os.environ.get("AGY_OFFLINE_ONLY") == "1"
     actions: list[dict[str, Any]] = []
+
+    if detected_quota_cooldowns:
+        recorded_models: list[str] = []
+        for q_ev in detected_quota_cooldowns:
+            m_id = str(q_ev.get("model") or "").strip()
+            if not m_id:
+                continue
+            dev_common.record_model_quota_cooldown(
+                m_id,
+                resets_at=str(q_ev.get("resets_at") or ""),
+                resets_in_seconds=q_ev.get("resets_in_seconds"),
+                reason="429 RESOURCE_EXHAUSTED",
+                source="agy_doctor",
+                state_dir=resolved_state,
+                now_ts=now_ts,
+                home_dir=home_dir,
+            )
+            if m_id not in recorded_models:
+                recorded_models.append(m_id)
+        if recorded_models:
+            actions.append(
+                {
+                    "action": "record_model_quota_cooldowns",
+                    "status": "applied",
+                    "models": recorded_models,
+                }
+            )
 
     if sync_git:
         if is_offline:
@@ -1218,6 +1521,60 @@ def apply_safe_fixes(
         }
     )
 
+    # 0-LLM auto-rebase & cross-impact verification for stale promoted/follower locks
+    cur_locks = pr_rem.get_all_dev_pr_locks(portfolio_dir=resolved_state)
+    rebase_runner = getattr(pr_rem, "run_slot_rebase_reverify", None)
+    if callable(rebase_runner):
+        for slug, lk in sorted(cur_locks.items()):
+            if not isinstance(lk, dict) or not bool(lk.get("active")):
+                continue
+            for slot_lk in dev_flow_optimizer._iter_active_lock_slots(lk):
+                st_u = str(slot_lk.get("status") or "").strip().upper()
+                needs_rb = bool(
+                    st_u == "NEEDS_REBASE_REVERIFY"
+                    or slot_lk.get("needs_base_rebase")
+                    or slot_lk.get("base_stale")
+                )
+                if not needs_rb:
+                    continue
+                br = str(slot_lk.get("branch_name") or "").strip()
+                wt_raw = str(slot_lk.get("worktree_path") or slot_lk.get("target_repo_dir") or "").strip()
+                wt_expanded = wt_raw.replace("$HOME", str(Path.home())) if wt_raw else ""
+                try:
+                    rb_res = rebase_runner(
+                        repo_slug=slug,
+                        workdir=wt_expanded or None,
+                        branch_name=br,
+                        fetch=bool(sync_git and not is_offline),
+                        portfolio_dir=resolved_state,
+                        git_client=git_client,
+                    )
+                    outcome = str((rb_res or {}).get("outcome") or (rb_res or {}).get("status") or "")
+                    actions.append(
+                        {
+                            "action": "rebase_and_reverify_stale_follower",
+                            "repo_slug": slug,
+                            "slot_id": int(slot_lk.get("slot_id") or 1),
+                            "branch_name": br,
+                            "status": "applied" if (rb_res or {}).get("status") == "ok" else "error",
+                            "outcome": outcome,
+                            "promoted_to_human_pr": bool((rb_res or {}).get("promoted_to_human_pr")),
+                            "requires_wake": outcome in ("NEEDS_AGENT_SEMANTIC_FIX", "NEEDS_AGENT_CONFLICT_RESOLUTION"),
+                        }
+                    )
+                except Exception as exc:
+                    actions.append(
+                        {
+                            "action": "rebase_and_reverify_stale_follower",
+                            "repo_slug": slug,
+                            "slot_id": int(slot_lk.get("slot_id") or 1),
+                            "branch_name": br,
+                            "status": "error",
+                            "error": _sanitize_path(str(exc)),
+                            "requires_wake": True,
+                        }
+                    )
+
     return {
         "status": "ok",
         "remediation_actions": actions,
@@ -1225,7 +1582,12 @@ def apply_safe_fixes(
     }
 
 
-def build_wake_prompt(diagnosis: dict[str, Any]) -> str:
+def build_wake_prompt(
+    diagnosis: dict[str, Any],
+    *,
+    selected_model: str = "",
+    model_routing: Mapping[str, Any] | None = None,
+) -> str:
     """Build a concise, Zero-PII pre-computed recovery prompt for `agy-dev-orchestrator`."""
     anomalies = [a for a in (diagnosis.get("anomalies") or []) if isinstance(a, dict)]
     q_sum = diagnosis.get("queue_summary") if isinstance(diagnosis.get("queue_summary"), dict) else {}
@@ -1234,17 +1596,34 @@ def build_wake_prompt(diagnosis: dict[str, Any]) -> str:
 
     anomaly_lines: list[str] = []
     stalled_lines: list[str] = []
+    quota_lines: list[str] = []
     for a in anomalies:
         code = str(a.get("code") or "anomaly")
         title = _sanitize_path(str(a.get("title") or code))
         anomaly_lines.append(f"- [{str(a.get('severity') or 'high').upper()}] `{code}`: {title}")
         if code == "stalled_worker":
             ev = a.get("evidence") if isinstance(a.get("evidence"), dict) else {}
-            stalled_lines.append(
-                f"- Repo `{ev.get('repo_slug', '')}` branch `{ev.get('branch_name', '')}` "
-                f"(worker `{ev.get('worker_cid', '') or 'unknown'}`, worktree `{ev.get('worktree_path', '')}`): "
-                "inspect worktree status, revive worker via `send_message` or re-dispatch `agy-dev-executor` "
-                "with `--reuse-active`, and arm a 1200s worker watchdog timer."
+            slot_lbl = f" slot {ev.get('slot_id', 1)}" if int(ev.get("slot_id") or 1) > 1 else ""
+            if str(ev.get("status") or "").upper() == "AWAITING_AGENT_REVIEW":
+                stalled_lines.append(
+                    f"- Repo `{ev.get('repo_slug', '')}`{slot_lbl} branch `{ev.get('branch_name', '')}` "
+                    f"(AWAITING_AGENT_REVIEW, reviewer `{ev.get('reviewer_subagent_id', '') or 'none'}`, "
+                    f"worktree `{ev.get('worktree_path', '')}`): check `swarm(action='models', all=true)`, "
+                    "re-dispatch `agy-code-pr-reviewer` on `pro` if healthy (`>25%`) or next optimal fallback "
+                    "model via `swarm(action='add', ..., model='<fallback>')`."
+                )
+            else:
+                stalled_lines.append(
+                    f"- Repo `{ev.get('repo_slug', '')}`{slot_lbl} branch `{ev.get('branch_name', '')}` "
+                    f"(worker `{ev.get('worker_cid', '') or 'unknown'}`, worktree `{ev.get('worktree_path', '')}`): "
+                    "inspect worktree status, revive worker via `send_message` or re-dispatch `agy-dev-executor` "
+                    "with `--reuse-active`, and arm a 1200s worker watchdog timer."
+                )
+        elif code == "quota_exhausted":
+            ev = a.get("evidence") if isinstance(a.get("evidence"), dict) else {}
+            quota_lines.append(
+                f"- Exhausted `{', '.join(ev.get('exhausted_models') or [])}` (resets `{ev.get('next_reset_at', '')}`); "
+                f"recommended healthy fallback: `{selected_model or ev.get('fallback_model', '')}`."
             )
 
     runnable_lines: list[str] = []
@@ -1265,10 +1644,20 @@ def build_wake_prompt(diagnosis: dict[str, Any]) -> str:
         "- Detected Anomalies:",
         *(anomaly_lines or ["- Manual `--force` wake requested."]),
     ]
+    if selected_model or quota_lines:
+        mode_lbl = str((model_routing or {}).get("mode") or "")
+        parts.append(
+            f"- Quota & Model Routing Guidance: active wake model `{selected_model or 'default'}`"
+            + (f" (mode=`{mode_lbl}`)" if mode_lbl else "")
+            + ". Run `swarm(action=\"models\", all=true)` before dispatching heavy waves, persist via "
+            "`pr_remediator.py quota-status --record-swarm-json ...`, default Round 1 Dev to `flash` "
+            "(escalating to `pro` on Round 2+ if needed), and route low-quota (`<=25%`) / `429` pools to the next optimal fallback."
+        )
+        parts.extend(quota_lines)
     if runnable_lines:
         parts.extend(["- Runnable Tasks on FREE Repositories:", *runnable_lines])
     if stalled_lines:
-        parts.extend(["- Stalled Workers Requiring Immediate Recovery:", *stalled_lines])
+        parts.extend(["- Stalled Workers/Reviewers Requiring Immediate Recovery:", *stalled_lines])
 
     parts.extend(
         [
@@ -1279,11 +1668,11 @@ def build_wake_prompt(diagnosis: dict[str, Any]) -> str:
             "1. Register your active conversation ID and verify state via "
             "`pr_remediator.py lock-status --all --sync-git` and "
             "`pr_remediator.py queue-next --unlocked --orchestrator-id <YOUR_CONVERSATION_ID>`.",
-            "2. Recover any stalled workers (`send_message` or `--reuse-active`) and dispatch runnable tasks "
-            "across unlocked repositories in parallel (scheduling 1200s worker watchdog timers).",
+            "2. Recover any stalled workers/reviewers (`send_message`, `--reuse-active`, or quota-fallback review dispatch) "
+            "and dispatch runnable tasks across unlocked repositories in parallel (scheduling 1200s worker watchdog timers).",
             "3. Whenever all remaining target repositories hold active locks/`pr_open` with queued work left, "
             "ALWAYS arm `pr_remediator.py wait-for-unlock --orchestrator-id <YOUR_CONVERSATION_ID> "
-            "--interval 15 --max-duration 3600` in the background (+ 65m safety timer) before going idle.",
+            "--interval 15 --max-duration 3600 --stall-seconds 900` in the background (+ 65m safety timer) before going idle.",
         ]
     )
     return "\n".join(parts)
@@ -1383,6 +1772,9 @@ def trigger_orchestrator_wake(
     startup_probe_seconds: float | None = None,
     dry_run: bool = False,
     force: bool = False,
+    wake_model: str = "",
+    available_models: Sequence[str] | None = None,
+    agy_models_runner: Callable[[list[str]], str] | None = None,
     now_ts: float | None = None,
     home_dir: Path | None = None,
     env: Mapping[str, str] | None = None,
@@ -1391,7 +1783,7 @@ def trigger_orchestrator_wake(
     pid_alive_fn: Callable[[int], bool] | None = None,
     sleep_fn: Callable[[float], None] | None = None,
 ) -> dict[str, Any]:
-    """Launch detached hybrid orchestrator wake (`agentapi` in Desktop/sidecar; `agy` CLI in terminal)."""
+    """Launch detached hybrid orchestrator wake (`agentapi` in Desktop/sidecar; `agy` CLI in terminal) with quota fallback."""
     resolved_state = dev_common.resolve_state_dir(
         state_dir if state_dir is not None else portfolio_dir,
         home_dir=home_dir,
@@ -1422,6 +1814,83 @@ def trigger_orchestrator_wake(
             "reason": "no_anomalies_requiring_wake",
             "cooldown_seconds": eff_cooldown,
         }
+
+    detected_cooldowns = [
+        q for q in (diagnosis.get("detected_quota_cooldowns") or []) if isinstance(q, Mapping)
+    ]
+    extra_cooldowns: dict[str, dict[str, Any]] = {}
+    for q_ev in detected_cooldowns:
+        m_id = str(q_ev.get("model") or "").strip()
+        if not m_id:
+            continue
+        extra_cooldowns[m_id.lower()] = {
+            "model": m_id,
+            "resets_at": str(q_ev.get("resets_at") or ""),
+            "reason": "429 RESOURCE_EXHAUSTED",
+            "source": "transcript",
+        }
+        if not dry_run:
+            dev_common.record_model_quota_cooldown(
+                m_id,
+                resets_at=str(q_ev.get("resets_at") or ""),
+                resets_in_seconds=q_ev.get("resets_in_seconds"),
+                reason="429 RESOURCE_EXHAUSTED",
+                source="agy_doctor_wake",
+                state_dir=resolved_state,
+                now_ts=cur_ts,
+                home_dir=home_dir,
+            )
+
+    ls_addr = str(eff_env.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
+    agentapi_cmd = (
+        resolve_agentapi_cmd(env=eff_env, home_dir=home_dir, which_fn=which_fn)
+        if ls_addr
+        else []
+    )
+    use_agentapi = bool(ls_addr and agentapi_cmd)
+    agy_bin = "" if use_agentapi else resolve_agy_cli(home_dir=home_dir, which_fn=which_fn)
+
+    eff_available_models = list(available_models) if available_models is not None else None
+    if eff_available_models is None and agy_models_runner is not None:
+        discovered = discover_agy_cli_models(
+            agy_bin or "agy",
+            env=eff_env,
+            runner=agy_models_runner,
+        )
+        if discovered:
+            eff_available_models = discovered
+
+    model_routing = dev_common.select_next_optimal_model(
+        role="wake",
+        preferred_model=str(wake_model or "").strip(),
+        available_models=eff_available_models,
+        extra_cooldowns=extra_cooldowns,
+        state_dir=resolved_state,
+        now_ts=cur_ts,
+        env=eff_env,
+        home_dir=home_dir,
+    )
+    if bool(model_routing.get("all_exhausted")) and not force:
+        return {
+            "status": "skipped_all_models_exhausted",
+            "woke": False,
+            "reason": "all_fallback_models_exhausted",
+            "next_reset_at": str(model_routing.get("next_reset_at") or ""),
+            "model_routing": model_routing,
+            "cooldown_seconds": eff_cooldown,
+        }
+
+    selected_model = str(model_routing.get("selected_model") or "").strip()
+    routing_mode = str(model_routing.get("mode") or "normal")
+    should_pin_model = bool(
+        selected_model
+        and (
+            str(wake_model or "").strip()
+            or routing_mode in ("unlimited", "quota_fallback", "eco_low_quota")
+            or bool(detected_cooldowns)
+        )
+    )
+    pinned_wake_model = selected_model if should_pin_model else ""
 
     state_file = resolved_state / DOCTOR_STATE_FILENAME
     lock_file = resolved_state / DOCTOR_LOCK_FILENAME
@@ -1460,20 +1929,23 @@ def trigger_orchestrator_wake(
                     "last_wake_pid": prev_pid,
                 }
 
-        prompt = build_wake_prompt(diagnosis)
-        ls_addr = str(eff_env.get("ANTIGRAVITY_LS_ADDRESS") or "").strip()
-        agentapi_cmd = (
-            resolve_agentapi_cmd(env=eff_env, home_dir=home_dir, which_fn=which_fn)
-            if ls_addr
-            else []
+        prompt = build_wake_prompt(
+            diagnosis,
+            selected_model=pinned_wake_model,
+            model_routing=model_routing if should_pin_model else None,
         )
-        if ls_addr and agentapi_cmd:
+        if use_agentapi:
             transport = "agentapi"
-            cmd = [*agentapi_cmd, "new-conversation", "--title=[agy-doctor] Orchestrator Recovery", prompt]
+            cmd = [*agentapi_cmd, "new-conversation"]
+            if pinned_wake_model:
+                cmd.append(f"--model={pinned_wake_model}")
+            cmd.extend(["--title=[agy-doctor] Orchestrator Recovery", prompt])
         else:
             transport = "agy_cli"
-            agy_bin = resolve_agy_cli(home_dir=home_dir, which_fn=which_fn)
-            cmd = [agy_bin, "--agent", "agy-dev-orchestrator", "--dangerously-skip-permissions", "-p", prompt]
+            cmd = [agy_bin, "--agent", "agy-dev-orchestrator"]
+            if pinned_wake_model:
+                cmd.extend(["--model", pinned_wake_model])
+            cmd.extend(["--dangerously-skip-permissions", "-p", prompt])
 
         if dry_run:
             return {
@@ -1481,6 +1953,8 @@ def trigger_orchestrator_wake(
                 "woke": False,
                 "dry_run": True,
                 "transport": transport,
+                "selected_wake_model": pinned_wake_model,
+                "model_routing": model_routing,
                 "reason": wake_reason,
                 "command": cmd,
                 "prompt": prompt,
@@ -1507,6 +1981,7 @@ def trigger_orchestrator_wake(
                 "status": "error",
                 "woke": False,
                 "transport": transport,
+                "selected_wake_model": pinned_wake_model,
                 "reason": "agentapi_spawn_failed" if transport == "agentapi" else "agy_spawn_failed",
                 "error": _sanitize_path(str(exc)),
                 "command": cmd,
@@ -1546,6 +2021,7 @@ def trigger_orchestrator_wake(
                 "status": "error",
                 "woke": False,
                 "transport": transport,
+                "selected_wake_model": pinned_wake_model,
                 "reason": "wake_startup_crashed" if sig_name == "SIGABRT" else "wake_exited_nonzero",
                 "exit_code": startup_exit_code,
                 "signal": sig_name,
@@ -1565,6 +2041,8 @@ def trigger_orchestrator_wake(
             "last_wake_reason": wake_reason,
             "last_wake_log": _sanitize_path(str(log_path)),
             "transport": transport,
+            "selected_wake_model": pinned_wake_model,
+            "model_routing_mode": routing_mode,
             "last_command": sanitized_cmd,
         }
         dev_common.atomic_write_json(state_file, persisted_state, mode=0o600)
@@ -1573,6 +2051,8 @@ def trigger_orchestrator_wake(
             "status": "woke",
             "woke": True,
             "transport": transport,
+            "selected_wake_model": pinned_wake_model,
+            "model_routing": model_routing,
             "pid": new_pid,
             "woke_at": wake_iso,
             "reason": wake_reason,
@@ -1600,6 +2080,9 @@ def run_queue_doctor(
     cooldown_seconds: int = DEFAULT_WAKE_COOLDOWN_SECONDS,
     startup_probe_seconds: float | None = None,
     stall_threshold_seconds: int | float | None = None,
+    wake_model: str = "",
+    available_models: Sequence[str] | None = None,
+    agy_models_runner: Callable[[list[str]], str] | None = None,
     now_ts: float | None = None,
     ps_output: str | None = None,
     ps_runner: Callable[[], str] | None = None,
@@ -1627,6 +2110,7 @@ def run_queue_doctor(
                     "status": "dry_run",
                     "would_sync_git": eff_sync_git,
                     "would_reconcile_queue": True,
+                    "would_rebase_stale_followers": True,
                 }
             )
             diag = diagnose_orchestrator(
@@ -1643,10 +2127,26 @@ def run_queue_doctor(
                 git_client=git_client,
             )
         else:
+            pre_diag = diagnose_orchestrator(
+                state_dir=target_state,
+                repos_dir=repos_dir,
+                brain_dir=brain_dir,
+                home_dir=home_dir,
+                orchestrator_cid=orchestrator_cid,
+                sync_git=False,
+                stall_threshold_seconds=stall_threshold_seconds,
+                now_ts=now_ts,
+                ps_output=ps_output,
+                ps_runner=ps_runner,
+                git_client=git_client,
+            )
             fix_res = apply_safe_fixes(
                 state_dir=target_state,
                 sync_git=eff_sync_git,
                 git_client=git_client,
+                detected_quota_cooldowns=pre_diag.get("detected_quota_cooldowns"),
+                now_ts=now_ts,
+                home_dir=home_dir,
             )
             remediation_actions.extend(fix_res.get("remediation_actions") or [])
             diag = diagnose_orchestrator(
@@ -1662,6 +2162,8 @@ def run_queue_doctor(
                 ps_runner=ps_runner,
                 git_client=git_client,
             )
+            if any(bool(a.get("requires_wake")) for a in remediation_actions) and not diag.get("needs_wake"):
+                diag = {**diag, "needs_wake": True, "action_required": True}
     else:
         diag = diagnose_orchestrator(
             state_dir=target_state,
@@ -1686,6 +2188,9 @@ def run_queue_doctor(
             startup_probe_seconds=startup_probe_seconds,
             dry_run=dry_run,
             force=force,
+            wake_model=wake_model,
+            available_models=available_models,
+            agy_models_runner=agy_models_runner,
             now_ts=now_ts,
             home_dir=home_dir,
             env=env,
@@ -1694,6 +2199,8 @@ def run_queue_doctor(
             pid_alive_fn=pid_alive_fn,
             sleep_fn=sleep_fn,
         )
+        if wake_result.get("prompt"):
+            wake_prompt = str(wake_result["prompt"])
     else:
         wake_result = {
             "status": "not_requested",
@@ -1805,22 +2312,29 @@ def render_doctor_report(report: dict[str, Any], *, color: bool = True) -> str:
     wake_info = report.get("wake") if isinstance(report.get("wake"), dict) else {}
     w_status = str(wake_info.get("status") or "not_requested")
     w_transport = str(wake_info.get("transport") or "agy_cli")
+    w_model = str(wake_info.get("selected_wake_model") or "")
+    w_model_sfx = f" model={w_model}" if w_model else ""
     if w_status == "woke":
         lines.append(
-            f"  • Wake: {_color('LAUNCHED', '1;32', color)} ({w_transport}) pid={wake_info.get('pid')} "
+            f"  • Wake: {_color('LAUNCHED', '1;32', color)} ({w_transport}{w_model_sfx}) pid={wake_info.get('pid')} "
             f"(log: {wake_info.get('log_path', '')})"
         )
     elif w_status == "dry_run":
         dry_cmd_lbl = (
-            "`agentapi new-conversation \"--title=[agy-doctor] Orchestrator Recovery\" <prompt>`"
+            f"`agentapi new-conversation {'--model=' + w_model + ' ' if w_model else ''}\"--title=[agy-doctor] Orchestrator Recovery\" <prompt>`"
             if w_transport == "agentapi"
-            else "`agy --agent agy-dev-orchestrator --dangerously-skip-permissions -p <prompt>`"
+            else f"`agy --agent agy-dev-orchestrator {'--model ' + w_model + ' ' if w_model else ''}--dangerously-skip-permissions -p <prompt>`"
         )
         lines.append(
-            f"  • Wake: {_color('DRY-RUN', '1;36', color)} ({w_transport}) would spawn {dry_cmd_lbl}"
+            f"  • Wake: {_color('DRY-RUN', '1;36', color)} ({w_transport}{w_model_sfx}) would spawn {dry_cmd_lbl}"
         )
     elif w_status == "skipped_healthy":
         lines.append("  • Wake: skipped (queue & orchestrator healthy — 0 LLM tokens used).")
+    elif w_status == "skipped_all_models_exhausted":
+        lines.append(
+            f"  • Wake: {_color('SUPPRESSED', '1;33', color)} (all fallback models exhausted until "
+            f"{wake_info.get('next_reset_at') or 'quota reset'} — 0 wake burn)."
+        )
     elif w_status == "skipped_wake_in_flight":
         lines.append(
             f"  • Wake: skipped (previous wake pid={wake_info.get('pid')} is still running)."

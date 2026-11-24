@@ -376,14 +376,22 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             by_cid_final = {it["conversation_id"]: it for it in q_final["items"]}
             self.assertEqual(by_cid_final[merged_root]["status"], "cleaned")
 
-            # Verify build_code_developer_subagent_plan supports optional model tiering & anchored context while preserving pro default
-            default_plan = prs.build_code_developer_subagent_plan(conversation_id="abcd1234-0000-0000-0000-000000000000", action_id="acme")
-            self.assertEqual(default_plan["subagent_invocation"]["Model"], "pro")
+            # Verify build_code_developer_subagent_plan defaults Round 1 to flash and auto-escalates Round 2+ to pro
+            default_plan = prs.build_code_developer_subagent_plan(conversation_id="abcd1234-0000-0000-0000-000000000000", action_id="acme", portfolio_dir=pdir)
+            self.assertEqual(default_plan["subagent_invocation"]["Model"], "flash")
+            round2_plan = prs.build_code_developer_subagent_plan(
+                conversation_id="abcd1234-0000-0000-0000-000000000000",
+                action_id="acme",
+                review_iteration=2,
+                portfolio_dir=pdir,
+            )
+            self.assertEqual(round2_plan["subagent_invocation"]["Model"], "pro")
             flash_plan = prs.build_code_developer_subagent_plan(
                 conversation_id="abcd1234-0000-0000-0000-000000000000",
                 action_id="acme",
                 model="flash",
                 anchored_context="clients/foo.py:10-40",
+                portfolio_dir=pdir,
             )
             self.assertEqual(flash_plan["subagent_invocation"]["Model"], "flash")
             self.assertIn("clients/foo.py:10-40", flash_plan["subagent_invocation"]["Prompt"])

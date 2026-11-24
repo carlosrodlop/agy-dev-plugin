@@ -644,7 +644,8 @@ class TestOptimizerTuiAndDocsContracts(unittest.TestCase):
             self.assertIn("AGY_DEV_PRIORITIZE_PARTIAL_WIP", text)
             self.assertIn("AGY_DEV_MAX_PARTIAL_WIP", text)
             self.assertIn("effective_priority", text)
-            self.assertIn("250", text)
+            self.assertIn("150", text)
+            self.assertIn("AGY_DEV_MAX_ORCHESTRATOR_STEPS", text)
 
         self.assertEqual(runner.audit_router_integrity(REPO_ROOT), [])
         for modified in (
