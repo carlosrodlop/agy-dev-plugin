@@ -1364,6 +1364,12 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
         self.assertIn("description:", co_design_text)
         for required_phrase in (
             "Adaptive Activation Gate",
+            "RCA / Discrepancy Triage -> Co-Design Transition",
+            "lock-status --all",
+            "queue-list",
+            "ask_question",
+            "(Recommended)",
+            "would you like me to",
             "Silent Codebase-First Discovery",
             "Demanding Partner Pushback",
             "Hybrid Interview Cadence",
@@ -1373,10 +1379,20 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
         ):
             self.assertIn(required_phrase, co_design_text, msg=f"Missing co-design contract section/term: {required_phrase}")
 
-        pillars_text = (REPO_ROOT / "rules" / "engineering-pillars.md").read_text(encoding="utf-8")
+        pillars_rule = REPO_ROOT / "rules" / "engineering-pillars.md"
+        self.assertTrue(pillars_rule.is_file(), msg="rules/engineering-pillars.md must exist")
+        self.assertLess(pillars_rule.stat().st_size, 24000)
+        pillars_text = pillars_rule.read_text(encoding="utf-8")
         self.assertIn("trigger: always_on", pillars_text)
         self.assertIn("co-design-and-discovery.md", pillars_text)
         self.assertIn("Grill-Me", pillars_text)
+        for required_pillar_term in (
+            "discrepancy RCA",
+            ">=2",
+            "ask_question",
+            "trailing plain-text open bullet questions",
+        ):
+            self.assertIn(required_pillar_term, pillars_text, msg=f"Missing RCA co-design term in engineering-pillars.md: {required_pillar_term}")
 
         planner_text = (REPO_ROOT / "agents" / "agy-dev-planner.md").read_text(encoding="utf-8")
         self.assertIn("ask_question", planner_text)
@@ -1753,11 +1769,28 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
         expected_rules = {
             "engineering-pillars.md": (
                 "always_on",
-                ("Santa Lockdown", "Vanilla-First", "Don't Reinvent the Wheel", "allowed non-binary libraries", "shell-standards.md", "web-frontend-standards.md"),
+                (
+                    "Santa Lockdown",
+                    "Vanilla-First",
+                    "Don't Reinvent the Wheel",
+                    "allowed non-binary libraries",
+                    "shell-standards.md",
+                    "web-frontend-standards.md",
+                    "discrepancy RCA",
+                    "trailing plain-text open bullet questions",
+                ),
             ),
             "co-design-and-discovery.md": (
                 "model_decision",
-                ("allowed non-binary library", "don't reinvent the wheel", "Santa Lockdown"),
+                (
+                    "allowed non-binary library",
+                    "don't reinvent the wheel",
+                    "Santa Lockdown",
+                    "RCA / Discrepancy Triage -> Co-Design Transition",
+                    "lock-status --all",
+                    "queue-list",
+                    "ask_question",
+                ),
             ),
             "python-and-testing.md": ("glob", ("Santa Lockdown", "Don't Reinvent the Wheel", "py3-none-any", "yaml.safe_load")),
             "shell-standards.md": ("glob", ("set -euo pipefail", "BASH_SOURCE", "Santa Lockdown", "bats")),

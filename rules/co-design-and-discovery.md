@@ -18,6 +18,7 @@ Instead of jumping straight to code or dumping a monolithic finished proposal wi
 ## 1. Adaptive Activation Gate (When to Grill vs. Skip)
 
 - **Trigger by Default (Interactive Engineering Work)**: Activate Phase 0 Grill-Me automatically whenever the user introduces a new feature, UX/UI change, architectural refactor, workflow design, cross-repo change, or open-ended problem statement — and whenever resolving an existing `hitl_blocked` item in `dev_queue.json`.
+- **RCA / Discrepancy Triage -> Co-Design Transition**: Whenever an interactive diagnostic investigation or discrepancy RCA surfaces `>=2` product, UX, or scope forks (rather than a single obvious deterministic bug), immediately run silent `pr_remediator.py lock-status --all` + `pr_remediator.py queue-list` inspection and transition directly to Phase 0 Co-Design in the **same response** using structured `ask_question` trade-offs with `(Recommended)` defaults — NEVER close an RCA with trailing plain-text `"would you like me to..."` open bullet lists.
 - **Skip Cleanly When Unnecessary**:
   1. **Trivial or Unambiguous Fixes**: Typos, mechanical lint/format repairs, or deterministic bugs with a single obvious root cause and fix.
   2. **Explicit User Bypass**: When the user explicitly asks to skip discovery (e.g., *"do it directly"*, *"no questions"*, *"skip grill-me"*).
@@ -27,7 +28,7 @@ Instead of jumping straight to code or dumping a monolithic finished proposal wi
 
 ## 2. Silent Codebase-First Discovery (Zero Redundant Questions)
 
-- Before asking the first question, **silently inspect** the target repositories, impacted modules, existing tests, active per-repository `dev_pr_locks` (`pr_remediator.py lock-status --all`), and `dev_queue.json`.
+- Before asking the first question (including when transitioning out of a discrepancy RCA), **silently inspect** the target repositories, impacted modules, existing tests, active per-repository `dev_pr_locks` (`pr_remediator.py lock-status --all`), and queued work (`pr_remediator.py queue-list` / `dev_queue.json`).
 - **NEVER** ask the user facts the codebase, git history, or runtime config can already answer (file paths, schemas, existing endpoints, lock collisions, test frameworks).
 - Reserve every question strictly for genuine product, UX, scope, trade-off, or risk-appetite forks where human judgment defines the right design.
 
@@ -51,7 +52,7 @@ Act as a candid, high-bar engineering partner — not a passive order-taker:
 Adapt interview rhythm to problem complexity using `ask_question` (or crisp structured prompts):
 
 - **Open-Ended / Architectural / Multi-Repo Problems (Iterative Tree)**: Walk down the decision tree **branch by branch** (1–2 high-leverage questions per turn, resolving the most structural fork first and letting each answer shape the next branch) until zero material ambiguity remains.
-- **Well-Bounded Changes with 2–3 Clear Forks (Compact Round)**: Present **1 focused structured round** via `ask_question` covering the concrete forks with trade-offs and `(Recommended)` defaults. Open a short Round 2 only if an answer reveals a genuinely new fork.
+- **Well-Bounded Changes or RCA Forks (Compact Round)**: Present **1 focused structured round** via `ask_question` in the same response covering the concrete forks with trade-offs and `(Recommended)` defaults (never plain-text `"would you like me to..."` bullet lists). Open a short Round 2 only if an answer reveals a genuinely new fork.
 - **Avoid Interview Fatigue**: Stop grilling as soon as every material product/UX/architecture fork is resolved; never pad rounds with trivial implementation minutiae.
 
 ---
