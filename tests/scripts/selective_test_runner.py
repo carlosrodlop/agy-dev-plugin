@@ -20,6 +20,7 @@ ALL_TEST_MODULES = [
     "tests.test_dev_queue_doctor",
     "tests.test_dev_queue_sidecar_panel",
     "tests.test_dev_queue_tui",
+    "tests.test_orchestration_pause_resume",
     "tests.test_orchestration_wip_and_wake_fixes",
     "tests.test_parallel_file_leases_and_tui",
     "tests.test_parallel_subagent_orchestration",
@@ -67,6 +68,7 @@ BATS_TRIGGER_SUFFIXES = (
     "worktree_ops.py",
     "review_gate.py",
     "merge_watcher.py",
+    "orchestration_control.py",
     "project_audit.py",
     "dev_queue_tui.py",
 )
@@ -80,6 +82,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_dev_queue_doctor.py": "tests.test_dev_queue_doctor",
     "tests/test_dev_queue_sidecar_panel.py": "tests.test_dev_queue_sidecar_panel",
     "tests/test_dev_queue_tui.py": "tests.test_dev_queue_tui",
+    "tests/test_orchestration_pause_resume.py": "tests.test_orchestration_pause_resume",
     "tests/test_orchestration_wip_and_wake_fixes.py": "tests.test_orchestration_wip_and_wake_fixes",
     "tests/test_parallel_file_leases_and_tui.py": "tests.test_parallel_file_leases_and_tui",
     "tests/test_parallel_subagent_orchestration.py": "tests.test_parallel_subagent_orchestration",
@@ -176,6 +179,26 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         if is_docs_only_path(norm):
             has_docs = True
             continue
+
+        if (
+            norm.endswith(
+                (
+                    "orchestration_control.py",
+                    "test_orchestration_pause_resume.py",
+                    "pr_remediator.py",
+                    "queue_store.py",
+                    "worktree_ops.py",
+                    "merge_watcher.py",
+                    "dev_queue_doctor.py",
+                    "dev_queue_tui.py",
+                    "agy_dev_queue.sh",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith(("sidecars/dev-queue-panel/", "sidecars/dev-queue-watchdog/"))
+        ):
+            if "tests.test_orchestration_pause_resume" not in selected:
+                selected.append("tests.test_orchestration_pause_resume")
 
         if (
             norm.endswith(

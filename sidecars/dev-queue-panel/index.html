@@ -20,6 +20,14 @@
           </span>
         </div>
         <div class="dq-header-actions">
+          <button
+            id="dq-pause-btn"
+            type="button"
+            class="dq-pause-btn"
+            data-action="toggle-pause"
+            aria-pressed="false"
+            title="Pause new dispatches (Graceful Drain: ongoing active-lock tasks finish cleanly)"
+          >⏸ Pause Dev</button>
           <button id="dq-orch-btn" type="button" class="dq-chip-btn dq-hidden" title="Switch to active orchestrator conversation"></button>
           <button id="dq-board-btn" type="button" class="dq-chip-btn dq-hidden" data-action="open-board" title="Open dev_queue_board.md in File View">Board .md</button>
           <button id="dq-refresh-btn" type="button" class="dq-icon-btn" data-action="refresh" aria-label="Refresh queue snapshot" title="Refresh snapshot">↻</button>
@@ -62,6 +70,19 @@
       </div>
     </header>
 
+    <div id="dq-pause-banner" class="dq-pause-banner dq-hidden" role="status" aria-live="polite">
+      <div class="dq-pause-banner-copy">
+        <strong id="dq-pause-banner-title" class="dq-pause-banner-title"></strong>
+        <span id="dq-pause-banner-meta" class="dq-pause-banner-meta"></span>
+      </div>
+      <button
+        id="dq-banner-resume-btn"
+        type="button"
+        class="dq-btn dq-btn-resume"
+        data-action="resume-dev"
+        title="Continue orchestration and auto-wake orchestrator"
+      >▶ Continue Dev</button>
+    </div>
     <div id="dq-toast" class="dq-toast dq-hidden" role="status" aria-live="polite"></div>
     <div id="dq-error" class="dq-error dq-hidden" role="alert"></div>
 

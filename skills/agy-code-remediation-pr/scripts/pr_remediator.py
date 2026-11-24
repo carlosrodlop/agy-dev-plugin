@@ -270,6 +270,27 @@ from merge_watcher import (  # noqa: F401, E402
     verify_branches_merged_into_base,
     wait_for_unlock_or_actionable_event,
 )
+import orchestration_control as _orch_ctrl  # noqa: F401, E402
+from orchestration_control import (  # noqa: F401, E402
+    DEFAULT_PAUSED_POLL_INTERVAL_SECONDS,
+    NON_ONGOING_LOCK_STATUSES,
+    ORCHESTRATION_CONTROL_FILENAME,
+    ORCHESTRATION_CONTROL_SCHEMA_VERSION,
+    PAUSE_MODE_GRACEFUL_DRAIN,
+    count_ongoing_lock_slots,
+    default_orchestration_control,
+    dispatch_control_cli,
+    get_orchestration_control_path,
+    has_unhandled_resume_request,
+    is_orchestration_paused,
+    load_orchestration_control,
+    mark_resume_handled,
+    pause_orchestration,
+    register_control_cli,
+    resume_orchestration,
+    stop_chrome_devtools_mcp_processes,
+    summarize_orchestration_phase,
+)
 from review_gate import (  # noqa: F401, E402
     _PREVIEW_TOP_LEVEL_ASSETS,
     _PREVIEW_WEB_SUBDIRS,
@@ -309,6 +330,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     register_worktree_cli(sub)
     register_watcher_cli(sub)
     register_queue_cli(sub)
+    register_control_cli(sub)
     return parser.parse_args(argv)
 
 
@@ -349,6 +371,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         dispatch_review_cli(args),
         dispatch_watcher_cli(args, argv),
         dispatch_queue_cli(args),
+        dispatch_control_cli(args),
     ):
         if rc is not None:
             return int(rc)

@@ -395,9 +395,113 @@
     sectionFilter: "all",
     query: "",
     inFlight: false,
+    pauseBusy: false,
     toastTimer: null,
     consumedIntentIds: new Set(),
   };
+
+  function formatPauseMeta(orch) {
+    if (!orch || typeof orch !== "object") {
+      return "Graceful Drain · ongoing tasks finish cleanly";
+    }
+    const parts = [];
+    const pausedAt = String(orch.paused_at || "").trim();
+    if (pausedAt.length >= 19) {
+      parts.push(`Paused ${pausedAt.slice(11, 16)}Z`);
+    }
+    parts.push("Graceful Drain");
+    const reason = String(orch.reason || "").trim();
+    if (reason) {
+      parts.push(reason);
+    }
+    return parts.join(" · ");
+  }
+
+  function renderOrchestrationControl(orch) {
+    const ctrl = orch && typeof orch === "object" ? orch : {};
+    const paused = Boolean(ctrl.paused);
+    const phase = String(ctrl.phase || (paused ? "paused" : "active"));
+    const ongoingCount = Number(ctrl.ongoing_count || 0);
+
+    const pauseBtn = document.getElementById("dq-pause-btn");
+    if (pauseBtn) {
+      pauseBtn.disabled = Boolean(uiState.pauseBusy);
+      pauseBtn.classList.toggle("is-paused", paused);
+      pauseBtn.setAttribute("aria-pressed", paused ? "true" : "false");
+      if (paused) {
+        pauseBtn.textContent = uiState.pauseBusy ? "Resuming…" : "▶ Continue Dev";
+        pauseBtn.title = "Continue orchestration and auto-wake orchestrator";
+      } else {
+        pauseBtn.textContent = uiState.pauseBusy ? "Pausing…" : "⏸ Pause Dev";
+        pauseBtn.title = "Pause new dispatches (Graceful Drain: ongoing active-lock tasks finish cleanly)";
+      }
+    }
+
+    const bannerEl = document.getElementById("dq-pause-banner");
+    const titleEl = document.getElementById("dq-pause-banner-title");
+    const metaEl = document.getElementById("dq-pause-banner-meta");
+    const bannerBtn = document.getElementById("dq-banner-resume-btn");
+    if (bannerEl) {
+      bannerEl.classList.toggle("dq-hidden", !paused);
+    }
+    if (titleEl && paused) {
+      titleEl.textContent = `⏸ ${ctrl.banner_text || "PAUSED — 0 new dispatches · Watchdog silent"}`;
+    }
+    if (metaEl && paused) {
+      metaEl.textContent = formatPauseMeta(ctrl);
+    }
+    if (bannerBtn) {
+      bannerBtn.disabled = Boolean(uiState.pauseBusy);
+      bannerBtn.textContent = uiState.pauseBusy ? "Resuming…" : "▶ Continue Dev";
+    }
+
+    const pillEl = document.getElementById("dq-live-pill");
+    const liveTxt = document.getElementById("dq-live-text");
+    if (pillEl && !pillEl.classList.contains("is-error")) {
+      pillEl.classList.toggle("is-paused", paused);
+      if (liveTxt) {
+        if (!paused) {
+          liveTxt.textContent = "Live";
+        } else if (phase === "draining" && ongoingCount > 0) {
+          liveTxt.textContent = `Draining (${ongoingCount})`;
+        } else {
+          liveTxt.textContent = "Paused";
+        }
+      }
+    }
+  }
+
+  async function setOrchestrationPaused(targetPaused) {
+    if (uiState.pauseBusy) {
+      return;
+    }
+    uiState.pauseBusy = true;
+    renderOrchestrationControl(uiState.snapshot && uiState.snapshot.orchestration);
+    try {
+      const endpoint = targetPaused ? "/api/orchestration/pause" : "/api/orchestration/resume";
+      const res = await apiFetch(endpoint, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      if (uiState.snapshot && res.orchestration) {
+        uiState.snapshot.orchestration = res.orchestration;
+      }
+      renderOrchestrationControl(res.orchestration);
+      if (targetPaused) {
+        const banner = (res.orchestration && res.orchestration.banner_text) || "PAUSED — 0 new dispatches";
+        showToast(`⏸ ${banner}`);
+      } else {
+        showToast("▶ Orchestration resumed — waking orchestrator…");
+      }
+      uiState.etag = "";
+      await pollState(true);
+    } catch (err) {
+      showToast(`Unable to ${targetPaused ? "pause" : "resume"} orchestration: ${err.message || "error"}`);
+    } finally {
+      uiState.pauseBusy = false;
+      renderOrchestrationControl(uiState.snapshot && uiState.snapshot.orchestration);
+    }
+  }
 
   function rememberConsumedIntent(intentId) {
     uiState.consumedIntentIds.add(intentId);
@@ -444,7 +548,10 @@
       if (pillEl) {
         pillEl.classList.remove("is-error");
       }
-      if (liveTxt) {
+      const orch = uiState.snapshot && uiState.snapshot.orchestration;
+      if (orch && orch.paused) {
+        renderOrchestrationControl(orch);
+      } else if (liveTxt) {
         liveTxt.textContent = "Live";
       }
     }
@@ -562,6 +669,8 @@
     if (!snap) {
       return;
     }
+
+    renderOrchestrationControl(snap.orchestration);
 
     const sections = snap.sections || {};
     const rawHitl = Array.isArray(sections.hitl_blocked) ? sections.hitl_blocked : [];
@@ -746,6 +855,13 @@
       const action = actionBtn.dataset.action;
       if (action === "refresh") {
         pollState(true);
+      } else if (action === "toggle-pause") {
+        const curPaused = Boolean(
+          uiState.snapshot && uiState.snapshot.orchestration && uiState.snapshot.orchestration.paused,
+        );
+        setOrchestrationPaused(!curPaused);
+      } else if (action === "resume-dev") {
+        setOrchestrationPaused(false);
       } else if (action === "open-conv") {
         triggerConversationToggle(actionBtn.dataset.convId, actionBtn.dataset.label);
       } else if (action === "open-board") {
@@ -802,6 +918,8 @@
       isNavIntentFresh,
       matchesCardFilter,
       matchesRepoFilter,
+      formatPauseMeta,
+      setOrchestrationPaused,
       pollState,
     };
   }

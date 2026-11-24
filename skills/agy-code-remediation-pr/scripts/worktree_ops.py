@@ -38,6 +38,7 @@ if _SCRIPT_DIR_STR not in sys.path:
 import dev_common  # noqa: E402
 from dev_flow_optimizer import normalize_pre_commit_status  # noqa: E402
 from git_client import GitVcsIntegrationClient, stamp_repo_version_manifests  # noqa: E402
+import orchestration_control as _orch_ctrl  # noqa: E402
 from lock_store import (  # noqa: E402
     PR_DEVELOPER_SUBAGENT_NAME,
     PR_REVIEWER_SUBAGENT_NAME,
@@ -441,6 +442,28 @@ def start_remediation_branch_and_lock(
         if slot2_overlap_dict:
             locked_out["overlap_analysis"] = slot2_overlap_dict
         return locked_out
+
+    # Graceful Drain Pause Guard: allow already-active locks owned by the same conversation to finish
+    # (e.g. review iteration with --reuse-active), while blocking all NEW lock / Slot #2 acquisitions.
+    is_reusing_existing_active = bool(
+        existing_lock.get("active")
+        and ((same_conv and not allocating_slot2) or (allocating_slot2 and same_conv_slot2))
+    )
+    orch_ctrl = _orch_ctrl.load_orchestration_control(portfolio_dir=portfolio_dir)
+    if bool(orch_ctrl.get("paused")) and not is_reusing_existing_active:
+        return {
+            "status": "paused",
+            "acquired": False,
+            "paused": True,
+            "repo_slug": repo_slug,
+            "orchestration_control": orch_ctrl,
+            "error": "orchestration_paused",
+            "message": (
+                f"Orchestration is paused (Graceful Drain): cannot acquire a new lock on `{repo_slug}` for "
+                f"`{cid_clean}`. Ongoing active-lock tasks may finish, but zero new tasks will be dispatched "
+                "until orchestration is resumed."
+            ),
+        }
 
     evidence = ""
     lock_for_reuse = slot2_existing if (allocating_slot2 and same_conv_slot2) else existing_lock
