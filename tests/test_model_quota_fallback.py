@@ -547,7 +547,16 @@ class TestDoctorBlindSpotsWatcherAndRotation(unittest.TestCase):
         ref_doc = REPO_ROOT / "skills" / "agy-dev-queue-orchestrator" / "references" / "model-quota-fallback.md"
         self.assertTrue(ref_doc.is_file())
         ref_text = ref_doc.read_text(encoding="utf-8")
-        for token in ("PR_DEV_DEFAULT_MODEL", "AGY_DEV_LOW_QUOTA_THRESHOLD_PCT", "AGY_DEV_MAX_ORCHESTRATOR_STEPS", "skipped_all_models_exhausted"):
+        for token in (
+            "PR_DEV_DEFAULT_MODEL",
+            "AGY_DEV_LOW_QUOTA_THRESHOLD_PCT",
+            "AGY_DEV_MAX_ORCHESTRATOR_STEPS",
+            "AGY_DEV_MODEL_ROUTING_STRATEGY",
+            "AGY_DEV_ORCHESTRATOR_MODEL",
+            "classify_change_risk_tier",
+            "skip_planner_subagent",
+            "skipped_all_models_exhausted",
+        ):
             self.assertIn(token, ref_text)
 
         for rel in (
@@ -560,6 +569,356 @@ class TestDoctorBlindSpotsWatcherAndRotation(unittest.TestCase):
         ):
             p = REPO_ROOT / rel
             self.assertLess(p.stat().st_size, 24000, msg=f"{rel} exceeds 24,000-byte Antigravity limit")
+
+
+class TestTokenOptimalCrossFamilyAndFastPaths(unittest.TestCase):
+    """Verify Highest-Quota Cross-Family Balancing, 3-tier risk classifier, Flash orchestrator, compact CLI & planner fast-path."""
+
+    def test_model_family_and_3_tier_risk_classifier(self) -> None:
+        self.assertEqual(mq.get_model_family("opus-5.5-high"), "claude_opus")
+        self.assertEqual(mq.get_model_broad_family("opus-5.5-high"), "claude")
+        self.assertEqual(mq.get_model_family("fable-5.2-medium"), "claude_fable")
+        self.assertEqual(mq.get_model_broad_family("fable-5.2-medium"), "claude")
+        self.assertEqual(mq.get_model_family("gemini-4-carbon-high"), "gemini_4")
+        self.assertEqual(mq.get_model_broad_family("gemini-4-carbon-high"), "gemini")
+        self.assertEqual(mq.get_model_family("hydrogen-l-tf-medium"), "gemini_hydrogen")
+        self.assertEqual(mq.get_model_family("auto"), "gemini_pro_next")
+        self.assertEqual(mq.get_model_family("gemini-flash-next"), "gemini_flash")
+        self.assertEqual(mq.get_model_family("gemini-3.5-flash-lite"), "gemini_flash_lite")
+
+        micro = mq.classify_change_risk_tier(["README.md", "web/styles.css"], lines_changed=24)
+        self.assertEqual(micro["risk_tier"], "micro")
+        self.assertEqual(micro["dev_effort"], "flash_lite")
+        self.assertEqual(micro["review_effort"], "low")
+
+        standard = mq.classify_change_risk_tier(["clients/helper.py", "tests/test_helper.py"], lines_changed=95)
+        self.assertEqual(standard["risk_tier"], "standard")
+        self.assertEqual(standard["dev_effort"], "flash")
+        self.assertEqual(standard["review_effort"], "medium")
+
+        crit_path = mq.classify_change_risk_tier(["hooks.json"], lines_changed=10)
+        self.assertEqual(crit_path["risk_tier"], "critical")
+        self.assertIn("hooks.json", crit_path["critical_files"])
+
+        crit_loc = mq.classify_change_risk_tier(["clients/helper.py"], lines_changed=450)
+        self.assertEqual(crit_loc["risk_tier"], "critical")
+
+        crit_files = mq.classify_change_risk_tier([f"clients/m{i}.py" for i in range(9)], lines_changed=90)
+        self.assertEqual(crit_files["risk_tier"], "critical")
+
+        crit_kw = mq.classify_change_risk_tier(["clients/helper.py"], title="OAuth token migration")
+        self.assertEqual(crit_kw["risk_tier"], "critical")
+
+    def test_highest_quota_cross_family_balancing_and_sequential_override(self) -> None:
+        live_pools = {
+            "quotas": {
+                "gemini-4-carbon-low": {"quota_remaining": "43%"},
+                "gemini-4-carbon-medium": {"quota_remaining": "43%"},
+                "gemini-4-carbon-high": {"quota_remaining": "43%"},
+                "hydrogen-l-tf-medium": {"quota_remaining": "90%"},
+                "hydrogen-l-tf-high": {"quota_remaining": "90%"},
+                "auto": {"quota_remaining": "93%"},
+                "fable-5.2-low": {"quota_remaining": "98%"},
+                "fable-5.2-medium": {"quota_remaining": "98%"},
+                "fable-5.2-high": {"quota_remaining": "98%"},
+                "opus-5.5-low": {"quota_remaining": "98%"},
+                "opus-5.5-medium": {"quota_remaining": "98%"},
+                "opus-5.5-high": {"quota_remaining": "98%"},
+                "gemini-flash-next": {"quota_remaining": "100%"},
+                "gemini-3.5-flash-lite": {"quota_remaining": "96%"},
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            st_dir = Path(tmp) / "state"
+            now_ts = 1_800_500_000.0
+
+            # Tier 1 micro: flash_lite dev + low-effort Cross-Family Claude review
+            dev_micro = mq.select_next_optimal_model(
+                role="developer",
+                risk_tier="micro",
+                live_quotas=live_pools,
+                state_dir=st_dir,
+                now_ts=now_ts,
+                env={},
+            )
+            self.assertEqual(dev_micro["selected_model"], "flash_lite")
+            self.assertEqual(dev_micro["subagent_model"], "flash_lite")
+
+            rev_micro = mq.select_next_optimal_model(
+                role="reviewer",
+                risk_tier="micro",
+                dev_model="flash_lite",
+                live_quotas=live_pools,
+                state_dir=st_dir,
+                now_ts=now_ts,
+                env={},
+            )
+            self.assertEqual(rev_micro["selected_model"], "fable-5.2-low")
+            self.assertEqual(rev_micro["broad_family"], "claude")
+            self.assertTrue(rev_micro["cross_family_matched"])
+            self.assertEqual(rev_micro["subagent_model"], "flash")
+
+            # Tier 2 standard: Gemini Flash dev -> medium-effort Cross-Family Claude review (fallback subagent tier stays 'pro')
+            rev_std = mq.select_next_optimal_model(
+                role="reviewer",
+                risk_tier="standard",
+                dev_model="gemini-flash-next",
+                live_quotas=live_pools,
+                state_dir=st_dir,
+                now_ts=now_ts,
+                env={},
+            )
+            self.assertEqual(rev_std["selected_model"], "fable-5.2-medium")
+            self.assertEqual(rev_std["mode"], "balanced_cross_family")
+            self.assertTrue(rev_std["cross_family_matched"])
+            self.assertEqual(rev_std["subagent_model"], "pro")
+
+            # Tier 3 critical: Dev picks highest-quota high pool (opus-5.5-high 98%), Review picks Cross-Family Gemini (auto 93%)
+            dev_crit = mq.select_next_optimal_model(
+                role="developer",
+                risk_tier="critical",
+                live_quotas=live_pools,
+                state_dir=st_dir,
+                now_ts=now_ts,
+                env={},
+            )
+            self.assertEqual(dev_crit["selected_model"], "opus-5.5-high")
+            self.assertEqual(dev_crit["subagent_model"], "pro")
+
+            rev_crit = mq.select_next_optimal_model(
+                role="reviewer",
+                risk_tier="critical",
+                dev_model="opus-5.5-high",
+                live_quotas=live_pools,
+                state_dir=st_dir,
+                now_ts=now_ts,
+                env={},
+            )
+            self.assertEqual(rev_crit["selected_model"], "auto")
+            self.assertEqual(rev_crit["broad_family"], "gemini")
+            self.assertTrue(rev_crit["cross_family_matched"])
+
+            # Sequential strategy override restores static preferred order (pro @ 43% > 25%)
+            rev_seq = mq.select_next_optimal_model(
+                role="reviewer",
+                live_quotas=live_pools,
+                state_dir=st_dir,
+                now_ts=now_ts,
+                env={"AGY_DEV_MODEL_ROUTING_STRATEGY": "sequential"},
+            )
+            self.assertEqual(rev_seq["selected_model"], "pro")
+            self.assertEqual(rev_seq["routing_strategy"], "sequential")
+            self.assertEqual(rev_seq["mode"], "normal")
+
+    def test_orchestrator_defaults_to_flash_and_honors_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            st_dir = Path(tmp) / "state"
+            orch_default = mq.select_next_optimal_model(role="orchestrator", state_dir=st_dir, env={})
+            self.assertEqual(orch_default["selected_model"], "gemini-flash-next")
+            self.assertEqual(orch_default["subagent_model"], "flash")
+
+            wake_override = mq.select_next_optimal_model(
+                role="wake",
+                state_dir=st_dir,
+                env={"AGY_DEV_MODEL_FALLBACK_ORDER": "auto,hydrogen-l-tf-high"},
+            )
+            self.assertEqual(wake_override["selected_model"], "auto")
+
+            orch_explicit = mq.select_next_optimal_model(
+                role="orchestrator",
+                state_dir=st_dir,
+                env={"AGY_DEV_ORCHESTRATOR_MODEL": "fable-5.2-medium"},
+            )
+            self.assertEqual(orch_explicit["selected_model"], "fable-5.2-medium")
+
+    def test_dynamic_created_by_label_and_compact_vs_verbose_cli(self) -> None:
+        import subprocess
+        from git_client import GitVcsIntegrationClient
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pdir = root / "state"
+            bare = root / "origin.git"
+            repo = root / "acme-repo"
+            subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+            subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "dev@example.com"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Acme Dev"], check=True)
+            subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(bare)], check=True)
+            (repo / "README.md").write_text("# Acme\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(repo), "push", "-u", "origin", "main"], check=True, capture_output=True)
+
+            cid = "55555555-1111-4222-8333-444444444444"
+            # 1. plan-developer compact default vs --verbose
+            buf_c = io.StringIO()
+            buf_v = io.StringIO()
+            with mock.patch.dict(os.environ, {"AGY_DEV_STATE_DIR": str(pdir)}):
+                with contextlib.redirect_stdout(buf_c):
+                    rc_c = prs.main(["plan-developer", "--id", cid, "--target-files", "README.md"])
+                with contextlib.redirect_stdout(buf_v):
+                    rc_v = prs.main(["plan-developer", "--id", cid, "--target-files", "README.md", "--verbose"])
+            self.assertEqual(rc_c, 0)
+            self.assertEqual(rc_v, 0)
+            out_c = json.loads(buf_c.getvalue())
+            out_v = json.loads(buf_v.getvalue())
+            self.assertTrue(out_c.get("compact"))
+            self.assertNotIn("subagent_definition", out_c)
+            self.assertIn("subagent_definition", out_v)
+            self.assertEqual(out_c["risk_classification"]["risk_tier"], "micro")
+            self.assertEqual(out_c["subagent_invocation"]["Model"], "flash_lite")
+            self.assertLess(len(buf_c.getvalue()), len(buf_v.getvalue()))
+
+            # 2. start-remediation compact default persists --dev-model & omits proposal_markdown
+            buf_start = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"AGY_DEV_STATE_DIR": str(pdir)}),
+                contextlib.redirect_stdout(buf_start),
+            ):
+                rc_s = prs.main(
+                    [
+                        "start-remediation",
+                        "--id",
+                        cid,
+                        "--action-id",
+                        "micro-doc",
+                        "--workdir",
+                        str(repo),
+                        "--dev-model",
+                        "gemini-3.5-flash-lite",
+                        "--target-files",
+                        "README.md",
+                        "--rca-summary",
+                        "Update docs",
+                        "--proposed-fix",
+                        "Clarify quickstart",
+                        "--worktree",
+                    ]
+                )
+            self.assertEqual(rc_s, 0)
+            start_out = json.loads(buf_start.getvalue())
+            self.assertTrue(start_out.get("compact"))
+            self.assertNotIn("proposal_markdown", start_out)
+            self.assertEqual(start_out["lock"]["dev_model"], "gemini-3.5-flash-lite")
+
+            wt_path = Path(start_out["worktree_path"])
+            (wt_path / "README.md").write_text("# Acme\n\nUpdated quickstart.\n", encoding="utf-8")
+
+            # 3. prepare-review compact default returns micro risk & cross-family Claude reviewer, strips SystemPrompt
+            buf_prep = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"AGY_DEV_STATE_DIR": str(pdir)}),
+                contextlib.redirect_stdout(buf_prep),
+            ):
+                rc_p = prs.main(
+                    [
+                        "prepare-review",
+                        "--workdir",
+                        str(wt_path),
+                        "--title",
+                        "docs(readme): clarify quickstart",
+                        "--executive-summary",
+                        "Clarify quickstart instructions in README.md.",
+                    ]
+                )
+            self.assertEqual(rc_p, 0)
+            prep_out = json.loads(buf_prep.getvalue())
+            self.assertTrue(prep_out.get("compact"))
+            self.assertNotIn("reviewer_subagent_definition", prep_out)
+            self.assertEqual(prep_out["risk_classification"]["risk_tier"], "micro")
+            self.assertEqual(prep_out["reviewer_model_routing"]["selected_model"], "fable-5.2-low")
+            self.assertTrue(prep_out["reviewer_model_routing"]["cross_family_matched"])
+
+            # 4. record-review stamps dynamic created_by using actual persisted dev_model & reviewer_model
+            vcs = GitVcsIntegrationClient()
+            rev = prs.record_pr_review_evaluation(
+                branch_name=start_out["branch_name"],
+                verdict="PASS",
+                score=96,
+                summary="Clean micro doc update.",
+                reviewer_model="fable-5.2-low",
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs,
+            )
+            self.assertEqual(rev["status"], "ok")
+            self.assertTrue(rev["ready_for_human_pr"])
+            self.assertEqual(
+                rev["created_by"],
+                "agy-code-developer (gemini-3.5-flash-lite) · agy-code-pr-reviewer (fable-5.2-low)",
+            )
+            self.assertEqual(rev["review_history"][-1]["dev_model"], "gemini-3.5-flash-lite")
+
+            # Also verify Round 2+ dev_model escalation attribution when no explicit dev_model is stored on lock
+            rev_r2 = prs.record_pr_review_evaluation(
+                branch_name="fix/20261124-120000-r2-99999999",
+                verdict="NEEDS_REVISION",
+                score=82,
+                summary="Needs extra test",
+                reviewer_model="opus-5.5-medium",
+                dev_model="pro",
+                portfolio_dir=pdir,
+                git_client=vcs,
+            )
+            self.assertEqual(
+                rev_r2["created_by"],
+                "agy-code-developer (pro) · agy-code-pr-reviewer (opus-5.5-medium)",
+            )
+
+            # 5. quota-status CLI with --files & --dev-model classifies critical risk & enforces cross-family
+            buf_q = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"AGY_DEV_STATE_DIR": str(pdir)}),
+                contextlib.redirect_stdout(buf_q),
+            ):
+                rc_q = prs.main(
+                    [
+                        "quota-status",
+                        "--role",
+                        "reviewer",
+                        "--files",
+                        "hooks.json",
+                        "--dev-model",
+                        "gemini-flash-next",
+                    ]
+                )
+            self.assertEqual(rc_q, 0)
+            q_out = json.loads(buf_q.getvalue())
+            self.assertEqual(q_out["risk_classification"]["risk_tier"], "critical")
+            self.assertTrue(q_out["routing"]["cross_family_matched"])
+            self.assertEqual(q_out["routing"]["broad_family"], "claude")
+
+    def test_queue_next_skip_planner_subagent_fast_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = Path(tmp) / "state"
+            cid_anchored = "66666666-1111-4222-8333-444444444441"
+            cid_unanchored = "66666666-1111-4222-8333-444444444442"
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_anchored,
+                title="Polish README badge",
+                priority=10,
+                repo_slugs=["acme/repo-a"],
+                target_files=["README.md"],
+                proposed_fix="Update badge URL in README.md",
+                portfolio_dir=pdir,
+            )
+            prs.enqueue_dev_queue_item(
+                conversation_id=cid_unanchored,
+                title="Investigate auth latency",
+                priority=20,
+                repo_slugs=["acme/repo-b"],
+                portfolio_dir=pdir,
+            )
+
+            nxt = prs.get_next_dev_queue_item(skip_locked_repos=True, portfolio_dir=pdir)
+            self.assertEqual(nxt["status"], "ok")
+            item_a = nxt["runnable_by_repo"]["acme/repo-a"]
+            item_b = nxt["runnable_by_repo"]["acme/repo-b"]
+            self.assertTrue(item_a["skip_planner_subagent"])
+            self.assertEqual(item_a["risk_classification"]["risk_tier"], "micro")
+            self.assertFalse(item_b["skip_planner_subagent"])
+            self.assertEqual(item_b["risk_classification"]["risk_tier"], "critical")
 
 
 if __name__ == "__main__":

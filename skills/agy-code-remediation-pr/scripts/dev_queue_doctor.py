@@ -1886,7 +1886,7 @@ def trigger_orchestrator_wake(
         selected_model
         and (
             str(wake_model or "").strip()
-            or routing_mode in ("unlimited", "quota_fallback", "eco_low_quota")
+            or routing_mode in ("unlimited", "quota_fallback", "eco_low_quota", "balanced_cross_family")
             or bool(detected_cooldowns)
         )
     )

@@ -1469,6 +1469,19 @@ def get_next_dev_queue_item(
     def _has_partial_wip(item: Mapping[str, Any]) -> bool:
         return any(str(r).strip() for r in (item.get("merged_repos") or []))
 
+    def _annotate_dispatch_hints(item: dict[str, Any]) -> dict[str, Any]:
+        """Attach 0-LLM `skip_planner_subagent` fast-path & 3-tier `risk_classification` hints."""
+        tfiles = [str(f).strip() for f in (item.get("target_files") or []) if str(f).strip()]
+        sanchors = [str(a).strip() for a in (item.get("section_anchors") or []) if str(a).strip()]
+        pfix = str(item.get("proposed_fix") or "").strip()
+        item["skip_planner_subagent"] = bool(tfiles and (pfix or sanchors))
+        item["risk_classification"] = dev_common.classify_change_risk_tier(
+            tfiles,
+            title=str(item.get("title") or ""),
+            proposed_fix=pfix,
+        )
+        return item
+
     def _dispatch_order_key(item: Mapping[str, Any]) -> tuple[int, int, int, int, int, str, str]:
         """Order queue-next candidates: preserve P<=17 infra precedence, then boost partial-WIP closure over 0% items."""
         st_rank = DEV_QUEUE_STATUS_RANK.get(str(item.get("status") or "pending").lower(), 9)
@@ -1526,6 +1539,7 @@ def get_next_dev_queue_item(
             )
             if s2_ok:
                 s2_annotated["wip_finish_boost"] = bool(prioritize_partial_wip and _has_partial_wip(it))
+                _annotate_dispatch_hints(s2_annotated)
                 slot2_candidates.append(s2_annotated)
                 slot2_by_repo[first_repo] = s2_annotated
                 if first_repo not in runnable_by_repo:
@@ -1583,6 +1597,7 @@ def get_next_dev_queue_item(
 
             annotated = dict(it)
             annotated["wip_finish_boost"] = bool(prioritize_partial_wip and _has_partial_wip(it))
+            _annotate_dispatch_hints(annotated)
             if remaining_repos:
                 annotated["target_slot"] = 1
                 annotated["dispatch_repos"] = list(dispatch_repos)

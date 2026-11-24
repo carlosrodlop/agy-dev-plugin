@@ -30,9 +30,10 @@ You take well-scoped tasks from `agy-dev-planner` / `dev_queue.json` (or direct 
      python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py analyze-overlap --repo <OWNER/REPO> --workdir <TARGET_REPO_DIR>
      python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation \
        --id <TASK_CID> --action-id <SCOPE> --workdir <TARGET_REPO_DIR> --worker-cid <CONVERSATION_ID> \
-       --target-files <FILE1> [<FILE2> ...] [--section-anchors <ANCHOR1> ...] [--allow-slot2] \
+       --dev-model <ACTUAL_DEV_MODEL> --target-files <FILE1> [<FILE2> ...] [--section-anchors <ANCHOR1> ...] [--allow-slot2] \
        --rca-summary "..." --proposed-fix "..." --worktree
      ```
+   - `start-remediation` and `prepare-review` emit compact token-saving JSON by default (pass `--verbose` only when full proposal markdown or system prompts are needed). Passing `--dev-model` persists the actual developer model on `dev_pr_lock` for Cross-Family reviewer balancing and accurate `created_by` attribution.
    - Pass `--allow-slot2` ONLY when dispatched for a verified `NONE` or `TRANSITIVE` Slot #2 task. For `TRANSITIVE` stacked work, maintain clean **Stacked Branches** (`git rebase --onto origin/main <old_base_sha> <branch>`); for `INTERFACE_SHARED` contracts, coordinate live inside one shared worktree via Antigravity-native swarm (`workspace='share'`); for `DEEP_SHARED` collisions, leave execution serialized (allowing pipelined read-only planning only).
    - If `status == "locked"` on that `repo_slug`, STOP work on that repo immediately and report the active lock collision cleanly.
 

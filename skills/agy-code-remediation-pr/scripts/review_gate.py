@@ -109,23 +109,49 @@ def build_code_developer_subagent_plan(
     workdir: str = "",
     repo_slug: str = "",
     review_iteration: int = 1,
+    risk_tier: str = "",
+    lines_changed: int | None = None,
     portfolio_dir: Path | str | None = None,
     live_quotas: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the `subagent_definition` and `subagent_invocation` for `agy-code-developer`.
+    """Build the `subagent_definition`, `subagent_invocation`, `risk_classification`, and `model_routing` for `agy-code-developer`.
 
-    Defaults to `flash` (`PR_DEV_DEFAULT_MODEL`) on Round 1 for token savings and automatically
-    escalates to `pro` (`PR_SUBAGENT_MODEL`) on Round 2+ remediation (`review_iteration >= 2`)
-    or when explicitly requested, while applying unlimited-first, preventive low-quota Eco
-    (`<= 25%`), and 429 cooldown fallback via `dev_common.select_next_optimal_model()`.
+    Uses 0-LLM 3-tier change risk classification (`micro` -> `flash_lite`, `standard` -> `flash`,
+    `critical` -> highest-quota high-reasoning pool) and automatically escalates Round 2+ remediation
+    (`review_iteration >= 2`) to `pro`/high-reasoning while applying Highest-Quota Cross-Family
+    Balancing, preventive low-quota Eco (`<= 25%`), and 429 cooldown fallback.
     """
     cid_clean = str(conversation_id or "").strip()
     files_list = [str(f).strip() for f in (target_files or []) if str(f).strip()]
     sib_list = [str(s).strip() for s in (sibling_ids or []) if str(s).strip()]
     eff_round = max(1, int(review_iteration or 1))
     explicit_model = str(model or "").strip()
+    explicit_tier = str(risk_tier or "").strip().lower()
+    risk_cls = dev_common.classify_change_risk_tier(
+        files_list,
+        lines_changed=lines_changed,
+        title=action_id,
+        proposed_fix=proposed_fix,
+    )
+    if explicit_tier in ("micro", "standard", "critical"):
+        eff_risk_tier = explicit_tier
+        risk_cls = {**risk_cls, "risk_tier": explicit_tier}
+    elif files_list:
+        eff_risk_tier = str(risk_cls.get("risk_tier") or "")
+    else:
+        eff_risk_tier = ""
+
     escalated_from_flash = bool(not explicit_model and eff_round >= 2)
-    target_model = explicit_model or (PR_SUBAGENT_MODEL if eff_round >= 2 else PR_DEV_DEFAULT_MODEL)
+    if explicit_model:
+        target_model = explicit_model
+    elif eff_round >= 2:
+        target_model = PR_SUBAGENT_MODEL
+    elif eff_risk_tier == "micro":
+        target_model = "flash_lite"
+    elif eff_risk_tier == "critical":
+        target_model = ""
+    else:
+        target_model = PR_DEV_DEFAULT_MODEL
 
     routing = dev_common.select_next_optimal_model(
         role="developer",
@@ -133,17 +159,25 @@ def build_code_developer_subagent_plan(
         live_quotas=live_quotas,
         state_dir=portfolio_dir,
         review_iteration=eff_round,
+        risk_tier=eff_risk_tier,
     )
     routing["escalated_from_flash"] = escalated_from_flash
     routing["review_iteration"] = eff_round
 
+    default_tier_fallback = (
+        "flash_lite"
+        if eff_risk_tier == "micro"
+        else (PR_SUBAGENT_MODEL if (eff_round >= 2 or eff_risk_tier == "critical") else PR_DEV_DEFAULT_MODEL)
+    )
     if routing.get("all_exhausted"):
-        resolved_model = dev_common.map_model_to_subagent_tier(target_model, default=PR_DEV_DEFAULT_MODEL)
+        resolved_model = dev_common.map_model_to_subagent_tier(target_model, default=default_tier_fallback)
     elif routing.get("mode") == "normal" and target_model.lower() in ("pro", "flash", "flash_lite", "inherit"):
         resolved_model = target_model.lower()
     else:
-        resolved_model = str(routing.get("subagent_model") or PR_DEV_DEFAULT_MODEL)
+        resolved_model = str(routing.get("subagent_model") or default_tier_fallback)
 
+    selected_dev_model = str(routing.get("selected_model") or resolved_model or PR_DEV_DEFAULT_MODEL)
+    dev_model_arg = f' --dev-model "{selected_dev_model}"' if selected_dev_model else ""
     sched_flag = " --scheduled" if scheduled else ""
     files_arg = (" --target-files " + " ".join(f'"{f}"' for f in files_list)) if files_list else ""
     sib_arg = (" --sibling-ids " + " ".join(sib_list)) if sib_list else ""
@@ -153,7 +187,7 @@ def build_code_developer_subagent_plan(
     routing_note = ""
     if routing.get("requires_swarm_dispatch") and routing.get("selected_model"):
         routing_note = (
-            f"- **Model Routing ({routing.get('mode')})**: Target `{target_model}` routed to "
+            f"- **Model Routing ({routing.get('mode')}, tier={eff_risk_tier or 'standard'})**: Target `{target_model or eff_risk_tier}` routed to "
             f"`{routing['selected_model']}` (invoke via `swarm(action=\"add\", ..., model=\"{routing['selected_model']}\")` "
             f"or fallback tier `Model=\"{resolved_model}\"`).\n"
         )
@@ -189,7 +223,7 @@ def build_code_developer_subagent_plan(
         + (f"- **Pre-Anchored Context & Contracts**:\n{anchored_clean}\n" if anchored_clean else "")
         + "\nExecute the Local-First Native Git branch workflow now:\n"
         f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py start-remediation "
-        f"--id {cid_clean} --action-id \"{action_id or 'code-change'}\"{workdir_arg} "
+        f"--id {cid_clean} --action-id \"{action_id or 'code-change'}\"{workdir_arg}{dev_model_arg} "
         f"--rca-summary \"<RCA_SUMMARY>\" --proposed-fix \"<PROPOSED_FIX>\"{files_arg}{sib_arg} --worktree`.\n"
         f"   - If `status == \"locked\"`, abort immediately and return the lock status.\n"
         f"2. Implement modular fixes and hermetic unit tests on the worktree branch, iterate with targeted `python3 -m unittest <target>`, then run single-pass `pr_remediator.py test-local --workdir <WORKTREE_PATH> --with-pre-commit` until `passed == true`.\n"
@@ -198,6 +232,7 @@ def build_code_developer_subagent_plan(
     )
 
     return {
+        "risk_classification": risk_cls,
         "model_routing": routing,
         "subagent_definition": {
             "Name": PR_DEVELOPER_SUBAGENT_NAME,
@@ -233,40 +268,64 @@ def build_pr_reviewer_subagent_plan(
     workdir: str = "",
     repo_slug: str = "",
     model: str = "",
+    risk_tier: str = "",
+    files_changed: list[Any] | None = None,
+    lines_changed: int | None = None,
+    dev_model: str = "",
     portfolio_dir: Path | str | None = None,
     live_quotas: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the `subagent_definition`, `subagent_invocation`, and `model_routing` for `agy-code-pr-reviewer`."""
+    """Build the `subagent_definition`, `subagent_invocation`, `risk_classification`, and `model_routing` for `agy-code-pr-reviewer`."""
     _ = pr_number, issue_number, scheduled, pr_url, issue_url
     resolved_ts = branch_timestamp or ""
     wd_flag = f' --workdir "{workdir.strip()}"' if str(workdir or "").strip() else ""
     repo_line = f"- **Target Repository**: `{repo_slug.strip()}`\n" if str(repo_slug or "").strip() else ""
 
-    preferred = str(model or "").strip() or PR_SUBAGENT_MODEL
+    explicit_model = str(model or "").strip()
+    explicit_tier = str(risk_tier or "").strip().lower()
+    risk_cls = dev_common.classify_change_risk_tier(
+        files_changed,
+        lines_changed=lines_changed,
+        title=branch_name,
+        proposed_fix=proposed_fix,
+    )
+    if explicit_tier in ("micro", "standard", "critical"):
+        eff_risk_tier = explicit_tier
+        risk_cls = {**risk_cls, "risk_tier": explicit_tier}
+    elif files_changed:
+        eff_risk_tier = str(risk_cls.get("risk_tier") or "")
+    else:
+        eff_risk_tier = ""
+
+    preferred = explicit_model if explicit_model else ("" if eff_risk_tier else PR_SUBAGENT_MODEL)
     routing = dev_common.select_next_optimal_model(
         role="reviewer",
         preferred_model=preferred,
         live_quotas=live_quotas,
         state_dir=portfolio_dir,
+        risk_tier=eff_risk_tier,
+        dev_model=str(dev_model or "").strip(),
     )
+    fallback_tier = "flash" if eff_risk_tier == "micro" else PR_SUBAGENT_MODEL
     if routing.get("all_exhausted"):
-        subagent_model = dev_common.map_model_to_subagent_tier(preferred, default=PR_SUBAGENT_MODEL)
+        subagent_model = dev_common.map_model_to_subagent_tier(preferred or fallback_tier, default=fallback_tier)
     elif routing.get("mode") == "normal" and preferred.lower() in ("pro", "flash", "flash_lite", "inherit"):
         subagent_model = preferred.lower()
     else:
-        subagent_model = str(routing.get("subagent_model") or PR_SUBAGENT_MODEL)
+        subagent_model = str(routing.get("subagent_model") or fallback_tier)
 
-    selected_model = str(routing.get("selected_model") or preferred)
+    selected_model = str(routing.get("selected_model") or preferred or PR_SUBAGENT_MODEL)
     model_flag = (
         f' --reviewer-model "{selected_model}"'
         if selected_model and selected_model.lower() != PR_SUBAGENT_MODEL
         else ""
     )
     routing_note = ""
-    if routing.get("mode") not in ("normal", ""):
+    if routing.get("mode") not in ("normal", "") or eff_risk_tier:
+        cross_tag = ", cross-family" if routing.get("cross_family_matched") else ""
         routing_note = (
-            f"- **Reviewer Model Routing ({routing.get('mode')})**: Preferred `{preferred}` routed to "
-            f"`{selected_model}` (pass `--reviewer-model \"{selected_model}\"` to `record-review`; "
+            f"- **Reviewer Model Routing ({routing.get('mode')}{cross_tag}, tier={eff_risk_tier or 'default'})**: "
+            f"Selected `{selected_model}` (pass `--reviewer-model \"{selected_model}\"` to `record-review`; "
             f"if `requires_swarm_dispatch`, dispatch via `swarm(action=\"add\", ..., model=\"{selected_model}\")`).\n"
         )
 
@@ -308,6 +367,7 @@ def build_pr_reviewer_subagent_plan(
     )
 
     return {
+        "risk_classification": risk_cls,
         "model_routing": routing,
         "subagent_definition": {
             "Name": PR_REVIEWER_SUBAGENT_NAME,
@@ -1195,6 +1255,8 @@ def push_remediation_branch_and_build_reviewer_plan(
         scheduled=scheduled,
         workdir=str(target_repo_dir),
         repo_slug=resolved_repo_slug,
+        files_changed=diff_res.get("files", []),
+        dev_model=str(lock_info.get("dev_model") or PR_DEV_DEFAULT_MODEL),
         portfolio_dir=portfolio_dir,
     )
 
@@ -1223,6 +1285,7 @@ def push_remediation_branch_and_build_reviewer_plan(
         "issue_number": resolved_issue,
         "files_changed": diff_res.get("files", []),
         "files_count": diff_res.get("files_count", 0),
+        "risk_classification": reviewer_plan["risk_classification"],
         "verification_results": valid_vr,
         "lock": updated_lock.get("lock", {}),
         "reviewer_model_routing": reviewer_plan["model_routing"],
@@ -1332,6 +1395,7 @@ def record_pr_review_evaluation(
     branch_name: str = "",
     reviewer_subagent_id: str = "",
     reviewer_model: str = "",
+    dev_model: str = "",
     send_email: bool = False,
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
@@ -1495,6 +1559,11 @@ def record_pr_review_evaluation(
     existing_history = list(lock_info.get("review_history") or [])
     now_iso = _utc_now_iso()
     effective_reviewer_model = str(reviewer_model or "").strip() or PR_SUBAGENT_MODEL
+    effective_dev_model = (
+        str(dev_model or "").strip()
+        or str(lock_info.get("dev_model") or "").strip()
+        or (PR_SUBAGENT_MODEL if current_iteration >= 2 else PR_DEV_DEFAULT_MODEL)
+    )
     review_entry = {
         "iteration": current_iteration,
         "verdict": norm_verdict,
@@ -1503,6 +1572,7 @@ def record_pr_review_evaluation(
         "summary": _sanitize_home_paths(summary.strip()),
         "reviewer_subagent_id": reviewer_subagent_id.strip(),
         "reviewer_model": effective_reviewer_model,
+        "dev_model": effective_dev_model,
         "head_sha": head_sha,
         "evaluated_at_utc": now_iso,
     }
@@ -1532,7 +1602,7 @@ def record_pr_review_evaluation(
         max_review_iterations=MAX_PR_REVIEW_ITERATIONS,
     )
 
-    created_by_label = f"{PR_DEVELOPER_SUBAGENT_NAME} ({PR_DEV_DEFAULT_MODEL}) · {PR_REVIEWER_SUBAGENT_NAME} ({effective_reviewer_model})"
+    created_by_label = f"{PR_DEVELOPER_SUBAGENT_NAME} ({effective_dev_model}) · {PR_REVIEWER_SUBAGENT_NAME} ({effective_reviewer_model})"
     validator_banner_label = (
         f"{PR_REVIEWER_SUBAGENT_NAME} ({effective_reviewer_model}) [{norm_verdict} {score_int}/100 · Round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS}]"
     )
@@ -1772,7 +1842,7 @@ def record_pr_review_evaluation(
             updated_history[-1] = review_entry
             slot1_br = str(lock_info.get("slot1_branch_name") or "")
             slot2_md = (
-                f"### ⏳ Slot #2 Validated Locally — Awaiting Slot #1 Base Merge (`{PR_REVIEWER_SUBAGENT_NAME}` · `{PR_SUBAGENT_MODEL}`)\n\n"
+                f"### ⏳ Slot #2 Validated Locally — Awaiting Slot #1 Base Merge (`{PR_REVIEWER_SUBAGENT_NAME}` · `{effective_reviewer_model}`)\n\n"
                 f"- **Slot**: `2` (behind active Slot #1 `{slot1_br}`)\n"
                 f"- **Status**: `{SLOT_STATUS_READY_AWAITING_BASE_MERGE}` (`max 1 open GitHub PR per repo` enforced — NOT pushed to `origin` yet)\n"
                 f"- **Local Branch**: `{resolved_branch}` (Timestamp `{resolved_ts}`, SHA `{head_sha[:12]}`)\n"
@@ -1958,7 +2028,7 @@ def record_pr_review_evaluation(
 
     badge = "🟢 PASS"
     review_markdown = (
-        f"### 🛡️ New Branch Validated & Published (`{PR_REVIEWER_SUBAGENT_NAME}` · `{PR_SUBAGENT_MODEL}`)\n\n"
+        f"### 🛡️ New Branch Validated & Published (`{PR_REVIEWER_SUBAGENT_NAME}` · `{effective_reviewer_model}`)\n\n"
         f"- **Branch Action**: **NEW BRANCH CREATED** (`origin/{resolved_branch}`)\n"
         f"- **New Branch Created**: `{resolved_branch}`\n"
         f"- **Created & Validated By**: `{created_by_label}`\n"
@@ -2992,9 +3062,11 @@ def register_review_cli(sub: Any) -> None:
     p_plan_dev.add_argument("--scheduled", action="store_true", help="Mark as scheduled run.")
     p_plan_dev.add_argument("--model", choices=("pro", "flash", "flash_lite", "inherit"), default="", help="Optional developer model tier (defaults to flash Round 1, pro Round 2+).")
     p_plan_dev.add_argument("--review-iteration", dest="review_iteration", type=int, default=1, help="Development/review iteration number (>=2 auto-escalates flash -> pro).")
+    p_plan_dev.add_argument("--risk-tier", dest="risk_tier", choices=("", "micro", "standard", "critical"), default="", help="Optional 3-tier change risk override (auto-classified from --target-files when omitted).")
     p_plan_dev.add_argument("--anchored-context", default="", help="Optional pre-anchored file line ranges and contracts.")
     p_plan_dev.add_argument("--repo", dest="repo_slug", default="", help="Optional target owner/repo slug.")
     p_plan_dev.add_argument("--workdir", default="", help="Optional target repository directory.")
+    p_plan_dev.add_argument("--verbose", action="store_true", help="Emit full subagent_definition SystemPrompt (default is compact token-saving JSON).")
 
     for push_cmd in ("push-branch", "prepare-review", "create-pr"):
         p_push = sub.add_parser(
@@ -3010,6 +3082,7 @@ def register_review_cli(sub: Any) -> None:
         p_push.add_argument("--workdir", default="", help="Optional worktree or repo directory.")
         p_push.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
         p_push.add_argument("--scheduled", action="store_true", help="Mark as scheduled run so Agent 2 sends notification email upon PASS (>90/100).")
+        p_push.add_argument("--verbose", action="store_true", help="Emit full reviewer_subagent_definition and nested lock blobs (default is compact token-saving JSON).")
 
     p_diff = sub.add_parser("branch-diff", help="Compute changed files and unified diff for a branch via native git.")
     p_diff.add_argument("--branch", "--head", dest="branch", default="", help="Target branch name (defaults to locked branch_name).")
@@ -3031,6 +3104,7 @@ def register_review_cli(sub: Any) -> None:
     p_rev.add_argument("--executive-summary", default="", help="Optional Executive Summary override.")
     p_rev.add_argument("--subagent-id", default="", help="Reviewer subagent conversationId.")
     p_rev.add_argument("--reviewer-model", dest="reviewer_model", default="", help="Optional actual reviewer model ID (e.g. pro or fallback model ID).")
+    p_rev.add_argument("--dev-model", dest="dev_model", default="", help="Optional actual developer model ID override for created_by attribution.")
     p_rev.add_argument(
         "--send-email",
         action="store_true",
@@ -3095,10 +3169,54 @@ def register_review_cli(sub: Any) -> None:
     )
     p_quota.add_argument("--preferred-model", dest="preferred_model", default="", help="Optional preferred model override.")
     p_quota.add_argument("--review-iteration", dest="review_iteration", type=int, default=1, help="Review/dev iteration number.")
+    p_quota.add_argument("--risk-tier", dest="risk_tier", choices=("", "micro", "standard", "critical"), default="", help="Optional 3-tier change risk override (micro/standard/critical).")
+    p_quota.add_argument("--files", dest="files", nargs="*", default=[], help="Optional changed/target files to auto-classify 3-tier change risk.")
+    p_quota.add_argument("--lines-changed", dest="lines_changed", type=int, default=None, help="Optional changed LOC count for 3-tier risk classification.")
+    p_quota.add_argument("--dev-model", dest="dev_model", default="", help="Optional developer model ID to enforce Cross-Family Maker-Checker separation.")
+    p_quota.add_argument("--exclude-family", dest="exclude_family", default="", help="Optional family/pool to exclude during cross-family balancing.")
+    p_quota.add_argument("--routing-strategy", dest="routing_strategy", choices=("", "balanced_cross_family", "sequential"), default="", help="Optional routing strategy override.")
     p_quota.add_argument("--record-swarm-json", dest="record_swarm_json", default="", help="Optional raw JSON string (or @path) from swarm(action='models', all=true) to persist.")
     p_quota.add_argument("--record-cooldown-model", dest="record_cooldown_model", default="", help="Optional exhausted model ID to record in cooldown ledger.")
     p_quota.add_argument("--resets-at", dest="resets_at", default="", help="Optional ISO-8601 UTC reset timestamp for --record-cooldown-model.")
     p_quota.add_argument("--resets-in-seconds", dest="resets_in_seconds", type=int, default=None, help="Optional reset duration in seconds for --record-cooldown-model.")
+
+
+def _compact_review_cli_output(subcommand: str, res: dict[str, Any]) -> dict[str, Any]:
+    """Strip bulky redundant prompts & nested lock blobs from CLI stdout to minimize LLM context tokens."""
+    if not isinstance(res, dict):
+        return res
+    if subcommand == "plan-developer":
+        out = {k: v for k, v in res.items() if k != "subagent_definition"}
+        out["compact"] = True
+        return out
+    if subcommand in ("push-branch", "prepare-review", "create-pr"):
+        drop_keys = ("reviewer_subagent_definition", "lock", "files_changed")
+        out = {k: v for k, v in res.items() if k not in drop_keys}
+        lock_src = res.get("lock") if isinstance(res.get("lock"), dict) else None
+        if lock_src is not None:
+            out["lock"] = {
+                k: lock_src.get(k)
+                for k in (
+                    "lock_id",
+                    "slot_id",
+                    "status",
+                    "repo_slug",
+                    "branch_name",
+                    "worktree_path",
+                    "dev_model",
+                    "staged_head_sha",
+                    "pr_gate_ready",
+                )
+                if k in lock_src
+            }
+        vr = res.get("verification_results")
+        if isinstance(vr, dict):
+            out["verification_results"] = {
+                k: v for k, v in vr.items() if k not in ("qa_output", "test_output", "coverage_output", "pre_commit_output")
+            }
+        out["compact"] = True
+        return out
+    return res
 
 
 def dispatch_review_cli(args: Any) -> int | None:
@@ -3117,8 +3235,11 @@ def dispatch_review_cli(args: Any) -> int | None:
             workdir=getattr(args, "workdir", ""),
             repo_slug=getattr(args, "repo_slug", ""),
             review_iteration=int(getattr(args, "review_iteration", 1) or 1),
+            risk_tier=str(getattr(args, "risk_tier", "") or ""),
         )
-        print(json.dumps({"status": "ok", **res}, indent=2, ensure_ascii=False))
+        full_payload = {"status": "ok", **res}
+        printed = full_payload if getattr(args, "verbose", False) else _compact_review_cli_output("plan-developer", full_payload)
+        print(json.dumps(printed, indent=2, ensure_ascii=False))
         return 0
 
     if args.subcommand in ("push-branch", "prepare-review", "create-pr"):
@@ -3136,7 +3257,8 @@ def dispatch_review_cli(args: Any) -> int | None:
             workdir=args.workdir or None,
             repo_slug=getattr(args, "repo_slug", ""),
         )
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        printed = res if getattr(args, "verbose", False) else _compact_review_cli_output(args.subcommand, res)
+        print(json.dumps(printed, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
 
     if args.subcommand == "branch-diff":
@@ -3162,6 +3284,7 @@ def dispatch_review_cli(args: Any) -> int | None:
             branch_name=args.branch,
             reviewer_subagent_id=args.subagent_id,
             reviewer_model=getattr(args, "reviewer_model", ""),
+            dev_model=getattr(args, "dev_model", ""),
             send_email=args.send_email,
             workdir=getattr(args, "workdir", "") or None,
             repo_slug=getattr(args, "repo_slug", ""),
@@ -3245,12 +3368,26 @@ def dispatch_review_cli(args: Any) -> int | None:
                 source="cli",
             )
         state = dev_common.load_model_quota_state()
+        q_files = list(getattr(args, "files", []) or [])
+        q_lines = getattr(args, "lines_changed", None)
+        q_tier = str(getattr(args, "risk_tier", "") or "").strip().lower()
+        risk_cls = (
+            dev_common.classify_change_risk_tier(q_files, lines_changed=q_lines)
+            if (q_files or q_lines is not None)
+            else None
+        )
+        if not q_tier and isinstance(risk_cls, dict):
+            q_tier = str(risk_cls.get("risk_tier") or "")
         routing = dev_common.select_next_optimal_model(
             role=str(getattr(args, "role", "developer") or "developer"),
             preferred_model=str(getattr(args, "preferred_model", "") or ""),
             review_iteration=int(getattr(args, "review_iteration", 1) or 1),
+            risk_tier=q_tier,
+            dev_model=str(getattr(args, "dev_model", "") or ""),
+            exclude_family=str(getattr(args, "exclude_family", "") or ""),
+            routing_strategy=str(getattr(args, "routing_strategy", "") or ""),
         )
-        out = {
+        out: dict[str, Any] = {
             "status": "ok",
             "routing": routing,
             "state": {
@@ -3260,6 +3397,8 @@ def dispatch_review_cli(args: Any) -> int | None:
                 "snapshot_recorded_at": (state.get("quota_snapshot") or {}).get("recorded_at", ""),
             },
         }
+        if risk_cls is not None:
+            out["risk_classification"] = risk_cls
         if snapshot_res is not None:
             out["snapshot_recorded"] = snapshot_res
         if cooldown_res is not None:
