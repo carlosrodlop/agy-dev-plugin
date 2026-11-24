@@ -11,6 +11,7 @@
 #        agy-queue watch [SECS] [--sync-interval SECS] [--no-auto-sync]
 #        agy-queue doctor [--fix] [--wake] [--heal] [--check-only] [--json]
 #        agy-queue optimize [--json] [--repos-dir DIR] [--stall-seconds N]
+#        agy-queue plan [--repo SLUG] [--importance TIER] [--include-done N] [--json]
 #        agy-queue sync [--offline] [--json]
 #        agy-queue list [--status STATUS] [--repo SLUG] [--all] [--json]
 #        agy-queue show <ID> [--json]

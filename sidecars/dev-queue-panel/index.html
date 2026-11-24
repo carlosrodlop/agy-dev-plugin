@@ -92,6 +92,16 @@
           <span class="dq-kpi-label">Pending</span>
           <span id="dq-count-pending" class="dq-kpi-num">0</span>
         </button>
+        <button
+          id="dq-kpi-planning"
+          type="button"
+          class="dq-kpi dq-kpi-planning"
+          data-section-filter="planning"
+          title="Component planning view: Repo -> Sub-Component progress, Importance x Wave &amp; Recently Integrated"
+        >
+          <span class="dq-kpi-label">Planning</span>
+          <span id="dq-count-planning" class="dq-kpi-num">0</span>
+        </button>
       </nav>
 
       <div class="dq-search-row">
@@ -250,6 +260,19 @@
           <span id="dq-badge-pending" class="dq-section-count">0</span>
         </div>
         <div id="dq-list-pending" class="dq-card-list"></div>
+      </section>
+
+      <section id="dq-sec-planning" class="dq-section dq-hidden" aria-labelledby="dq-h-planning">
+        <div class="dq-section-head">
+          <h2 id="dq-h-planning" class="dq-section-title">Component Planning · Repo → Sub-Component</h2>
+          <span id="dq-badge-planning" class="dq-section-count">0</span>
+        </div>
+        <div id="dq-planning-filters" class="dq-planning-filters" role="group" aria-label="Importance and wave filters"></div>
+        <div id="dq-list-planning" class="dq-planning-repos"></div>
+        <details id="dq-planning-done" class="dq-planning-done dq-hidden">
+          <summary id="dq-planning-done-summary" class="dq-planning-done-summary">Recently Integrated</summary>
+          <div id="dq-list-planning-done" class="dq-card-list"></div>
+        </details>
       </section>
 
       <section id="dq-empty" class="dq-empty dq-hidden" aria-labelledby="dq-h-empty">

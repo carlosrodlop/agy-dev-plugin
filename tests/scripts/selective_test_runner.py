@@ -18,6 +18,7 @@ ALL_TEST_MODULES = [
     "tests.test_agy_dev_plugin",
     "tests.test_dev_queue_cli_ux",
     "tests.test_dev_queue_doctor",
+    "tests.test_dev_queue_planning",
     "tests.test_dev_queue_sidecar_panel",
     "tests.test_dev_queue_tui",
     "tests.test_model_quota_fallback",
@@ -67,6 +68,7 @@ BATS_TRIGGER_SUFFIXES = (
     "pr_remediator.py",
     "lock_store.py",
     "queue_store.py",
+    "dev_queue_planner.py",
     "worktree_ops.py",
     "review_gate.py",
     "merge_watcher.py",
@@ -82,6 +84,7 @@ BATS_TRIGGER_PREFIXES = (
 ISOLATED_TEST_FILE_MODULES = {
     "tests/test_dev_queue_cli_ux.py": "tests.test_dev_queue_cli_ux",
     "tests/test_dev_queue_doctor.py": "tests.test_dev_queue_doctor",
+    "tests/test_dev_queue_planning.py": "tests.test_dev_queue_planning",
     "tests/test_dev_queue_sidecar_panel.py": "tests.test_dev_queue_sidecar_panel",
     "tests/test_dev_queue_tui.py": "tests.test_dev_queue_tui",
     "tests/test_model_quota_fallback.py": "tests.test_model_quota_fallback",
@@ -298,6 +301,24 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_dev_queue_doctor" not in selected:
                 selected.append("tests.test_dev_queue_doctor")
+        if (
+            norm.endswith(
+                (
+                    "dev_queue_planner.py",
+                    "queue_store.py",
+                    "pr_remediator.py",
+                    "dev_queue_tui.py",
+                    "agy_dev_queue.sh",
+                    "test_dev_queue_planning.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith(("sidecars/dev-queue-panel/", "skills/agy-dev-queue-orchestrator/"))
+            or norm in ("agents/agy-dev-planner.md",)
+        ):
+            if "tests.test_dev_queue_planning" not in selected:
+                selected.append("tests.test_dev_queue_planning")
+
         if (
             norm.endswith(
                 (

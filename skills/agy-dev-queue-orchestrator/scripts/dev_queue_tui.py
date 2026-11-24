@@ -80,6 +80,8 @@ _git_client: Any = None
 _git_client_loaded = False
 _queue_doctor: Any = None
 _queue_doctor_loaded = False
+_queue_planner: Any = None
+_queue_planner_loaded = False
 _orch_ctrl_mod: Any = None
 _orch_ctrl_loaded = False
 
@@ -134,6 +136,17 @@ def _get_queue_doctor() -> Any:
             _queue_doctor = _qd
     return _queue_doctor
 
+
+def _get_queue_planner() -> Any:
+    global _queue_planner, _queue_planner_loaded
+    if not _queue_planner_loaded:
+        _queue_planner_loaded = True
+        with contextlib.suppress(Exception):
+            import dev_queue_planner as _qp  # type: ignore[import-not-found]
+
+            _queue_planner = _qp
+    return _queue_planner
+
 ANSI_RE = re.compile(r"\x1b\]8;;[^\x1b\x07]*(?:\x1b\\|\x07)|\x1b\[[0-9;?]*[A-Za-z]")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _CREATED_PR_PATH_RE = re.compile(r"/(?:pull|pulls|pull-requests|merge_requests)/\d+(?:/|$)")
@@ -168,6 +181,7 @@ AGY_QUEUE_SUBCOMMANDS: tuple[str, ...] = (
     "watch",
     "doctor",
     "optimize",
+    "plan",
     "sync",
     "list",
     "show",
@@ -4467,6 +4481,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "  agy-queue watch [SECS]        Flicker-free interactive TUI (--watch)\n"
         "  agy-queue doctor [FLAGS]      Run 0-LLM orchestrator doctor (--fix/--wake/--heal)\n"
         "  agy-queue optimize [FLAGS]    Run 0-LLM dev flow bottleneck analyzer\n"
+        "  agy-queue plan [FLAGS]        Show Repo -> Sub-Component planning view (Importance x Wave)\n"
         "  agy-queue sync [FLAGS]        Fetch origin refs & reconcile merged PRs\n"
         "  agy-queue list [FLAGS]        List filtered queue items (--status/--repo/--json)\n"
         "  agy-queue show <ID> [FLAGS]   Inspect single item + live worker/reviewer telemetry\n"
@@ -5672,6 +5687,194 @@ def _run_subcommand_status(argv: list[str]) -> int:
     return 0
 
 
+def _plan_progress_bar(pct: int, width: int = 10) -> str:
+    """Render an ASCII/Unicode progress bar for component completion percentage."""
+    clamped = max(0, min(100, int(pct)))
+    filled = int(round((clamped / 100.0) * width))
+    return f"[{'█' * filled}{'░' * (width - filled)}] {clamped:3d}%"
+
+
+def _render_plan_lines(plan: dict[str, Any], term_w: int, color_on: bool) -> list[str]:
+    """Render deterministic `Repo -> Sub-Component` planning view for terminal output."""
+    bar_w = max(72, min(term_w, 160))
+    totals = plan.get("totals") or {}
+    by_wave = totals.get("by_wave") or {}
+    by_imp = totals.get("by_importance") or {}
+    lines: list[str] = [
+        _color("═" * bar_w, "2;36", color_on),
+        _color(
+            f"AGY-QUEUE COMPONENT PLAN  open:{totals.get('open_count', 0)}  "
+            f"repos:{totals.get('repos_count', 0)}  components:{totals.get('components_count', 0)}  "
+            f"done:{totals.get('total_done_count', 0)}",
+            "1;36",
+            color_on,
+        ),
+        (
+            f"  Waves: active={by_wave.get('active', 0)} · partial_wip={by_wave.get('partial_wip', 0)} · "
+            f"ready={by_wave.get('ready', 0)} · blocked={by_wave.get('blocked', 0)} · "
+            f"standby={by_wave.get('standby', 0)}"
+        ),
+        (
+            f"  Importance: critical={by_imp.get('critical', 0)} · high={by_imp.get('high', 0)} · "
+            f"medium={by_imp.get('medium', 0)} · low={by_imp.get('low', 0)}"
+        ),
+        _color("─" * bar_w, "2;36", color_on),
+    ]
+
+    wave_colors = {
+        "active": "1;36",
+        "partial_wip": "1;33",
+        "ready": "1;32",
+        "blocked": "1;35",
+        "standby": "2;37",
+    }
+    imp_colors = {
+        "critical": "1;31",
+        "high": "1;33",
+        "medium": "0;36",
+        "low": "2;37",
+    }
+
+    repos = plan.get("repos") or []
+    if not repos:
+        lines.append("  No open items match the active planning filters.")
+    for repo in repos:
+        r_slug = str(repo.get("repo_slug") or "")
+        r_label = str(repo.get("repo_label") or r_slug)
+        r_bar = _plan_progress_bar(int(repo.get("completion_pct") or 0), width=10)
+        repo_head_lbl = f"▸ {r_label}"
+        lines.append(
+            f"{_color(repo_head_lbl, '1;37', color_on)} ({r_slug})  {r_bar}  "
+            f"open:{repo.get('open_count', 0)}  done:{repo.get('done_count', 0)}"
+        )
+        for comp in repo.get("components") or []:
+            c_bar = _plan_progress_bar(int(comp.get("completion_pct") or 0), width=8)
+            comp_name_lbl = f"▪ {comp.get('name', 'general')}"
+            lines.append(
+                f"  {_color(comp_name_lbl, '1;34', color_on)}  {c_bar}  "
+                f"({comp.get('done_count', 0)}/{comp.get('total_count', 0)})  "
+                f"top:{str(comp.get('highest_importance') or 'medium').upper()}"
+            )
+            for item in comp.get("items") or []:
+                wave = str(item.get("wave") or "ready")
+                imp = str(item.get("importance") or "medium")
+                prio = int(item.get("priority") or 50)
+                eff_p = int(item.get("effective_priority") or prio)
+                p_lbl = f"P{eff_p}<-P{prio}" if eff_p != prio else f"P{prio}"
+                title = str(item.get("sidebar_title") or item.get("title") or item.get("display_id") or "")
+                extras: list[str] = []
+                if item.get("unblocks_label"):
+                    extras.append(_color(str(item["unblocks_label"]), "1;33", color_on))
+                if item.get("blocked_by_label"):
+                    extras.append(_color(str(item["blocked_by_label"]), "1;35", color_on))
+                if item.get("pr_url"):
+                    extras.append(_color(f"PR:{item['pr_url']}", "1;32", color_on))
+                extra_txt = f"  [{'; '.join(extras)}]" if extras else ""
+                lines.append(
+                    f"    • {_color(f'[{wave.upper()}]', wave_colors.get(wave, '0'), color_on)} "
+                    f"{_color(f'[{imp.upper()}]', imp_colors.get(imp, '0'), color_on)} "
+                    f"{p_lbl}  {item.get('display_id', '')}  {title}{extra_txt}"
+                )
+
+    recent = plan.get("recently_integrated") or {}
+    recent_items = recent.get("items") or []
+    total_done = int(recent.get("total_done_count") or 0)
+    if recent_items or total_done > 0:
+        lines.append(_color("─" * bar_w, "2;36", color_on))
+        lines.append(
+            _color(f"Recently Integrated (showing {len(recent_items)} of {total_done}):", "1;32", color_on)
+        )
+        for d_it in recent_items:
+            d_repos = ",".join(d_it.get("repo_slugs") or []) or "-"
+            d_title = str(d_it.get("sidebar_title") or d_it.get("title") or d_it.get("display_id") or "")
+            lines.append(
+                f"  ✓ {d_it.get('display_id', '')} [{d_it.get('status', 'merged')}] "
+                f"{d_repos} / {d_it.get('component', 'general')}  {d_title}"
+            )
+    lines.append(_color("═" * bar_w, "2;36", color_on))
+    return lines
+
+
+def _run_subcommand_plan(argv: list[str]) -> int:
+    """Handle `agy-queue plan [--repo SLUG] [--importance TIER] [--include-done N] [--json]`."""
+    parser = argparse.ArgumentParser(
+        prog="agy-queue plan",
+        description="Render 0-LLM Repo -> Sub-Component planning view (Importance x Wave & Recently Integrated).",
+    )
+    parser.add_argument("--repo", default="", help="Filter by repository slug or substring.")
+    parser.add_argument(
+        "--importance",
+        choices=("critical", "high", "medium", "low"),
+        default="",
+        help="Filter open items by importance tier.",
+    )
+    parser.add_argument(
+        "--include-done",
+        dest="include_done",
+        type=int,
+        default=10,
+        help="Maximum recently integrated (merged/cleaned) items to include (default: 10).",
+    )
+    parser.add_argument("--state-dir", default="", help="Override state directory.")
+    parser.add_argument("--repos-dir", default="", help="Optional parent directory for managed git repos.")
+    parser.add_argument("--json", action="store_true", help="Output structured JSON.")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
+    parser.add_argument("--debug", action="store_true", help="Emit debug diagnostics to stderr.")
+    args = parser.parse_args(argv)
+
+    st_dir = _resolve_state_dir(args.state_dir)
+    q_data = _load_json(st_dir / "dev_queue.json")
+    raw_items = [it for it in (q_data.get("items") or []) if isinstance(it, dict)]
+    locks, all_locks = _load_locks(st_dir)
+    repo_web_bases, _ = _discover_repos(all_locks, raw_items, args.repos_dir)
+    all_slugs: set[str] = set(locks.keys()) | set(repo_web_bases.keys())
+    for it in raw_items:
+        for s in it.get("repo_slugs") or []:
+            if s:
+                all_slugs.add(str(s))
+    label_map = _build_repo_labels(all_slugs)
+    cids = [str(it.get("conversation_id") or "").strip() for it in raw_items if it.get("conversation_id")]
+    ag_titles = _load_conversation_titles(cids)
+
+    qp = _get_queue_planner()
+    if qp is not None and hasattr(qp, "build_component_planning_snapshot"):
+        plan = dict(
+            qp.build_component_planning_snapshot(
+                raw_items,
+                locks=locks,
+                repo_labels=label_map,
+                repo_filter=args.repo,
+                importance_filter=args.importance,
+                include_done=args.include_done,
+                ag_titles=ag_titles,
+            )
+        )
+    else:
+        pr_rem = _resolve_pr_remediator_script()
+        cmd = [sys.executable, str(pr_rem), "queue-plan", "--include-done", str(args.include_done)]
+        if args.repo:
+            cmd.extend(["--repo", args.repo])
+        if args.importance:
+            cmd.extend(["--importance", args.importance])
+        proc = subprocess.run(
+            cmd,
+            env={**os.environ, "AGY_DEV_STATE_DIR": str(st_dir)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        plan = json.loads(proc.stdout or "{}") if proc.returncode == 0 else {"status": "error", "repos": []}
+
+    plan.setdefault("schema_version", JSON_SCHEMA_VERSION)
+    if args.json:
+        print(json.dumps({"status": "ok", **plan}, indent=2, ensure_ascii=False))
+        return 0
+    color_on = _should_enable_color(args.no_color, sys.stdout.isatty())
+    term_w = shutil.get_terminal_size((124, 40)).columns
+    print("\n".join(_render_plan_lines(plan, term_w, color_on)))
+    return 0
+
+
 def _dispatch_subcommand(subcmd: str, rest: list[str], raw_cli_argv: list[str]) -> int:
     """Dispatch unified `agy-queue` subcommands while keeping full legacy flag compatibility."""
     if subcmd == "doctor":
@@ -5690,6 +5893,8 @@ def _dispatch_subcommand(subcmd: str, rest: list[str], raw_cli_argv: list[str]) 
         return _main_dashboard(rest, raw_cli_argv)
     if subcmd == "optimize":
         return _run_subcommand_optimize(rest)
+    if subcmd == "plan":
+        return _run_subcommand_plan(rest)
     if subcmd == "sync":
         return _run_subcommand_sync(rest)
     if subcmd == "show":
