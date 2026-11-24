@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import threading
 from typing import Any
 
 OVERLAP_NONE = "NONE"
@@ -1645,33 +1646,95 @@ def extract_file_structure(
 # ==============================================================================
 
 
+_REPO_GRAPH_CACHE_LOCK = threading.Lock()
+_REPO_GRAPH_CACHE_MAX_REPOS = 8
+_REPO_GRAPH_CACHE: dict[
+    str,
+    tuple[
+        tuple[tuple[str, int, int], ...],
+        dict[str, FileStructure],
+        dict[str, tuple[str, ...]],
+    ],
+] = {}
+_REPO_GRAPH_SUPPORTED_EXT: frozenset[str] = frozenset({".py", ".js", ".mjs", ".html", ".htm", ".css"})
+
+
+def clear_repository_import_graph_cache() -> None:
+    """Clear the in-process fingerprinted repository import-graph cache."""
+    with _REPO_GRAPH_CACHE_LOCK:
+        _REPO_GRAPH_CACHE.clear()
+
+
+def _scan_repo_graph_sources(
+    root_dir: Path,
+) -> tuple[list[str], dict[str, list[str]], tuple[tuple[str, int, int], ...]]:
+    """Single-pass scan returning sorted source relative paths, Python module index, and `(rel, mtime_ns, size)` fingerprint."""
+    rel_files: list[str] = []
+    py_index: dict[str, list[str]] = {}
+    fp_items: list[tuple[str, int, int]] = []
+
+    for cur_root, dirs, files in os.walk(root_dir, topdown=True, followlinks=False):
+        dirs[:] = [d for d in sorted(dirs) if d not in SKIP_SCAN_DIRS]
+        cur_p = Path(cur_root)
+        for fname in sorted(files):
+            suffix = Path(fname).suffix.lower()
+            if suffix not in _REPO_GRAPH_SUPPORTED_EXT:
+                continue
+            fpath = cur_p / fname
+            try:
+                rel = str(fpath.relative_to(root_dir)).replace("\\", "/")
+                st = fpath.lstat()
+            except (ValueError, OSError):
+                continue
+            rel_files.append(rel)
+            fp_items.append((rel, int(st.st_mtime_ns), int(st.st_size)))
+            if suffix == ".py":
+                no_ext = rel[:-3]
+                if no_ext.endswith("/__init__"):
+                    pkg_dotted = no_ext[: -len("/__init__")].replace("/", ".")
+                    if pkg_dotted:
+                        py_index.setdefault(pkg_dotted, []).append(rel)
+                        py_index.setdefault(pkg_dotted.rsplit(".", 1)[-1], []).append(rel)
+                else:
+                    dotted = no_ext.replace("/", ".")
+                    py_index.setdefault(dotted, []).append(rel)
+                    stem = Path(no_ext).name
+                    py_index.setdefault(stem, []).append(rel)
+
+    return rel_files, py_index, tuple(fp_items)
+
+
 def build_repository_import_graph(
     repo_dir: Path | str,
+    *,
+    use_cache: bool = True,
 ) -> tuple[dict[str, FileStructure], dict[str, tuple[str, ...]]]:
     """Scan trackable Python, JS, HTML, and CSS files in `repo_dir` and return `(structures, forward_imports)`."""
     root_dir = Path(repo_dir).expanduser().resolve()
     if not root_dir.is_dir():
         return {}, {}
 
-    py_index = _build_repo_python_module_index(root_dir)
+    rel_files, py_index, fingerprint = _scan_repo_graph_sources(root_dir)
+    cache_key = str(root_dir)
+    if use_cache:
+        with _REPO_GRAPH_CACHE_LOCK:
+            cached = _REPO_GRAPH_CACHE.get(cache_key)
+            if cached is not None and cached[0] == fingerprint:
+                return dict(cached[1]), dict(cached[2])
+
     structures: dict[str, FileStructure] = {}
     forward_graph: dict[str, tuple[str, ...]] = {}
-    supported_ext = {".py", ".js", ".mjs", ".html", ".htm", ".css"}
+    for rel in rel_files:
+        st = extract_file_structure(rel, repo_dir=root_dir, py_index=py_index)
+        structures[rel] = st
+        forward_graph[rel] = st.resolved_local_imports
 
-    for cur_root, dirs, files in os.walk(root_dir, topdown=True, followlinks=False):
-        dirs[:] = [d for d in sorted(dirs) if d not in SKIP_SCAN_DIRS]
-        cur_p = Path(cur_root)
-        for fname in sorted(files):
-            if Path(fname).suffix.lower() not in supported_ext:
-                continue
-            fpath = cur_p / fname
-            try:
-                rel = str(fpath.relative_to(root_dir)).replace("\\", "/")
-            except ValueError:
-                continue
-            st = extract_file_structure(rel, repo_dir=root_dir, py_index=py_index)
-            structures[rel] = st
-            forward_graph[rel] = st.resolved_local_imports
+    if use_cache:
+        with _REPO_GRAPH_CACHE_LOCK:
+            if cache_key not in _REPO_GRAPH_CACHE and len(_REPO_GRAPH_CACHE) >= _REPO_GRAPH_CACHE_MAX_REPOS:
+                oldest_key = next(iter(_REPO_GRAPH_CACHE))
+                _REPO_GRAPH_CACHE.pop(oldest_key, None)
+            _REPO_GRAPH_CACHE[cache_key] = (fingerprint, dict(structures), dict(forward_graph))
 
     return structures, forward_graph
 
@@ -2536,6 +2599,8 @@ def analyze_candidate_against_slots(
     *,
     repo_dir: Path | str | None = None,
     repo_slug: str = "",
+    structures: Mapping[str, FileStructure] | None = None,
+    forward_graph: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, Any]:
     """Validate `candidate` pairwise against EVERY active slot (`1..N`) of one repository.
 
@@ -2545,10 +2610,15 @@ def analyze_candidate_against_slots(
     """
     cand_spec = candidate if isinstance(candidate, TaskAnchorSpec) else TaskAnchorSpec.from_mapping(candidate)
     r_dir = Path(repo_dir).expanduser().resolve() if repo_dir else None
-    if r_dir is not None and r_dir.is_dir():
-        structures, forward_graph = build_repository_import_graph(r_dir)
+    if structures is not None and forward_graph is not None:
+        eff_structures: dict[str, FileStructure] = dict(structures)
+        eff_forward_graph: dict[str, tuple[str, ...]] = {
+            str(k): tuple(v) for k, v in forward_graph.items()
+        }
+    elif r_dir is not None and r_dir.is_dir():
+        eff_structures, eff_forward_graph = build_repository_import_graph(r_dir)
     else:
-        structures, forward_graph = {}, {}
+        eff_structures, eff_forward_graph = {}, {}
     pairs: list[dict[str, Any]] = []
     worst_tier = OVERLAP_NONE
     blocking: list[int] = []
@@ -2564,8 +2634,8 @@ def analyze_candidate_against_slots(
             cand_spec,
             repo_dir=r_dir,
             repo_slug=repo_slug,
-            structures=structures,
-            forward_graph=forward_graph,
+            structures=eff_structures,
+            forward_graph=eff_forward_graph,
         )
         pair_dict = res.to_dict()
         pair_dict["slot_id"] = slot_num

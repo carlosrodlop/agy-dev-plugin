@@ -958,9 +958,149 @@ def _matches_companion_artifact_name(filename: str, cid: str) -> bool:
     return low == c or low.startswith(f"{c}.")
 
 
+_CONV_DB_SUFFIXES: tuple[str, ...] = (".db-journal", ".db-wal", ".db-shm", ".db")
+
+
+def _build_disk_artifacts_index(roots: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Single-pass `os.scandir` index over `brain/`, `conversations/`, `annotations/`, and `presence/` across `roots`."""
+    root_entries: list[dict[str, Any]] = []
+    disk_present_cids: set[str] = set()
+    prefix8_uuids: dict[str, list[str]] = {}
+    seen_p8: dict[str, set[str]] = {}
+
+    def _record_uuid_prefix(cand_uuid: str) -> None:
+        if _CONVERSATION_UUID_RE.fullmatch(cand_uuid):
+            p8 = cand_uuid[:8]
+            bucket = seen_p8.setdefault(p8, set())
+            if cand_uuid not in bucket:
+                bucket.add(cand_uuid)
+                prefix8_uuids.setdefault(p8, []).append(cand_uuid)
+
+    for root in roots:
+        runtime = str(root.get("label") or "desktop")
+        b_dir = Path(root["brain_dir"])
+        c_dir = Path(root["conversations_dir"])
+        ann_dir = Path(root["annotations_dir"])
+        pres_dir = Path(root["presence_dir"])
+
+        brain_by_low: dict[str, Path] = {}
+        with contextlib.suppress(OSError):
+            if b_dir.is_dir():
+                with os.scandir(b_dir) as it_b:
+                    for entry in it_b:
+                        low = entry.name.lower()
+                        p = Path(entry.path)
+                        brain_by_low[low] = p
+                        if _CONVERSATION_UUID_RE.fullmatch(low):
+                            with contextlib.suppress(OSError):
+                                if entry.is_dir(follow_symlinks=True):
+                                    disk_present_cids.add(low)
+                            _record_uuid_prefix(low)
+
+        conv_by_low: dict[str, list[tuple[Path, str]]] = {}
+        with contextlib.suppress(OSError):
+            if c_dir.is_dir():
+                with os.scandir(c_dir) as it_c:
+                    for entry in it_c:
+                        name = entry.name
+                        low = name.lower()
+                        stem_low = low.split(".", 1)[0].strip()
+                        if _CONVERSATION_UUID_RE.fullmatch(stem_low):
+                            disk_present_cids.add(stem_low)
+                            _record_uuid_prefix(stem_low)
+                        matched_kind = ""
+                        matched_stem = ""
+                        for db_sfx in _CONV_DB_SUFFIXES:
+                            if low.endswith(db_sfx):
+                                matched_kind = "conversations_db"
+                                matched_stem = low[: -len(db_sfx)]
+                                break
+                        if not matched_kind and low.endswith(".pb"):
+                            matched_kind = "conversations_pb"
+                            matched_stem = low[:-3]
+                        if matched_kind and matched_stem:
+                            conv_by_low.setdefault(matched_stem, []).append((Path(entry.path), matched_kind))
+        for entries_list in conv_by_low.values():
+            entries_list.sort(key=lambda pair: pair[0].name)
+
+        def _scan_companion(comp_dir: Path) -> tuple[dict[str, list[Path]], list[tuple[str, Path]]]:
+            by_uuid: dict[str, list[Path]] = {}
+            all_list: list[tuple[str, Path]] = []
+            with contextlib.suppress(OSError):
+                if comp_dir.is_dir():
+                    raw_names: list[tuple[str, Path]] = []
+                    with os.scandir(comp_dir) as it_comp:
+                        for entry in it_comp:
+                            raw_names.append((entry.name, Path(entry.path)))
+                    raw_names.sort(key=lambda item: item[0])
+                    for orig_name, ep in raw_names:
+                        low = orig_name.lower()
+                        all_list.append((low, ep))
+                        if len(low) >= 36 and _CONVERSATION_UUID_RE.fullmatch(low[:36]):
+                            if len(low) == 36 or low[36] in (".", "-", "_"):
+                                u36 = low[:36]
+                                by_uuid.setdefault(u36, []).append(ep)
+                                _record_uuid_prefix(u36)
+            return by_uuid, all_list
+
+        ann_by_uuid, ann_all = _scan_companion(ann_dir)
+        pres_by_uuid, pres_all = _scan_companion(pres_dir)
+
+        root_entries.append(
+            {
+                "runtime": runtime,
+                "brain_by_low": brain_by_low,
+                "conv_by_low": conv_by_low,
+                "ann_by_uuid": ann_by_uuid,
+                "ann_all": ann_all,
+                "pres_by_uuid": pres_by_uuid,
+                "pres_all": pres_all,
+            }
+        )
+
+    for p8, u_list in prefix8_uuids.items():
+        u_list.sort()
+
+    return {
+        "roots": root_entries,
+        "disk_present_cids": disk_present_cids,
+        "prefix8_uuids": prefix8_uuids,
+    }
+
+
+def _has_conversation_disk_artifacts(
+    cid: str,
+    roots: Sequence[Mapping[str, Any]],
+    *,
+    disk_index: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return True when `cid` has at least one disk artifact across `roots` (O(1) with `disk_index`, zero `rglob`)."""
+    clean = str(cid or "").strip()
+    if not clean:
+        return False
+    if disk_index is None:
+        return bool(_collect_conversation_disk_artifacts(clean, roots))
+    c_low = clean.lower()
+    is_uuid = bool(_CONVERSATION_UUID_RE.fullmatch(c_low))
+    for r_idx in disk_index.get("roots") or ():
+        if c_low in r_idx["brain_by_low"] or c_low in r_idx["conv_by_low"]:
+            return True
+        if is_uuid:
+            if c_low in r_idx["ann_by_uuid"] or c_low in r_idx["pres_by_uuid"]:
+                return True
+        else:
+            if any(_matches_companion_artifact_name(nm, c_low) for nm, _ in r_idx["ann_all"]):
+                return True
+            if any(_matches_companion_artifact_name(nm, c_low) for nm, _ in r_idx["pres_all"]):
+                return True
+    return False
+
+
 def _collect_conversation_disk_artifacts(
     cid: str,
     roots: Sequence[Mapping[str, Any]],
+    *,
+    disk_index: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Collect all existing disk paths for `cid` across `brain/`, `.db`/`.db-wal`/`.db-shm`, `.pb`, `annotations/`, and `presence/`."""
     clean = str(cid or "").strip()
@@ -988,6 +1128,30 @@ def _collect_conversation_disk_artifacts(
                 "bytes": _dir_tree_bytes(path),
             }
         )
+
+    if disk_index is not None:
+        c_low = clean.lower()
+        is_uuid = bool(_CONVERSATION_UUID_RE.fullmatch(c_low))
+        for r_idx in disk_index.get("roots") or ():
+            runtime = str(r_idx["runtime"])
+            b_path = r_idx["brain_by_low"].get(c_low)
+            if b_path is not None:
+                _add(b_path, "brain", runtime)
+            for c_path, c_kind in r_idx["conv_by_low"].get(c_low, ()):
+                _add(c_path, c_kind, runtime)
+            if is_uuid:
+                for ap in r_idx["ann_by_uuid"].get(c_low, ()):
+                    _add(ap, "annotations", runtime)
+                for pp in r_idx["pres_by_uuid"].get(c_low, ()):
+                    _add(pp, "presence", runtime)
+            else:
+                for nm, ap in r_idx["ann_all"]:
+                    if _matches_companion_artifact_name(nm, c_low):
+                        _add(ap, "annotations", runtime)
+                for nm, pp in r_idx["pres_all"]:
+                    if _matches_companion_artifact_name(nm, c_low):
+                        _add(pp, "presence", runtime)
+        return artifacts
 
     for root in roots:
         runtime = str(root.get("label") or "desktop")
@@ -1318,6 +1482,7 @@ def is_conversation_fully_idle(
     antigravity_dirs: Sequence[Path | str] | None = None,
     summaries_db: Path | str | Sequence[Path | str] | None = None,
     summaries_graph: Mapping[str, Any] | None = None,
+    disk_index: Mapping[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Return `(True, 'idle')` only if a conversation shows no RUNNING summary/step and no recent `.db`/`.db-wal`/`.pb`/transcript activity."""
     roots = _resolve_antigravity_roots(
@@ -1342,23 +1507,48 @@ def is_conversation_fully_idle(
     cur_ts = float(now_ts if now_ts is not None else time.time())
     transcript_paths: list[Path] = []
     mtime_artifacts: list[Path] = []
-    for r_spec in roots:
-        b_dir = Path(r_spec["brain_dir"])
-        c_dir = Path(r_spec["conversations_dir"])
-        ann_dir = Path(r_spec["annotations_dir"])
-        pres_dir = Path(r_spec["presence_dir"])
-        for cand_id in dict.fromkeys((cid, cid_lower)):
-            tp = b_dir / cand_id / ".system_generated" / "logs" / "transcript.jsonl"
-            transcript_paths.append(tp)
-            mtime_artifacts.append(tp)
-            for ext in (".db", ".db-wal", ".db-shm", ".db-journal", ".pb"):
-                mtime_artifacts.append(c_dir / f"{cand_id}{ext}")
-        for comp_dir in (pres_dir, ann_dir):
-            with contextlib.suppress(OSError):
-                if comp_dir.is_dir():
-                    for p_entry in comp_dir.iterdir():
-                        if _matches_companion_artifact_name(p_entry.name, cid_lower):
-                            mtime_artifacts.append(p_entry)
+    if disk_index is not None:
+        is_uuid = bool(_CONVERSATION_UUID_RE.fullmatch(cid_lower))
+        for r_spec, r_idx in zip(roots, disk_index.get("roots") or ()):
+            b_dir = Path(r_spec["brain_dir"])
+            b_hit = r_idx["brain_by_low"].get(cid_lower)
+            if b_hit is not None:
+                tp = b_hit / ".system_generated" / "logs" / "transcript.jsonl"
+                transcript_paths.append(tp)
+                mtime_artifacts.append(tp)
+            else:
+                tp = b_dir / cid_lower / ".system_generated" / "logs" / "transcript.jsonl"
+                transcript_paths.append(tp)
+            for c_path, _ in r_idx["conv_by_low"].get(cid_lower, ()):
+                mtime_artifacts.append(c_path)
+            if is_uuid:
+                mtime_artifacts.extend(r_idx["pres_by_uuid"].get(cid_lower, ()))
+                mtime_artifacts.extend(r_idx["ann_by_uuid"].get(cid_lower, ()))
+            else:
+                for nm, pp in r_idx["pres_all"]:
+                    if _matches_companion_artifact_name(nm, cid_lower):
+                        mtime_artifacts.append(pp)
+                for nm, ap in r_idx["ann_all"]:
+                    if _matches_companion_artifact_name(nm, cid_lower):
+                        mtime_artifacts.append(ap)
+    else:
+        for r_spec in roots:
+            b_dir = Path(r_spec["brain_dir"])
+            c_dir = Path(r_spec["conversations_dir"])
+            ann_dir = Path(r_spec["annotations_dir"])
+            pres_dir = Path(r_spec["presence_dir"])
+            for cand_id in dict.fromkeys((cid, cid_lower)):
+                tp = b_dir / cand_id / ".system_generated" / "logs" / "transcript.jsonl"
+                transcript_paths.append(tp)
+                mtime_artifacts.append(tp)
+                for ext in (".db", ".db-wal", ".db-shm", ".db-journal", ".pb"):
+                    mtime_artifacts.append(c_dir / f"{cand_id}{ext}")
+            for comp_dir in (pres_dir, ann_dir):
+                with contextlib.suppress(OSError):
+                    if comp_dir.is_dir():
+                        for p_entry in comp_dir.iterdir():
+                            if _matches_companion_artifact_name(p_entry.name, cid_lower):
+                                mtime_artifacts.append(p_entry)
 
     min_disk_age: float | None = None
     seen_art: set[str] = set()
@@ -1874,6 +2064,8 @@ def _resolve_uuid_candidates_for_queue_id(
     raw_id: str,
     roots: Sequence[Mapping[str, Any]],
     summaries_graph: Mapping[str, Any],
+    *,
+    disk_index: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Resolve a queue or CLI conversation identifier (full UUID, 8-char hex, or synthetic `<hex8>-<slug>`) to lowercase root CIDs."""
     clean = str(raw_id or "").strip().lower()
@@ -1897,15 +2089,19 @@ def _resolve_uuid_candidates_for_queue_id(
     for known_cid in sorted(summaries_graph.get("all_cids") or ()):
         _add_match(known_cid)
 
-    for r_spec in roots:
-        for dir_key in ("brain_dir", "conversations_dir", "annotations_dir", "presence_dir"):
-            d_path = Path(r_spec[dir_key])
-            with contextlib.suppress(OSError):
-                if d_path.is_dir():
-                    for entry in sorted(d_path.iterdir(), key=lambda p: p.name):
-                        if entry.name.lower().startswith(f"{pfx8}-"):
-                            stem = entry.name.split(".", 1)[0]
-                            _add_match(stem[:36])
+    if disk_index is not None:
+        for cand_u in (disk_index.get("prefix8_uuids") or {}).get(pfx8, ()):
+            _add_match(cand_u)
+    else:
+        for r_spec in roots:
+            for dir_key in ("brain_dir", "conversations_dir", "annotations_dir", "presence_dir"):
+                d_path = Path(r_spec[dir_key])
+                with contextlib.suppress(OSError):
+                    if d_path.is_dir():
+                        for entry in sorted(d_path.iterdir(), key=lambda p: p.name):
+                            if entry.name.lower().startswith(f"{pfx8}-"):
+                                stem = entry.name.split(".", 1)[0]
+                                _add_match(stem[:36])
 
     return matched_uuids or [clean]
 
@@ -1946,11 +2142,31 @@ def _is_superseded_cancelled_queue_item(
     return True
 
 
+def _collect_existing_branch_refs_for_repo(repo_dir: Path) -> set[str] | None:
+    """Return all existing `refs/heads/*` and `refs/remotes/*` refnames in `repo_dir` via one local `git for-each-ref` call."""
+    if not (repo_dir / ".git").exists():
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "for-each-ref", "--format=%(refname)", "refs/heads/", "refs/remotes/"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()}
+
+
 def _find_unmerged_local_branches_for_queue_item(
     item: Mapping[str, Any],
     *,
     p_dir: Path,
     git_client: GitVcsIntegrationClient | None = None,
+    repo_refs_cache: dict[str, set[str] | None] | None = None,
 ) -> list[str]:
     """Check strictly via local Git refs (zero network calls) whether any branch on `item` still exists unmerged."""
     raw_branches = [str(b).strip() for b in (item.get("branch_names") or []) if str(b).strip()]
@@ -1989,6 +2205,20 @@ def _find_unmerged_local_branches_for_queue_item(
             if not candidate_dirs and (base_repo / ".git").exists():
                 candidate_dirs = [base_repo]
         for r_dir in candidate_dirs:
+            if repo_refs_cache is not None:
+                try:
+                    r_key = str(r_dir.resolve())
+                except OSError:
+                    r_key = str(r_dir)
+                if r_key not in repo_refs_cache:
+                    repo_refs_cache[r_key] = _collect_existing_branch_refs_for_repo(r_dir)
+                existing_refs = repo_refs_cache[r_key]
+                if (
+                    existing_refs is not None
+                    and f"refs/heads/{clean_br}" not in existing_refs
+                    and f"refs/remotes/origin/{clean_br}" not in existing_refs
+                ):
+                    continue
             merged_ok, reason = _inspect_local_branch_merged_readonly(r_dir, clean_br)
             if not merged_ok and reason == "unmerged_local_ref_exists" and clean_br not in unmerged:
                 unmerged.append(clean_br)
@@ -2006,6 +2236,7 @@ def _discover_scheduled_action_conversations(
     now_ts: float,
     queue_items: Sequence[Mapping[str, Any]] = (),
     include_deliverable_and_unaudited: bool = True,
+    disk_index: Mapping[str, Any] | None = None,
 ) -> list[tuple[str, str]]:
     """Discover idle scheduled action roots classified as `noop_actions`, `deliverable_actions`, or `unaudited_expired_actions`."""
     noop_cutoff_ts = float(now_ts) - max(0.0, float(noop_hours)) * 3600.0
@@ -2031,7 +2262,7 @@ def _discover_scheduled_action_conversations(
         mod_ep = _parse_iso_epoch_seconds(mod_iso)
         if mod_ep is not None:
             epochs.append(mod_ep)
-        for art in _collect_conversation_disk_artifacts(cid, roots):
+        for art in _collect_conversation_disk_artifacts(cid, roots, disk_index=disk_index):
             p = Path(art["path"])
             with contextlib.suppress(OSError):
                 if p.is_symlink():
@@ -2193,7 +2424,7 @@ def _discover_scheduled_action_conversations(
                             if upd_ep is not None:
                                 extra_ts.append(upd_ep)
 
-                        if _is_older_than_cutoff(cid, extra_ts, cutoff) and _collect_conversation_disk_artifacts(cid, roots):
+                        if _is_older_than_cutoff(cid, extra_ts, cutoff) and _has_conversation_disk_artifacts(cid, roots, disk_index=disk_index):
                             seen.add(cid)
                             discovered.append((cid, cat))
         except sqlite3.Error:
@@ -2212,7 +2443,7 @@ def _discover_scheduled_action_conversations(
             or _matches_any_queue_item(cid)
         ):
             continue
-        if not _collect_conversation_disk_artifacts(cid, roots):
+        if not _has_conversation_disk_artifacts(cid, roots, disk_index=disk_index):
             continue
 
         has_error_step = cid in alert_cids
@@ -2977,6 +3208,7 @@ def _is_ghost_cid(
     roots: Sequence[Mapping[str, Any]],
     protected_map: Mapping[str, list[str]],
     running_cids: set[str],
+    disk_index: Mapping[str, Any] | None = None,
 ) -> bool:
     """Return True when `cid` is neither running, protected, nor backed by any disk artifact."""
     c_val = str(cid or "").strip().lower()
@@ -2984,7 +3216,7 @@ def _is_ghost_cid(
         return False
     if c_val in running_cids or _find_protection_reasons(c_val, protected_map):
         return False
-    return not _collect_conversation_disk_artifacts(c_val, roots)
+    return not _has_conversation_disk_artifacts(c_val, roots, disk_index=disk_index)
 
 
 def _scan_summaries_db_ghosts(
@@ -2992,6 +3224,7 @@ def _scan_summaries_db_ghosts(
     *,
     roots: Sequence[Mapping[str, Any]],
     protected_map: Mapping[str, list[str]],
+    disk_index: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read-only scan of one `conversation_summaries.db` returning ghost CIDs, running CIDs, and table flags."""
     ro_conn = _open_sqlite_readonly(db_p)
@@ -3042,12 +3275,14 @@ def _scan_summaries_db_ghosts(
                         c_val = str(raw_col or "").strip().lower()
                         if c_val:
                             db_cids.add(c_val)
+        eff_disk_index = disk_index if disk_index is not None else _build_disk_artifacts_index(roots)
         for c_val in sorted(db_cids):
             if _is_ghost_cid(
                 c_val,
                 roots=roots,
                 protected_map=protected_map,
                 running_cids=running_in_db,
+                disk_index=eff_disk_index,
             ):
                 ghost_cids.append(c_val)
     finally:
@@ -3094,6 +3329,7 @@ def _inspect_app_storage_ghosts(
     roots: Sequence[Mapping[str, Any]],
     protected_map: Mapping[str, list[str]],
     running_cids: set[str],
+    disk_index: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read-only inspection of ghost references in `app_storage.json` returning updated dict in memory."""
     breakdown = {"pinned": 0, "layout_keys": 0, "layout_index_pairs": 0, "expanded_keys": 0}
@@ -3113,9 +3349,16 @@ def _inspect_app_storage_ghosts(
 
     updated = dict(raw_obj)
     ghost_set: set[str] = set()
+    eff_disk_index = disk_index if disk_index is not None else _build_disk_artifacts_index(roots)
 
     def _check_ghost(uid: str) -> bool:
-        if _is_ghost_cid(uid, roots=roots, protected_map=protected_map, running_cids=running_cids):
+        if _is_ghost_cid(
+            uid,
+            roots=roots,
+            protected_map=protected_map,
+            running_cids=running_cids,
+            disk_index=eff_disk_index,
+        ):
             ghost_set.add(uid.lower())
             return True
         return False
@@ -3193,6 +3436,7 @@ def _prune_app_storage_ghosts(
     running_cids: set[str],
     dry_run: bool,
     ts_slug: str,
+    disk_index: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Prune ghost UUIDs from `app_storage.json` with `0600` timestamped backup and atomic replace."""
     agg_breakdown = {"pinned": 0, "layout_keys": 0, "layout_index_pairs": 0, "expanded_keys": 0}
@@ -3200,6 +3444,7 @@ def _prune_app_storage_ghosts(
     ghost_cids: set[str] = set()
     files_modified = 0
     entries_removed = 0
+    eff_disk_index = disk_index if disk_index is not None else _build_disk_artifacts_index(roots)
 
     for storage_path in app_storage_paths:
         inspected = _inspect_app_storage_ghosts(
@@ -3207,6 +3452,7 @@ def _prune_app_storage_ghosts(
             roots=roots,
             protected_map=protected_map,
             running_cids=running_cids,
+            disk_index=eff_disk_index,
         )
         if not inspected["changed"]:
             continue
@@ -3320,10 +3566,11 @@ def count_ghost_sidebar_entries(
         env=env,
     )
 
+    disk_index = _build_disk_artifacts_index(roots)
     db_ghosts: set[str] = set()
     running_cids: set[str] = set()
     for db_p in existing_dbs:
-        scan = _scan_summaries_db_ghosts(db_p, roots=roots, protected_map=protected_map)
+        scan = _scan_summaries_db_ghosts(db_p, roots=roots, protected_map=protected_map, disk_index=disk_index)
         db_ghosts.update(scan["ghost_cids"])
         running_cids.update(scan["running_cids"])
 
@@ -3337,6 +3584,7 @@ def count_ghost_sidebar_entries(
                 roots=roots,
                 protected_map=protected_map,
                 running_cids=running_cids,
+                disk_index=disk_index,
             )
             app_ghosts.update(insp["ghost_cids"])
             app_entries += int(insp["entries_removed"])
@@ -3459,6 +3707,7 @@ def prune_ghost_conversation_summaries(
         env=env,
     )
 
+    disk_index = _build_disk_artifacts_index(roots)
     cur_now = float(now_ts if now_ts is not None else time.time())
     ts_slug = datetime.fromtimestamp(cur_now, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backups: list[str] = []
@@ -3467,7 +3716,7 @@ def prune_ghost_conversation_summaries(
     running_in_all_dbs: set[str] = set()
 
     for db_p in existing_dbs:
-        scan = _scan_summaries_db_ghosts(db_p, roots=roots, protected_map=protected_map)
+        scan = _scan_summaries_db_ghosts(db_p, roots=roots, protected_map=protected_map, disk_index=disk_index)
         running_in_all_dbs.update(scan["running_cids"])
         if not scan["opened"]:
             continue
@@ -3555,6 +3804,7 @@ def prune_ghost_conversation_summaries(
             running_cids=running_in_all_dbs,
             dry_run=dry_run,
             ts_slug=ts_slug,
+            disk_index=disk_index,
         )
         backups.extend(app_storage_res["backups"])
 
@@ -4466,6 +4716,8 @@ def cleanup_merged_conversations(
         cli_dir=cli_dir,
         antigravity_dirs=antigravity_dirs,
     )
+    disk_index = _build_disk_artifacts_index(roots)
+    repo_refs_cache: dict[str, set[str] | None] = {}
     summaries_graph = _load_conversation_summaries_graph(roots, summaries_db=summaries_db)
     q_data = load_dev_queue(portfolio_dir=p_dir)
     q_items = list(q_data.get("items") or [])
@@ -4512,19 +4764,19 @@ def cleanup_merged_conversations(
             summaries_db=summaries_db,
             summaries_graph=summaries_graph,
         ):
-            if only_if_present and not _collect_conversation_disk_artifacts(child, roots):
+            if only_if_present and not _has_conversation_disk_artifacts(child, roots, disk_index=disk_index):
                 continue
             _add_candidate(child, child_category)
 
     for rcid in root_cids:
-        resolved_roots = _resolve_uuid_candidates_for_queue_id(rcid, roots, summaries_graph)
+        resolved_roots = _resolve_uuid_candidates_for_queue_id(rcid, roots, summaries_graph, disk_index=disk_index)
         for u_cid in resolved_roots:
             _add_candidate(u_cid, "merged_roots")
             if not _find_protection_reasons(u_cid, protected_map):
                 _expand_children_for(u_cid, "subagents")
 
     for orch_cid in subonly_cids:
-        for u_orch in _resolve_uuid_candidates_for_queue_id(orch_cid, roots, summaries_graph):
+        for u_orch in _resolve_uuid_candidates_for_queue_id(orch_cid, roots, summaries_graph, disk_index=disk_index):
             _expand_children_for(u_orch, "subagents")
 
     if explicit_seed_cids:
@@ -4534,7 +4786,7 @@ def cleanup_merged_conversations(
                 if str(q_it.get("status") or "").lower() == "merged" and any(_matches_cid(q_cid_raw, r) for r in root_cids):
                     queue_items_to_mark_cleaned.setdefault(
                         q_cid_raw,
-                        _resolve_uuid_candidates_for_queue_id(q_cid_raw, roots, summaries_graph),
+                        _resolve_uuid_candidates_for_queue_id(q_cid_raw, roots, summaries_graph, disk_index=disk_index),
                     )
                 if not _find_protection_reasons(q_cid_raw, protected_map):
                     for sub in q_it.get("subagent_conversation_ids") or []:
@@ -4555,7 +4807,12 @@ def cleanup_merged_conversations(
             else:
                 continue
 
-            unmerged_brs = _find_unmerged_local_branches_for_queue_item(q_it, p_dir=p_dir, git_client=git_client)
+            unmerged_brs = _find_unmerged_local_branches_for_queue_item(
+                q_it,
+                p_dir=p_dir,
+                git_client=git_client,
+                repo_refs_cache=repo_refs_cache,
+            )
             if unmerged_brs:
                 skipped.append(
                     {
@@ -4567,13 +4824,13 @@ def cleanup_merged_conversations(
                     merge_check["unmerged"].append({"branch_name": ubr, "reason": "unmerged_local_ref_exists"})
                 continue
 
-            resolved_roots = _resolve_uuid_candidates_for_queue_id(q_cid_raw, roots, summaries_graph)
+            resolved_roots = _resolve_uuid_candidates_for_queue_id(q_cid_raw, roots, summaries_graph, disk_index=disk_index)
             if q_st == "merged":
                 queue_items_to_mark_cleaned.setdefault(q_cid_raw, resolved_roots)
 
             only_present = q_st == "cleaned"
             for u_cid in resolved_roots:
-                has_disk = bool(_collect_conversation_disk_artifacts(u_cid, roots))
+                has_disk = _has_conversation_disk_artifacts(u_cid, roots, disk_index=disk_index)
                 if not only_present or has_disk:
                     _add_candidate(u_cid, cat)
                 if not _find_protection_reasons(u_cid, protected_map):
@@ -4583,7 +4840,7 @@ def cleanup_merged_conversations(
                 not _find_protection_reasons(u_cid, protected_map) for u_cid in resolved_roots
             ):
                 for sub in q_it.get("subagent_conversation_ids") or []:
-                    if not only_present or _collect_conversation_disk_artifacts(str(sub), roots):
+                    if not only_present or _has_conversation_disk_artifacts(str(sub), roots, disk_index=disk_index):
                         _add_candidate(str(sub), "subagents")
 
         merged_cid8, unmerged_cid8 = _collect_repo_branch_merge_index(
@@ -4645,6 +4902,7 @@ def cleanup_merged_conversations(
             now_ts=cur_now,
             queue_items=q_items,
             include_deliverable_and_unaudited=bool(include_scheduled_actions),
+            disk_index=disk_index,
         )
         for a_cid, a_cat in action_pairs:
             _add_candidate(a_cid, a_cat)
@@ -4679,12 +4937,13 @@ def cleanup_merged_conversations(
             antigravity_dirs=antigravity_dirs,
             summaries_db=summaries_db,
             summaries_graph=summaries_graph,
+            disk_index=disk_index,
         )
         if not idle_ok:
             skipped.append({"conversation_id": cid, "reasons": [idle_reason]})
             continue
 
-        artifacts = _collect_conversation_disk_artifacts(cid, roots)
+        artifacts = _collect_conversation_disk_artifacts(cid, roots, disk_index=disk_index)
         if not artifacts:
             skipped.append({"conversation_id": cid, "reasons": ["not_present_on_disk"]})
             continue

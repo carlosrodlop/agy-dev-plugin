@@ -222,6 +222,11 @@ button {
   cursor: wait;
 }
 
+.dq-clean-btn[aria-expanded="true"] {
+  border-color: var(--dq-primary);
+  background: color-mix(in srgb, var(--dq-primary) 12%, var(--dq-card));
+}
+
 .dq-cleanup-panel {
   margin: 8px 12px 0;
   padding: 8px 10px;

@@ -1229,6 +1229,8 @@ def _detect_parallel_lookahead_opportunity(
             continue
 
         disjoint_cands: list[dict[str, Any]] = []
+        repo_structures: dict[str, Any] | None = None
+        repo_forward_graph: dict[str, tuple[str, ...]] | None = None
         for cand in pending_sorted:
             cand_cid = str(cand.get("conversation_id") or "").strip()
             if _lock_matches_cid(repo_lk, cand_cid):
@@ -1269,12 +1271,17 @@ def _detect_parallel_lookahead_opportunity(
             if not cand_spec.target_files and not cand_spec.section_anchors:
                 continue
 
-            # Pairwise validation against ALL active slots (worst tier wins)
+            if repo_structures is None and r_dir is not None and r_dir.is_dir():
+                repo_structures, repo_forward_graph = _parallel_scope.build_repository_import_graph(r_dir)
+
+            # Pairwise validation against ALL active slots (worst tier wins), reusing the repo import graph
             multi_ov = _parallel_scope.analyze_candidate_against_slots(
                 slot_specs,
                 cand_spec,
                 repo_dir=r_dir,
                 repo_slug=repo_slug,
+                structures=repo_structures,
+                forward_graph=repo_forward_graph,
             )
             if multi_ov.get("parallel_safe"):
                 disjoint_cands.append(

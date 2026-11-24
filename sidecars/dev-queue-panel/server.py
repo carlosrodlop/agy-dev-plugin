@@ -405,6 +405,7 @@ def build_panel_state(
     now_ts: float | None = None,
     stall_threshold_seconds: int | float | None = None,
     repo_cache: dict[str, Any] | None = None,
+    cache_lock: threading.Lock | None = None,
     client_etag: str = "",
     env: Mapping[str, str] | None = None,
     home_dir: Path | None = None,
@@ -434,16 +435,17 @@ def build_panel_state(
                 brain_dir=brain_roots,
             )
 
-    opt_hint = _tui._compute_lightweight_opt_hint(
+    opt_hint = _get_cached_lightweight_opt_hint(
+        st_dir=st_dir,
         items=raw_items,
         locks=locks,
         all_locks=all_locks,
         repo_local_dirs=repo_local_dirs,
-        bar_w=140,
+        brain_roots=brain_roots,
         now_ts=now_ts,
         stall_threshold_seconds=stall_threshold_seconds,
-        brain_dir=brain_roots,
-        enabled=True,
+        repo_cache=repo_cache,
+        cache_lock=cache_lock,
     )
 
     all_managed_slugs: set[str] = set(locks.keys()) | set(repo_web_bases.keys())
@@ -789,6 +791,7 @@ def build_panel_state(
     ghost_purge_state = _get_cached_ghost_purge_status(
         ghost_kwargs,
         repo_cache=repo_cache,
+        cache_lock=cache_lock,
         now_ts=now_ts,
     )
 
@@ -873,6 +876,7 @@ def _resolve_sidecar_agy_dirs(
 
 
 GHOST_PURGE_CACHE_TTL_SECONDS = 45.0
+OPT_HINT_CACHE_TTL_SECONDS = 30.0
 
 
 def _stat_path_signature(path: Path) -> tuple[str, int, int]:
@@ -882,6 +886,80 @@ def _stat_path_signature(path: Path) -> tuple[str, int, int]:
         return (str(path), int(st.st_mtime_ns), int(st.st_size))
     except OSError:
         return (str(path), 0, -1)
+
+
+def _compute_opt_hint_cache_signature(
+    st_dir: Path,
+    repo_local_dirs: Mapping[str, Path],
+    brain_roots: Sequence[Path],
+    stall_threshold_seconds: int | float | None,
+) -> tuple[Any, ...]:
+    """Build a fast `os.stat` cache key for `_get_cached_lightweight_opt_hint()`."""
+    return (
+        str(st_dir),
+        _stat_path_signature(st_dir / "dev_queue.json"),
+        _stat_path_signature(st_dir / "actions_state.json"),
+        tuple(sorted((str(k), str(v)) for k, v in repo_local_dirs.items())),
+        tuple(str(b) for b in brain_roots),
+        None if stall_threshold_seconds is None else float(stall_threshold_seconds),
+    )
+
+
+def _get_cached_lightweight_opt_hint(
+    *,
+    st_dir: Path,
+    items: list[dict[str, Any]],
+    locks: dict[str, dict[str, Any]],
+    all_locks: dict[str, dict[str, Any]],
+    repo_local_dirs: dict[str, Path],
+    brain_roots: Sequence[Path],
+    now_ts: float | None = None,
+    stall_threshold_seconds: int | float | None = None,
+    repo_cache: dict[str, Any] | None = None,
+    cache_lock: threading.Lock | None = None,
+    ttl_seconds: float = OPT_HINT_CACHE_TTL_SECONDS,
+) -> str:
+    """Return single-flight mtime+TTL cached `OPT:` footer hint so 1.5s `/api/state` polls stay <5ms."""
+    if repo_cache is None:
+        return _tui._compute_lightweight_opt_hint(
+            items=items,
+            locks=locks,
+            all_locks=all_locks,
+            repo_local_dirs=repo_local_dirs,
+            bar_w=140,
+            now_ts=now_ts,
+            stall_threshold_seconds=stall_threshold_seconds,
+            brain_dir=brain_roots,
+            enabled=True,
+        )
+
+    cur_ts = float(now_ts if now_ts is not None else time.time())
+    sig = _compute_opt_hint_cache_signature(st_dir, repo_local_dirs, brain_roots, stall_threshold_seconds)
+    lock_ctx = cache_lock if cache_lock is not None else contextlib.nullcontext()
+    with lock_ctx:
+        cached = repo_cache.get("_opt_hint_cache")
+        if isinstance(cached, Mapping) and cached.get("signature") == sig:
+            age = cur_ts - float(cached.get("cached_at") or 0.0)
+            if 0.0 <= age < float(ttl_seconds):
+                return str(cached.get("value") or "")
+
+        fresh = _tui._compute_lightweight_opt_hint(
+            items=items,
+            locks=locks,
+            all_locks=all_locks,
+            repo_local_dirs=repo_local_dirs,
+            bar_w=140,
+            now_ts=now_ts,
+            stall_threshold_seconds=stall_threshold_seconds,
+            brain_dir=brain_roots,
+            enabled=True,
+        )
+        repo_cache["_opt_hint_cache"] = {
+            "signature": sig,
+            "cached_at": cur_ts,
+            "value": fresh,
+        }
+        return fresh
 
 
 def _compute_ghost_purge_cache_signature(ghost_kwargs: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -910,33 +988,36 @@ def _get_cached_ghost_purge_status(
     ghost_kwargs: Mapping[str, Any],
     *,
     repo_cache: dict[str, Any] | None = None,
+    cache_lock: threading.Lock | None = None,
     now_ts: float | None = None,
     ttl_seconds: float = GHOST_PURGE_CACHE_TTL_SECONDS,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
-    """Return mtime + TTL cached `get_ghost_purge_status()` so 1.5s `/api/state` polls run in <5ms."""
+    """Return single-flight mtime + TTL cached `get_ghost_purge_status()` so 1.5s `/api/state` polls run in <5ms."""
     cur_ts = float(now_ts if now_ts is not None else time.time())
     sig = _compute_ghost_purge_cache_signature(ghost_kwargs)
-    if repo_cache is not None and not force_refresh:
-        cached = repo_cache.get("_ghost_purge_cache")
-        if isinstance(cached, Mapping) and cached.get("signature") == sig:
-            age = cur_ts - float(cached.get("cached_at") or 0.0)
-            exp_ts = cached.get("armed_expires_at_ts")
-            arm_unexpired = not isinstance(exp_ts, (int, float)) or cur_ts < float(exp_ts)
-            if 0.0 <= age < float(ttl_seconds) and arm_unexpired:
-                return dict(cached["value"])
+    lock_ctx = cache_lock if cache_lock is not None else contextlib.nullcontext()
+    with lock_ctx:
+        if repo_cache is not None and not force_refresh:
+            cached = repo_cache.get("_ghost_purge_cache")
+            if isinstance(cached, Mapping) and cached.get("signature") == sig:
+                age = cur_ts - float(cached.get("cached_at") or 0.0)
+                exp_ts = cached.get("armed_expires_at_ts")
+                arm_unexpired = not isinstance(exp_ts, (int, float)) or cur_ts < float(exp_ts)
+                if 0.0 <= age < float(ttl_seconds) and arm_unexpired:
+                    return dict(cached["value"])
 
-    fresh = _merge_watcher.get_ghost_purge_status(**ghost_kwargs, now_ts=now_ts)
-    if repo_cache is not None:
-        st_dir = Path(ghost_kwargs["portfolio_dir"])
-        arm_doc = _merge_watcher._read_unexpired_ghost_purge_arm(st_dir, now_ts=cur_ts)
-        repo_cache["_ghost_purge_cache"] = {
-            "signature": sig,
-            "cached_at": cur_ts,
-            "armed_expires_at_ts": arm_doc.get("expires_at_ts") if isinstance(arm_doc, Mapping) else None,
-            "value": fresh,
-        }
-    return fresh
+        fresh = _merge_watcher.get_ghost_purge_status(**ghost_kwargs, now_ts=now_ts)
+        if repo_cache is not None:
+            st_dir = Path(ghost_kwargs["portfolio_dir"])
+            arm_doc = _merge_watcher._read_unexpired_ghost_purge_arm(st_dir, now_ts=cur_ts)
+            repo_cache["_ghost_purge_cache"] = {
+                "signature": sig,
+                "cached_at": cur_ts,
+                "armed_expires_at_ts": arm_doc.get("expires_at_ts") if isinstance(arm_doc, Mapping) else None,
+                "value": fresh,
+            }
+        return fresh
 
 
 def _resolve_sidecar_ghost_kwargs(
@@ -1002,6 +1083,7 @@ class DevQueuePanelConfig:
         self.home_dir = home_dir
         self.env = dict(env) if env is not None else None
         self.repo_cache: dict[str, Any] = {}
+        self.cache_lock = threading.Lock()
         self.preload_js = resolve_preload_js(env=self.env, home_dir=self.home_dir)
 
 
@@ -1113,6 +1195,7 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
                         brain_dir=cfg.brain_dir,
                         board_override=cfg.board_override,
                         repo_cache=cfg.repo_cache,
+                        cache_lock=cfg.cache_lock,
                         client_etag=etag_param,
                         env=cfg.env,
                         home_dir=cfg.home_dir,
@@ -1267,24 +1350,26 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
                 clean_res = _merge_watcher.cleanup_merged_conversations(**cleanup_kwargs)
                 ok = str(clean_res.get("status") or "") == "ok"
                 status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
-                extra_ghost: dict[str, Any] = {}
-                if not is_dry_run:
-                    cfg.repo_cache.pop("_ghost_purge_cache", None)
-                else:
-                    ghost_kwargs = _resolve_sidecar_ghost_kwargs(
-                        state_dir=cfg.state_dir,
-                        conv_db_path=cfg.conv_db_path,
-                        brain_dir=cfg.brain_dir,
-                        home_dir=cfg.home_dir,
-                        env=cfg.env,
-                    )
-                    extra_ghost["ghost_purge"] = _get_cached_ghost_purge_status(
+                ghost_kwargs = _resolve_sidecar_ghost_kwargs(
+                    state_dir=cfg.state_dir,
+                    conv_db_path=cfg.conv_db_path,
+                    brain_dir=cfg.brain_dir,
+                    home_dir=cfg.home_dir,
+                    env=cfg.env,
+                )
+                extra_ghost: dict[str, Any] = {
+                    "ghost_purge": _get_cached_ghost_purge_status(
                         ghost_kwargs,
                         repo_cache=cfg.repo_cache,
+                        cache_lock=cfg.cache_lock,
                         force_refresh=True,
                     )
+                }
+                err_fields: dict[str, Any] = {}
+                if not ok and not clean_res.get("error"):
+                    err_fields["error"] = str(clean_res.get("blocked_message") or clean_res.get("reason") or "conflict")
                 payload = sanitize_zero_pii_payload(
-                    {"ok": ok, **clean_res, **extra_ghost},
+                    {"ok": ok, **clean_res, **err_fields, **extra_ghost},
                     home_dir=cfg.home_dir,
                 )
                 self._send_json(status_code, payload)
@@ -1352,14 +1437,19 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
                     ok = str(action_res.get("status") or "") == "ok"
                     status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
 
-                cfg.repo_cache.pop("_ghost_purge_cache", None)
                 ghost_state = _get_cached_ghost_purge_status(
                     ghost_kwargs,
                     repo_cache=cfg.repo_cache,
+                    cache_lock=cfg.cache_lock,
                     force_refresh=True,
                 )
+                err_fields = {}
+                if not ok and not action_res.get("error"):
+                    err_fields["error"] = str(
+                        action_res.get("blocked_message") or action_res.get("reason") or "conflict"
+                    )
                 payload = sanitize_zero_pii_payload(
-                    {"ok": ok, **action_res, "ghost_purge": ghost_state},
+                    {"ok": ok, **action_res, **err_fields, "ghost_purge": ghost_state},
                     home_dir=cfg.home_dir,
                 )
                 self._send_json(status_code, payload)

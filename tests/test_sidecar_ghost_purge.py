@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -29,6 +30,7 @@ for _p in (CLIENTS_DIR, PR_REM_DIR):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
+import merge_watcher as mw  # noqa: E402
 import pr_remediator as prs  # noqa: E402
 
 
@@ -766,10 +768,23 @@ class TestSidecarGhostPurgeEndpointsAndUI(unittest.TestCase):
             self.assertIn(route, js)
         self.assertIn("renderGhostPurgeControls", js)
         self.assertIn("renderGhostResultBanner", js)
+        self.assertIn('aria-expanded="false"', html)
+        for js_symbol in (
+            "CLEANUP_FETCH_TIMEOUT_MS",
+            "toggleCleanupDrawer",
+            "closeCleanupDrawer",
+            "cleanupOpen",
+            "cleanupLoading",
+            "cleanupRequestSeq",
+            "blocked_message",
+            "aria-expanded",
+        ):
+            self.assertIn(js_symbol, js)
         for unsafe_sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
             self.assertNotIn(unsafe_sink, js)
         self.assertIn(".dq-ghost-section", css)
         self.assertIn(".dq-ghost-result-banner", css)
+        self.assertIn('.dq-clean-btn[aria-expanded="true"]', css)
         self.assertEqual(css.count("{"), css.count("}"))
 
     def test_build_panel_state_mtime_ttl_cache_avoids_redundant_scans(self) -> None:
@@ -839,6 +854,326 @@ class TestSidecarGhostPurgeEndpointsAndUI(unittest.TestCase):
                     env={},
                 )
                 self.assertEqual(spy_status.call_count, 3)
+
+    def test_cleanup_execute_includes_ghost_purge_and_409_populates_error_field(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _seed_ghost_workspace(root, include_running_in_db=True)
+            fake_home = root / "home_testuser"
+            fake_home.mkdir(parents=True, exist_ok=True)
+            mock_token = "mock-cleanup-exec-panel-token-0000"
+
+            httpd = panel_srv.create_panel_server(
+                port=0,
+                ui_token=mock_token,
+                state_dir=paths["pdir"],
+                brain_dir=paths["brain_dir"],
+                conv_db_path=paths["db_path"],
+                home_dir=fake_home,
+                env={},
+            )
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{port}"
+                st_exec, raw_exec = _http_request(
+                    f"{base}/api/cleanup/execute",
+                    method="POST",
+                    headers={"X-Sidecar-Token": mock_token},
+                    body={"include_unaudited_check": False},
+                )
+                self.assertEqual(st_exec, 200)
+                exec_json = json.loads(raw_exec)
+                self.assertTrue(exec_json["ok"])
+                self.assertIn("ghost_purge", exec_json)
+                self.assertEqual(exec_json["ghost_purge"]["summary"]["db_ghost_count"], 1)
+
+                st_409, raw_409 = _http_request(
+                    f"{base}/api/cleanup/ghosts/arm",
+                    method="POST",
+                    headers={"X-Sidecar-Token": mock_token},
+                    body={"mode": "restart_now"},
+                )
+                self.assertEqual(st_409, 409)
+                err_json = json.loads(raw_409)
+                self.assertFalse(err_json["ok"])
+                self.assertEqual(err_json["blocked_reason"], "running_conversations_active")
+                self.assertTrue(str(err_json.get("error") or "").strip())
+                self.assertEqual(err_json["error"], err_json["blocked_message"])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2.0)
+
+    def test_single_flight_cache_lock_and_opt_hint_ttl_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _seed_ghost_workspace(root, include_running_in_db=False)
+            fake_home = root / "home_testuser"
+            fake_home.mkdir(parents=True, exist_ok=True)
+            repo_cache: dict[str, object] = {}
+            cache_lock = threading.Lock()
+
+            orig_status = panel_srv._merge_watcher.get_ghost_purge_status
+            call_count = 0
+
+            def _slow_status(*args: object, **kwargs: object) -> dict[str, object]:
+                nonlocal call_count
+                call_count += 1
+                time.sleep(0.05)
+                return orig_status(*args, **kwargs)
+
+            ghost_kwargs = panel_srv._resolve_sidecar_ghost_kwargs(
+                state_dir=paths["pdir"],
+                conv_db_path=paths["db_path"],
+                brain_dir=paths["brain_dir"],
+                home_dir=fake_home,
+                env={},
+            )
+            barrier = threading.Barrier(4)
+            results: list[dict[str, object]] = []
+            res_lock = threading.Lock()
+
+            def _worker() -> None:
+                barrier.wait()
+                got = panel_srv._get_cached_ghost_purge_status(
+                    ghost_kwargs,
+                    repo_cache=repo_cache,
+                    cache_lock=cache_lock,
+                    now_ts=1_800_000_000.0,
+                )
+                with res_lock:
+                    results.append(got)
+
+            with mock.patch.object(panel_srv._merge_watcher, "get_ghost_purge_status", side_effect=_slow_status):
+                threads = [threading.Thread(target=_worker) for _ in range(4)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=5.0)
+            self.assertEqual(len(results), 4)
+            self.assertEqual(call_count, 1)
+            for item in results[1:]:
+                self.assertEqual(item, results[0])
+
+            # Verify `_compute_lightweight_opt_hint` caches by queue/lock signature + TTL
+            with mock.patch.object(
+                panel_srv._tui,
+                "_compute_lightweight_opt_hint",
+                return_value="OPT: mock cached hint",
+            ) as spy_opt:
+                snap1 = panel_srv.build_panel_state(
+                    state_dir=paths["pdir"],
+                    brain_dir=paths["brain_dir"],
+                    conv_db_path=paths["db_path"],
+                    repo_cache=repo_cache,
+                    cache_lock=cache_lock,
+                    home_dir=fake_home,
+                    now_ts=1_800_000_010.0,
+                    env={},
+                )
+                snap2 = panel_srv.build_panel_state(
+                    state_dir=paths["pdir"],
+                    brain_dir=paths["brain_dir"],
+                    conv_db_path=paths["db_path"],
+                    repo_cache=repo_cache,
+                    cache_lock=cache_lock,
+                    home_dir=fake_home,
+                    now_ts=1_800_000_015.0,
+                    env={},
+                )
+                self.assertEqual(spy_opt.call_count, 1)
+                self.assertEqual(snap1["opt_hint"], "OPT: mock cached hint")
+                self.assertEqual(snap2["opt_hint"], "OPT: mock cached hint")
+
+                # Mutating queue invalidates opt_hint cache signature immediately
+                q_file = paths["pdir"] / "dev_queue.json"
+                q_file.write_text(
+                    json.dumps(
+                        {
+                            "items": [
+                                {
+                                    "conversation_id": "aaaa1111-1111-4111-8111-111111111111",
+                                    "status": "pending",
+                                    "priority": 10,
+                                    "repo_slugs": ["acme-org/acme-plugin"],
+                                    "title": "Sample task",
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                panel_srv.build_panel_state(
+                    state_dir=paths["pdir"],
+                    brain_dir=paths["brain_dir"],
+                    conv_db_path=paths["db_path"],
+                    repo_cache=repo_cache,
+                    cache_lock=cache_lock,
+                    home_dir=fake_home,
+                    now_ts=1_800_000_016.0,
+                    env={},
+                )
+                self.assertEqual(spy_opt.call_count, 2)
+
+                # TTL expiry also refreshes after OPT_HINT_CACHE_TTL_SECONDS
+                panel_srv.build_panel_state(
+                    state_dir=paths["pdir"],
+                    brain_dir=paths["brain_dir"],
+                    conv_db_path=paths["db_path"],
+                    repo_cache=repo_cache,
+                    cache_lock=cache_lock,
+                    home_dir=fake_home,
+                    now_ts=1_800_000_016.0 + panel_srv.OPT_HINT_CACHE_TTL_SECONDS + 5.0,
+                    env={},
+                )
+                self.assertEqual(spy_opt.call_count, 3)
+
+    def test_disk_artifacts_index_parity_and_repo_refs_prefilter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agy_dir = root / "agy"
+            brain_dir = agy_dir / "brain"
+            conv_dir = agy_dir / "conversations"
+            ann_dir = agy_dir / "annotations"
+            pres_dir = agy_dir / "presence"
+            for d in (brain_dir, conv_dir, ann_dir, pres_dir):
+                d.mkdir(parents=True, exist_ok=True)
+
+            live_uuid = "11111111-aaaa-4111-8111-111111111111"
+            pb_uuid = "22222222-bbbb-4222-8222-222222222222"
+            db_uuid = "33333333-cccc-4333-8333-333333333333"
+            ghost_uuid = "44444444-dddd-4444-8444-444444444444"
+            non_uuid = "custom-session-alpha"
+
+            (brain_dir / live_uuid).mkdir()
+            (brain_dir / live_uuid / "notes.md").write_text("# ok\n", encoding="utf-8")
+            (conv_dir / f"{pb_uuid}.pb").write_bytes(b"pb")
+            (pres_dir / f"{db_uuid}.db").write_bytes(b"db")
+            (ann_dir / f"{non_uuid}.pbtxt").write_text("k: v\n", encoding="utf-8")
+
+            roots = [
+                {
+                    "runtime": "desktop",
+                    "root": agy_dir,
+                    "brain_dir": brain_dir,
+                    "conversations_dir": conv_dir,
+                    "annotations_dir": ann_dir,
+                    "presence_dir": pres_dir,
+                }
+            ]
+            disk_idx = mw._build_disk_artifacts_index(roots)
+
+            for cid, expected in (
+                (live_uuid, True),
+                (pb_uuid, True),
+                (db_uuid, True),
+                (non_uuid, True),
+                (ghost_uuid, False),
+            ):
+                direct = mw._collect_conversation_disk_artifacts(cid, roots)
+                indexed = mw._collect_conversation_disk_artifacts(cid, roots, disk_index=disk_idx)
+                self.assertEqual(bool(direct), expected, msg=f"cid={cid}")
+                self.assertEqual(mw._has_conversation_disk_artifacts(cid, roots, disk_index=disk_idx), expected)
+                self.assertEqual(
+                    [(a["kind"], a["path"]) for a in indexed],
+                    [(a["kind"], a["path"]) for a in direct],
+                )
+
+            # Hermetic git repo: verify repo_refs_cache skips pruned branches without invoking per-branch git checks
+            repo_dir = root / "repos" / "acme-plugin"
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            env_clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            subprocess.run(["git", "init", "-b", "main", str(repo_dir)], check=True, capture_output=True, env=env_clean)
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "config", "user.name", "Acme Bot"],
+                check=True,
+                capture_output=True,
+                env=env_clean,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "config", "user.email", "acme-bot@example.com"],
+                check=True,
+                capture_output=True,
+                env=env_clean,
+            )
+            (repo_dir / "README.md").write_text("# Acme\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "add", "README.md"],
+                check=True,
+                capture_output=True,
+                env=env_clean,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "commit", "-m", "chore: init"],
+                check=True,
+                capture_output=True,
+                env=env_clean,
+            )
+
+            unmerged_branch = "fix/20261124-000001-unmerged-11111111"
+            pruned_branch = "fix/20261124-000002-pruned-22222222"
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "checkout", "-b", unmerged_branch],
+                check=True,
+                capture_output=True,
+                env=env_clean,
+            )
+            (repo_dir / "feature.txt").write_text("unmerged change\n", encoding="utf-8")
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "add", "feature.txt"],
+                check=True,
+                capture_output=True,
+                env=env_clean,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "commit", "-m", "feat: wip"],
+                check=True,
+                capture_output=True,
+                env=env_clean,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "checkout", "main"],
+                check=True,
+                capture_output=True,
+                env=env_clean,
+            )
+
+            vcs = mock.Mock(resolve_repo_dir=mock.Mock(return_value=repo_dir))
+            refs_cache: dict[str, set[str] | None] = {}
+            with mock.patch.object(
+                mw,
+                "_inspect_local_branch_merged_readonly",
+                wraps=mw._inspect_local_branch_merged_readonly,
+            ) as spy_inspect:
+                res_pruned = mw._find_unmerged_local_branches_for_queue_item(
+                    {
+                        "branch_names": [pruned_branch],
+                        "repo_slugs": ["acme-org/acme-plugin"],
+                    },
+                    p_dir=root / "state",
+                    git_client=vcs,
+                    repo_refs_cache=refs_cache,
+                )
+                self.assertEqual(res_pruned, [])
+                self.assertEqual(spy_inspect.call_count, 0)
+                cached_refs = refs_cache[str(repo_dir.resolve())]
+                self.assertIsNotNone(cached_refs)
+                assert cached_refs is not None
+                self.assertIn(f"refs/heads/{unmerged_branch}", cached_refs)
+
+                res_unmerged = mw._find_unmerged_local_branches_for_queue_item(
+                    {
+                        "branch_names": [unmerged_branch],
+                        "repo_slugs": ["acme-org/acme-plugin"],
+                    },
+                    p_dir=root / "state",
+                    git_client=vcs,
+                    repo_refs_cache=refs_cache,
+                )
+                self.assertEqual(res_unmerged, [unmerged_branch])
+                self.assertEqual(spy_inspect.call_count, 1)
 
 
 if __name__ == "__main__":

@@ -569,6 +569,54 @@ class TestParallelScopeAnalyzer(unittest.TestCase):
             self.assertEqual(ov_only_foreign.overlap_tier, pscope.OVERLAP_DEEP_SHARED)
             self.assertFalse(ov_only_foreign.parallel_safe)
 
+    def test_build_repository_import_graph_fingerprinted_cache_and_invalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._build_polyglot_fixture_repo(pathlib.Path(tmp))
+            pscope.clear_repository_import_graph_cache()
+            try:
+                with mock.patch.object(
+                    pscope,
+                    "extract_file_structure",
+                    wraps=pscope.extract_file_structure,
+                ) as spy_extract:
+                    s1, g1 = pscope.build_repository_import_graph(repo)
+                    first_calls = spy_extract.call_count
+                    self.assertGreater(first_calls, 0)
+
+                    # Second call with unchanged files hits fingerprinted cache (zero re-parses)
+                    s2, g2 = pscope.build_repository_import_graph(repo)
+                    self.assertEqual(spy_extract.call_count, first_calls)
+                    self.assertEqual(set(s1.keys()), set(s2.keys()))
+                    self.assertEqual(g1, g2)
+
+                    # Shared graph reuse in `analyze_candidate_against_slots` avoids rebuilding graph
+                    slot_res = pscope.analyze_candidate_against_slots(
+                        [{"slot": 1, "target_files": ["web/utils.js#renderTimestamp"]}],
+                        {"id": "11111111-aaaa", "target_files": ["pkg/independent_cli.py"]},
+                        repo_dir=repo,
+                        structures=s2,
+                        forward_graph=g2,
+                    )
+                    self.assertTrue(slot_res["parallel_safe"])
+                    self.assertEqual(spy_extract.call_count, first_calls)
+
+                    # Mutating a source file invalidates the fingerprint and rebuilds
+                    indep = repo / "pkg" / "independent_cli.py"
+                    indep.write_text(
+                        "from pkg.leaf_db import purge_stale\n\n"
+                        "def run_health_ping() -> int:\n"
+                        "    return purge_stale()\n",
+                        encoding="utf-8",
+                    )
+                    st = indep.stat()
+                    os.utime(indep, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+                    s3, g3 = pscope.build_repository_import_graph(repo)
+                    self.assertGreater(spy_extract.call_count, first_calls)
+                    self.assertIn("pkg/leaf_db.py", g3["pkg/independent_cli.py"])
+                    self.assertIn("pkg/leaf_db.py", s3["pkg/independent_cli.py"].resolved_local_imports)
+            finally:
+                pscope.clear_repository_import_graph_cache()
+
 
 class TestRebaseGate(unittest.TestCase):
     """Test native git drift detection, `merge-tree` conflict probing, cross-impact union, and 3 rebase outcomes."""
