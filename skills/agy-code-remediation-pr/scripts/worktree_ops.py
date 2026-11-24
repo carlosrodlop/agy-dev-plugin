@@ -314,6 +314,7 @@ def start_remediation_branch_and_lock(
     allow_slot2: bool = False,
     force_slot2: bool = False,
     max_slots: int | None = None,
+    dev_model: str = "",
 ) -> dict[str, Any]:
     """Execute Steps 1–2: inspect/RCA, verify lock/slot availability (1-slot or safe 2-slot parallel), create timestamped git branch, and acquire `dev_pr_lock`."""
     vcs = git_client or GitVcsIntegrationClient()
@@ -658,6 +659,7 @@ def start_remediation_branch_and_lock(
         force_slot2=force_slot2,
         overlap_tier=slot2_overlap_tier,
         landing_order=slot2_landing_order or None,
+        dev_model=dev_model,
     )
     if not lock_res.get("acquired"):
         return lock_res
@@ -1721,6 +1723,7 @@ def register_worktree_cli(sub: Any) -> None:
     p_start.add_argument("--checkout", action="store_true", help="Checkout the timestamped branch directly in the local repository.")
     p_start.add_argument("--workdir", default="", help="Optional target repository directory (defaults to active cwd repo or AGY_CONF_REPO_DIR).")
     p_start.add_argument("--worker-cid", dest="worker_cid", default="", help="Optional active worker subagent conversation ID for stall monitoring.")
+    p_start.add_argument("--dev-model", dest="dev_model", default="", help="Optional actual developer model ID used on this branch (persisted on lock for cross-family review).")
     p_start.add_argument("--allow-slot2", "--parallel-slot", dest="allow_slot2", action="store_true", help="Allow allocating parallel Slot #2 when overlap check passes.")
     p_start.add_argument(
         "--reuse-active",
@@ -1729,6 +1732,7 @@ def register_worktree_cli(sub: Any) -> None:
         action="store_true",
         help="Reuse the currently active open PR branch when addressing PR comments or CI fixes.",
     )
+    p_start.add_argument("--verbose", action="store_true", help="Emit full untruncated proposal_markdown and nested lock blobs (default is compact token-saving JSON).")
 
     p_test = sub.add_parser("test-local", help="Run local offline unit tests, static QA auditor, and persist verification_results on dev_pr_lock.")
     p_test.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
@@ -1763,6 +1767,48 @@ def register_worktree_cli(sub: Any) -> None:
     )
 
 
+def _compact_start_remediation_output(res: dict[str, Any]) -> dict[str, Any]:
+    """Strip redundant proposal_markdown & nested lock blobs from CLI stdout to minimize LLM context tokens."""
+    if not isinstance(res, dict):
+        return res
+    out = {k: v for k, v in res.items() if k not in ("proposal_markdown", "lock", "active_lock")}
+    lock_src = res.get("lock") if isinstance(res.get("lock"), dict) else None
+    if lock_src is not None:
+        out["lock"] = {
+            k: lock_src.get(k)
+            for k in (
+                "lock_id",
+                "slot_id",
+                "status",
+                "repo_slug",
+                "branch_name",
+                "worktree_path",
+                "worker_cid",
+                "dev_model",
+                "pr_gate_ready",
+            )
+            if k in lock_src
+        }
+    active_src = res.get("active_lock") if isinstance(res.get("active_lock"), dict) else None
+    if active_src is not None:
+        out["active_lock"] = {
+            k: active_src.get(k)
+            for k in (
+                "lock_id",
+                "slot_id",
+                "status",
+                "conversation_id",
+                "branch_name",
+                "branch_timestamp",
+                "manual_pr_url",
+                "pr_gate_ready",
+            )
+            if k in active_src
+        }
+    out["compact"] = True
+    return out
+
+
 def dispatch_worktree_cli(args: Any) -> int | None:
     """Handle worktree & validation CLI subcommands; return exit code or None if unhandled."""
     if args.subcommand == "start-remediation":
@@ -1782,8 +1828,10 @@ def dispatch_worktree_cli(args: Any) -> int | None:
             worker_cid=getattr(args, "worker_cid", ""),
             section_anchors=getattr(args, "section_anchors", []) or None,
             allow_slot2=bool(getattr(args, "allow_slot2", False)),
+            dev_model=str(getattr(args, "dev_model", "") or ""),
         )
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        printed = res if getattr(args, "verbose", False) else _compact_start_remediation_output(res)
+        print(json.dumps(printed, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
 
     if args.subcommand == "test-local":

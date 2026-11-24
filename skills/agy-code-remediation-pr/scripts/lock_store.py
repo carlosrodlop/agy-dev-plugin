@@ -590,6 +590,8 @@ _SLOT_SYNC_FIELDS: tuple[str, ...] = (
     "reviewer_score",
     "reviewer_summary",
     "reviewer_subagent_id",
+    "dev_model",
+    "last_reviewer_model",
     "subagent_conversation_ids",
     "review_markdown",
     "verification_results",
@@ -1049,6 +1051,7 @@ def acquire_dev_pr_lock(
     force_slot2: bool = False,
     overlap_tier: str = "",
     landing_order: list[str] | None = None,
+    dev_model: str = "",
 ) -> dict[str, Any]:
     """Acquire a 1-slot or 2-slot per-repository development lock (`dev_pr_locks[repo_slug]`).
 
@@ -1243,6 +1246,7 @@ def acquire_dev_pr_lock(
                         ),
                         "acquired_at": str(prev_s2.get("acquired_at") or now_iso) if same_conv_slot2 else now_iso,
                         "worker_cid": str(worker_cid or prev_s2.get("worker_cid") or "").strip(),
+                        "dev_model": str(dev_model or prev_s2.get("dev_model") or "").strip(),
                         "last_activity_at": now_iso,
                         "updated_at": now_iso,
                     }
@@ -1421,6 +1425,10 @@ def acquire_dev_pr_lock(
             "worker_cid": (
                 str(worker_cid or "").strip()
                 or (str(existing_lock.get("worker_cid") or "").strip() if same_prev else "")
+            ),
+            "dev_model": (
+                str(dev_model or "").strip()
+                or (str(existing_lock.get("dev_model") or "").strip() if same_prev else "")
             ),
             "last_activity_at": now_iso,
             "updated_at": now_iso,
