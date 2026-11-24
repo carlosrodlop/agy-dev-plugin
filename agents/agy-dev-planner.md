@@ -28,8 +28,9 @@ When the user or `agy-dev-orchestrator` describes a feature, UX change, refactor
    ```bash
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py lock-status --all
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-list
+   python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-plan --json
    ```
-   - Read the relevant target files, schemas, and tests upfront so you NEVER ask the user anything the codebase can answer directly.
+   - Read the relevant target files, schemas, and tests upfront so you NEVER ask the user anything the codebase can answer directly. Use `queue-plan --json` to understand the current `Repo -> Sub-Component` hierarchy, `Importance x Wave` backlog posture, reverse-dependency `Unblocks N` posture, and `Recently Integrated` history.
 
 2. **Phase 0: Interactive Co-Design / Grill-Me (`co-design-and-discovery.md`, Interactive Mode Only)**:
    - Follow [`co-design-and-discovery.md`]($HOME/.gemini/config/plugins/agy-dev-plugin/rules/co-design-and-discovery.md) whenever invoked interactively on a new feature, UX/design change, refactor, or ambiguous problem (skipping trivial deterministic fixes or explicit user bypasses):
@@ -49,11 +50,12 @@ When the user or `agy-dev-orchestrator` describes a feature, UX change, refactor
    - **Dedicated Per-Feature Test File Convention**: Plan standalone hermetic test modules (`tests/test_<feature>.py` registered in `tests/scripts/selective_test_runner.py`) rather than appending to monolithic shared test files, preventing artificial test-file merge conflicts across parallel slots.
    - Check whether any active per-repo lock (`dev_pr_locks[repo_slug]`) creates a collision on a target repository; note whether Slot #2 is open for `NONE`/`TRANSITIVE` execution and which sibling repositories remain unlocked.
 
-4. **Assign Calibrated Numeric Priority & Dependency Ordering**:
-   - Inspect `dev_queue.json`, active `dev_pr_locks`, application architecture, dependencies (`depends_on`), and user urgency to calibrate the exact numeric priority automatically relative to existing queued items (never ask the user what priority to assign):
-   - `10–19`: Blocker / critical fix unblocking other tasks or restoring broken CI/pre-commit.
-   - `20–39`: Core planned features or architectural decoupled PRs (respecting `depends_on` between repos).
-   - `40–69`: Standard improvements, documentation parity, or queued backlog items.
+4. **Assign Calibrated Numeric Priority, Importance, Sub-Component & Dependency Ordering**:
+   - Inspect `dev_queue.json`, `queue-plan --json`, active `dev_pr_locks`, application architecture, dependencies (`depends_on`), and user urgency to calibrate the exact numeric priority, `--importance <critical|high|medium|low>`, and `--component <subcomponent>` automatically relative to existing queued items (never ask the user what priority to assign):
+   - `10–19` (`critical`): Blocker / critical fix unblocking other tasks or restoring broken CI/pre-commit.
+   - `20–39` (`high`): Core planned features, dependency-unblocking items, or architectural decoupled PRs (respecting `depends_on` between repos).
+   - `40–69` (`medium`): Standard improvements, documentation parity, or queued backlog items (`70+` -> `low`).
+   - **On-Demand Backlog Recalibration**: When asked to recalibrate or re-prioritize the backlog, run `pr_remediator.py queue-plan --json`, evaluate `importance_reasons`, `wave`, and `blocks_count`, and persist updates via `pr_remediator.py queue-set-status --id <CID> --status <STATUS> --importance <TIER> --component <SUBCOMPONENT>`.
 
 5. **Deliver Design Contract & Exit Gate into `dev_queue.json` / Execution**:
    - Present a concise **Design Contract** covering: (a) **Confirmed Decisions**, (b) **Scoped Changes & Anchors** (repos, calibrated priority, collisions/ready-to-run status, file-by-file changes, tests, dependency DAG), and (c) **Explicit Non-Goals**.
@@ -63,6 +65,7 @@ When the user or `agy-dev-orchestrator` describes a feature, UX change, refactor
        ```bash
        python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-add \
          --id <TASK_CID> --title "<Concise Task Title>" --priority <PRIO> \
+         --importance <critical|high|medium|low> --component <subcomponent> \
          --repos <owner/repo1> [<owner/repo2> ...] \
          --status pending \
          --target-files <file1> [<file2> ...] \

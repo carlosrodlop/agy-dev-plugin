@@ -488,7 +488,7 @@ button {
 
 .dq-kpi-bar {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 4px;
 }
 
@@ -811,6 +811,224 @@ button {
 
 .dq-shell .dq-hidden {
   display: none;
+}
+
+.dq-planning-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.dq-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.dq-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--dq-border);
+  background: var(--dq-card);
+  color: var(--dq-fg-muted);
+  font-size: 11px;
+  font-weight: 550;
+  white-space: nowrap;
+}
+
+.dq-filter-chip:hover {
+  background: var(--dq-hover);
+  color: var(--dq-fg);
+}
+
+.dq-filter-chip.active {
+  border-color: var(--dq-primary);
+  background: color-mix(in srgb, var(--dq-primary) 14%, var(--dq-card));
+  color: var(--dq-fg);
+}
+
+.dq-filter-chip-num {
+  font-family: var(--dq-mono);
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+.dq-planning-repos {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dq-plan-repo {
+  background: var(--dq-card);
+  border: 1px solid var(--dq-border);
+  border-radius: var(--dq-r-lg);
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.dq-plan-repo-title {
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.dq-plan-comp-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 7px;
+}
+
+.dq-plan-comp {
+  background: var(--dq-muted-bg);
+  border: 1px solid var(--dq-border);
+  border-radius: var(--dq-r-md);
+  padding: 7px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dq-plan-comp-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.dq-plan-comp-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 650;
+  word-break: break-word;
+}
+
+.dq-progress-track {
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--dq-secondary-bg);
+  overflow: hidden;
+}
+
+.dq-progress-fill {
+  height: 100%;
+  background: var(--dq-success);
+  border-radius: 999px;
+}
+
+.dq-plan-items {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.dq-plan-item {
+  background: var(--dq-card);
+  border: 1px solid var(--dq-border);
+  border-radius: var(--dq-r-sm);
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dq-plan-item.is-wave-blocked {
+  border-color: var(--dq-hitl-border);
+}
+
+.dq-plan-item.is-wave-active {
+  border-color: color-mix(in srgb, var(--dq-primary) 40%, var(--dq-border));
+}
+
+.dq-plan-item-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 550;
+  word-break: break-word;
+}
+
+.dq-badge-imp-critical {
+  background: var(--dq-danger-tint);
+  color: var(--dq-danger);
+}
+
+.dq-badge-imp-high {
+  background: var(--dq-warn-tint);
+  color: var(--dq-warning);
+}
+
+.dq-badge-imp-medium {
+  background: color-mix(in srgb, var(--dq-primary) 14%, transparent);
+  color: var(--dq-primary);
+}
+
+.dq-badge-imp-low {
+  background: var(--dq-muted-bg);
+  color: var(--dq-fg-muted);
+}
+
+.dq-badge-wave-active {
+  background: color-mix(in srgb, var(--dq-primary) 16%, transparent);
+  color: var(--dq-primary);
+}
+
+.dq-badge-wave-partial_wip {
+  background: var(--dq-warn-tint);
+  color: var(--dq-warning);
+}
+
+.dq-badge-wave-ready {
+  background: color-mix(in srgb, var(--dq-success) 16%, transparent);
+  color: var(--dq-success);
+}
+
+.dq-badge-wave-blocked {
+  background: var(--dq-hitl-tint);
+  color: var(--dq-hitl);
+}
+
+.dq-badge-wave-standby {
+  background: var(--dq-muted-bg);
+  color: var(--dq-fg-muted);
+}
+
+.dq-badge-unblocks {
+  background: var(--dq-warn-tint);
+  color: var(--dq-warning);
+}
+
+.dq-planning-done {
+  border: 1px solid var(--dq-border);
+  border-radius: var(--dq-r-md);
+  background: var(--dq-card);
+  padding: 6px 9px;
+}
+
+.dq-planning-done-summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 650;
+  color: var(--dq-fg-muted);
+  user-select: none;
+}
+
+.dq-planning-done[open] .dq-planning-done-summary {
+  margin-bottom: 7px;
+  color: var(--dq-fg);
+}
+
+.dq-plan-done-row {
+  border-top: 1px solid var(--dq-border);
+  padding-top: 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
 }
 
 @media (max-width: 420px) {

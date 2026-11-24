@@ -414,6 +414,9 @@
     snapshot: null,
     etag: "",
     sectionFilter: "all",
+    planningImportanceFilter: "all",
+    planningWaveFilter: "all",
+    planningDoneOpen: false,
     query: "",
     inFlight: false,
     pauseBusy: false,
@@ -1081,6 +1084,300 @@
     return cards.length;
   }
 
+  function matchesPlanningItemFilter(item, needle, impFilter, waveFilter) {
+    if (impFilter && impFilter !== "all" && String(item.importance || "") !== impFilter) {
+      return false;
+    }
+    if (waveFilter && waveFilter !== "all" && String(item.wave || "") !== waveFilter) {
+      return false;
+    }
+    if (!needle) {
+      return true;
+    }
+    const q = needle.toLowerCase();
+    const parts = [
+      item.conversation_id,
+      item.display_id,
+      item.title,
+      item.sidebar_title,
+      item.component,
+      item.importance,
+      item.wave,
+      item.effective_status,
+      item.unblocks_label,
+      item.blocked_by_label,
+      ...(Array.isArray(item.repo_slugs) ? item.repo_slugs : []),
+    ];
+    return parts.some((p) => String(p || "").toLowerCase().includes(q));
+  }
+
+  const PLANNING_IMPORTANCE_OPTIONS = [
+    ["all", "All Tiers"],
+    ["critical", "Critical"],
+    ["high", "High"],
+    ["medium", "Medium"],
+    ["low", "Low"],
+  ];
+
+  const PLANNING_WAVE_OPTIONS = [
+    ["all", "All Waves"],
+    ["active", "Active"],
+    ["partial_wip", "Partial WIP"],
+    ["ready", "Ready"],
+    ["blocked", "Blocked"],
+    ["standby", "Standby"],
+  ];
+
+  function buildFilterChip(label, action, dataKey, dataVal, isActive, countVal) {
+    const btn = el("button", isActive ? "dq-filter-chip active" : "dq-filter-chip");
+    btn.type = "button";
+    btn.dataset.action = action;
+    btn.dataset[dataKey] = dataVal;
+    btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    btn.appendChild(el("span", "", label));
+    if (countVal !== undefined && countVal !== null) {
+      btn.appendChild(el("span", "dq-filter-chip-num", String(countVal)));
+    }
+    return btn;
+  }
+
+  function renderPlanningView() {
+    const secEl = document.getElementById("dq-sec-planning");
+    const badgeEl = document.getElementById("dq-badge-planning");
+    const filtersEl = document.getElementById("dq-planning-filters");
+    const listEl = document.getElementById("dq-list-planning");
+    const doneDetails = document.getElementById("dq-planning-done");
+    const doneSummary = document.getElementById("dq-planning-done-summary");
+    const doneList = document.getElementById("dq-list-planning-done");
+    if (!secEl || !badgeEl || !filtersEl || !listEl) {
+      return 0;
+    }
+
+    const snap = uiState.snapshot || {};
+    const planning = snap.planning && typeof snap.planning === "object" ? snap.planning : {};
+    const totals = planning.totals && typeof planning.totals === "object" ? planning.totals : {};
+    const byImp = totals.by_importance && typeof totals.by_importance === "object" ? totals.by_importance : {};
+    const byWave = totals.by_wave && typeof totals.by_wave === "object" ? totals.by_wave : {};
+
+    secEl.classList.remove("dq-hidden");
+
+    const filterFrag = document.createDocumentFragment();
+    const impRow = el("div", "dq-filter-row");
+    for (const [key, label] of PLANNING_IMPORTANCE_OPTIONS) {
+      const countVal = key === "all" ? totals.open_count || 0 : byImp[key] || 0;
+      impRow.appendChild(
+        buildFilterChip(label, "set-plan-imp", "imp", key, uiState.planningImportanceFilter === key, countVal),
+      );
+    }
+    filterFrag.appendChild(impRow);
+
+    const waveRow = el("div", "dq-filter-row");
+    for (const [key, label] of PLANNING_WAVE_OPTIONS) {
+      const countVal = key === "all" ? totals.open_count || 0 : byWave[key] || 0;
+      waveRow.appendChild(
+        buildFilterChip(label, "set-plan-wave", "wave", key, uiState.planningWaveFilter === key, countVal),
+      );
+    }
+    filterFrag.appendChild(waveRow);
+    filtersEl.replaceChildren(filterFrag);
+
+    const needle = uiState.query.trim();
+    const impFilter = uiState.planningImportanceFilter;
+    const waveFilter = uiState.planningWaveFilter;
+    const repos = Array.isArray(planning.repos) ? planning.repos : [];
+
+    let matchedItemsCount = 0;
+    const reposFrag = document.createDocumentFragment();
+
+    for (const repo of repos) {
+      const comps = Array.isArray(repo.components) ? repo.components : [];
+      const compNodes = [];
+      let repoMatchedCount = 0;
+
+      for (const comp of comps) {
+        const items = Array.isArray(comp.items) ? comp.items : [];
+        const filteredItems = items.filter((it) => matchesPlanningItemFilter(it, needle, impFilter, waveFilter));
+        if (filteredItems.length === 0) {
+          continue;
+        }
+        repoMatchedCount += filteredItems.length;
+        matchedItemsCount += filteredItems.length;
+
+        const compCard = el("section", "dq-plan-comp");
+        const compHead = el("div", "dq-plan-comp-head");
+        const compTitleWrap = el("div", "dq-badges");
+        compTitleWrap.appendChild(el("h3", "dq-plan-comp-title", comp.name || "general"));
+        const hiImp = String(comp.highest_importance || "medium");
+        compTitleWrap.appendChild(el("span", `dq-badge dq-badge-imp-${hiImp}`, hiImp.toUpperCase()));
+        compHead.appendChild(compTitleWrap);
+
+        const doneCount = Number(comp.done_count || 0);
+        const totalCount = Number(comp.total_count || filteredItems.length);
+        const pct = Math.max(0, Math.min(100, Number(comp.completion_pct || 0)));
+        compHead.appendChild(el("span", "dq-badge dq-badge-mono", `${doneCount}/${totalCount} · ${pct}%`));
+        compCard.appendChild(compHead);
+
+        const track = el("div", "dq-progress-track");
+        track.setAttribute("role", "progressbar");
+        track.setAttribute("aria-valuemin", "0");
+        track.setAttribute("aria-valuemax", "100");
+        track.setAttribute("aria-valuenow", String(pct));
+        const fill = el("div", "dq-progress-fill");
+        fill.style.width = `${pct}%`;
+        track.appendChild(fill);
+        compCard.appendChild(track);
+
+        const itemsWrap = el("div", "dq-plan-items");
+        for (const item of filteredItems) {
+          const itemWave = String(item.wave || "ready");
+          const itemImp = String(item.importance || "medium");
+          const row = el("article", `dq-plan-item is-wave-${itemWave}`);
+
+          const top = el("div", "dq-card-top");
+          const leftBadges = el("div", "dq-badges");
+          leftBadges.appendChild(
+            el("span", `dq-badge dq-badge-wave-${itemWave}`, itemWave.replace("_", " ").toUpperCase()),
+          );
+          leftBadges.appendChild(el("span", `dq-badge dq-badge-imp-${itemImp}`, itemImp.toUpperCase()));
+          const prioTxt =
+            item.effective_priority && item.effective_priority !== item.priority
+              ? `P${item.effective_priority}<-P${item.priority}`
+              : `P${item.priority || 50}`;
+          leftBadges.appendChild(el("span", "dq-badge dq-badge-mono", prioTxt));
+          if (item.display_id) {
+            leftBadges.appendChild(el("span", "dq-badge dq-badge-mono", item.display_id));
+          }
+          top.appendChild(leftBadges);
+
+          if (Number(item.blocks_count || 0) > 0) {
+            const unbBadge = el("span", "dq-badge dq-badge-unblocks", item.unblocks_label || `Unblocks ${item.blocks_count}`);
+            const unbTargets = Array.isArray(item.unblocks)
+              ? item.unblocks.map((u) => `${u.display_id}: ${u.title || ""}`).join("\n")
+              : "";
+            if (unbTargets) {
+              unbBadge.title = unbTargets;
+            }
+            top.appendChild(unbBadge);
+          }
+          row.appendChild(top);
+
+          const itemTitle = item.sidebar_title || item.title || item.conversation_id;
+          row.appendChild(el("p", "dq-plan-item-title", itemTitle));
+
+          if (item.blocked_by_label) {
+            row.appendChild(el("p", "dq-card-sub", item.blocked_by_label));
+          }
+
+          const actions = el("div", "dq-actions");
+          if (item.pr_url) {
+            const prAnchor = buildExternalLink("↗ Open PR", item.pr_url, true);
+            if (prAnchor) {
+              actions.appendChild(prAnchor);
+            }
+          }
+          if (isValidUuid(item.conversation_id)) {
+            actions.appendChild(
+              buildActionButton(
+                "Open Chat",
+                "open-conv",
+                { convId: item.conversation_id, label: itemTitle },
+                false,
+              ),
+            );
+          }
+          if (actions.childNodes.length > 0) {
+            row.appendChild(actions);
+          }
+          itemsWrap.appendChild(row);
+        }
+        compCard.appendChild(itemsWrap);
+        compNodes.push(compCard);
+      }
+
+      if (compNodes.length === 0) {
+        continue;
+      }
+
+      const repoBox = el("article", "dq-plan-repo");
+      const repoHead = el("div", "dq-repo-top");
+      const repoLeft = el("div", "dq-badges");
+      repoLeft.appendChild(el("strong", "dq-plan-repo-title", repo.repo_label || repo.repo_slug));
+      repoLeft.appendChild(el("span", "dq-badge dq-badge-mono", `${repoMatchedCount} open`));
+      repoHead.appendChild(repoLeft);
+      const rPct = Math.max(0, Math.min(100, Number(repo.completion_pct || 0)));
+      repoHead.appendChild(el("span", "dq-badge dq-badge-free", `${repo.done_count || 0} done · ${rPct}%`));
+      repoBox.appendChild(repoHead);
+
+      const compGrid = el("div", "dq-plan-comp-list");
+      for (const cn of compNodes) {
+        compGrid.appendChild(cn);
+      }
+      repoBox.appendChild(compGrid);
+      reposFrag.appendChild(repoBox);
+    }
+
+    listEl.replaceChildren(reposFrag);
+    badgeEl.textContent = String(matchedItemsCount);
+
+    let doneShown = 0;
+    if (doneDetails && doneSummary && doneList) {
+      const recent = planning.recently_integrated && typeof planning.recently_integrated === "object"
+        ? planning.recently_integrated
+        : {};
+      const totalDoneCount = Number(recent.total_done_count || 0);
+      const rawDoneItems = Array.isArray(recent.items) ? recent.items : [];
+      const doneItems = needle
+        ? rawDoneItems.filter((d) =>
+            [d.display_id, d.title, d.sidebar_title, d.component, ...(d.repo_slugs || [])].some((p) =>
+              String(p || "").toLowerCase().includes(needle.toLowerCase()),
+            ),
+          )
+        : rawDoneItems;
+
+      if (totalDoneCount > 0 || doneItems.length > 0) {
+        doneDetails.classList.remove("dq-hidden");
+        doneDetails.open = Boolean(uiState.planningDoneOpen);
+        doneSummary.textContent = `Recently Integrated (${totalDoneCount})`;
+        const dFrag = document.createDocumentFragment();
+        for (const d of doneItems) {
+          const dRow = el("div", "dq-plan-done-row");
+          const dTop = el("div", "dq-card-top");
+          const dBadges = el("div", "dq-badges");
+          dBadges.appendChild(el("span", "dq-badge dq-badge-free", String(d.status || "merged").toUpperCase()));
+          if (d.component) {
+            dBadges.appendChild(el("span", "dq-badge", d.component));
+          }
+          if (Array.isArray(d.repo_slugs) && d.repo_slugs.length > 0) {
+            dBadges.appendChild(el("span", "dq-badge dq-badge-mono", d.repo_slugs.join(", ")));
+          }
+          if (d.display_id) {
+            dBadges.appendChild(el("span", "dq-badge dq-badge-mono", d.display_id));
+          }
+          dTop.appendChild(dBadges);
+          dRow.appendChild(dTop);
+          const dTitle = d.sidebar_title || d.title || d.conversation_id;
+          dRow.appendChild(el("p", "dq-card-sub", dTitle));
+          if (d.pr_url) {
+            const dLink = buildExternalLink("↗ PR", d.pr_url, false);
+            if (dLink) {
+              const dAct = el("div", "dq-actions");
+              dAct.appendChild(dLink);
+              dRow.appendChild(dAct);
+            }
+          }
+          dFrag.appendChild(dRow);
+          doneShown += 1;
+        }
+        doneList.replaceChildren(dFrag);
+      } else {
+        doneDetails.classList.add("dq-hidden");
+        doneList.replaceChildren();
+      }
+    }
+
+    return matchedItemsCount + doneShown;
+  }
+
   function renderView() {
     const snap = uiState.snapshot;
     if (!snap) {
@@ -1110,6 +1407,8 @@
     setCount("dq-count-pr", rawPr.length);
     setCount("dq-count-run", rawActive.length);
     setCount("dq-count-pending", rawPending.length);
+    const planTotals = snap.planning && snap.planning.totals ? snap.planning.totals : {};
+    setCount("dq-count-planning", planTotals.open_count !== undefined ? planTotals.open_count : totalOpen);
 
     const kpiHitl = document.getElementById("dq-kpi-hitl");
     if (kpiHitl) {
@@ -1154,59 +1453,79 @@
     const reposFiltered = rawRepos.filter((r) => matchesRepoFilter(r, q));
 
     let shownCount = 0;
-    shownCount += renderSectionList(
-      "dq-sec-hitl",
-      "dq-badge-hitl",
-      "dq-list-hitl",
-      hitlFiltered,
-      "hitl",
-      tab === "all" || tab === "hitl_blocked",
-    );
-
-    const repoSec = document.getElementById("dq-sec-repos");
-    const repoBadge = document.getElementById("dq-badge-repos");
-    const repoList = document.getElementById("dq-list-repos");
-    if (repoSec && repoBadge && repoList) {
-      if (tab === "all" && reposFiltered.length > 0) {
-        repoSec.classList.remove("dq-hidden");
-        repoBadge.textContent = String(reposFiltered.length);
-        const rFrag = document.createDocumentFragment();
-        for (const r of reposFiltered) {
-          rFrag.appendChild(renderRepoCard(r));
-        }
-        repoList.replaceChildren(rFrag);
-        shownCount += reposFiltered.length;
-      } else {
+    const planSec = document.getElementById("dq-sec-planning");
+    if (tab === "planning") {
+      renderSectionList("dq-sec-hitl", "dq-badge-hitl", "dq-list-hitl", [], "hitl", false);
+      const repoSec = document.getElementById("dq-sec-repos");
+      const repoList = document.getElementById("dq-list-repos");
+      if (repoSec) {
         repoSec.classList.add("dq-hidden");
-        repoList.replaceChildren();
-        repoBadge.textContent = "0";
       }
-    }
+      if (repoList) {
+        repoList.replaceChildren();
+      }
+      renderSectionList("dq-sec-pr", "dq-badge-pr", "dq-list-pr", [], "pr", false);
+      renderSectionList("dq-sec-active", "dq-badge-active", "dq-list-active", [], "active", false);
+      renderSectionList("dq-sec-pending", "dq-badge-pending", "dq-list-pending", [], "pending", false);
+      shownCount = renderPlanningView();
+    } else {
+      if (planSec) {
+        planSec.classList.add("dq-hidden");
+      }
+      shownCount += renderSectionList(
+        "dq-sec-hitl",
+        "dq-badge-hitl",
+        "dq-list-hitl",
+        hitlFiltered,
+        "hitl",
+        tab === "all" || tab === "hitl_blocked",
+      );
 
-    shownCount += renderSectionList(
-      "dq-sec-pr",
-      "dq-badge-pr",
-      "dq-list-pr",
-      prFiltered,
-      "pr",
-      tab === "all" || tab === "pr_open",
-    );
-    shownCount += renderSectionList(
-      "dq-sec-active",
-      "dq-badge-active",
-      "dq-list-active",
-      activeFiltered,
-      "active",
-      tab === "all" || tab === "in_progress",
-    );
-    shownCount += renderSectionList(
-      "dq-sec-pending",
-      "dq-badge-pending",
-      "dq-list-pending",
-      pendingFiltered,
-      "pending",
-      tab === "all" || tab === "pending",
-    );
+      const repoSec = document.getElementById("dq-sec-repos");
+      const repoBadge = document.getElementById("dq-badge-repos");
+      const repoList = document.getElementById("dq-list-repos");
+      if (repoSec && repoBadge && repoList) {
+        if (tab === "all" && reposFiltered.length > 0) {
+          repoSec.classList.remove("dq-hidden");
+          repoBadge.textContent = String(reposFiltered.length);
+          const rFrag = document.createDocumentFragment();
+          for (const r of reposFiltered) {
+            rFrag.appendChild(renderRepoCard(r));
+          }
+          repoList.replaceChildren(rFrag);
+          shownCount += reposFiltered.length;
+        } else {
+          repoSec.classList.add("dq-hidden");
+          repoList.replaceChildren();
+          repoBadge.textContent = "0";
+        }
+      }
+
+      shownCount += renderSectionList(
+        "dq-sec-pr",
+        "dq-badge-pr",
+        "dq-list-pr",
+        prFiltered,
+        "pr",
+        tab === "all" || tab === "pr_open",
+      );
+      shownCount += renderSectionList(
+        "dq-sec-active",
+        "dq-badge-active",
+        "dq-list-active",
+        activeFiltered,
+        "active",
+        tab === "all" || tab === "in_progress",
+      );
+      shownCount += renderSectionList(
+        "dq-sec-pending",
+        "dq-badge-pending",
+        "dq-list-pending",
+        pendingFiltered,
+        "pending",
+        tab === "all" || tab === "pending",
+      );
+    }
 
     const emptySec = document.getElementById("dq-empty");
     if (emptySec) {
@@ -1313,8 +1632,21 @@
           conversation_id: actionBtn.dataset.convId || "",
           filename: actionBtn.dataset.filename || "",
         });
+      } else if (action === "set-plan-imp") {
+        uiState.planningImportanceFilter = String(actionBtn.dataset.imp || "all");
+        renderView();
+      } else if (action === "set-plan-wave") {
+        uiState.planningWaveFilter = String(actionBtn.dataset.wave || "all");
+        renderView();
       }
     });
+
+    const planDoneEl = document.getElementById("dq-planning-done");
+    if (planDoneEl) {
+      planDoneEl.addEventListener("toggle", () => {
+        uiState.planningDoneOpen = Boolean(planDoneEl.open);
+      });
+    }
 
     const filterInput = document.getElementById("dq-filter");
     if (filterInput) {
@@ -1359,6 +1691,8 @@
       isNavIntentFresh,
       matchesCardFilter,
       matchesRepoFilter,
+      matchesPlanningItemFilter,
+      renderPlanningView,
       formatPauseMeta,
       setOrchestrationPaused,
       previewCleanup,

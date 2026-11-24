@@ -50,6 +50,7 @@ for _cand_root in (_INSTALLED_PLUGIN_ROOT, _PLUGIN_ROOT):
                 sys.path.remove(_cand_str)
             sys.path.insert(0, _cand_str)
 
+import dev_queue_planner as _queue_planner  # noqa: E402
 import dev_queue_tui as _tui  # noqa: E402
 import merge_watcher as _merge_watcher  # noqa: E402
 import orchestration_control as _orch_ctrl  # noqa: E402
@@ -492,11 +493,18 @@ def build_panel_state(
 
     counts: dict[str, int] = {}
     active_items: list[dict[str, Any]] = []
+    effective_statuses_map: dict[str, str] = {}
+    recent_done_cids: list[str] = []
     for it in effective_items:
         eff_st = _tui._resolve_effective_item_status(it, locks_by_cid)
         counts[eff_st] = counts.get(eff_st, 0) + 1
+        icid = str(it.get("conversation_id") or "").strip()
+        if icid:
+            effective_statuses_map[icid] = eff_st
         if eff_st not in _tui.INACTIVE_STATUSES:
             active_items.append(it)
+        elif icid and eff_st.lower() in ("merged", "cleaned"):
+            recent_done_cids.append(icid)
 
     active_items.sort(
         key=lambda x: (
@@ -513,6 +521,7 @@ def build_panel_state(
 
     orch_full = str(queue_data.get("orchestrator_conversation_id") or "").strip()
     all_lookup_cids = [str(it.get("conversation_id") or "") for it in active_items]
+    all_lookup_cids.extend(recent_done_cids[:20])
     if orch_full:
         all_lookup_cids.append(orch_full)
     for repo_lk in locks.values():
@@ -639,6 +648,7 @@ def build_panel_state(
     sec_pr_open: list[dict[str, Any]] = []
     sec_in_progress: list[dict[str, Any]] = []
     sec_pending: list[dict[str, Any]] = []
+    human_pr_urls_map: dict[str, str] = {}
     hitl_idx = 0
 
     for row_num, it in enumerate(active_items, 1):
@@ -745,6 +755,7 @@ def build_panel_state(
             card["hotkey"] = f"h{hitl_idx}"
             sec_hitl.append(card)
         elif is_human_pr and safe_pr_url:
+            human_pr_urls_map[cid_full] = safe_pr_url
             sec_pr_open.append(card)
         elif eff_lower in (
             "in_progress",
@@ -781,6 +792,16 @@ def build_panel_state(
         now_ts=now_ts,
     )
 
+    planning_snapshot = _queue_planner.build_component_planning_snapshot(
+        effective_items,
+        locks=locks,
+        locks_by_cid=locks_by_cid,
+        repo_labels=label_map,
+        ag_titles=ag_titles,
+        effective_statuses=effective_statuses_map,
+        human_pr_urls=human_pr_urls_map,
+    )
+
     semantic_core = sanitize_zero_pii_payload(
         {
             "orchestrator": orchestrator_info,
@@ -793,6 +814,7 @@ def build_panel_state(
                 "in_progress": sec_in_progress,
                 "pending": sec_pending,
             },
+            "planning": planning_snapshot,
             "board": board_info,
             "opt_hint": opt_hint,
             "ghost_purge": ghost_purge_state,

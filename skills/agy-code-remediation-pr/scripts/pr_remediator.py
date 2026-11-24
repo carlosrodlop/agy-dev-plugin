@@ -49,6 +49,19 @@ if _SCRIPT_DIR_STR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR_STR)
 
 import dev_flow_optimizer as _flow_opt  # noqa: F401, E402
+import dev_queue_planner as _queue_planner  # noqa: F401, E402
+from dev_queue_planner import (  # noqa: F401, E402
+    EXECUTION_WAVES,
+    IMPORTANCE_RANK,
+    IMPORTANCE_TIERS,
+    WAVE_RANK,
+    build_component_planning_snapshot,
+    classify_execution_wave,
+    infer_importance,
+    infer_subcomponent,
+    normalize_component_name,
+    normalize_importance_tier,
+)
 from dev_flow_optimizer import (  # noqa: F401, E402
     DEFAULT_STALL_THRESHOLD_SECONDS,
     analyze_dev_flow_optimizations,

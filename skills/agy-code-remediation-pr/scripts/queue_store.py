@@ -49,6 +49,12 @@ from lock_store import (  # noqa: E402
     _utc_now_iso,
     get_all_dev_pr_locks,
 )
+from dev_queue_planner import (  # noqa: E402
+    IMPORTANCE_TIERS,
+    build_component_planning_snapshot,
+    normalize_component_name,
+    normalize_importance_tier,
+)
 from parallel_scope import analyze_candidate_against_slots  # noqa: E402
 import orchestration_control as _orch_ctrl  # noqa: E402
 
@@ -436,6 +442,8 @@ def enqueue_dev_queue_item(
     section_anchors: list[str] | None = None,
     replace_depends_on: list[str] | None = None,
     clear_depends_on: bool = False,
+    importance: str = "",
+    component: str = "",
 ) -> dict[str, Any]:
     """Upsert a development task entry into persistent `dev_queue.json` (`0600` + `file_lock`).
 
@@ -451,6 +459,14 @@ def enqueue_dev_queue_item(
             "status": "error",
             "error": f"Invalid queue status '{status}'. Expected one of {DEV_QUEUE_STATUSES}.",
         }
+    raw_imp = str(importance or "").strip()
+    norm_importance = normalize_importance_tier(raw_imp)
+    if raw_imp and not norm_importance:
+        return {
+            "status": "error",
+            "error": f"Invalid queue importance '{importance}'. Expected one of {IMPORTANCE_TIERS}.",
+        }
+    norm_component = normalize_component_name(component)
     try:
         norm_priority = int(priority)
     except (TypeError, ValueError):
@@ -521,6 +537,12 @@ def enqueue_dev_queue_item(
         merged_anchors = _normalize_str_list([*(existing.get("section_anchors") or []), *(section_anchors or [])])
         if merged_anchors:
             item["section_anchors"] = merged_anchors
+        resolved_importance = norm_importance or normalize_importance_tier(existing.get("importance"))
+        if resolved_importance:
+            item["importance"] = resolved_importance
+        resolved_component = norm_component or normalize_component_name(existing.get("component"))
+        if resolved_component:
+            item["component"] = resolved_component
         if existing.get("merged_repos"):
             item["merged_repos"] = _normalize_str_list(
                 [dev_common.normalize_repo_slug(str(r)) for r in existing.get("merged_repos") or [] if str(r).strip()]
@@ -596,6 +618,8 @@ def update_dev_queue_item_status(
     *,
     strip_pr_urls_for_branches: list[str] | None = None,
     strip_repo_slug: str = "",
+    importance: str | None = None,
+    component: str | None = None,
 ) -> dict[str, Any]:
     """Transition an existing `dev_queue.json` entry to `status`, append artifacts, and deduplicate `pr_urls` keeping the richest verified URL per `(repo_slug, branch_name)`."""
     cid_clean = str(conversation_id or "").strip()
@@ -606,6 +630,20 @@ def update_dev_queue_item_status(
             "updated": False,
             "error": f"Invalid queue status '{status}'. Expected one of {DEV_QUEUE_STATUSES}.",
         }
+    norm_importance: str | None = None
+    if importance is not None:
+        raw_imp = str(importance).strip()
+        if raw_imp:
+            norm_importance = normalize_importance_tier(raw_imp)
+            if not norm_importance:
+                return {
+                    "status": "error",
+                    "updated": False,
+                    "error": f"Invalid queue importance '{importance}'. Expected one of {IMPORTANCE_TIERS}.",
+                }
+        else:
+            norm_importance = ""
+    norm_component: str | None = normalize_component_name(component) if component is not None else None
     q_path = get_dev_queue_path(portfolio_dir=portfolio_dir)
     now_iso = _utc_now_iso()
     with dev_common.file_lock(q_path.with_suffix(".json.lock")):
@@ -633,6 +671,16 @@ def update_dev_queue_item_status(
         )
         if notes is not None and notes.strip():
             item["notes"] = _sanitize_home_paths(notes.strip())
+        if norm_importance is not None:
+            if norm_importance:
+                item["importance"] = norm_importance
+            else:
+                item.pop("importance", None)
+        if norm_component is not None:
+            if norm_component:
+                item["component"] = norm_component
+            else:
+                item.pop("component", None)
         item["updated_at"] = now_iso
         items[idx] = item
         data["items"] = _sort_dev_queue_items(items)
@@ -1777,6 +1825,17 @@ def register_queue_cli(sub: Any) -> None:
     p_qadd.add_argument("--title", default="", help="Short descriptive title.")
     p_qadd.add_argument("--action-id", default="", help="Action or prompt scope ID.")
     p_qadd.add_argument("--priority", type=int, default=50, help="Numeric priority (lower executes first).")
+    p_qadd.add_argument(
+        "--importance",
+        choices=IMPORTANCE_TIERS,
+        default="",
+        help="Optional explicit business importance tier (critical|high|medium|low).",
+    )
+    p_qadd.add_argument(
+        "--component",
+        default="",
+        help="Optional explicit sub-component label (e.g. dev-queue-panel, auth).",
+    )
     p_qadd.add_argument("--repos", nargs="*", default=[], help="Target repository slugs.")
     p_qadd.add_argument("--status", choices=DEV_QUEUE_STATUSES, default="pending", help="Queue item status.")
     p_qadd.add_argument("--depends-on", nargs="*", default=[], help="Dependency conversation IDs (merged into existing `depends_on`).")
@@ -1808,7 +1867,38 @@ def register_queue_cli(sub: Any) -> None:
     p_qset.add_argument("--branches", nargs="*", default=[], help="Branch names to attach.")
     p_qset.add_argument("--pr-urls", nargs="*", default=[], help="PR/Compare URLs to attach.")
     p_qset.add_argument("--notes", default="", help="Optional updated notes.")
+    p_qset.add_argument(
+        "--importance",
+        choices=IMPORTANCE_TIERS,
+        default=None,
+        help="Optional updated importance tier (critical|high|medium|low).",
+    )
+    p_qset.add_argument(
+        "--component",
+        default=None,
+        help="Optional updated sub-component label.",
+    )
     p_qset.add_argument("--orchestrator-id", default="", help="Optional active orchestrator conversation ID.")
+
+    p_qplan = sub.add_parser(
+        "queue-plan",
+        help="Emit deterministic 0-LLM Repo -> Sub-Component planning view (Importance x Wave & Recently Integrated).",
+    )
+    p_qplan.add_argument("--repo", dest="repo_slug", default="", help="Optional repository slug/substring filter.")
+    p_qplan.add_argument(
+        "--importance",
+        choices=IMPORTANCE_TIERS,
+        default="",
+        help="Optional importance tier filter.",
+    )
+    p_qplan.add_argument(
+        "--include-done",
+        dest="include_done",
+        type=int,
+        default=10,
+        help="Maximum recently integrated (merged/cleaned) items to include (default: 10).",
+    )
+    p_qplan.add_argument("--json", dest="as_json", action="store_true", help="Emit structured JSON snapshot (default).")
 
     p_qnext = sub.add_parser("queue-next", help="Select the highest-priority runnable item from `dev_queue.json`.")
     p_qnext.add_argument("--orchestrator-id", default="", help="Optional active orchestrator conversation ID to record.")
@@ -1883,6 +1973,8 @@ def dispatch_queue_cli(args: Any) -> int | None:
             pr_urls=args.pr_urls,
             notes=args.notes,
             orchestrator_conversation_id=args.orchestrator_id,
+            importance=getattr(args, "importance", "") or "",
+            component=getattr(args, "component", "") or "",
         )
         print(json.dumps(q_res, indent=2, ensure_ascii=False))
         return 0 if q_res.get("status") == "ok" else 1
@@ -1895,9 +1987,24 @@ def dispatch_queue_cli(args: Any) -> int | None:
             pr_urls=args.pr_urls or None,
             notes=args.notes or None,
             orchestrator_conversation_id=args.orchestrator_id,
+            importance=getattr(args, "importance", None),
+            component=getattr(args, "component", None),
         )
         print(json.dumps(q_res, indent=2, ensure_ascii=False))
         return 0 if q_res.get("status") == "ok" else 1
+
+    if args.subcommand == "queue-plan":
+        q_res = _facade_attr("load_dev_queue", load_dev_queue)()
+        active_locks = _facade_attr("get_all_dev_pr_locks", get_all_dev_pr_locks)()
+        plan = build_component_planning_snapshot(
+            q_res.get("items") or [],
+            locks=active_locks,
+            repo_filter=str(getattr(args, "repo_slug", "") or ""),
+            importance_filter=str(getattr(args, "importance", "") or ""),
+            include_done=int(getattr(args, "include_done", 10)),
+        )
+        print(json.dumps({"status": "ok", "queue_path": q_res.get("queue_path", ""), **plan}, indent=2, ensure_ascii=False))
+        return 0
 
     if args.subcommand == "queue-next":
         q_res = _facade_attr("get_next_dev_queue_item", get_next_dev_queue_item)(
