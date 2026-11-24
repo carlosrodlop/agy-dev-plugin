@@ -28,6 +28,7 @@ ALL_TEST_MODULES = [
     "tests.test_parallel_subagent_orchestration",
     "tests.test_pr_remediator_preview_staging",
     "tests.test_pr_remediator_queue_and_cleanup",
+    "tests.test_queue_compactor",
     "tests.test_sidecar_ghost_purge",
 ]
 
@@ -68,6 +69,7 @@ BATS_TRIGGER_SUFFIXES = (
     "pr_remediator.py",
     "lock_store.py",
     "queue_store.py",
+    "queue_compactor.py",
     "dev_queue_planner.py",
     "worktree_ops.py",
     "review_gate.py",
@@ -100,6 +102,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_parallel_subagent_orchestration.py": "tests.test_parallel_subagent_orchestration",
     "tests/test_pr_remediator_preview_staging.py": "tests.test_pr_remediator_preview_staging",
     "tests/test_pr_remediator_queue_and_cleanup.py": "tests.test_pr_remediator_queue_and_cleanup",
+    "tests/test_queue_compactor.py": "tests.test_queue_compactor",
     "tests/test_sidecar_ghost_purge.py": "tests.test_sidecar_ghost_purge",
 }
 
@@ -477,6 +480,26 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_model_quota_fallback" not in selected:
                 selected.append("tests.test_model_quota_fallback")
+
+        if (
+            norm.endswith(
+                (
+                    "queue_compactor.py",
+                    "dev_flow_optimizer.py",
+                    "queue_store.py",
+                    "pr_remediator.py",
+                    "dev_queue_tui.py",
+                    "tui_models.py",
+                    "tui_render.py",
+                    "tui_watch.py",
+                    "test_queue_compactor.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm in ("agents/agy-dev-orchestrator.md", "agents/agy-dev-planner.md", "skills/agy-dev-queue-orchestrator/SKILL.md")
+        ):
+            if "tests.test_queue_compactor" not in selected:
+                selected.append("tests.test_queue_compactor")
 
         if norm not in ISOLATED_TEST_FILE_MODULES and "tests.test_agy_dev_plugin" not in selected:
             selected.append("tests.test_agy_dev_plugin")

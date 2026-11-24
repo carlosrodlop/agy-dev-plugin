@@ -133,6 +133,7 @@ def _collect_watched_script_paths() -> list[Path]:
             _add(mod_file)
     for root in (_SCRIPT_PLUGIN_ROOT, _INSTALLED_PLUGIN_ROOT):
         _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "dev_flow_optimizer.py")
+        _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "queue_compactor.py")
         _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "dev_queue_doctor.py")
         _add(root / "clients" / "dev_common.py")
         _add(root / "clients" / "git_client.py")
@@ -1202,6 +1203,95 @@ def _run_subcommand_optimize(argv: list[str]) -> int:
     term_w = shutil.get_terminal_size((124, 40)).columns
     print("\n".join(_render_optimizer_overlay_lines(report, term_w, color_on)))
     return 0
+
+
+def _get_queue_compactor() -> Any:
+    """Import sibling `queue_compactor` module lazily without mutating global import state."""
+    for root in (_SCRIPT_PLUGIN_ROOT, _INSTALLED_PLUGIN_ROOT):
+        cand_dir = root / "skills" / "agy-code-remediation-pr" / "scripts"
+        if (cand_dir / "queue_compactor.py").is_file():
+            cand_s = str(cand_dir)
+            if cand_s not in sys.path:
+                sys.path.insert(0, cand_s)
+            try:
+                import queue_compactor as _qc  # type: ignore[import-not-found]
+
+                return _qc
+            except Exception:
+                return None
+    return None
+
+
+def _run_subcommand_compact(argv: list[str]) -> int:
+    """Execute `agy-queue compact [--apply] [--tier 1|all] [--repo SLUG] [--json]`."""
+    parser = argparse.ArgumentParser(
+        prog="agy-queue compact",
+        description="0-LLM deterministic PR compaction detector & atomic executor (defaults to --dry-run).",
+    )
+    parser.add_argument("--apply", action="store_true", help="Atomically apply detected compactions under file_lock (default: dry-run).")
+    parser.add_argument("--tier", choices=("1", "all"), default="all", help="Compaction tier: '1' or 'all' (default: all).")
+    parser.add_argument("--repo", default="", help="Filter compaction targets by repository slug/substring.")
+    parser.add_argument("--ids", nargs="*", default=[], help="Optional explicit conversation ID pair/prefixes.")
+    parser.add_argument("--max-files", dest="max_files", type=int, default=None, help="Override combined file ceiling (default: 16).")
+    parser.add_argument("--respect-pause", dest="respect_pause", action="store_true", help="Skip when orchestration is PAUSED.")
+    parser.add_argument("--state-dir", default="", help="Override state directory.")
+    parser.add_argument("--repos-dir", default="", help="Optional parent directory for managed git repos.")
+    parser.add_argument("--orchestrator-id", default="", help="Optional active orchestrator conversation ID.")
+    parser.add_argument("--json", action="store_true", help="Output structured JSON.")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
+    args = parser.parse_args(argv)
+
+    st_dir = _resolve_state_dir(args.state_dir)
+    qc_mod = _get_queue_compactor()
+    if qc_mod is not None and hasattr(qc_mod, "compact_dev_queue"):
+        res = dict(
+            qc_mod.compact_dev_queue(
+                portfolio_dir=st_dir,
+                apply=bool(args.apply),
+                tier=args.tier,
+                repo_slug=args.repo,
+                item_ids=args.ids or None,
+                repos_dir=args.repos_dir or None,
+                max_combined_files=args.max_files,
+                orchestrator_id=args.orchestrator_id,
+                respect_pause=bool(args.respect_pause),
+            )
+        )
+    else:
+        pr_rem = _resolve_pr_remediator_script()
+        cmd = [sys.executable, str(pr_rem), "queue-compact", "--tier", args.tier]
+        if args.apply:
+            cmd.append("--apply")
+        if args.repo:
+            cmd.extend(["--repo", args.repo])
+        if args.ids:
+            cmd.extend(["--ids", *args.ids])
+        if args.max_files is not None:
+            cmd.extend(["--max-files", str(args.max_files)])
+        if args.repos_dir:
+            cmd.extend(["--repos-dir", args.repos_dir])
+        if args.orchestrator_id:
+            cmd.extend(["--orchestrator-id", args.orchestrator_id])
+        if args.respect_pause:
+            cmd.append("--respect-pause")
+        proc = subprocess.run(
+            cmd,
+            env={**os.environ, "AGY_DEV_STATE_DIR": str(st_dir)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        res = json.loads(proc.stdout or "{}") if proc.returncode == 0 else {"status": "error", "error": (proc.stderr or proc.stdout).strip()}
+
+    res.setdefault("schema_version", JSON_SCHEMA_VERSION)
+    if args.json:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    elif qc_mod is not None and hasattr(qc_mod, "render_compaction_report"):
+        color_on = _should_enable_color(args.no_color, sys.stdout.isatty())
+        print(qc_mod.render_compaction_report(res, color=color_on))
+    else:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("status") == "ok" else 1
 
 
 def _run_subcommand_sync(argv: list[str]) -> int:

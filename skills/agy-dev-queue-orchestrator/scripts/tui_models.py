@@ -206,6 +206,7 @@ AGY_QUEUE_SUBCOMMANDS: tuple[str, ...] = (
     "watch",
     "doctor",
     "optimize",
+    "compact",
     "plan",
     "sync",
     "list",

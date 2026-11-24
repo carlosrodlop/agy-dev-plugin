@@ -50,6 +50,21 @@ if _SCRIPT_DIR_STR not in sys.path:
 
 import dev_flow_optimizer as _flow_opt  # noqa: F401, E402
 import dev_queue_planner as _queue_planner  # noqa: F401, E402
+import queue_compactor as _queue_compactor  # noqa: F401, E402
+from queue_compactor import (  # noqa: F401, E402
+    DEFAULT_MAX_COMBINED_FILES,
+    DEFAULT_MAX_COMBINED_FIX_CHARS,
+    GLOBAL_HUB_FILES,
+    build_compaction_optimizer_finding,
+    compact_dev_queue,
+    detect_pr_compaction_candidates,
+    infer_repo_path_owners,
+    is_compaction_excluded,
+    is_hub_file,
+    partition_item_files_by_repo,
+    render_compaction_report,
+    validate_queue_invariants,
+)
 from dev_queue_planner import (  # noqa: F401, E402
     EXECUTION_WAVES,
     IMPORTANCE_RANK,

@@ -206,6 +206,7 @@ from tui_watch import (  # noqa: F401, E402
     _parse_watch_key_sequence,
     _read_tty_byte,
     _read_watch_key,
+    _run_subcommand_compact,
     _run_subcommand_locks,
     _run_subcommand_optimize,
     _run_subcommand_pause,
@@ -258,6 +259,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "  agy-queue watch [SECS]        Flicker-free interactive TUI (--watch)\n"
         "  agy-queue doctor [FLAGS]      Run 0-LLM orchestrator doctor (--fix/--wake/--heal)\n"
         "  agy-queue optimize [FLAGS]    Run 0-LLM dev flow bottleneck analyzer\n"
+        "  agy-queue compact [FLAGS]     Detect or atomically compact overlapping PRs (--apply)\n"
         "  agy-queue plan [FLAGS]        Show Repo -> Sub-Component planning view (Importance x Wave)\n"
         "  agy-queue sync [FLAGS]        Fetch origin refs & reconcile merged PRs\n"
         "  agy-queue list [FLAGS]        List filtered queue items (--status/--repo/--json)\n"
@@ -352,6 +354,8 @@ def _dispatch_subcommand(subcmd: str, rest: list[str], raw_cli_argv: list[str]) 
         return _main_dashboard(rest, raw_cli_argv)
     if subcmd == "optimize":
         return _run_subcommand_optimize(rest)
+    if subcmd == "compact":
+        return _run_subcommand_compact(rest)
     if subcmd == "plan":
         return _run_subcommand_plan(rest)
     if subcmd == "sync":
