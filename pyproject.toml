@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agy-dev-plugin"
-version = "20261123+g9b8b1f2"
+version = "20261124+g8d47228"
 description = "Antigravity Dev & SDLC Plugin: VCS-interoperable native Git PR remediation, dev queue orchestration, static QA/Zero-PII auditing, and engineering best-practice guardrails."
 readme = "README.md"
 requires-python = ">=3.11"
