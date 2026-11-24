@@ -42,6 +42,14 @@ import parallel_scope as _parallel_scope  # noqa: E402
 DEFAULT_STALL_THRESHOLD_SECONDS = 900
 DEFAULT_MAX_PARTIAL_WIP = 3
 DEFAULT_MAX_ORCHESTRATOR_STEPS = 150
+# Multi-slot per-repository engine bounds (mirrors `dev_common.resolve_max_repo_slots`, clamped `[1..4]`).
+DEFAULT_MAX_REPO_SLOTS = 3
+MAX_REPO_SLOTS_CAP = 4
+MAX_REPO_SLOTS_ENV = "AGY_DEV_MAX_SLOTS_PER_REPO"
+# Queue statuses that can never satisfy a dependency without manual re-activation / re-planning.
+DEADLOCK_DEPENDENCY_STATUSES: frozenset[str] = frozenset({"standby", "cancelled", "rejected"})
+# Dispatchable queue statuses whose unmet dependencies block `queue-next` (candidates for `standby_dependency_deadlock`).
+DEPENDENCY_BLOCKED_OPEN_STATUSES: frozenset[str] = frozenset({"pending"})
 STALL_ELIGIBLE_LOCK_STATUSES: frozenset[str] = frozenset(
     {"DEVELOPING", "NEEDS_REVISION_ITERATING", "AWAITING_AGENT_REVIEW"}
 )
@@ -133,6 +141,24 @@ def resolve_max_orchestrator_steps(max_steps: int | float | None = None) -> int:
             if val > 0:
                 return max(30, val)
     return DEFAULT_MAX_ORCHESTRATOR_STEPS
+
+
+def resolve_max_repo_slots(explicit_max_slots: Any = None) -> int:
+    """Resolve per-repository slot capacity clamped to `[1..4]` (explicit -> `AGY_DEV_MAX_SLOTS_PER_REPO` -> `3`)."""
+    shared_resolver = getattr(dev_common, "resolve_max_repo_slots", None)
+    if callable(shared_resolver):
+        with contextlib.suppress(Exception):
+            return max(1, min(int(shared_resolver(explicit_max_slots)), MAX_REPO_SLOTS_CAP))
+    for raw in (explicit_max_slots, str(os.environ.get(MAX_REPO_SLOTS_ENV) or "").strip()):
+        if raw is None or raw == "" or isinstance(raw, bool):
+            continue
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if val >= 1:
+            return min(val, MAX_REPO_SLOTS_CAP)
+    return DEFAULT_MAX_REPO_SLOTS
 
 
 def parse_iso_timestamp(ts_val: Any) -> float:
@@ -1103,7 +1129,7 @@ def _detect_partial_wip_accumulation(
 def _detect_stale_follower_needs_rebase(
     active_locks: dict[str, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Detect any parallel follower / Slot #2 lock in `NEEDS_REBASE_REVERIFY` or `base_stale=True` needing `rebase-reverify`."""
+    """Detect any parallel follower / Slot #2..#N lock in `NEEDS_REBASE_REVERIFY` or `base_stale=True` needing `rebase-reverify`."""
     flagged: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, str]] = set()
     for repo_slug, repo_lk in sorted(active_locks.items()):
@@ -1169,7 +1195,10 @@ def _detect_parallel_lookahead_opportunity(
     active_locks: dict[str, dict[str, Any]],
     repo_dirs: dict[str, Path],
 ) -> list[dict[str, Any]]:
-    """Detect when Slot #1 is `PENDING_HUMAN_PR_VALIDATION` and Slot #2 is free with a disjoint pending task in the same repo."""
+    """Detect when Slot #1 is `PENDING_HUMAN_PR_VALIDATION` and a Slot #2..#N is free (`active < max_slots`).
+
+    Candidates must be parallel-safe pairwise against EVERY active slot of the repo (worst tier wins).
+    """
     if not items or not active_locks:
         return []
 
@@ -1203,17 +1232,19 @@ def _detect_parallel_lookahead_opportunity(
     for repo_slug, repo_lk in sorted(active_locks.items()):
         if not isinstance(repo_lk, dict) or not bool(repo_lk.get("active", True)):
             continue
-        try:
-            max_slots = int(repo_lk.get("max_slots") or 2)
-        except (TypeError, ValueError):
-            max_slots = 2
+        max_slots = resolve_max_repo_slots(repo_lk.get("max_slots"))
         if max_slots < 2:
             continue
 
         active_slots = _iter_active_lock_slots(repo_lk)
-        if len(active_slots) != 1 or int(active_slots[0].get("slot_id") or 1) != 1:
+        active_ids = [int(s.get("slot_id") or 1) for s in active_slots]
+        if not active_slots or active_ids[0] != 1 or len(active_slots) >= max_slots:
             continue
-        slot1 = active_slots[0]
+        free_slot_id = next((sid for sid in range(2, max_slots + 1) if sid not in active_ids), 0)
+        if not free_slot_id:
+            continue
+        top_level = {k: v for k, v in repo_lk.items() if k != "slots" and v not in (None, "", [], {})}
+        slot1 = {**active_slots[0], **top_level, "slot_id": 1}
         s1_status = str(slot1.get("status") or "").strip().upper()
         if s1_status != "PENDING_HUMAN_PR_VALIDATION":
             continue
@@ -1223,19 +1254,25 @@ def _detect_parallel_lookahead_opportunity(
         norm_repo = dev_common.normalize_repo_slug(repo_slug) or repo_slug.lower()
         r_dir = repo_dirs.get(repo_slug) or repo_dirs.get(norm_repo)
 
-        s1_targets = [str(f).strip() for f in (slot1.get("target_files") or []) if str(f).strip()]
-        if not s1_targets and not slot1.get("section_anchors"):
-            s1_wt_raw = str(slot1.get("worktree_path") or "").strip()
-            wt_dir = Path(s1_wt_raw.replace("$HOME", str(Path.home()))).expanduser() if s1_wt_raw else r_dir
-            if wt_dir is not None and (wt_dir / ".git").exists():
-                s1_targets = _parallel_scope.collect_git_changed_files(
-                    r_dir or wt_dir,
-                    branch_name=str(slot1.get("branch_name") or ""),
-                    base_sha=str(slot1.get("base_sha") or ""),
-                    worktree_path=s1_wt_raw,
-                )
-        s1_spec = _parallel_scope.TaskAnchorSpec.from_mapping({**slot1, "target_files": s1_targets})
-        if not s1_spec.target_files and not s1_spec.section_anchors:
+        # Resolve anchors for EVERY active slot (git-diff fallback when a slot recorded no targets/anchors)
+        slot_specs: list[dict[str, Any]] = []
+        for slot_obj in [slot1, *active_slots[1:]]:
+            s_targets = [str(f).strip() for f in (slot_obj.get("target_files") or []) if str(f).strip()]
+            if not s_targets and not slot_obj.get("section_anchors"):
+                s_wt_raw = str(slot_obj.get("worktree_path") or "").strip()
+                wt_dir = Path(s_wt_raw.replace("$HOME", str(Path.home()))).expanduser() if s_wt_raw else r_dir
+                if wt_dir is not None and (wt_dir / ".git").exists():
+                    s_targets = _parallel_scope.collect_git_changed_files(
+                        r_dir or wt_dir,
+                        branch_name=str(slot_obj.get("branch_name") or ""),
+                        base_sha=str(slot_obj.get("base_sha") or ""),
+                        worktree_path=s_wt_raw,
+                    )
+            if not s_targets and not slot_obj.get("section_anchors"):
+                break
+            slot_specs.append({**slot_obj, "target_files": s_targets})
+        if len(slot_specs) != len(active_slots):
+            # At least one active slot cannot prove disjointness; never suggest a parallel dispatch
             continue
 
         disjoint_cands: list[dict[str, Any]] = []
@@ -1249,7 +1286,7 @@ def _detect_parallel_lookahead_opportunity(
                 dep_s = str(raw_dep or "").strip()
                 if not dep_s:
                     continue
-                if _slot_matches_cid(slot1, dep_s):
+                if any(_slot_matches_cid(sl, dep_s) for sl in slot_specs):
                     unmet_dep = True
                     break
                 for ocid, ost in status_by_cid.items():
@@ -1279,19 +1316,20 @@ def _detect_parallel_lookahead_opportunity(
             if not cand_spec.target_files and not cand_spec.section_anchors:
                 continue
 
-            ov = _parallel_scope.analyze_pair_overlap(
-                s1_spec,
+            # Pairwise validation against ALL active slots (worst tier wins)
+            multi_ov = _parallel_scope.analyze_candidate_against_slots(
+                slot_specs,
                 cand_spec,
                 repo_dir=r_dir,
                 repo_slug=repo_slug,
             )
-            if ov.parallel_safe:
+            if multi_ov.get("parallel_safe"):
                 disjoint_cands.append(
                     {
                         "conversation_id": cand_cid,
                         "title": str(cand.get("title") or ""),
                         "priority": _raw_item_priority(cand),
-                        "overlap_tier": ov.overlap_tier,
+                        "overlap_tier": str(multi_ov.get("overlap_tier") or ""),
                     }
                 )
 
@@ -1302,6 +1340,11 @@ def _detect_parallel_lookahead_opportunity(
                     "repo_slug": repo_slug,
                     "slot1_conversation_id": str(slot1.get("conversation_id") or ""),
                     "slot1_branch": str(slot1.get("branch_name") or ""),
+                    "max_slots": max_slots,
+                    "active_slot_ids": active_ids,
+                    "free_slot_id": free_slot_id,
+                    "next_slot_id": free_slot_id,
+                    "free_slot_count": max_slots - len(active_slots),
                     "candidate_count": len(disjoint_cands),
                     "top_candidate_id": best["conversation_id"],
                     "top_candidate_title": best["title"],
@@ -1313,13 +1356,15 @@ def _detect_parallel_lookahead_opportunity(
     if not opportunities:
         return []
     top_op = opportunities[0]
+    top_slot = int(top_op["free_slot_id"])
     return [
         _make_finding(
             code="parallel_lookahead_opportunity",
             severity="high",
             category="throughput",
             title=(
-                f"Slot #2 free on {top_op['repo_slug']} while Slot #1 awaits PR merge "
+                f"Slot #{top_slot} free on {top_op['repo_slug']} ({len(top_op['active_slot_ids'])}/{top_op['max_slots']} "
+                f"slots active) while Slot #1 awaits PR merge "
                 f"({top_op['candidate_count']} disjoint pending task(s), top: {top_op['top_candidate_id'][:8]} [{top_op['top_overlap_tier']}])"
             ),
             evidence={
@@ -1327,16 +1372,203 @@ def _detect_parallel_lookahead_opportunity(
                 "top_repo_slug": top_op["repo_slug"],
                 "top_candidate_id": top_op["top_candidate_id"],
                 "top_overlap_tier": top_op["top_overlap_tier"],
+                "free_slot_id": top_slot,
+                "next_slot_id": top_slot,
                 "opportunities": opportunities,
             },
             recommendation=(
-                "Dispatch the disjoint pending candidate into parallel Slot #2 (`start-remediation --allow-slot2 --worktree`) "
-                "while Slot #1 awaits human PR validation (`READY_AWAITING_BASE_MERGE` preserves max 1 open GitHub PR per repo)."
+                f"Dispatch the pairwise-disjoint pending candidate into parallel Slot #{top_slot} "
+                "(`start-remediation --parallel-slot --worktree`; legacy alias `--allow-slot2` still works) "
+                "while Slot #1 awaits human PR validation (Slots #2..#N stay `READY_AWAITING_BASE_MERGE`, "
+                "preserving max 1 open GitHub PR per repo)."
             ),
             auto_action_hint=(
                 f"pr_remediator.py queue-next --unlocked && pr_remediator.py start-remediation --id {top_op['top_candidate_id']} --allow-slot2 --worktree"
             ),
-            estimated_savings_min=len(opportunities) * 15,
+            estimated_savings_min=sum(int(op.get("free_slot_count") or 1) for op in opportunities) * 15,
+        )
+    ]
+
+
+def _detect_standby_dependency_deadlock(
+    items: list[dict[str, Any]],
+    active_locks: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Detect pending items whose `depends_on` (directly or transitively) waits on `standby`/`cancelled`/`rejected` items.
+
+    Such items can never be dispatched by `queue-next` until a human re-activates the dependency or rewrites
+    the dependency list, so they silently starve FREE repositories (no active lock) the most.
+    """
+    if not items:
+        return []
+    by_cid: dict[str, dict[str, Any]] = {}
+    for it in items:
+        cid = str(it.get("conversation_id") or "").strip()
+        if cid:
+            by_cid[cid] = it
+
+    def _resolve_dep(dep_ref: str) -> tuple[str, dict[str, Any]] | None:
+        for cand_cid, cand_it in by_cid.items():
+            if _cids_match(cand_cid, dep_ref):
+                return (cand_cid, cand_it)
+        return None
+
+    def _status(it: dict[str, Any]) -> str:
+        return str(it.get("status") or "pending").strip().lower()
+
+    pending = [it for it in items if _status(it) in DEPENDENCY_BLOCKED_OPEN_STATUSES and str(it.get("conversation_id") or "").strip()]
+    # Direct blockers per pending item
+    direct: dict[str, list[dict[str, Any]]] = {}
+    pending_deps: dict[str, list[str]] = {}
+    for it in pending:
+        cid = str(it.get("conversation_id") or "").strip()
+        for raw_dep in it.get("depends_on") or []:
+            dep_ref = str(raw_dep or "").strip()
+            if not dep_ref:
+                continue
+            resolved = _resolve_dep(dep_ref)
+            if resolved is None:
+                continue
+            dep_cid, dep_it = resolved
+            dep_st = _status(dep_it)
+            if dep_st in DEADLOCK_DEPENDENCY_STATUSES:
+                direct.setdefault(cid, []).append(
+                    {
+                        "conversation_id": dep_cid,
+                        "depends_on_ref": dep_ref,
+                        "status": dep_st,
+                        "title": str(dep_it.get("title") or ""),
+                    }
+                )
+            elif dep_st in DEPENDENCY_BLOCKED_OPEN_STATUSES:
+                pending_deps.setdefault(cid, []).append(dep_cid)
+
+    # Transitive propagation: a pending item waiting on a deadlocked pending item is deadlocked too (cycle-safe)
+    deadlocked: dict[str, list[str]] = {cid: [] for cid in direct}
+    changed = True
+    while changed:
+        changed = False
+        for cid, dep_cids in pending_deps.items():
+            if cid in deadlocked:
+                continue
+            via = [d for d in dep_cids if d in deadlocked]
+            if via:
+                deadlocked[cid] = via
+                changed = True
+    if not deadlocked:
+        return []
+
+    locked_slugs = {
+        dev_common.normalize_repo_slug(str(k)) or str(k).strip().lower()
+        for k, v in active_locks.items()
+        if isinstance(v, dict) and bool(v.get("active", True))
+    }
+
+    def _root_blockers(cid: str, seen: set[str]) -> list[dict[str, Any]]:
+        if cid in seen:
+            return []
+        seen.add(cid)
+        out = list(direct.get(cid, []))
+        for via_cid in deadlocked.get(cid, []):
+            out.extend(_root_blockers(via_cid, seen))
+        return out
+
+    offenders: list[dict[str, Any]] = []
+    for it in pending:
+        cid = str(it.get("conversation_id") or "").strip()
+        if cid not in deadlocked:
+            continue
+        merged_set = {
+            dev_common.normalize_repo_slug(str(r)) or str(r).strip().lower()
+            for r in (it.get("merged_repos") or [])
+            if str(r).strip()
+        }
+        remaining = [
+            dev_common.normalize_repo_slug(str(r)) or str(r).strip().lower()
+            for r in (it.get("repo_slugs") or [])
+            if str(r).strip()
+        ]
+        remaining = [r for r in remaining if r not in merged_set]
+        next_repo = remaining[0] if remaining else ""
+        on_free_repo = not next_repo or next_repo not in locked_slugs
+
+        blockers = direct.get(cid, [])
+        roots: list[dict[str, Any]] = []
+        for rb in _root_blockers(cid, set()):
+            if all(rb["conversation_id"] != r["conversation_id"] for r in roots):
+                roots.append(rb)
+
+        hints: list[str] = []
+        if blockers:
+            dead_refs = {b["depends_on_ref"] for b in blockers}
+            keep_deps = [
+                str(d).strip()
+                for d in (it.get("depends_on") or [])
+                if str(d).strip() and str(d).strip() not in dead_refs
+            ]
+            if keep_deps:
+                hints.append(f"pr_remediator.py queue-add --id {cid} --replace-depends-on {' '.join(keep_deps)}")
+            else:
+                hints.append(f"pr_remediator.py queue-add --id {cid} --clear-depends-on")
+        for rb in roots:
+            if rb["status"] == "standby":
+                hints.append(f"pr_remediator.py queue-set-status --id {rb['conversation_id']} --status pending")
+        offenders.append(
+            {
+                "conversation_id": cid,
+                "title": str(it.get("title") or ""),
+                "priority": _raw_item_priority(it),
+                "status": _status(it),
+                "repo_slugs": list(it.get("repo_slugs") or []),
+                "next_repo": next_repo,
+                "on_free_repo": on_free_repo,
+                "blocking_dependencies": blockers,
+                "transitive_via": list(deadlocked.get(cid, [])),
+                "root_blockers": roots,
+                "remediation_hints": hints,
+            }
+        )
+
+    offenders.sort(key=lambda o: (0 if o["on_free_repo"] else 1, o["priority"], o["conversation_id"]))
+    free_count = sum(1 for o in offenders if o["on_free_repo"])
+    root_ids: list[str] = []
+    root_statuses: dict[str, str] = {}
+    for o in offenders:
+        for rb in o["root_blockers"]:
+            if rb["conversation_id"] not in root_ids:
+                root_ids.append(rb["conversation_id"])
+                root_statuses[rb["conversation_id"]] = rb["status"]
+    top = offenders[0]
+    all_hints: list[str] = []
+    for o in offenders:
+        for h in o["remediation_hints"]:
+            if h not in all_hints:
+                all_hints.append(h)
+    return [
+        _make_finding(
+            code="standby_dependency_deadlock",
+            severity="high" if free_count else "medium",
+            category="throughput",
+            title=(
+                f"{len(offenders)} pending item(s) deadlocked on standby/cancelled/rejected dependencies "
+                f"({free_count} on free repo(s); blockers: {', '.join(c[:8] for c in root_ids[:3])})"
+            ),
+            evidence={
+                "count": len(offenders),
+                "free_repo_count": free_count,
+                "conversation_ids": [o["conversation_id"] for o in offenders],
+                "blocking_dependency_ids": root_ids,
+                "blocking_dependency_statuses": root_statuses,
+                "items": offenders,
+                "remediation_hints": all_hints,
+            },
+            recommendation=(
+                "Pending work cannot dispatch while it depends on `standby`/`cancelled`/`rejected` items. Either "
+                "re-activate the blocker (`queue-set-status --id <dep> --status pending`) or rewrite the dependent's "
+                "`depends_on` (`queue-add --id <cid> --replace-depends-on <ids...>` / `--clear-depends-on`)."
+            ),
+            auto_action_hint=(top["remediation_hints"][0] if top["remediation_hints"] else "pr_remediator.py queue-list --status standby"),
+            estimated_savings_min=len(offenders) * 10 + free_count * 10,
         )
     ]
 
@@ -1889,7 +2121,10 @@ def format_compact_opt_hint(analysis: dict[str, Any], max_width: int = 120) -> s
             bits.append(f"rebase-reverify {r_short} ({ev.get('count', 1)})")
         elif code == "parallel_lookahead_opportunity":
             r_short = str(ev.get("top_repo_slug") or "").split("/")[-1]
-            bits.append(f"slot2 lookahead {r_short} ({ev.get('count', 1)})")
+            free_sid = int(ev.get("free_slot_id") or 2)
+            bits.append(f"slot{free_sid} lookahead {r_short} ({ev.get('count', 1)})")
+        elif code == "standby_dependency_deadlock":
+            bits.append(f"dep deadlock ({ev.get('count', 1)}, {ev.get('free_repo_count', 0)} free repo)")
         else:
             bits.append(str(f.get("title") or code))
 
@@ -1969,13 +2204,15 @@ def analyze_dev_flow_optimizations(
         )
     )
     # 1b. Phantom pr_open items (0 active locks & 0 pr_urls), untracked ad-hoc active locks,
-    #     priority inversions, downstream partial-WIP accumulation, stale follower rebase, and Slot #2 lookahead
+    #     priority inversions, downstream partial-WIP accumulation, stale follower rebase, Slot #2..#N lookahead,
+    #     and standby/cancelled/rejected dependency deadlocks
     findings.extend(_detect_phantom_pr_open(items, active_locks))
     findings.extend(_detect_untracked_active_locks(items, active_locks))
     findings.extend(_detect_priority_inversions(items))
     findings.extend(_detect_partial_wip_accumulation(items))
     findings.extend(_detect_stale_follower_needs_rebase(active_locks))
     findings.extend(_detect_parallel_lookahead_opportunity(items, active_locks, repo_dirs))
+    findings.extend(_detect_standby_dependency_deadlock(items, active_locks))
     # 2. Micro-PR batch candidates
     findings.extend(_detect_micro_pr_batch_candidates(items))
     # 3. Repo contention hotspots

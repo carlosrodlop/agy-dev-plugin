@@ -37,6 +37,34 @@ PLUGIN_NAME = "agy-dev-plugin"
 DEFAULT_DEV_STATE_DIRNAME = "agy-dev-plugin"
 COMPAT_PORTFOLIO_STATE_DIRNAME = "wiz-customer-portfolio"
 
+# Multi-slot per-repository development engine bounds (`AGY_DEV_MAX_SLOTS_PER_REPO`, clamped to `[1..4]`).
+DEFAULT_MAX_REPO_SLOTS = 3
+MAX_REPO_SLOTS_CAP = 4
+MAX_REPO_SLOTS_ENV = "AGY_DEV_MAX_SLOTS_PER_REPO"
+
+
+def resolve_max_repo_slots(explicit_max_slots: Any = None, *, env: Any = None) -> int:
+    """Resolve the per-repository slot capacity clamped to `[1..MAX_REPO_SLOTS_CAP]` (default `3`).
+
+    Precedence: explicit value (when parseable and `>= 1`) -> `AGY_DEV_MAX_SLOTS_PER_REPO` -> `DEFAULT_MAX_REPO_SLOTS`.
+    """
+    env_map = os.environ if env is None else env
+    for raw in (explicit_max_slots, str(env_map.get(MAX_REPO_SLOTS_ENV) or "").strip()):
+        if raw is None or raw == "" or isinstance(raw, bool):
+            continue
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if val >= 1:
+            return min(val, MAX_REPO_SLOTS_CAP)
+    return DEFAULT_MAX_REPO_SLOTS
+
+
+def iter_active_lock_slots(lock_data: Any) -> list[dict[str, Any]]:
+    """Return ordered active slot dicts (`slot_id` 1..N) from a multi-slot or legacy flat repository lock."""
+    return DevLifecycleGuardrailEvaluator._extract_active_slots_from_lock(lock_data if isinstance(lock_data, dict) else {})
+
 DIRECT_MAIN_PUSH_RE = re.compile(
     r"\bgit\s+(?:-[A-Za-z]+\s+\S+\s+)*push\b(?![^\n;]*--delete\b)[^\n;|&]*\b(?:origin\s+)?(?:HEAD:)?(?:refs/heads/)?(?:main|master)\b"
 )
@@ -1788,11 +1816,7 @@ class DevLifecycleGuardrailEvaluator:
             active_slots = self._extract_active_slots_from_lock(lock_data)
             if not active_slots:
                 return ""
-            try:
-                raw_max = int(lock_data.get("max_slots") or 2)
-            except (TypeError, ValueError):
-                raw_max = 2
-            max_slots = max(len(active_slots), raw_max, 2)
+            max_slots = max(len(active_slots), resolve_max_repo_slots(lock_data.get("max_slots")))
             occ_txt = f"{len(active_slots)}/{max_slots} slots active"
 
             owned_slot = next((s for s in active_slots if current_cid and self._cid_matches_slot(current_cid, s)), None)
@@ -1831,7 +1855,8 @@ class DevLifecycleGuardrailEvaluator:
             ]
             extra_txt = f" (+ {', '.join(extra_slots)})" if extra_slots else ""
             slot2_hint = (
-                " (parallel Slot #2 available via --allow-slot2 when blast-radius overlap is NONE/TRANSITIVE)"
+                f" (parallel Slot #{len(active_slots) + 1} available via --allow-slot2/--parallel-slot when blast-radius "
+                f"overlap vs ALL active slots is NONE/TRANSITIVE)"
                 if len(active_slots) < max_slots
                 else " (all parallel slots occupied)"
             )
@@ -1852,7 +1877,7 @@ class DevLifecycleGuardrailEvaluator:
             for slug, lock_data in active_map.items():
                 if slug not in workspace_repos:
                     active_slots = self._extract_active_slots_from_lock(lock_data)
-                    max_slots = max(len(active_slots), int(lock_data.get("max_slots") or 2), 2)
+                    max_slots = max(len(active_slots), resolve_max_repo_slots(lock_data.get("max_slots")))
                     if active_slots and str(active_slots[0].get("branch_name") or lock_data.get("branch_name") or "").strip():
                         br0 = str(active_slots[0].get("branch_name") or lock_data.get("branch_name") or "")
                         cid0 = str(active_slots[0].get("conversation_id") or lock_data.get("conversation_id") or "")[:8]

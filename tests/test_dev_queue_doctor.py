@@ -1236,5 +1236,219 @@ class TestDevQueueDoctor(unittest.TestCase):
             self.assertIn("RuntimeError: transient fs glitch", err_buf.getvalue())
 
 
+class TestStandbyDependencyDeadlockAndNSlotLookahead(unittest.TestCase):
+    """Hermetic tests for `standby_dependency_deadlock` (optimizer + doctor) and N-slot optimizer lookahead."""
+
+    CID_STANDBY = "aaaa0001-0000-4000-8000-000000000001"
+    CID_CANCELLED = "aaaa0002-0000-4000-8000-000000000002"
+    CID_FREE = "bbbb0001-0000-4000-8000-000000000001"
+    CID_LOCKED = "bbbb0002-0000-4000-8000-000000000002"
+    CID_TRANSITIVE = "bbbb0003-0000-4000-8000-000000000003"
+    CID_MIXED = "bbbb0004-0000-4000-8000-000000000004"
+    CID_MERGED = "cccc0001-0000-4000-8000-000000000001"
+
+    def _deadlock_items(self) -> list[dict[str, object]]:
+        return [
+            {"conversation_id": self.CID_STANDBY, "title": "Parked prerequisite", "priority": 20, "status": "standby", "repo_slugs": ["owner/repo-a"]},
+            {"conversation_id": self.CID_CANCELLED, "title": "Dropped prerequisite", "priority": 20, "status": "cancelled", "repo_slugs": ["owner/repo-b"]},
+            {"conversation_id": self.CID_MERGED, "title": "Done prerequisite", "priority": 20, "status": "merged", "repo_slugs": ["owner/repo-a"]},
+            # Free repo (no active lock) -> high severity
+            {"conversation_id": self.CID_FREE, "title": "Free repo dependent", "priority": 10, "status": "pending", "repo_slugs": ["owner/repo-free"], "target_files": ["src/a.py"], "depends_on": [self.CID_STANDBY[:8]]},
+            # Repo with an active lock
+            {"conversation_id": self.CID_LOCKED, "title": "Locked repo dependent", "priority": 12, "status": "pending", "repo_slugs": ["owner/repo-locked"], "target_files": ["src/b.py"], "depends_on": [self.CID_CANCELLED]},
+            # Transitive: waits on a deadlocked pending item
+            {"conversation_id": self.CID_TRANSITIVE, "title": "Transitive dependent", "priority": 30, "status": "pending", "repo_slugs": ["owner/repo-free"], "target_files": ["src/c.py"], "depends_on": [self.CID_FREE]},
+            # Mixed: merged dep kept, cancelled dep dropped via --replace-depends-on
+            {"conversation_id": self.CID_MIXED, "title": "Mixed deps", "priority": 40, "status": "pending", "repo_slugs": ["owner/repo-free2"], "target_files": ["src/d.py"], "depends_on": [self.CID_MERGED, self.CID_CANCELLED]},
+        ]
+
+    def _locked_repo_lock(self) -> dict[str, dict[str, object]]:
+        return {
+            "owner/repo-locked": {
+                "active": True,
+                "repo_slug": "owner/repo-locked",
+                "conversation_id": "dddd0001-0000-4000-8000-000000000001",
+                "branch_name": "fix/20261124-locked-dddd0001",
+                "status": "DEVELOPING",
+                "target_files": ["src/other.py"],
+            }
+        }
+
+    def test_optimizer_detects_standby_dependency_deadlock_with_hints(self) -> None:
+        report = flow_opt.analyze_dev_flow_optimizations(
+            lightweight=True,
+            preloaded_items=self._deadlock_items(),
+            preloaded_active_locks=self._locked_repo_lock(),
+            preloaded_repo_dirs={},
+        )
+        by_code = {f["code"]: f for f in report["findings"]}
+        self.assertIn("standby_dependency_deadlock", by_code)
+        finding = by_code["standby_dependency_deadlock"]
+        self.assertEqual(finding["severity"], "high")
+        self.assertEqual(finding["category"], "throughput")
+        ev = finding["evidence"]
+        self.assertEqual(ev["count"], 4)
+        self.assertEqual(ev["free_repo_count"], 3)
+        self.assertEqual(set(ev["conversation_ids"]), {self.CID_FREE, self.CID_LOCKED, self.CID_TRANSITIVE, self.CID_MIXED})
+        self.assertEqual(ev["blocking_dependency_statuses"][self.CID_STANDBY], "standby")
+        self.assertEqual(ev["blocking_dependency_statuses"][self.CID_CANCELLED], "cancelled")
+        self.assertNotIn(self.CID_MERGED, ev["blocking_dependency_ids"])
+
+        items_by_cid = {o["conversation_id"]: o for o in ev["items"]}
+        # Free-repo offenders rank first; locked-repo offender is flagged as not free
+        self.assertTrue(items_by_cid[self.CID_FREE]["on_free_repo"])
+        self.assertFalse(items_by_cid[self.CID_LOCKED]["on_free_repo"])
+        self.assertEqual(ev["items"][0]["conversation_id"], self.CID_FREE)
+        self.assertEqual(items_by_cid[self.CID_TRANSITIVE]["blocking_dependencies"], [])
+        self.assertEqual(items_by_cid[self.CID_TRANSITIVE]["transitive_via"], [self.CID_FREE])
+        self.assertEqual(items_by_cid[self.CID_TRANSITIVE]["root_blockers"][0]["conversation_id"], self.CID_STANDBY)
+
+        hints = ev["remediation_hints"]
+        self.assertIn(f"pr_remediator.py queue-add --id {self.CID_FREE} --clear-depends-on", hints)
+        self.assertIn(f"pr_remediator.py queue-set-status --id {self.CID_STANDBY} --status pending", hints)
+        self.assertIn(f"pr_remediator.py queue-add --id {self.CID_MIXED} --replace-depends-on {self.CID_MERGED}", hints)
+        self.assertEqual(finding["auto_action_hint"], f"pr_remediator.py queue-add --id {self.CID_FREE} --clear-depends-on")
+        self.assertIn("dep deadlock (4, 3 free repo)", flow_opt.format_compact_opt_hint({"findings": [finding]}))
+
+    def test_optimizer_deadlock_medium_when_only_locked_repos_and_absent_when_healthy(self) -> None:
+        items = [it for it in self._deadlock_items() if it["conversation_id"] in (self.CID_CANCELLED, self.CID_LOCKED)]
+        report = flow_opt.analyze_dev_flow_optimizations(
+            lightweight=True,
+            preloaded_items=items,
+            preloaded_active_locks=self._locked_repo_lock(),
+            preloaded_repo_dirs={},
+        )
+        by_code = {f["code"]: f for f in report["findings"]}
+        self.assertEqual(by_code["standby_dependency_deadlock"]["severity"], "medium")
+        self.assertEqual(by_code["standby_dependency_deadlock"]["evidence"]["free_repo_count"], 0)
+
+        healthy_items = [
+            {"conversation_id": self.CID_MERGED, "status": "merged", "repo_slugs": ["owner/repo-a"]},
+            {"conversation_id": self.CID_FREE, "status": "pending", "repo_slugs": ["owner/repo-a"], "target_files": ["src/a.py"], "depends_on": [self.CID_MERGED]},
+            {"conversation_id": self.CID_STANDBY, "status": "standby", "repo_slugs": ["owner/repo-a"]},
+        ]
+        healthy = flow_opt.analyze_dev_flow_optimizations(
+            lightweight=True,
+            preloaded_items=healthy_items,
+            preloaded_active_locks={},
+            preloaded_repo_dirs={},
+        )
+        self.assertNotIn("standby_dependency_deadlock", {f["code"] for f in healthy["findings"]})
+
+    def test_doctor_surfaces_standby_dependency_deadlock_anomaly_without_wake(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            brain_dir = root / "brain"
+            items = [it for it in self._deadlock_items() if it["conversation_id"] in (self.CID_STANDBY, self.CID_FREE)]
+            _write_state_files(state_dir, items=items, locks={})
+
+            diag = doctor.diagnose_orchestrator(
+                state_dir=state_dir,
+                brain_dir=brain_dir,
+                ps_output="  PID ARGS\n  100 /sbin/launchd\n",
+            )
+            by_code = {a["code"]: a for a in diag["anomalies"]}
+            self.assertIn("standby_dependency_deadlock", by_code)
+            anomaly = by_code["standby_dependency_deadlock"]
+            self.assertEqual(anomaly["severity"], "high")
+            self.assertFalse(anomaly["requires_wake"])
+            self.assertFalse(anomaly["auto_fixable"])
+            self.assertEqual(anomaly["safe_fix_action"], f"pr_remediator.py queue-add --id {self.CID_FREE} --clear-depends-on")
+            self.assertIn(f"{self.CID_STANDBY[:8]}(standby)", anomaly["cause"])
+            self.assertIn(
+                f"pr_remediator.py queue-set-status --id {self.CID_STANDBY} --status pending",
+                anomaly["evidence"]["remediation_hints"],
+            )
+            self.assertEqual(diag["overall_status"], "degraded")
+            self.assertFalse(diag["needs_wake"])
+            # Owned by the doctor -> not duplicated as a PR-only improvement
+            self.assertNotIn("standby_dependency_deadlock", {i["code"] for i in diag["improvements"]})
+            self.assertIn("standby_dependency_deadlock", doctor.render_doctor_report(diag, color=False))
+
+    def _three_slot_repo(self, root: Path) -> Path:
+        repo_dir = root / "owner-repo"
+        (repo_dir / "src").mkdir(parents=True)
+        for name in ("alpha", "beta", "gamma", "delta"):
+            (repo_dir / "src" / f"{name}.py").write_text(f"def {name}() -> int:\n    return 1\n", encoding="utf-8")
+        return repo_dir
+
+    def _three_slot_lock(self, *, max_slots: int, with_slot3: bool = False) -> dict[str, dict[str, object]]:
+        slots: dict[str, dict[str, object]] = {
+            "1": {"slot_id": 1, "active": True, "conversation_id": "eeee0001-0000-4000-8000-000000000001", "status": "PENDING_HUMAN_PR_VALIDATION", "branch_name": "fix/20261124-alpha-eeee0001", "target_files": ["src/alpha.py"]},
+            "2": {"slot_id": 2, "active": True, "conversation_id": "eeee0002-0000-4000-8000-000000000002", "status": "READY_AWAITING_BASE_MERGE", "branch_name": "fix/20261124-beta-eeee0002", "target_files": ["src/beta.py"]},
+        }
+        if with_slot3:
+            slots["3"] = {"slot_id": 3, "active": True, "conversation_id": "eeee0003-0000-4000-8000-000000000003", "status": "DEVELOPING", "branch_name": "fix/20261124-gamma-eeee0003", "target_files": ["src/gamma.py"]}
+        return {
+            "owner/repo": {
+                "active": True,
+                "repo_slug": "owner/repo",
+                "max_slots": max_slots,
+                "conversation_id": "eeee0001-0000-4000-8000-000000000001",
+                "branch_name": "fix/20261124-alpha-eeee0001",
+                "status": "PENDING_HUMAN_PR_VALIDATION",
+                "pr_gate_ready": True,
+                "target_files": ["src/alpha.py"],
+                "slots": slots,
+            }
+        }
+
+    def test_optimizer_parallel_lookahead_targets_free_slot3_with_pairwise_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = self._three_slot_repo(Path(tmp))
+            items = [
+                # Collides with Slot #2 (`src/beta.py`) -> must be rejected even though it is disjoint from Slot #1
+                {"conversation_id": "ffff0001-0000-4000-8000-000000000001", "title": "Beta collision", "priority": 5, "status": "pending", "repo_slugs": ["owner/repo"], "target_files": ["src/beta.py"]},
+                {"conversation_id": "ffff0002-0000-4000-8000-000000000002", "title": "Delta feature", "priority": 9, "status": "pending", "repo_slugs": ["owner/repo"], "target_files": ["src/delta.py"]},
+            ]
+            report = flow_opt.analyze_dev_flow_optimizations(
+                lightweight=True,
+                preloaded_items=items,
+                preloaded_active_locks=self._three_slot_lock(max_slots=3),
+                preloaded_repo_dirs={"owner/repo": repo_dir},
+            )
+            by_code = {f["code"]: f for f in report["findings"]}
+            self.assertIn("parallel_lookahead_opportunity", by_code)
+            finding = by_code["parallel_lookahead_opportunity"]
+            ev = finding["evidence"]
+            self.assertEqual(ev["top_candidate_id"], "ffff0002-0000-4000-8000-000000000002")
+            self.assertEqual(ev["free_slot_id"], 3)
+            self.assertEqual(ev["next_slot_id"], 3)
+            op = ev["opportunities"][0]
+            self.assertEqual(op["candidate_count"], 1)
+            self.assertEqual(op["active_slot_ids"], [1, 2])
+            self.assertEqual(op["max_slots"], 3)
+            self.assertIn("Slot #3", finding["title"])
+            self.assertIn("--allow-slot2", finding["recommendation"])
+            self.assertIn("--parallel-slot", finding["recommendation"])
+            self.assertIn("slot3 lookahead repo", flow_opt.format_compact_opt_hint({"findings": [finding]}))
+
+            # Repo at capacity (3/3 active) -> no opportunity
+            full = flow_opt.analyze_dev_flow_optimizations(
+                lightweight=True,
+                preloaded_items=items,
+                preloaded_active_locks=self._three_slot_lock(max_slots=3, with_slot3=True),
+                preloaded_repo_dirs={"owner/repo": repo_dir},
+            )
+            self.assertNotIn("parallel_lookahead_opportunity", {f["code"] for f in full["findings"]})
+
+            # 4-slot repo with 3 active: candidate colliding with Slot #3 is rejected, disjoint one targets Slot #4
+            items_four = [
+                {"conversation_id": "ffff0003-0000-4000-8000-000000000003", "title": "Gamma collision", "priority": 5, "status": "pending", "repo_slugs": ["owner/repo"], "target_files": ["src/gamma.py"]},
+                items[1],
+            ]
+            four = flow_opt.analyze_dev_flow_optimizations(
+                lightweight=True,
+                preloaded_items=items_four,
+                preloaded_active_locks=self._three_slot_lock(max_slots=4, with_slot3=True),
+                preloaded_repo_dirs={"owner/repo": repo_dir},
+            )
+            four_ev = {f["code"]: f for f in four["findings"]}["parallel_lookahead_opportunity"]["evidence"]
+            self.assertEqual(four_ev["free_slot_id"], 4)
+            self.assertEqual(four_ev["top_candidate_id"], "ffff0002-0000-4000-8000-000000000002")
+            self.assertEqual(four_ev["opportunities"][0]["candidate_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

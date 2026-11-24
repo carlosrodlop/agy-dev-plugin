@@ -949,6 +949,8 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
                 "AGY_DEV_STATE_DIR": str(state_dir),
                 "AGY_CONF_REPO_DIR": str(clone),
                 "AGY_REPOS_ROOT": str(clone.parent),
+                # Legacy 2-slot contract (`AGY_DEV_MAX_SLOTS_PER_REPO=2`) stays fully backward-compatible.
+                "AGY_DEV_MAX_SLOTS_PER_REPO": "2",
             }
             with (
                 mock.patch.dict(os.environ, env_patch, clear=False),
@@ -1962,6 +1964,265 @@ class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
                 ".gemini/config/plugins/acme-hermetic-guard/sidecars/dev-queue-watchdog/watchdog.py",
                 reexec_res.get("pruned_orphans", []),
             )
+
+
+class TestNSlotLocksHydrationAndPromotion(unittest.TestCase):
+    """Test generalized N-slot (`1..4`, default `3`) locks, pairwise overlap, promotion, and B1 queue hydration."""
+
+    SLUG = "acme-org/acme-nslots"
+    CID_A = "aaaaaaaa-0000-4000-8000-000000000001"
+    CID_B = "bbbbbbbb-0000-4000-8000-000000000002"
+    CID_C = "cccccccc-0000-4000-8000-000000000003"
+    CID_D = "dddddddd-0000-4000-8000-000000000004"
+    CID_E = "eeeeeeee-0000-4000-8000-000000000005"
+
+    def _seed_repo(self, root: pathlib.Path) -> pathlib.Path:
+        repo = root / "repos" / "acme-nslots"
+        (repo / "src").mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+        _git(repo, "config", "user.name", "Acme Bot")
+        _git(repo, "config", "user.email", "acme-bot@example.com")
+        for mod in ("a", "b", "c", "d", "e"):
+            (repo / "src" / f"{mod}.py").write_text(f"def {mod}_value() -> int:\n    return 1\n", encoding="utf-8")
+        _git(repo, "add", "src")
+        _git(repo, "commit", "-m", "feat: seed five disjoint modules")
+        return repo
+
+    def _acquire(self, state_dir: pathlib.Path, repo: pathlib.Path, cid: str, files: list[str], **kw: object) -> dict:
+        return prs.acquire_dev_pr_lock(
+            conversation_id=cid,
+            action_id=f"task-{cid[:4]}",
+            branch_timestamp=f"20261124-10000{cid[-1]}",
+            summary=f"Task {cid[:8]}",
+            proposed_fix="Disjoint module change",
+            target_files=files,
+            portfolio_dir=state_dir,
+            repo_slug=self.SLUG,
+            workdir=repo,
+            allow_slot2=True,
+            **kw,
+        )
+
+    def test_resolve_max_repo_slots_defaults_and_clamps(self) -> None:
+        import lock_store
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGY_DEV_MAX_SLOTS_PER_REPO", None)
+            self.assertEqual(lock_store.DEFAULT_MAX_REPO_SLOTS, 3)
+            self.assertEqual(lock_store._resolve_max_repo_slots(), 3)
+            self.assertEqual(dev_common.resolve_max_repo_slots(), 3)
+            self.assertEqual(lock_store._resolve_max_repo_slots(1), 1)
+            self.assertEqual(lock_store._resolve_max_repo_slots(10), 4)
+            self.assertEqual(lock_store._resolve_max_repo_slots(0), 3)
+        for env_val, expected in (("9", 4), ("2", 2), ("0", 3), ("junk", 3), ("4", 4)):
+            with mock.patch.dict(os.environ, {"AGY_DEV_MAX_SLOTS_PER_REPO": env_val}, clear=False):
+                self.assertEqual(lock_store._resolve_max_repo_slots(), expected, msg=env_val)
+                self.assertEqual(dev_common.resolve_max_repo_slots(), expected, msg=env_val)
+        self.assertEqual(lock_store._next_free_slot_id({"1": {}, "2": {"active": True}}, 3), 3)
+        self.assertIsNone(lock_store._next_free_slot_id({"1": {}, "2": {}, "3": {}}, 3))
+        self.assertEqual(lock_store._next_free_slot_id({"1": {}, "3": {}}, 3), 2)
+        self.assertEqual(lock_store._secondary_slot_keys({"1": {}, "4": {}, "2": {}, "9": {}, "x": {}}), ["2", "4"])
+
+    def test_three_slot_pairwise_overlap_capacity_promotion_and_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            fake_home = root / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
+            repo = self._seed_repo(root)
+            env_patch = {"HOME": str(fake_home), "AGY_DEV_STATE_DIR": str(state_dir)}
+            with (
+                mock.patch.dict(os.environ, env_patch, clear=False),
+                mock.patch.object(prs, "stop_dev_api_server", return_value={"stopped": False}),
+                mock.patch.object(prs, "restart_pro_api_server", return_value={"restarted": False}),
+            ):
+                os.environ.pop("AGY_DEV_MAX_SLOTS_PER_REPO", None)
+                s1 = self._acquire(state_dir, repo, self.CID_A, ["src/a.py"])
+                self.assertTrue(s1["acquired"])
+                self.assertEqual(s1["slot_id"], 1)
+                self.assertEqual(s1["max_slots"], 3)
+                br1 = s1["lock"]["branch_name"]
+
+                s2 = self._acquire(state_dir, repo, self.CID_B, ["src/b.py"])
+                self.assertTrue(s2["acquired"], msg=s2)
+                self.assertEqual(s2["slot_id"], 2)
+
+                # Candidate disjoint from Slot #1 but colliding with Slot #2 MUST be rejected (pairwise vs ALL slots)
+                collide = self._acquire(state_dir, repo, self.CID_C, ["src/b.py"])
+                self.assertEqual(collide["status"], "locked")
+                self.assertFalse(collide["acquired"])
+                self.assertEqual(collide["overlap_analysis"]["blocking_slot_ids"], [2])
+                self.assertEqual(len(collide["overlap_analysis"]["pairwise"]), 2)
+
+                s3 = self._acquire(state_dir, repo, self.CID_C, ["src/c.py"])
+                self.assertTrue(s3["acquired"], msg=s3)
+                self.assertEqual(s3["slot_id"], 3)
+                self.assertEqual(s3["active_slots_count"], 3)
+                self.assertEqual(s3["landing_order"], [self.CID_A, self.CID_B, self.CID_C])
+                br3 = s3["lock"]["branch_name"]
+
+                repo_lock = prs.get_all_dev_pr_locks(portfolio_dir=state_dir)[self.SLUG]
+                self.assertEqual(sorted(repo_lock["slots"]), ["1", "2", "3"])
+                self.assertEqual(repo_lock["slot_occupancy"], "3/3")
+                self.assertIn(f"{self.SLUG}#slot2", repo_lock["repo_branches"])
+                self.assertIn(f"{self.SLUG}#slot3", repo_lock["repo_branches"])
+                prot_branches, _ = dev_common.get_active_dev_pr_lock_protections(state_dir=state_dir)
+                self.assertIn(br3, prot_branches)
+
+                # Capacity exhausted at default max_slots=3
+                full = self._acquire(state_dir, repo, self.CID_D, ["src/d.py"])
+                self.assertEqual(full["status"], "locked")
+                self.assertTrue(full["slots_full"])
+                self.assertIn("All 3 parallel slot(s) are occupied", full["error"])
+
+                # Slot #3 routing by branch + slot-scoped update
+                view3 = prs.get_dev_pr_lock(portfolio_dir=state_dir, repo_slug=self.SLUG, branch_name=br3)
+                self.assertEqual(view3["slot_id"], 3)
+                self.assertEqual(view3["conversation_id"], self.CID_C)
+                self.assertEqual(view3["slot1_branch_name"], br1)
+                upd = prs.update_dev_pr_lock(
+                    {"status": prs.SLOT_STATUS_READY_AWAITING_BASE_MERGE},
+                    portfolio_dir=state_dir,
+                    repo_slug=self.SLUG,
+                    branch_name=br3,
+                )
+                self.assertEqual(upd["slot_id"], 3)
+                prs.update_dev_pr_lock(
+                    {"landing_order": [self.CID_A, self.CID_C, self.CID_B]},
+                    portfolio_dir=state_dir,
+                    repo_slug=self.SLUG,
+                    branch_name=br1,
+                    slot_id=1,
+                )
+
+                # AGY_DEV_MAX_SLOTS_PER_REPO=4 unlocks a 4th disjoint slot (cap 4)
+                with mock.patch.dict(os.environ, {"AGY_DEV_MAX_SLOTS_PER_REPO": "4"}, clear=False):
+                    s4 = self._acquire(state_dir, repo, self.CID_D, ["src/d.py"])
+                self.assertTrue(s4["acquired"], msg=s4)
+                self.assertEqual(s4["slot_id"], 4)
+                self.assertEqual(s4["max_slots"], 4)
+
+                # Releasing Slot #1 promotes the earliest follower in landing_order (Slot #3), not the lowest id
+                rel = prs.release_dev_pr_lock(
+                    reason="MANUAL_RELEASE",
+                    portfolio_dir=state_dir,
+                    repo_slug=self.SLUG,
+                    branch_name=br1,
+                )
+                promoted = rel["promoted_slots"][self.SLUG]
+                self.assertEqual(promoted["conversation_id"], self.CID_C)
+                self.assertEqual(promoted["promoted_from_slot"], 3)
+                self.assertEqual(promoted["status"], prs.SLOT_STATUS_NEEDS_REBASE_REVERIFY)
+                self.assertEqual(sorted(promoted["slots"]), ["1", "2", "4"])
+                self.assertEqual(promoted["slots"]["2"]["conversation_id"], self.CID_B)
+                self.assertFalse(promoted["branch_pushed"])
+
+                # Explicit selector for an inactive follower slot never releases Slot #1
+                noop = prs.release_dev_pr_lock(
+                    reason="MANUAL_RELEASE", portfolio_dir=state_dir, repo_slug=self.SLUG, slot_id=3
+                )
+                self.assertEqual(noop["released_repos"], [])
+                self.assertTrue(prs.get_dev_pr_lock(portfolio_dir=state_dir, repo_slug=self.SLUG)["active"])
+
+                # Releasing follower Slot #2 keeps Slot #1 + Slot #4 intact
+                br2 = promoted["slots"]["2"]["branch_name"]
+                prs.release_dev_pr_lock(reason="MANUAL_RELEASE", portfolio_dir=state_dir, repo_slug=self.SLUG, branch_name=br2)
+                after = prs.get_all_dev_pr_locks(portfolio_dir=state_dir)[self.SLUG]
+                self.assertEqual(sorted(after["slots"]), ["1", "4"])
+                self.assertEqual(after["conversation_id"], self.CID_C)
+
+    def test_acquire_auto_hydrates_repo_scoped_anchors_from_queue_preserving_overrides(self) -> None:
+        import lock_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            state_dir = root / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            fake_home = root / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
+            repo = self._seed_repo(root)
+            with mock.patch.dict(os.environ, {"HOME": str(fake_home), "AGY_DEV_STATE_DIR": str(state_dir)}, clear=False):
+                prs.enqueue_dev_queue_item(
+                    conversation_id=self.CID_E,
+                    title="Hydration candidate",
+                    repo_slugs=[self.SLUG, "other-org/other-repo"],
+                    target_files=[f"{self.SLUG}:src/e.py", "other-org/other-repo:src/foreign.py", "src/d.py"],
+                    section_anchors=["src/e.py::e_value", "other-repo:src/foreign.py::x"],
+                    portfolio_dir=state_dir,
+                )
+                h_targets, h_anchors = lock_store._hydrate_anchors_from_queue(
+                    self.CID_E, repo_slug=self.SLUG, portfolio_dir=state_dir
+                )
+                self.assertEqual(h_targets, ["src/e.py", "src/d.py"])
+                self.assertEqual(h_anchors, ["src/e.py::e_value"])
+
+                res = prs.acquire_dev_pr_lock(
+                    conversation_id=self.CID_E,
+                    action_id="hydrate",
+                    portfolio_dir=state_dir,
+                    repo_slug=self.SLUG,
+                    workdir=repo,
+                )
+                self.assertTrue(res["acquired"])
+                self.assertEqual(res["hydrated_from_queue"], ["target_files", "section_anchors"])
+                self.assertEqual(res["lock"]["target_files"], ["src/e.py", "src/d.py"])
+                self.assertEqual(res["lock"]["section_anchors"], ["src/e.py::e_value"])
+
+                # Explicit `target_files` override wins; only the omitted `section_anchors` are hydrated
+                res2 = prs.acquire_dev_pr_lock(
+                    conversation_id=self.CID_E,
+                    action_id="hydrate",
+                    target_files=["src/e.py"],
+                    portfolio_dir=state_dir,
+                    repo_slug=self.SLUG,
+                    workdir=repo,
+                    reuse_active_branch=True,
+                )
+                self.assertTrue(res2["acquired"])
+                self.assertEqual(res2["hydrated_from_queue"], ["section_anchors"])
+                self.assertEqual(res2["lock"]["target_files"], ["src/e.py"])
+
+                # Unknown conversation -> nothing hydrated, never raises
+                self.assertEqual(lock_store._hydrate_anchors_from_queue("ffffffff", repo_slug=self.SLUG, portfolio_dir=state_dir), ([], []))
+
+    def test_analyze_candidate_against_slots_and_batch_multi_slot_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._seed_repo(pathlib.Path(tmp))
+            slots = [
+                {"conversation_id": self.CID_A, "slot_id": 1, "target_files": ["src/a.py"]},
+                {"conversation_id": self.CID_B, "slot_id": 2, "target_files": ["src/b.py"]},
+            ]
+            ok = pscope.analyze_candidate_against_slots(
+                slots, {"conversation_id": self.CID_C, "target_files": ["src/c.py"]}, repo_dir=repo, repo_slug=self.SLUG
+            )
+            self.assertTrue(ok["parallel_safe"])
+            self.assertEqual(ok["overlap_tier"], pscope.OVERLAP_NONE)
+            self.assertEqual(ok["landing_order"], [self.CID_A, self.CID_B, self.CID_C])
+            self.assertEqual([p["slot_id"] for p in ok["pairwise"]], [1, 2])
+            bad = pscope.analyze_candidate_against_slots(
+                slots, {"conversation_id": self.CID_C, "target_files": ["src/b.py"]}, repo_dir=repo, repo_slug=self.SLUG
+            )
+            self.assertFalse(bad["parallel_safe"])
+            self.assertEqual(bad["blocking_slot_ids"], [2])
+            self.assertEqual(bad["overlap_tier"], pscope.OVERLAP_DEEP_SHARED)
+            self.assertFalse(pscope.analyze_candidate_against_slots([], {"conversation_id": self.CID_C})["parallel_safe"])
+
+            batch = pscope.analyze_candidates_overlap(
+                [
+                    *slots,
+                    {"conversation_id": self.CID_C, "target_files": ["src/b.py"]},
+                    {"conversation_id": self.CID_D, "target_files": ["src/d.py"]},
+                ],
+                repo_dir=repo,
+                repo_slug=self.SLUG,
+                primary_slot_id=self.CID_A,
+                active_slot_ids=[self.CID_B],
+            ).to_dict()
+            self.assertIn(self.CID_C, batch["parallel_slot2_candidates"])
+            self.assertNotIn(self.CID_C, batch["multi_slot_candidates"])
+            self.assertIn(self.CID_D, batch["multi_slot_candidates"])
+            self.assertNotIn(self.CID_B, batch["multi_slot_candidates"])
 
 
 if __name__ == "__main__":

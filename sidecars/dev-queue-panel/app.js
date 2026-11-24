@@ -8,6 +8,8 @@
   const POLL_INTERVAL_MS = 1500;
   const FETCH_TIMEOUT_MS = 6000;
   const MAX_CONSUMED_INTENTS = 64;
+  const DEFAULT_MAX_REPO_SLOTS = 3;
+  const MAX_REPO_SLOTS_CAP = 4;
 
   /* -------------------- 1. Pure Formatters & Validators -------------------- */
 
@@ -210,15 +212,33 @@
     return anchor;
   }
 
+  function sortedRepoSlots(repo) {
+    const slots = Array.isArray(repo.slots) ? repo.slots.slice() : [];
+    slots.sort((a, b) => (Number(a.slot_id) || 1) - (Number(b.slot_id) || 1));
+    return slots;
+  }
+
+  function repoSlotOccupancy(repo, slots) {
+    if (repo.slot_occupancy) {
+      return String(repo.slot_occupancy);
+    }
+    const maxRaw = Number(repo.max_slots);
+    const maxSlots =
+      Number.isFinite(maxRaw) && maxRaw >= 1 ? Math.min(Math.floor(maxRaw), MAX_REPO_SLOTS_CAP) : DEFAULT_MAX_REPO_SLOTS;
+    const active = slots.length || 1;
+    return `${active}/${Math.max(active, maxSlots)}`;
+  }
+
   function renderRepoCard(repo) {
     const cardClass = repo.is_stalled ? "dq-repo-card is-stalled" : "dq-repo-card";
     const root = el("article", cardClass);
+    const slots = sortedRepoSlots(repo);
 
     const top = el("div", "dq-repo-top");
     const leftBadges = el("div", "dq-badges");
     leftBadges.appendChild(el("strong", "", repo.label || repo.slug));
     if (repo.locked) {
-      leftBadges.appendChild(el("span", "dq-badge dq-badge-mono", `[${repo.slot_occupancy || "1/2"}]`));
+      leftBadges.appendChild(el("span", "dq-badge dq-badge-mono", `[${repoSlotOccupancy(repo, slots)}]`));
     }
     top.appendChild(leftBadges);
 
@@ -232,9 +252,9 @@
     top.appendChild(el("span", stateClass, repo.state_tag || (repo.locked ? "LOCKED" : "FREE")));
     root.appendChild(top);
 
-    const slots = Array.isArray(repo.slots) ? repo.slots : [];
     for (const slot of slots) {
-      const slotBits = [`S${slot.slot_id}: ${slot.status || "ACTIVE"}`];
+      const slotLabel = slot.slot_label || `S${slot.slot_id}`;
+      const slotBits = [`${slotLabel}: ${slot.status || "ACTIVE"}`];
       if (slot.idle_label) {
         slotBits.push(slot.is_stalled ? `STALL ${slot.idle_label}` : `idle ${slot.idle_label}`);
       }
@@ -258,11 +278,12 @@
     }
     for (const slot of slots) {
       if (slot.is_uuid) {
+        const slotLabel = slot.slot_label || `S${slot.slot_id}`;
         actions.appendChild(
           buildActionButton(
-            `S${slot.slot_id} Chat`,
+            `${slotLabel} Chat`,
             "open-conv",
-            { convId: slot.conversation_id, label: `S${slot.slot_id} (${slot.display_id})` },
+            { convId: slot.conversation_id, label: `${slotLabel} (${slot.display_id})` },
             false,
           ),
         );

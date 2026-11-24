@@ -52,6 +52,7 @@ from lock_store import (  # noqa: E402
     _is_slot_scoped_rb_key,
     _read_locks_state,
     _resolve_lock_target_repo_dir,
+    _secondary_slot_keys,
     get_all_dev_pr_locks,
     get_dev_pr_lock,
     sync_dev_pr_lock_with_git,
@@ -565,9 +566,9 @@ def wait_for_unlock_or_actionable_event(
         rebase_reverify_locks: list[dict[str, Any]] = []
         for slug, lk in sorted(current_locks.items()):
             slot_candidates: list[tuple[int, dict[str, Any]]] = [(1, lk)]
-            s2_lk = lk.get("slots", {}).get("2") if isinstance(lk.get("slots"), dict) else None
-            if isinstance(s2_lk, dict) and bool(s2_lk.get("active", True)):
-                slot_candidates.append((2, s2_lk))
+            lk_slots = lk.get("slots") if isinstance(lk.get("slots"), dict) else {}
+            for f_key in _secondary_slot_keys(lk_slots):
+                slot_candidates.append((int(f_key), lk_slots[f_key]))
             for s_num, slot_entry in slot_candidates:
                 slot_st_u = str(slot_entry.get("status") or "").strip().upper()
                 if (
@@ -1535,8 +1536,8 @@ def verify_branches_merged_into_base(
                         str(cand_lock.get("branch_name") or cand_lock.get("last_branch_name") or ""),
                     )
             if cand_lock.get("active") and isinstance(cand_lock.get("slots"), dict):
-                s2_cand = cand_lock["slots"].get("2")
-                if isinstance(s2_cand, dict) and bool(s2_cand.get("active", True)):
+                for f_key in _secondary_slot_keys(cand_lock["slots"]):
+                    s2_cand = cand_lock["slots"][f_key]
                     s2_cid = str(s2_cand.get("conversation_id") or "")
                     if s2_cid and any(_matches_cid(c, s2_cid) for c in cids_clean) and s2_cand.get("branch_name"):
                         _add_target(

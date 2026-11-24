@@ -4560,5 +4560,188 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertIn("| `coverage` | ⏭️ SKIPPED | `coverage_not_installed` |", skip_md)
 
 
+class TestQueueNextMultiSlotLookaheadAndDependsOnFlags(unittest.TestCase):
+    """Hermetic tests for N-slot `queue-next` lookahead (`multi_slot_*` + legacy `slot2_*`) and `queue-add` depends_on flags."""
+
+    REPO = "owner/repo"
+
+    def _repo_dir(self, root: pathlib.Path) -> pathlib.Path:
+        repo_dir = root / "owner-repo"
+        (repo_dir / "src").mkdir(parents=True)
+        for name in ("alpha", "beta", "gamma", "delta", "epsilon"):
+            (repo_dir / "src" / f"{name}.py").write_text(f"def {name}() -> int:\n    return 1\n", encoding="utf-8")
+        return repo_dir
+
+    def _lock(self, repo_dir: pathlib.Path, *, max_slots: int, slot_files: dict[int, str]) -> dict[str, dict[str, object]]:
+        slots: dict[str, dict[str, object]] = {}
+        for s_id, s_file in sorted(slot_files.items()):
+            slots[str(s_id)] = {
+                "slot_id": s_id,
+                "active": True,
+                "conversation_id": f"1111000{s_id}-0000-4000-8000-00000000000{s_id}",
+                "status": "PENDING_HUMAN_PR_VALIDATION" if s_id == 1 else "READY_AWAITING_BASE_MERGE",
+                "branch_name": f"fix/20261124-slot{s_id}-1111000{s_id}",
+                "target_files": [s_file],
+            }
+        return {
+            self.REPO: {
+                "active": True,
+                "repo_slug": self.REPO,
+                "lock_id": "lock-owner-repo",
+                "max_slots": max_slots,
+                "target_repo_dir": str(repo_dir),
+                **{k: v for k, v in slots["1"].items() if k not in ("slot_id", "active")},
+                "slots": slots,
+            }
+        }
+
+    def _enqueue(self, pdir: pathlib.Path, cid: str, prio: int, target: str) -> None:
+        res = prs.enqueue_dev_queue_item(
+            conversation_id=cid,
+            title=f"Task {cid[:8]}",
+            priority=prio,
+            repo_slugs=[self.REPO],
+            target_files=[target],
+            portfolio_dir=pdir,
+        )
+        self.assertEqual(res["status"], "ok")
+
+    def _queue_next(self, pdir: pathlib.Path, locks: dict[str, dict[str, object]]) -> dict[str, object]:
+        import queue_store
+
+        with mock.patch.object(queue_store, "get_all_dev_pr_locks", return_value=locks):
+            return queue_store.get_next_dev_queue_item(portfolio_dir=pdir, skip_locked_repos=True)
+
+    def test_three_slot_lookahead_candidate_and_legacy_alias_parity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            pdir = root / "state"
+            repo_dir = self._repo_dir(root)
+            cid_delta = "22220001-0000-4000-8000-000000000001"
+            self._enqueue(pdir, cid_delta, 10, "src/delta.py")
+
+            locks = self._lock(repo_dir, max_slots=3, slot_files={1: "src/alpha.py", 2: "src/beta.py"})
+            qnext = self._queue_next(pdir, locks)
+            self.assertEqual(len(qnext["multi_slot_candidates"]), 1)
+            cand = qnext["multi_slot_candidates"][0]
+            self.assertEqual(cand["conversation_id"], cid_delta)
+            self.assertEqual(cand["target_slot"], 3)
+            self.assertEqual(cand["free_slot_id"], 3)
+            self.assertEqual(cand["next_slot_id"], 3)
+            self.assertEqual(cand["slot_allocation"], "slot_3_lookahead")
+            self.assertEqual(cand["active_slot_ids"], [1, 2])
+            self.assertEqual(cand["max_slots"], 3)
+            self.assertEqual(cand["overlap_tier"], "NONE")
+            self.assertEqual([p["slot_id"] for p in cand["pairwise_overlap"]], [1, 2])
+            self.assertEqual(cand["landing_order"][-1], cid_delta)
+            self.assertEqual(qnext["multi_slot_by_repo"][self.REPO]["conversation_id"], cid_delta)
+            # Legacy aliases mirror the generalized keys identically
+            self.assertEqual(qnext["slot2_candidates"], qnext["multi_slot_candidates"])
+            self.assertEqual(qnext["slot2_by_repo"], qnext["multi_slot_by_repo"])
+            self.assertEqual(qnext["next_unlocked_item"]["conversation_id"], cid_delta)
+            self.assertEqual(qnext["runnable_by_repo"][self.REPO]["target_slot"], 3)
+
+            # Legacy 2-slot lock with only Slot #1 active keeps `target_slot=2` / `slot_2_lookahead`
+            legacy = self._queue_next(pdir, self._lock(repo_dir, max_slots=2, slot_files={1: "src/alpha.py"}))
+            self.assertEqual(legacy["slot2_candidates"][0]["target_slot"], 2)
+            self.assertEqual(legacy["slot2_candidates"][0]["slot_allocation"], "slot_2_lookahead")
+
+    def test_pairwise_overlap_rejection_against_slot3_and_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            pdir = root / "state"
+            repo_dir = self._repo_dir(root)
+            cid_gamma = "33330001-0000-4000-8000-000000000001"
+            cid_eps = "33330002-0000-4000-8000-000000000002"
+            self._enqueue(pdir, cid_gamma, 5, "src/gamma.py")
+            self._enqueue(pdir, cid_eps, 10, "src/epsilon.py")
+
+            # 4-slot repo with Slots #1..#3 active: gamma collides with Slot #3 only -> rejected; epsilon -> Slot #4
+            locks = self._lock(repo_dir, max_slots=4, slot_files={1: "src/alpha.py", 2: "src/beta.py", 3: "src/gamma.py"})
+            qnext = self._queue_next(pdir, locks)
+            self.assertEqual([c["conversation_id"] for c in qnext["multi_slot_candidates"]], [cid_eps])
+            self.assertEqual(qnext["multi_slot_candidates"][0]["target_slot"], 4)
+            blocked = {b["conversation_id"]: b for b in qnext["blocked_by_repo_locks"]}
+            self.assertIn(cid_gamma, blocked)
+            self.assertEqual(blocked[cid_gamma]["blocking_slot_ids"], [3])
+            self.assertTrue(blocked[cid_gamma]["slot2_blocked_reason"].startswith("overlap_"))
+            self.assertEqual(blocked[cid_gamma]["parallel_slot_blocked_reason"], blocked[cid_gamma]["slot2_blocked_reason"])
+            self.assertNotEqual(blocked[cid_gamma]["overlap_tier"], "NONE")
+
+            # 3-slot repo at capacity (3/3 active) -> no candidates, `max_slots_occupied`
+            full = self._queue_next(pdir, self._lock(repo_dir, max_slots=3, slot_files={1: "src/alpha.py", 2: "src/beta.py", 3: "src/delta.py"}))
+            self.assertEqual(full["multi_slot_candidates"], [])
+            self.assertEqual(full["slot2_candidates"], [])
+            self.assertEqual(
+                {b["slot2_blocked_reason"] for b in full["blocked_by_repo_locks"]},
+                {"max_slots_occupied"},
+            )
+
+    def test_two_free_slots_reserve_distinct_slot_ids_and_reject_mutual_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            pdir = root / "state"
+            repo_dir = self._repo_dir(root)
+            cid_a = "44440001-0000-4000-8000-000000000001"
+            cid_b = "44440002-0000-4000-8000-000000000002"
+            cid_c = "44440003-0000-4000-8000-000000000003"
+            self._enqueue(pdir, cid_a, 5, "src/beta.py")
+            self._enqueue(pdir, cid_b, 6, "src/beta.py")  # collides with reserved candidate A
+            self._enqueue(pdir, cid_c, 7, "src/gamma.py")
+
+            qnext = self._queue_next(pdir, self._lock(repo_dir, max_slots=3, slot_files={1: "src/alpha.py"}))
+            picks = [(c["conversation_id"], c["target_slot"]) for c in qnext["multi_slot_candidates"]]
+            self.assertEqual(picks, [(cid_a, 2), (cid_c, 3)])
+            self.assertEqual(qnext["multi_slot_by_repo"][self.REPO]["conversation_id"], cid_a)
+            blocked = {b["conversation_id"]: b for b in qnext["blocked_by_repo_locks"]}
+            self.assertTrue(blocked[cid_b]["slot2_blocked_reason"].startswith("overlap_"))
+
+    def test_queue_add_replace_and_clear_depends_on_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pdir = pathlib.Path(tmp) / "state"
+            cid = "55550001-0000-4000-8000-000000000001"
+            dep_a = "55550002-0000-4000-8000-000000000002"
+            dep_b = "55550003-0000-4000-8000-000000000003"
+            dep_c = "55550004-0000-4000-8000-000000000004"
+
+            def _run(*extra: str) -> dict[str, object]:
+                buf = io.StringIO()
+                with (
+                    mock.patch.dict(os.environ, {"AGY_DEV_STATE_DIR": str(pdir)}),
+                    contextlib.redirect_stdout(buf),
+                ):
+                    rc = prs.main(["queue-add", "--id", cid, "--repos", self.REPO, *extra])
+                self.assertEqual(rc, 0)
+                return json.loads(buf.getvalue())
+
+            self.assertEqual(_run("--depends-on", dep_a)["item"]["depends_on"], [dep_a])
+            # Default `--depends-on` still merges
+            self.assertEqual(_run("--depends-on", dep_b)["item"]["depends_on"], [dep_a, dep_b])
+            # Plain re-add without dependency flags preserves the list
+            self.assertEqual(_run("--title", "Renamed")["item"]["depends_on"], [dep_a, dep_b])
+            # `--replace-depends-on` replaces instead of merging (and wins over `--depends-on`)
+            self.assertEqual(_run("--replace-depends-on", dep_c, "--depends-on", dep_a)["item"]["depends_on"], [dep_c])
+            # `--clear-depends-on` empties (and wins over both other flags)
+            self.assertEqual(
+                _run("--clear-depends-on", "--replace-depends-on", dep_a, "--depends-on", dep_b)["item"]["depends_on"],
+                [],
+            )
+            self.assertEqual(_run("--depends-on", dep_a)["item"]["depends_on"], [dep_a])
+            # `--replace-depends-on` with no IDs also clears
+            self.assertEqual(_run("--replace-depends-on")["item"]["depends_on"], [])
+            q_final = prs.load_dev_queue(portfolio_dir=pdir)
+            self.assertEqual(q_final["items"][0]["depends_on"], [])
+            self.assertEqual(q_final["items"][0]["title"], "Renamed")
+
+            # Python API precedence mirrors the CLI
+            api_res = prs.enqueue_dev_queue_item(
+                conversation_id=cid,
+                depends_on=[dep_a],
+                replace_depends_on=[dep_b, dep_c],
+                portfolio_dir=pdir,
+            )
+            self.assertEqual(api_res["item"]["depends_on"], [dep_b, dep_c])
+
+
 if __name__ == "__main__":
     unittest.main()

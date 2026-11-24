@@ -55,6 +55,7 @@ from lock_store import (  # noqa: E402
     _resolve_repo_dir_for_slug,
     _resolve_repo_slug_and_dir,
     _sanitize_home_paths,
+    _secondary_slot_keys,
     _slot_repo_branch_key,
     _utc_now_iso,
     build_pro_dashboard_ui_url,
@@ -1834,7 +1835,7 @@ def record_pr_review_evaluation(
             valid_vr = {**valid_vr, "head_sha": amended_head_sha, "dirty": False}
 
         # MAX 1 OPEN GITHUB PR PER REPOSITORY INVARIANT:
-        # When Slot #2 passes review while Slot #1 is still active on the repo, DO NOT push to origin
+        # When any follower Slot #2..#N passes review while Slot #1 is still active on the repo, DO NOT push to origin
         # and DO NOT surface `manual_pr_url` until Slot #1 merges + rebase-reverify passes (`deferred_send_email=False`).
         if is_slot2_branch:
             head_sha = amended_head_sha
@@ -1842,8 +1843,8 @@ def record_pr_review_evaluation(
             updated_history[-1] = review_entry
             slot1_br = str(lock_info.get("slot1_branch_name") or "")
             slot2_md = (
-                f"### ⏳ Slot #2 Validated Locally — Awaiting Slot #1 Base Merge (`{PR_REVIEWER_SUBAGENT_NAME}` · `{effective_reviewer_model}`)\n\n"
-                f"- **Slot**: `2` (behind active Slot #1 `{slot1_br}`)\n"
+                f"### ⏳ Slot #{slot_num} Validated Locally — Awaiting Slot #1 Base Merge (`{PR_REVIEWER_SUBAGENT_NAME}` · `{effective_reviewer_model}`)\n\n"
+                f"- **Slot**: `{slot_num}` (behind active Slot #1 `{slot1_br}`; promotes in `landing_order` via `rebase-reverify`)\n"
                 f"- **Status**: `{SLOT_STATUS_READY_AWAITING_BASE_MERGE}` (`max 1 open GitHub PR per repo` enforced — NOT pushed to `origin` yet)\n"
                 f"- **Local Branch**: `{resolved_branch}` (Timestamp `{resolved_ts}`, SHA `{head_sha[:12]}`)\n"
                 f"- **Verdict**: **🟢 PASS** (`{score_int}/100` · Round `{current_iteration}/{MAX_PR_REVIEW_ITERATIONS}`)\n"
@@ -1912,7 +1913,7 @@ def record_pr_review_evaluation(
                         strip_repo_slug=resolved_repo_slug,
                         subagent_conversation_ids=recorded_subagents,
                         notes=(
-                            f"Slot #2 passed {PR_REVIEWER_SUBAGENT_NAME} ({norm_verdict} {score_int}/100) locally; "
+                            f"Slot #{slot_num} passed {PR_REVIEWER_SUBAGENT_NAME} ({norm_verdict} {score_int}/100) locally; "
                             f"{SLOT_STATUS_READY_AWAITING_BASE_MERGE} behind Slot #1 ({slot1_br})."
                         ),
                         portfolio_dir=portfolio_dir,
@@ -1921,7 +1922,7 @@ def record_pr_review_evaluation(
                 "status": "ok",
                 "vcs_mode": "native_git",
                 "repo_slug": resolved_repo_slug,
-                "slot_id": 2,
+                "slot_id": slot_num,
                 "branch_action": SLOT_STATUS_READY_AWAITING_BASE_MERGE,
                 "lock_status": SLOT_STATUS_READY_AWAITING_BASE_MERGE,
                 "awaiting_base_merge": True,
@@ -2617,14 +2618,20 @@ def analyze_queue_or_tasks_overlap(
 
     tasks_list: list[TaskAnchorSpec] = []
     primary_cid = ""
+    follower_cids: list[str] = []
     if include_active_lock:
         act_lock = get_dev_pr_lock(portfolio_dir=portfolio_dir, repo_slug=resolved_slug, workdir=workdir)
         if act_lock.get("active"):
-            primary_cid = str(act_lock.get("conversation_id") or "")
-            tasks_list.append(TaskAnchorSpec.from_mapping(act_lock))
-            s2_lk = act_lock.get("slots", {}).get("2") if isinstance(act_lock.get("slots"), dict) else None
-            if isinstance(s2_lk, dict) and bool(s2_lk.get("active", True)):
-                tasks_list.append(TaskAnchorSpec.from_mapping(s2_lk))
+            act_slots = act_lock.get("slots") if isinstance(act_lock.get("slots"), dict) else {}
+            s1_lk = act_slots.get("1") if isinstance(act_slots.get("1"), dict) else act_lock
+            primary_cid = str(s1_lk.get("conversation_id") or act_lock.get("conversation_id") or "")
+            tasks_list.append(TaskAnchorSpec.from_mapping(s1_lk))
+            for f_key in _secondary_slot_keys(act_slots):
+                f_lk = act_slots[f_key]
+                tasks_list.append(TaskAnchorSpec.from_mapping(f_lk))
+                f_cid = str(f_lk.get("conversation_id") or "").strip()
+                if f_cid:
+                    follower_cids.append(f_cid)
 
     q_data = load_dev_queue(portfolio_dir=portfolio_dir)
     filter_ids = [str(c).strip() for c in (candidate_ids or []) if str(c).strip()]
@@ -2651,11 +2658,13 @@ def analyze_queue_or_tasks_overlap(
         repo_dir=main_repo_dir,
         repo_slug=resolved_slug,
         primary_slot_id=primary_cid,
+        active_slot_ids=follower_cids,
     )
     out = batch_res.to_dict()
     out["mode"] = "queue_and_locks"
     out["repo_slug"] = resolved_slug
     out["primary_slot_id"] = primary_cid
+    out["active_follower_slot_ids"] = follower_cids
     if len(batch_res.pairwise) == 1:
         p0 = batch_res.pairwise[0]
         out["overlap_tier"] = p0.overlap_tier
@@ -2919,7 +2928,7 @@ def run_slot_rebase_reverify(
                         portfolio_dir=portfolio_dir,
                     )
 
-            # PR Ready for Validation (status='OK') emails are permanently disabled on 0-LLM Slot #2 promotion.
+            # PR Ready for Validation (status='OK') emails are permanently disabled on 0-LLM follower Slot #2..#N promotion.
             _ = send_email
             email_sent = False
 
@@ -2940,7 +2949,7 @@ def run_slot_rebase_reverify(
 
         next_st = (
             SLOT_STATUS_READY_AWAITING_BASE_MERGE
-            if (slot_num == 2 and was_review_approved)
+            if (slot_num > 1 and was_review_approved)
             else str(lock_info.get("status") or "DEVELOPING")
         )
         if next_st == SLOT_STATUS_NEEDS_REBASE_REVERIFY:

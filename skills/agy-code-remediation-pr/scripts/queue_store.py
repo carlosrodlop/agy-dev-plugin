@@ -49,7 +49,7 @@ from lock_store import (  # noqa: E402
     _utc_now_iso,
     get_all_dev_pr_locks,
 )
-from parallel_scope import TaskAnchorSpec, analyze_pair_overlap  # noqa: E402
+from parallel_scope import analyze_candidate_against_slots  # noqa: E402
 import orchestration_control as _orch_ctrl  # noqa: E402
 
 DEV_QUEUE_FILENAME = "dev_queue.json"
@@ -113,6 +113,54 @@ def _normalize_str_list(values: list[str] | tuple[str, ...] | None) -> list[str]
 def _matches_cid(cand: str, ref: str) -> bool:
     """Return True if two conversation IDs match exactly or one is an 8-char hex short prefix of the other."""
     return _is_same_conversation_id(cand, ref)
+
+
+def _lock_max_slots(lock_obj: Mapping[str, Any]) -> int:
+    """Resolve a repository lock's slot capacity (`max_slots`, clamped `[1..4]`, default `3`)."""
+    resolver = getattr(dev_common, "resolve_max_repo_slots", None)
+    raw_max = lock_obj.get("max_slots") if isinstance(lock_obj, Mapping) else None
+    if callable(resolver):
+        return int(resolver(raw_max))
+    return int(_resolve_max_repo_slots(raw_max))
+
+
+def _active_lock_slot_specs(lock_obj: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return ordered active slot dicts (`slot_id` 1..N); Slot #1 is merged over the top-level lock mirror."""
+    if not isinstance(lock_obj, Mapping) or not bool(lock_obj.get("active")):
+        return []
+    lock_dict = dict(lock_obj)
+    iter_fn = getattr(dev_common, "iter_active_lock_slots", None)
+    slots_out: list[dict[str, Any]] = []
+    if callable(iter_fn):
+        slots_out = [dict(s) for s in iter_fn(lock_dict) if isinstance(s, dict)]
+    else:
+        raw_slots = lock_dict.get("slots") if isinstance(lock_dict.get("slots"), dict) else {}
+        for raw_k, raw_v in raw_slots.items():
+            if isinstance(raw_v, dict) and bool(raw_v.get("active", True)):
+                with contextlib.suppress(TypeError, ValueError):
+                    slots_out.append({**raw_v, "slot_id": int(raw_v.get("slot_id") or raw_k)})
+    top_level = {k: v for k, v in lock_dict.items() if k != "slots"}
+    by_id: dict[int, dict[str, Any]] = {}
+    for slot_obj in slots_out:
+        with contextlib.suppress(TypeError, ValueError):
+            by_id[int(slot_obj.get("slot_id") or 1)] = slot_obj
+    # Slot #1 always mirrors the top-level lock (preserving any additive per-slot keys)
+    by_id[1] = {**by_id.get(1, {}), **{k: v for k, v in top_level.items() if v not in (None, "", [], {})}}
+    by_id[1]["slot_id"] = 1
+    target_dir = str(lock_dict.get("target_repo_dir") or "")
+    for s_id, slot_obj in by_id.items():
+        slot_obj["slot_id"] = s_id
+        slot_obj.setdefault("target_repo_dir", target_dir)
+    return [by_id[k] for k in sorted(by_id)]
+
+
+def _next_free_slot_id(active_slot_ids: Sequence[int], max_slots: int, reserved: Sequence[int] = ()) -> int:
+    """Return the lowest free parallel slot id in `2..max_slots` (0 when the repository is at capacity)."""
+    taken = {int(s) for s in active_slot_ids} | {int(s) for s in reserved}
+    for cand_id in range(2, int(max_slots) + 1):
+        if cand_id not in taken:
+            return cand_id
+    return 0
 
 
 def get_dev_queue_path(portfolio_dir: Path | str | None = None) -> Path:
@@ -350,6 +398,21 @@ def set_dev_queue_orchestrator(
     }
 
 
+def _resolve_depends_on_update(
+    existing: Sequence[str],
+    merge_values: Sequence[str] | None,
+    *,
+    replace_depends_on: Sequence[str] | None = None,
+    clear_depends_on: bool = False,
+) -> list[str]:
+    """Resolve the new `depends_on` list with precedence clear > replace > merge (default)."""
+    if clear_depends_on:
+        return []
+    if replace_depends_on is not None:
+        return _normalize_str_list(list(replace_depends_on))
+    return _normalize_str_list([*(existing or []), *(merge_values or [])])
+
+
 def enqueue_dev_queue_item(
     conversation_id: str,
     title: str = "",
@@ -371,8 +434,14 @@ def enqueue_dev_queue_item(
     portfolio_dir: Path | str | None = None,
     *,
     section_anchors: list[str] | None = None,
+    replace_depends_on: list[str] | None = None,
+    clear_depends_on: bool = False,
 ) -> dict[str, Any]:
-    """Upsert a development task entry into persistent `dev_queue.json` (`0600` + `file_lock`)."""
+    """Upsert a development task entry into persistent `dev_queue.json` (`0600` + `file_lock`).
+
+    `depends_on` merges into the existing list by default. `replace_depends_on` (any list, even empty) replaces it
+    and `clear_depends_on=True` empties it; precedence is clear > replace > merge.
+    """
     cid_clean = str(conversation_id or "").strip()
     if not cid_clean:
         return {"status": "error", "error": "conversation_id is required"}
@@ -429,7 +498,12 @@ def enqueue_dev_queue_item(
             "priority": resolved_prio,
             "status": resolved_status,
             "repo_slugs": _normalize_str_list([*(existing.get("repo_slugs") or []), *(repo_slugs or [])]),
-            "depends_on": _normalize_str_list([*(existing.get("depends_on") or []), *(depends_on or [])]),
+            "depends_on": _resolve_depends_on_update(
+                existing.get("depends_on") or [],
+                depends_on,
+                replace_depends_on=replace_depends_on,
+                clear_depends_on=clear_depends_on,
+            ),
             "rca_summary": _sanitize_home_paths(rca_summary.strip()) or str(existing.get("rca_summary") or ""),
             "proposed_fix": _sanitize_home_paths(proposed_fix.strip()) or str(existing.get("proposed_fix") or ""),
             "target_files": _normalize_str_list([*(existing.get("target_files") or []), *(target_files or [])]),
@@ -1300,7 +1374,12 @@ def get_next_dev_queue_item(
     *,
     skip_locked_repos: bool = False,
 ) -> dict[str, Any]:
-    """Return the highest-priority runnable item from `dev_queue.json`, including safe Slot #2 lookahead candidates."""
+    """Return the highest-priority runnable item from `dev_queue.json`, including safe Slot #2..#N lookahead candidates.
+
+    `multi_slot_candidates` / `multi_slot_by_repo` list pending items that are parallel-safe pairwise against every
+    active slot of a locked repo with free capacity (`len(active slots) < max_slots`); each carries `free_slot_id`
+    / `next_slot_id`. Legacy `slot2_candidates` / `slot2_by_repo` mirror them identically.
+    """
     if orchestrator_conversation_id.strip():
         set_dev_queue_orchestrator(orchestrator_conversation_id.strip(), portfolio_dir=portfolio_dir)
     data = load_dev_queue(portfolio_dir=portfolio_dir)
@@ -1321,6 +1400,8 @@ def get_next_dev_queue_item(
             "next_pending_item": None,
             "next_unlocked_item": None,
             "runnable_by_repo": {},
+            "multi_slot_candidates": [],
+            "multi_slot_by_repo": {},
             "slot2_candidates": [],
             "slot2_by_repo": {},
             "locked_repos": locked_repos,
@@ -1351,11 +1432,10 @@ def get_next_dev_queue_item(
         act_sibs = [str(s).strip() for s in (lock_obj.get("sibling_conversation_ids") or [])]
         if _matches_cid(act_cid, cid_val) or any(_matches_cid(s, cid_val) for s in act_sibs):
             return True
-        s2 = lock_obj.get("slots", {}).get("2") if isinstance(lock_obj.get("slots"), dict) else None
-        if isinstance(s2, dict) and bool(s2.get("active", True)):
-            s2_cid = str(s2.get("conversation_id") or "").strip()
-            s2_sibs = [str(s).strip() for s in (s2.get("sibling_conversation_ids") or [])]
-            if _matches_cid(s2_cid, cid_val) or any(_matches_cid(s, cid_val) for s in s2_sibs):
+        for slot_obj in _active_lock_slot_specs(lock_obj):
+            s_cid = str(slot_obj.get("conversation_id") or "").strip()
+            s_sibs = [str(s).strip() for s in (slot_obj.get("sibling_conversation_ids") or [])]
+            if _matches_cid(s_cid, cid_val) or any(_matches_cid(s, cid_val) for s in s_sibs):
                 return True
         return False
 
@@ -1398,46 +1478,86 @@ def get_next_dev_queue_item(
                 dispatch_repos.append(r)
         return (remaining_repos, dispatch_repos, foreign_locked, self_locked)
 
-    def _probe_slot2_lookahead(item: dict[str, Any], target_repo: str) -> tuple[bool, dict[str, Any], str]:
-        """Return `(eligible, slot2_annotation, blocked_reason)` for a pending item on a Slot-#1-locked repo."""
+    reserved_by_repo: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+
+    def _probe_parallel_slot_lookahead(item: dict[str, Any], target_repo: str) -> tuple[bool, dict[str, Any], str]:
+        """Return `(eligible, slot_annotation, blocked_reason)` for a pending item on a locked repo with a free Slot #2..#N.
+
+        Overlap is validated pairwise against EVERY active slot plus candidates already reserved for this repo
+        in the same `queue-next` pass, so two lookahead picks can never collide with each other either.
+        """
         act = active_locks.get(target_repo)
         if not isinstance(act, dict) or not bool(act.get("active")):
             return (False, {}, "repo_not_locked")
-        max_slots = int(act.get("max_slots") or _resolve_max_repo_slots())
-        slots_map = act.get("slots") if isinstance(act.get("slots"), dict) else {}
-        if max_slots < 2 or ("2" in slots_map and bool(slots_map["2"].get("active", True))):
-            return (False, {}, "max_slots_occupied")
+        max_slots = _lock_max_slots(act)
+        active_slots = _active_lock_slot_specs(act)
+        active_ids = [int(s.get("slot_id") or 1) for s in active_slots]
+        reserved = reserved_by_repo.get(target_repo, [])
+        free_slot_id = _next_free_slot_id(active_ids, max_slots, [r_id for r_id, _ in reserved])
+        if max_slots < 2 or not free_slot_id:
+            return (False, {"max_slots": max_slots, "active_slot_ids": active_ids}, "max_slots_occupied")
         if str(item.get("status") or "pending").lower() != "pending":
             return (False, {}, "item_not_pending")
         if not (item.get("target_files") or item.get("section_anchors")):
             return (False, {}, "candidate_unanchored")
-        if not (
-            act.get("target_files")
-            or act.get("section_anchors")
-            or act.get("branch_name")
-            or act.get("worktree_path")
-        ):
-            return (False, {}, "slot1_unanchored")
+        for slot_obj in active_slots:
+            if not (
+                slot_obj.get("target_files")
+                or slot_obj.get("section_anchors")
+                or slot_obj.get("branch_name")
+                or slot_obj.get("worktree_path")
+            ):
+                return (False, {}, f"slot{int(slot_obj.get('slot_id') or 1)}_unanchored")
 
         r_dir = _resolve_lock_target_repo_dir(act) or _resolve_repo_dir_for_slug(target_repo, portfolio_dir=portfolio_dir)
-        slot1_spec = TaskAnchorSpec.from_mapping(act)
-        cand_spec = TaskAnchorSpec.from_mapping(item)
-        ov_res = analyze_pair_overlap(slot1_spec, cand_spec, repo_dir=r_dir, repo_slug=target_repo)
-        if not ov_res.parallel_safe:
+        peers: list[dict[str, Any]] = [dict(s) for s in active_slots]
+        peers.extend({**r_item, "slot_id": r_id} for r_id, r_item in reserved)
+        ov_res = analyze_candidate_against_slots(peers, item, repo_dir=r_dir, repo_slug=target_repo)
+        reserved_ids = {r_id for r_id, _ in reserved}
+        pairwise = [
+            {
+                "peer": "candidate" if int(p.get("slot_id") or 0) in reserved_ids else "slot",
+                "slot_id": int(p.get("slot_id") or 0),
+                "conversation_id": str(p.get("task_a_id") or ""),
+                "overlap_tier": str(p.get("overlap_tier") or ""),
+                "parallel_safe": bool(p.get("parallel_safe")),
+            }
+            for p in (ov_res.get("pairwise") or [])
+        ]
+        if not ov_res.get("parallel_safe"):
+            blocking_ids = [int(x) for x in (ov_res.get("blocking_slot_ids") or [])]
+            first_block = next((p for p in pairwise if not p["parallel_safe"]), {})
+            block_tier = str(first_block.get("overlap_tier") or ov_res.get("overlap_tier") or "DEEP_SHARED")
             return (
                 False,
-                {"overlap_tier": ov_res.overlap_tier},
-                f"overlap_{ov_res.overlap_tier.lower()}",
+                {
+                    "overlap_tier": block_tier,
+                    "overlap_with_slot": blocking_ids[0] if blocking_ids else 0,
+                    "overlap_with": str(first_block.get("peer") or "slot"),
+                    "blocking_slot_ids": blocking_ids,
+                    "pairwise_overlap": pairwise,
+                },
+                f"overlap_{block_tier.lower()}",
             )
+        raw_pairs = list(ov_res.get("pairwise") or [])
+        monolith_disjoint = any(bool(p.get("monolith_disjoint")) for p in raw_pairs)
+        requires_reverify = any(bool(p.get("requires_rebase_reverify")) for p in raw_pairs)
+        worst_tier = str(ov_res.get("overlap_tier") or "NONE")
+        landing_order = [str(c) for c in (ov_res.get("landing_order") or []) if str(c).strip()]
 
         annotated = dict(item)
-        annotated["target_slot"] = 2
-        annotated["slot_allocation"] = "slot_2_lookahead"
+        annotated["target_slot"] = free_slot_id
+        annotated["free_slot_id"] = free_slot_id
+        annotated["next_slot_id"] = free_slot_id
+        annotated["slot_allocation"] = f"slot_{free_slot_id}_lookahead"
+        annotated["max_slots"] = max_slots
+        annotated["active_slot_ids"] = active_ids
         annotated["dispatch_repos"] = [target_repo]
-        annotated["overlap_tier"] = ov_res.overlap_tier
-        annotated["monolith_disjoint"] = ov_res.monolith_disjoint
-        annotated["requires_rebase_reverify"] = ov_res.requires_rebase_reverify
-        annotated["landing_order"] = list(ov_res.landing_order)
+        annotated["overlap_tier"] = worst_tier
+        annotated["pairwise_overlap"] = pairwise
+        annotated["monolith_disjoint"] = monolith_disjoint
+        annotated["requires_rebase_reverify"] = requires_reverify
+        annotated["landing_order"] = landing_order
         annotated["slot1_lock_id"] = str(act.get("lock_id") or "")
         annotated["slot1_branch_name"] = str(act.get("branch_name") or "")
         annotated["slot1_status"] = str(act.get("status") or "")
@@ -1506,8 +1626,8 @@ def get_next_dev_queue_item(
     next_pending_item: dict[str, Any] | None = None
     next_unlocked_item: dict[str, Any] | None = None
     runnable_by_repo: dict[str, dict[str, Any]] = {}
-    slot2_candidates: list[dict[str, Any]] = []
-    slot2_by_repo: dict[str, dict[str, Any]] = {}
+    multi_slot_candidates: list[dict[str, Any]] = []
+    multi_slot_by_repo: dict[str, dict[str, Any]] = {}
     blocked_deps: list[dict[str, Any]] = []
     blocked_repos: list[dict[str, Any]] = []
     blocked_partial_wip: list[dict[str, Any]] = []
@@ -1532,16 +1652,13 @@ def get_next_dev_queue_item(
 
         if is_contract_blocked:
             first_repo = remaining_repos[0]
-            s2_ok, s2_annotated, s2_reason = (
-                _probe_slot2_lookahead(it, first_repo)
-                if first_repo not in slot2_by_repo
-                else (False, {}, "slot2_already_selected")
-            )
+            s2_ok, s2_annotated, s2_reason = _probe_parallel_slot_lookahead(it, first_repo)
             if s2_ok:
                 s2_annotated["wip_finish_boost"] = bool(prioritize_partial_wip and _has_partial_wip(it))
                 _annotate_dispatch_hints(s2_annotated)
-                slot2_candidates.append(s2_annotated)
-                slot2_by_repo[first_repo] = s2_annotated
+                multi_slot_candidates.append(s2_annotated)
+                multi_slot_by_repo.setdefault(first_repo, s2_annotated)
+                reserved_by_repo.setdefault(first_repo, []).append((int(s2_annotated["free_slot_id"]), s2_annotated))
                 if first_repo not in runnable_by_repo:
                     runnable_by_repo[first_repo] = s2_annotated
                 if next_unlocked_item is None:
@@ -1559,8 +1676,11 @@ def get_next_dev_queue_item(
             }
             if s2_annotated.get("overlap_tier"):
                 blk_entry["overlap_tier"] = s2_annotated["overlap_tier"]
+            if s2_annotated.get("blocking_slot_ids"):
+                blk_entry["blocking_slot_ids"] = list(s2_annotated["blocking_slot_ids"])
             if s2_reason:
                 blk_entry["slot2_blocked_reason"] = s2_reason
+                blk_entry["parallel_slot_blocked_reason"] = s2_reason
             blocked_repos.append(blk_entry)
             if skip_locked_repos:
                 continue
@@ -1631,8 +1751,11 @@ def get_next_dev_queue_item(
         "next_pending_item": next_pending_item,
         "next_unlocked_item": next_unlocked_item,
         "runnable_by_repo": runnable_by_repo,
-        "slot2_candidates": slot2_candidates,
-        "slot2_by_repo": slot2_by_repo,
+        "multi_slot_candidates": multi_slot_candidates,
+        "multi_slot_by_repo": multi_slot_by_repo,
+        # Legacy aliases (pre-N-slot clients): populated identically to `multi_slot_*`
+        "slot2_candidates": list(multi_slot_candidates),
+        "slot2_by_repo": dict(multi_slot_by_repo),
         "locked_repos": locked_repos,
         "partial_wip_by_repo": partial_wip_by_repo,
         "blocked_by_dependencies": blocked_deps,
@@ -1656,7 +1779,20 @@ def register_queue_cli(sub: Any) -> None:
     p_qadd.add_argument("--priority", type=int, default=50, help="Numeric priority (lower executes first).")
     p_qadd.add_argument("--repos", nargs="*", default=[], help="Target repository slugs.")
     p_qadd.add_argument("--status", choices=DEV_QUEUE_STATUSES, default="pending", help="Queue item status.")
-    p_qadd.add_argument("--depends-on", nargs="*", default=[], help="Dependency conversation IDs.")
+    p_qadd.add_argument("--depends-on", nargs="*", default=[], help="Dependency conversation IDs (merged into existing `depends_on`).")
+    p_qadd.add_argument(
+        "--replace-depends-on",
+        dest="replace_depends_on",
+        nargs="*",
+        default=None,
+        help="Replace the item's `depends_on` list with these IDs instead of merging (no IDs = clear).",
+    )
+    p_qadd.add_argument(
+        "--clear-depends-on",
+        dest="clear_depends_on",
+        action="store_true",
+        help="Empty the item's `depends_on` list (takes precedence over --replace-depends-on / --depends-on).",
+    )
     p_qadd.add_argument("--rca-summary", default="", help="RCA summary.")
     p_qadd.add_argument("--proposed-fix", default="", help="Proposed fix summary.")
     p_qadd.add_argument("--target-files", nargs="*", default=[], help="Target file paths.")
@@ -1741,6 +1877,8 @@ def dispatch_queue_cli(args: Any) -> int | None:
             proposed_fix=args.proposed_fix,
             target_files=args.target_files,
             section_anchors=getattr(args, "section_anchors", []) or None,
+            replace_depends_on=getattr(args, "replace_depends_on", None),
+            clear_depends_on=bool(getattr(args, "clear_depends_on", False)),
             branch_names=args.branches,
             pr_urls=args.pr_urls,
             notes=args.notes,

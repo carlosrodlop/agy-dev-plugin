@@ -98,7 +98,9 @@ PR_DEV_DEFAULT_MODEL = "flash"
 PR_SUBAGENT_MODEL = "pro"
 PR_REVIEW_PASS_MIN_SCORE = 91
 MAX_PR_REVIEW_ITERATIONS = 3
-DEFAULT_MAX_REPO_SLOTS = 2
+DEFAULT_MAX_REPO_SLOTS = 3
+MAX_REPO_SLOTS_CAP = 4
+MAX_REPO_SLOTS_ENV = "AGY_DEV_MAX_SLOTS_PER_REPO"
 SLOT_STATUS_READY_AWAITING_BASE_MERGE = "READY_AWAITING_BASE_MERGE"
 SLOT_STATUS_NEEDS_REBASE_REVERIFY = "NEEDS_REBASE_REVERIFY"
 SLOT_STATUS_NEEDS_AGENT_SEMANTIC_FIX = "NEEDS_AGENT_SEMANTIC_FIX"
@@ -611,19 +613,148 @@ _SLOT_SYNC_FIELDS: tuple[str, ...] = (
 
 
 def _resolve_max_repo_slots(explicit_max_slots: int | None = None) -> int:
-    """Resolve `max_slots` per repository (default `2`, overrideable via `AGY_DEV_MAX_SLOTS_PER_REPO`)."""
-    if explicit_max_slots is not None:
+    """Resolve `max_slots` per repository clamped to `[1..MAX_REPO_SLOTS_CAP]` (default `3`, env `AGY_DEV_MAX_SLOTS_PER_REPO`)."""
+    for raw in (explicit_max_slots, str(os.environ.get(MAX_REPO_SLOTS_ENV) or "").strip()):
+        if raw is None or raw == "" or isinstance(raw, bool):
+            continue
         with contextlib.suppress(TypeError, ValueError):
-            val = int(explicit_max_slots)
+            val = int(raw)
             if val >= 1:
-                return val
-    env_raw = str(os.environ.get("AGY_DEV_MAX_SLOTS_PER_REPO") or "").strip()
-    if env_raw:
-        with contextlib.suppress(TypeError, ValueError):
-            val = int(env_raw)
-            if val >= 1:
-                return val
+                return min(val, MAX_REPO_SLOTS_CAP)
     return DEFAULT_MAX_REPO_SLOTS
+
+
+def _slot_sort_key(raw_key: Any) -> int:
+    """Return the integer slot number for a `slots` dict key (non-numeric keys sort last)."""
+    try:
+        return int(str(raw_key).strip())
+    except (TypeError, ValueError):
+        return 10_000
+
+
+def _secondary_slot_keys(slots_map: Mapping[str, Any] | None) -> list[str]:
+    """Return ordered active secondary slot keys (`'2'..'N'`) from a normalized `slots` mapping."""
+    if not isinstance(slots_map, Mapping):
+        return []
+    keys = [
+        str(k)
+        for k, v in slots_map.items()
+        if isinstance(v, dict)
+        and bool(v.get("active", True))
+        and 2 <= _slot_sort_key(k) <= MAX_REPO_SLOTS_CAP
+    ]
+    return sorted(keys, key=_slot_sort_key)
+
+
+def _next_free_slot_id(slots_map: Mapping[str, Any] | None, max_slots: int) -> int | None:
+    """Return the lowest free parallel slot id in `[2..max_slots]`, or None when every slot is occupied."""
+    taken = {_slot_sort_key(k) for k in _secondary_slot_keys(slots_map)}
+    for cand in range(2, max(1, min(int(max_slots), MAX_REPO_SLOTS_CAP)) + 1):
+        if cand not in taken:
+            return cand
+    return None
+
+
+def _select_promotion_slot_key(lock_obj: Mapping[str, Any], follower_keys: Sequence[str]) -> str:
+    """Pick the follower slot to promote into Slot #1: earliest in combined `landing_order`, then lowest slot id."""
+    keys = [str(k) for k in follower_keys]
+    if not keys:
+        return ""
+    slots_map = lock_obj.get("slots") if isinstance(lock_obj.get("slots"), Mapping) else {}
+    combined: list[str] = [str(c).strip() for c in (lock_obj.get("landing_order") or []) if str(c).strip()]
+    for f_key in sorted(keys, key=_slot_sort_key):
+        f_obj = slots_map.get(f_key) if isinstance(slots_map, Mapping) else None
+        if isinstance(f_obj, Mapping):
+            combined.extend(str(c).strip() for c in (f_obj.get("landing_order") or []) if str(c).strip())
+    combined = list(dict.fromkeys(combined))
+
+    def _rank(f_key: str) -> tuple[int, int]:
+        f_obj = slots_map.get(f_key) if isinstance(slots_map, Mapping) else None
+        f_cid = str(f_obj.get("conversation_id") or "").strip() if isinstance(f_obj, Mapping) else ""
+        pos = next((i for i, c in enumerate(combined) if f_cid and _is_same_conversation_id(c, f_cid)), len(combined) + 1)
+        return (pos, _slot_sort_key(f_key))
+
+    return min(keys, key=_rank)
+
+
+def _slot_owned_by_conversation(slot_obj: Mapping[str, Any] | None, cid_clean: str) -> bool:
+    """Return True when `cid_clean` owns `slot_obj` (`conversation_id` or `sibling_conversation_ids`)."""
+    if not isinstance(slot_obj, Mapping) or not cid_clean:
+        return False
+    holder = str(slot_obj.get("conversation_id") or "").strip()
+    sibs = [str(s).strip() for s in (slot_obj.get("sibling_conversation_ids") or [])]
+    return bool(holder) and (
+        _is_same_conversation_id(holder, cid_clean) or any(_is_same_conversation_id(s, cid_clean) for s in sibs)
+    )
+
+
+def _hydrate_anchors_from_queue(
+    conversation_id: str,
+    *,
+    repo_slug: str = "",
+    portfolio_dir: Path | str | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return repo-scoped `(target_files, section_anchors)` recorded on the `dev_queue.json` item for `conversation_id`.
+
+    Repo scoping: entries prefixed with `<owner/repo>:` (or `<repo>:`) are kept (prefix stripped) only when the
+    prefix matches `repo_slug`; entries prefixed with any other repository are dropped; unprefixed entries are kept.
+    Per-repo maps (`target_files_by_repo` / `section_anchors_by_repo`) take precedence when present.
+    """
+    cid_clean = str(conversation_id or "").strip()
+    if not cid_clean:
+        return [], []
+    try:
+        q_snap = _get_queue_store().load_dev_queue(portfolio_dir=portfolio_dir)
+    except Exception:  # noqa: BLE001 - hydration is best-effort and must never block lock acquisition
+        return [], []
+    items = q_snap.get("items") if isinstance(q_snap, dict) else None
+    if not isinstance(items, list):
+        return [], []
+    match = next(
+        (
+            it
+            for it in items
+            if isinstance(it, dict) and _is_same_conversation_id(str(it.get("conversation_id") or ""), cid_clean)
+        ),
+        None,
+    )
+    if not isinstance(match, dict):
+        return [], []
+    clean_slug = dev_common.normalize_repo_slug(repo_slug) or str(repo_slug or "").strip().lower()
+
+    def _scope(raw_vals: Any, by_repo_key: str) -> list[str]:
+        by_repo = match.get(by_repo_key)
+        if isinstance(by_repo, dict) and clean_slug:
+            for rk, rv in by_repo.items():
+                if _parallel_scope._repo_prefix_matches_slug(str(rk), clean_slug) and isinstance(rv, list):
+                    return list(dict.fromkeys(str(v).strip() for v in rv if str(v).strip()))
+        if isinstance(raw_vals, str):
+            raw_vals = [raw_vals]
+        elif isinstance(raw_vals, Mapping):
+            raw_vals = [
+                f"{fk}#{str(fv).strip()}"
+                for fk, fvals in raw_vals.items()
+                for fv in (fvals if isinstance(fvals, (list, tuple, set)) else [fvals])
+                if str(fv).strip()
+            ]
+        out: list[str] = []
+        for raw in raw_vals if isinstance(raw_vals, (list, tuple)) else []:
+            val = str(raw or "").strip()
+            if not val:
+                continue
+            pref, rest = _parallel_scope.split_repo_prefixed_target(val)
+            if pref:
+                if clean_slug and not _parallel_scope._repo_prefix_matches_slug(pref, clean_slug):
+                    continue
+                val = rest.strip()
+            if val:
+                out.append(val)
+        return list(dict.fromkeys(out))
+
+    return (
+        _scope(match.get("target_files"), "target_files_by_repo"),
+        _scope(match.get("section_anchors"), "section_anchors_by_repo"),
+    )
 
 
 def _resolve_repo_base_sha(repo_dir: Path | None, base_branch: str = "main") -> str:
@@ -734,44 +865,47 @@ def _sync_lock_slots_structure(lock_obj: dict[str, Any], *, repo_slug: str = "")
     slot1["active"] = True
 
     slots_clean: dict[str, dict[str, Any]] = {"1": slot1}
-    raw_slot2 = raw_slots.get("2")
-    if isinstance(raw_slot2, dict) and bool(raw_slot2.get("active", True)):
-        s2 = _build_slot_dict_from_mapping(raw_slot2, 2)
-        s2["slot_id"] = 2
-        s2["active"] = True
-        slots_clean["2"] = s2
+    for s_key in _secondary_slot_keys(raw_slots):
+        s_num = _slot_sort_key(s_key)
+        s_obj = _build_slot_dict_from_mapping(raw_slots[s_key], s_num)
+        s_obj["slot_id"] = s_num
+        s_obj["active"] = True
+        slots_clean[str(s_num)] = s_obj
 
     for k, v in slot1.items():
         if k not in ("slot_id", "active"):
             out[k] = v
     out["active"] = True
     out["slot_id"] = 1
-    out["max_slots"] = max_slots
+    # Never shrink below the number of occupied slots (env downgrade must not orphan in-flight followers).
+    out["max_slots"] = min(MAX_REPO_SLOTS_CAP, max(max_slots, max(_slot_sort_key(k) for k in slots_clean)))
     out["active_slots_count"] = len(slots_clean)
+    out["slot_occupancy"] = f"{len(slots_clean)}/{out['max_slots']}"
     out["slots"] = slots_clean
 
-    # Keep `repo_branches` synchronized so `dev_common.get_active_dev_pr_lock_protections()` protects Slot #2 worktrees too
+    # Keep `repo_branches` synchronized so `dev_common.get_active_dev_pr_lock_protections()` protects Slot #2..#N worktrees too
     raw_rb = out.get("repo_branches") if isinstance(out.get("repo_branches"), dict) else {}
     clean_rb = {
         str(k): dict(v)
         for k, v in raw_rb.items()
         if str(k).strip() and not _is_slot_scoped_rb_key(str(k)) and isinstance(v, dict)
     }
-    if eff_slug and "2" in slots_clean:
-        s2_entry = slots_clean["2"]
-        s2_rb_key = _slot_repo_branch_key(eff_slug, 2)
-        clean_rb[s2_rb_key] = {
-            "repo_slug": eff_slug,
-            "slot_id": 2,
-            "branch_name": str(s2_entry.get("branch_name") or ""),
-            "branch_timestamp": str(s2_entry.get("branch_timestamp") or ""),
-            "target_repo_dir": str(s2_entry.get("target_repo_dir") or out.get("target_repo_dir") or ""),
-            "worktree_path": str(s2_entry.get("worktree_path") or ""),
-            "manual_pr_url": "",
-            "branch_pushed": False,
-            "head_sha": str(s2_entry.get("head_sha") or s2_entry.get("staged_head_sha") or ""),
-            "updated_at": str(s2_entry.get("updated_at") or out.get("updated_at") or ""),
-        }
+    if eff_slug:
+        for s_key in _secondary_slot_keys(slots_clean):
+            s_entry = slots_clean[s_key]
+            s_num = _slot_sort_key(s_key)
+            clean_rb[_slot_repo_branch_key(eff_slug, s_num)] = {
+                "repo_slug": eff_slug,
+                "slot_id": s_num,
+                "branch_name": str(s_entry.get("branch_name") or ""),
+                "branch_timestamp": str(s_entry.get("branch_timestamp") or ""),
+                "target_repo_dir": str(s_entry.get("target_repo_dir") or out.get("target_repo_dir") or ""),
+                "worktree_path": str(s_entry.get("worktree_path") or ""),
+                "manual_pr_url": "",
+                "branch_pushed": False,
+                "head_sha": str(s_entry.get("head_sha") or s_entry.get("staged_head_sha") or ""),
+                "updated_at": str(s_entry.get("updated_at") or out.get("updated_at") or ""),
+            }
     out["repo_branches"] = clean_rb
     return out
 
@@ -806,26 +940,32 @@ def _match_slot_key(
     conversation_id: str = "",
     slot_id: int | str | None = None,
 ) -> str:
-    """Identify whether a selector targets Slot `'1'` or Slot `'2'` inside an active repository lock."""
-    if slot_id is not None and str(slot_id).strip() in ("1", "2"):
-        return str(slot_id).strip()
+    """Identify which active slot key (`'1'`..`'N'`) a selector targets inside an active repository lock."""
     slots_map = lock_obj.get("slots") if isinstance(lock_obj.get("slots"), dict) else {}
-    slot2 = slots_map.get("2")
-    if not isinstance(slot2, dict) or not bool(slot2.get("active", True)):
+    sec_keys = _secondary_slot_keys(slots_map)
+    if slot_id is not None and str(slot_id).strip():
+        req_key = str(slot_id).strip()
+        if req_key == "1" or req_key in sec_keys:
+            return req_key
+        if _slot_sort_key(req_key) <= MAX_REPO_SLOTS_CAP:
+            # Explicit but inactive secondary slot: preserve caller intent (callers error out cleanly).
+            return req_key
+    if not sec_keys:
         return "1"
 
-    s2_br = str(slot2.get("branch_name") or "").strip()
     s1_br = str(lock_obj.get("branch_name") or "").strip()
     clean_br = (branch_name or "").strip().removeprefix("refs/heads/")
     if clean_br:
-        if s2_br and s2_br == clean_br:
-            return "2"
+        for s_key in sec_keys:
+            if str(slots_map[s_key].get("branch_name") or "").strip() == clean_br:
+                return s_key
         if s1_br and s1_br == clean_br:
             return "1"
 
     if workdir:
-        if _path_matches_slot_worktree(workdir, str(slot2.get("worktree_path") or "")):
-            return "2"
+        for s_key in sec_keys:
+            if _path_matches_slot_worktree(workdir, str(slots_map[s_key].get("worktree_path") or "")):
+                return s_key
         if _path_matches_slot_worktree(workdir, str(lock_obj.get("worktree_path") or "")):
             return "1"
         wd_git_root = _find_git_root_from_path(
@@ -840,44 +980,47 @@ def _match_slot_key(
                 check=False,
             )
             wd_br = (br_proc.stdout or "").strip() if br_proc.returncode == 0 else ""
-            if wd_br and s2_br and wd_br == s2_br:
-                return "2"
-            if wd_br and s1_br and wd_br == s1_br:
-                return "1"
+            if wd_br:
+                for s_key in sec_keys:
+                    if str(slots_map[s_key].get("branch_name") or "").strip() == wd_br:
+                        return s_key
+                if s1_br and wd_br == s1_br:
+                    return "1"
 
     clean_cid = (conversation_id or "").strip()
     if clean_cid:
-        s2_cid = str(slot2.get("conversation_id") or "").strip()
-        s2_sibs = [str(s).strip() for s in (slot2.get("sibling_conversation_ids") or [])]
-        if _is_same_conversation_id(s2_cid, clean_cid) or any(_is_same_conversation_id(s, clean_cid) for s in s2_sibs):
-            return "2"
+        for s_key in sec_keys:
+            if _slot_owned_by_conversation(slots_map[s_key], clean_cid):
+                return s_key
 
     return "1"
 
 
 def _project_slot_view(lock_obj: dict[str, Any], slot_key: str) -> dict[str, Any]:
-    """Return a caller-facing lock dict representing `slot_key` (`'1'` or `'2'`) without bleeding Slot #1 fields into Slot #2."""
+    """Return a caller-facing lock dict representing `slot_key` (`'1'`..`'N'`) without bleeding Slot #1 fields into followers."""
     norm = _sync_lock_slots_structure(lock_obj)
-    if slot_key != "2" or "2" not in norm.get("slots", {}):
+    slot_key = str(slot_key or "1").strip()
+    if slot_key == "1" or slot_key not in norm.get("slots", {}):
         return norm
-    slot2 = dict(norm["slots"]["2"])
+    slot_n = dict(norm["slots"][slot_key])
+    slot_num = _slot_sort_key(slot_key)
     slot1 = dict(norm["slots"]["1"])
     projected: dict[str, Any] = {
         "active": True,
         "vcs_mode": str(norm.get("vcs_mode") or "native_git"),
         "repo_slug": str(norm.get("repo_slug") or norm.get("repo") or ""),
         "repo": str(norm.get("repo") or norm.get("repo_slug") or ""),
-        "slot_id": 2,
+        "slot_id": slot_num,
         "max_slots": int(norm.get("max_slots") or DEFAULT_MAX_REPO_SLOTS),
         "active_slots_count": int(norm.get("active_slots_count") or len(norm.get("slots") or {})),
         "slots": norm.get("slots", {}),
         "repo_branches": norm.get("repo_branches", {}),
-        "target_repo_dir": str(slot2.get("target_repo_dir") or norm.get("target_repo_dir") or ""),
+        "target_repo_dir": str(slot_n.get("target_repo_dir") or norm.get("target_repo_dir") or ""),
     }
-    for k, v in slot2.items():
+    for k, v in slot_n.items():
         projected[k] = v
     projected["active"] = True
-    projected["slot_id"] = 2
+    projected["slot_id"] = slot_num
     projected["slot1_lock_id"] = str(slot1.get("lock_id") or "")
     projected["slot1_branch_name"] = str(slot1.get("branch_name") or "")
     projected["slot1_status"] = str(slot1.get("status") or "")
@@ -1052,11 +1195,15 @@ def acquire_dev_pr_lock(
     overlap_tier: str = "",
     landing_order: list[str] | None = None,
     dev_model: str = "",
+    allow_parallel_slot: bool = False,
 ) -> dict[str, Any]:
-    """Acquire a 1-slot or 2-slot per-repository development lock (`dev_pr_locks[repo_slug]`).
+    """Acquire a 1..N-slot per-repository development lock (`dev_pr_locks[repo_slug]`, `N = max_slots`, default 3, cap 4).
 
-    Backward-compatibly preserves Slot #1 on top-level lock fields while supporting parallel Slot #2
-    acquisition in `slots["2"]` when `max_slots >= 2` and blast-radius overlap check passes (`NONE` or `TRANSITIVE`).
+    Backward-compatibly preserves Slot #1 on top-level lock fields while supporting parallel follower slots
+    `slots["2"]..slots["N"]` when the candidate's blast-radius overlap is `NONE`/`TRANSITIVE` against EVERY active slot.
+    `allow_slot2` / `force_slot2` are kept as backward-compatible aliases for any parallel follower slot
+    (`allow_parallel_slot` is the generalized alias). Omitted `target_files` / `section_anchors` are auto-hydrated
+    from the repo-scoped `dev_queue.json` item for `conversation_id` (explicit values always win).
     """
     _ = scheduled
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
@@ -1091,6 +1238,22 @@ def acquire_dev_pr_lock(
     clean_repo_dir = _sanitize_home_paths(str(persistent_repo_dir or target_repo_dir or "").strip())
     resolved_base_sha = (base_sha or "").strip() or _resolve_repo_base_sha(persistent_repo_dir)
     eff_max_slots = _resolve_max_repo_slots(max_slots)
+    allow_slot2 = bool(allow_slot2 or allow_parallel_slot)
+
+    # (B1) Auto-hydrate omitted `target_files` / `section_anchors` from `dev_queue.json` (explicit overrides win).
+    hydrated_fields: list[str] = []
+    if not clean_targets or not clean_anchors:
+        h_targets, h_anchors = _hydrate_anchors_from_queue(
+            cid_clean,
+            repo_slug=resolved_slug,
+            portfolio_dir=portfolio_dir,
+        )
+        if not clean_targets and h_targets:
+            clean_targets = h_targets
+            hydrated_fields.append("target_files")
+        if not clean_anchors and h_anchors:
+            clean_anchors = h_anchors
+            hydrated_fields.append("section_anchors")
 
     with dev_common.file_lock(lock_file):
         state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
@@ -1105,7 +1268,6 @@ def acquire_dev_pr_lock(
 
         if isinstance(existing_lock, dict) and bool(existing_lock.get("active")):
             norm_existing = _sync_lock_slots_structure(existing_lock, repo_slug=resolved_slug)
-            eff_max_slots = int(max_slots if max_slots is not None else norm_existing.get("max_slots") or eff_max_slots)
             slots_existing = dict(norm_existing.get("slots") or {})
             holder_cid = str(norm_existing.get("conversation_id") or "").strip()
             existing_siblings = [str(s).strip() for s in (norm_existing.get("sibling_conversation_ids") or [])]
@@ -1114,27 +1276,28 @@ def acquire_dev_pr_lock(
                 or _is_same_conversation_id(holder_cid, cid_clean)
                 or any(_is_same_conversation_id(s, cid_clean) for s in existing_siblings)
             )
-            slot2_existing = slots_existing.get("2")
+            slot2_existing: dict[str, Any] = {}
             same_conv_slot2 = False
-            if isinstance(slot2_existing, dict) and bool(slot2_existing.get("active", True)):
-                s2_holder = str(slot2_existing.get("conversation_id") or "").strip()
-                s2_sibs = [str(s).strip() for s in (slot2_existing.get("sibling_conversation_ids") or [])]
-                same_conv_slot2 = bool(
-                    s2_holder
-                    and (
-                        _is_same_conversation_id(s2_holder, cid_clean)
-                        or any(_is_same_conversation_id(s, cid_clean) for s in s2_sibs)
-                    )
-                )
+            same_conv_key = next(
+                (k for k in _secondary_slot_keys(slots_existing) if _slot_owned_by_conversation(slots_existing[k], cid_clean)),
+                "",
+            )
+            if same_conv_key:
+                slot2_existing = dict(slots_existing[same_conv_key])
+                same_conv_slot2 = True
 
             existing_status = str(norm_existing.get("status") or "")
-            # Case A: Re-acquiring or allocating Slot #2
+            # Case A: Re-acquiring or allocating a parallel follower Slot #2..#N
             if not same_conv_slot1:
-                can_try_slot2 = eff_max_slots >= 2 and (same_conv_slot2 or "2" not in slots_existing)
+                target_slot_num: int | None = (
+                    _slot_sort_key(same_conv_key) if same_conv_key else _next_free_slot_id(slots_existing, eff_max_slots)
+                )
+                can_try_slot2 = target_slot_num is not None and (same_conv_slot2 or eff_max_slots >= 2)
                 ov_tier_resolved = (overlap_tier or "").strip()
                 ov_order_resolved = list(landing_order or [])
                 ov_dict: dict[str, Any] = {}
                 slot2_allowed = False
+                active_slot_list = [slots_existing["1"], *(slots_existing[k] for k in _secondary_slot_keys(slots_existing))]
 
                 if can_try_slot2:
                     if same_conv_slot2:
@@ -1144,8 +1307,11 @@ def acquire_dev_pr_lock(
                     elif force_slot2:
                         slot2_allowed = True
                         ov_tier_resolved = ov_tier_resolved or OVERLAP_TRANSITIVE
-                    elif allow_slot2 or (bool(worktree_path) and bool(clean_targets) and bool(norm_existing.get("target_files"))):
-                        slot1_spec = TaskAnchorSpec.from_mapping(norm_existing)
+                    elif allow_slot2 or (
+                        bool(worktree_path)
+                        and bool(clean_targets)
+                        and any(bool(s.get("target_files")) for s in active_slot_list)
+                    ):
                         cand_spec = TaskAnchorSpec(
                             conversation_id=cid_clean,
                             title=str(summary or action_id or ""),
@@ -1156,18 +1322,37 @@ def acquire_dev_pr_lock(
                             branch_name=default_branch,
                             prose_context=f"{summary}\n{proposed_fix}",
                         )
-                        ov_res = analyze_pair_overlap(
-                            slot1_spec,
+                        multi_res = _parallel_scope.analyze_candidate_against_slots(
+                            [
+                                TaskAnchorSpec.from_mapping(norm_existing if str(s.get("slot_id") or 1) == "1" else s)
+                                for s in active_slot_list
+                            ],
                             cand_spec,
                             repo_dir=persistent_repo_dir,
                             repo_slug=resolved_slug,
                         )
-                        ov_dict = ov_res.to_dict()
-                        ov_tier_resolved = ov_res.overlap_tier
-                        ov_order_resolved = list(ov_res.landing_order)
-                        slot2_allowed = bool(ov_res.parallel_safe)
+                        pairs = list(multi_res.get("pairwise") or [])
+                        for p_idx, p_dict in enumerate(pairs):
+                            p_dict["slot_id"] = int(active_slot_list[p_idx].get("slot_id") or p_idx + 1)
+                        ov_dict = dict(pairs[0]) if len(pairs) == 1 else {}
+                        ov_dict.update(
+                            {
+                                "overlap_tier": multi_res.get("overlap_tier"),
+                                "parallel_safe": bool(multi_res.get("parallel_safe")),
+                                "landing_order": list(multi_res.get("landing_order") or []),
+                                "pairwise": pairs,
+                                "blocking_slot_ids": [
+                                    int(p.get("slot_id") or 0) for p in pairs if not bool(p.get("parallel_safe"))
+                                ],
+                            }
+                        )
+                        ov_tier_resolved = str(multi_res.get("overlap_tier") or "")
+                        ov_order_resolved = list(multi_res.get("landing_order") or [])
+                        slot2_allowed = bool(multi_res.get("parallel_safe"))
 
-                if slot2_allowed:
+                if slot2_allowed and target_slot_num is not None:
+                    slot_num = int(target_slot_num)
+                    slot_key = str(slot_num)
                     prev_s2 = dict(slot2_existing) if isinstance(slot2_existing, dict) else {}
                     s2_ts = (
                         str(prev_s2.get("branch_timestamp") or resolved_ts)
@@ -1181,10 +1366,10 @@ def acquire_dev_pr_lock(
                     )
                     slot1_lock_ids = {
                         str(norm_existing.get("lock_id") or "").strip(),
-                        (
-                            str((slots_existing.get("1") or {}).get("lock_id") or "").strip()
-                            if isinstance(slots_existing.get("1"), dict)
-                            else ""
+                        *(
+                            str(s_val.get("lock_id") or "").strip()
+                            for s_k, s_val in slots_existing.items()
+                            if isinstance(s_val, dict) and str(s_k) != slot_key
                         ),
                     }
                     s2_lock_id = (
@@ -1193,13 +1378,19 @@ def acquire_dev_pr_lock(
                         else _build_slot_lock_id(
                             cid_clean,
                             s2_ts,
-                            slot_id=2,
+                            slot_id=slot_num,
                             action_id=str(action_id or prev_s2.get("action_id") or ""),
                             existing_lock_ids=slot1_lock_ids,
                         )
                     )
+                    default_order = [
+                        str(s.get("conversation_id") or "").strip()
+                        for s in active_slot_list
+                        if str(s.get("conversation_id") or "").strip()
+                        and not _is_same_conversation_id(str(s.get("conversation_id") or ""), cid_clean)
+                    ] + [cid_clean]
                     slot2_obj: dict[str, Any] = {
-                        "slot_id": 2,
+                        "slot_id": slot_num,
                         "active": True,
                         "lock_id": s2_lock_id,
                         "conversation_id": cid_clean,
@@ -1210,7 +1401,7 @@ def acquire_dev_pr_lock(
                         "branch_name": s2_branch,
                         "base_sha": resolved_base_sha or str(prev_s2.get("base_sha") or ""),
                         "overlap_tier": ov_tier_resolved or OVERLAP_NONE,
-                        "landing_order": ov_order_resolved or [holder_cid, cid_clean],
+                        "landing_order": ov_order_resolved or default_order,
                         "section_anchors": clean_anchors or list(prev_s2.get("section_anchors") or []),
                         "branch_pushed": False,
                         "pr_gate_ready": False,
@@ -1250,7 +1441,7 @@ def acquire_dev_pr_lock(
                         "last_activity_at": now_iso,
                         "updated_at": now_iso,
                     }
-                    slots_existing["2"] = slot2_obj
+                    slots_existing[slot_key] = slot2_obj
                     norm_existing["slots"] = slots_existing
                     norm_existing["max_slots"] = eff_max_slots
                     updated_repo_lock = _sync_lock_slots_structure(norm_existing, repo_slug=resolved_slug)
@@ -1264,17 +1455,24 @@ def acquire_dev_pr_lock(
                     os.replace(tmp_path, state_path)
 
                     active_count = sum(1 for v in locks_map.values() if isinstance(v, dict) and bool(v.get("active")))
-                    return {
+                    slot_res: dict[str, Any] = {
                         "status": "ok",
                         "acquired": True,
-                        "slot_id": 2,
+                        "slot_id": slot_num,
                         "overlap_tier": slot2_obj["overlap_tier"],
                         "landing_order": slot2_obj["landing_order"],
                         "repo_slug": resolved_slug,
+                        "max_slots": int(updated_repo_lock.get("max_slots") or eff_max_slots),
+                        "active_slots_count": int(updated_repo_lock.get("active_slots_count") or 0),
                         "active_locks_count": active_count,
-                        "lock": _project_slot_view(updated_repo_lock, "2"),
+                        "lock": _project_slot_view(updated_repo_lock, slot_key),
                         "repo_lock": updated_repo_lock,
                     }
+                    if hydrated_fields:
+                        slot_res["hydrated_from_queue"] = list(hydrated_fields)
+                    if ov_dict:
+                        slot_res["overlap_analysis"] = ov_dict
+                    return slot_res
 
                 blocked_payload: dict[str, Any] = {
                     "status": "locked",
@@ -1286,7 +1484,17 @@ def acquire_dev_pr_lock(
                         f"status={existing_status}) pending manual PR validation. Sibling repositories remain unlocked."
                     ),
                     "active_lock": norm_existing,
+                    "max_slots": eff_max_slots,
+                    "active_slots_count": len(active_slot_list),
+                    "slots_full": target_slot_num is None,
                 }
+                if target_slot_num is None:
+                    blocked_payload["error"] += (
+                        f" All {eff_max_slots} parallel slot(s) are occupied (max_slots={eff_max_slots}, "
+                        f"`{MAX_REPO_SLOTS_ENV}` clamps 1..{MAX_REPO_SLOTS_CAP})."
+                    )
+                if hydrated_fields:
+                    blocked_payload["hydrated_from_queue"] = list(hydrated_fields)
                 if ov_tier_resolved:
                     blocked_payload["overlap_tier"] = ov_tier_resolved
                 if ov_dict:
@@ -1343,16 +1551,19 @@ def acquire_dev_pr_lock(
             cid_clean,
         )
         prev_gate_ready = bool(existing_lock.get("pr_gate_ready")) if (same_prev and not reuse_active_branch) else False
-        preserved_slot2 = (
-            existing_lock.get("slots", {}).get("2")
+        raw_prev_slots = (
+            existing_lock.get("slots")
             if isinstance(existing_lock, dict) and isinstance(existing_lock.get("slots"), dict)
-            else None
+            else {}
         )
-        existing_s2_lock_ids = (
-            {str(preserved_slot2.get("lock_id") or "").strip()}
-            if isinstance(preserved_slot2, dict) and bool(preserved_slot2.get("active", True))
-            else set()
-        )
+        preserved_followers: dict[str, dict[str, Any]] = {
+            k: dict(raw_prev_slots[k]) for k in _secondary_slot_keys(raw_prev_slots)
+        }
+        existing_s2_lock_ids = {
+            str(s_val.get("lock_id") or "").strip()
+            for s_val in preserved_followers.values()
+            if str(s_val.get("lock_id") or "").strip()
+        }
         s1_lock_id = (
             str(existing_lock.get("lock_id") or "").strip()
             if (same_prev and reuse_active_branch and str(existing_lock.get("lock_id") or "").strip())
@@ -1409,7 +1620,7 @@ def acquire_dev_pr_lock(
                 if same_prev and existing_lock.get("executive_summary")
                 else _sanitize_home_paths(str(proposed_fix or summary or "").strip())
             ),
-            "target_files": clean_targets,
+            "target_files": clean_targets or (list(existing_lock.get("target_files") or []) if same_prev else []),
             "review_iteration": int(existing_lock.get("review_iteration") or 0) if same_prev else 0,
             "review_history": list(existing_lock.get("review_history") or []) if same_prev else [],
             "verification_results": (
@@ -1433,8 +1644,8 @@ def acquire_dev_pr_lock(
             "last_activity_at": now_iso,
             "updated_at": now_iso,
         }
-        if isinstance(preserved_slot2, dict) and bool(preserved_slot2.get("active", True)):
-            new_lock_raw["slots"] = {"2": dict(preserved_slot2)}
+        if preserved_followers:
+            new_lock_raw["slots"] = preserved_followers
         new_lock = _sync_lock_slots_structure(new_lock_raw, repo_slug=resolved_slug)
         locks_map[resolved_slug] = new_lock
         _write_locks_state(audit_state, locks_map, touched_repo_slug=resolved_slug)
@@ -1446,14 +1657,19 @@ def acquire_dev_pr_lock(
         os.replace(tmp_path, state_path)
 
     active_count = sum(1 for v in locks_map.values() if isinstance(v, dict) and bool(v.get("active")))
-    return {
+    s1_res: dict[str, Any] = {
         "status": "ok",
         "acquired": True,
         "slot_id": 1,
         "repo_slug": resolved_slug,
+        "max_slots": int(new_lock.get("max_slots") or eff_max_slots),
+        "active_slots_count": int(new_lock.get("active_slots_count") or 1),
         "active_locks_count": active_count,
         "lock": new_lock,
     }
+    if hydrated_fields:
+        s1_res["hydrated_from_queue"] = list(hydrated_fields)
+    return s1_res
 
 
 def update_dev_pr_lock(
@@ -1465,7 +1681,7 @@ def update_dev_pr_lock(
     branch_name: str = "",
     slot_id: int | str | None = None,
 ) -> dict[str, Any]:
-    """Update fields on the matching active per-repository lock (Slot #1 or Slot #2) inside `actions_state.json`."""
+    """Update fields on the matching active per-repository lock (Slot #1 or follower Slot #2..#N) inside `actions_state.json`."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
     state_path = p_dir / "actions_state.json"
     lock_file = state_path.with_suffix(".json.lock")
@@ -1509,24 +1725,24 @@ def update_dev_pr_lock(
             slot_id=slot_id,
         )
 
-        if matched_slot == "2":
-            if "2" not in norm_cand.get("slots", {}):
+        if matched_slot != "1":
+            if matched_slot not in norm_cand.get("slots", {}):
                 return {
                     "status": "error",
-                    "error": f"No active Slot #2 dev_pr_lock to update for `{target_slug or 'default'}`.",
+                    "error": f"No active Slot #{matched_slot} dev_pr_lock to update for `{target_slug or 'default'}`.",
                 }
-            slot2_cur = dict(norm_cand["slots"]["2"])
+            slot2_cur = dict(norm_cand["slots"][matched_slot])
             for k, v in updates.items():
                 if v is not None and k not in ("slots", "repo_branches"):
                     if k in sanitize_str_keys and isinstance(v, str):
                         slot2_cur[k] = _sanitize_home_paths(v)
                     else:
                         slot2_cur[k] = v
-            slot2_cur["slot_id"] = 2
+            slot2_cur["slot_id"] = _slot_sort_key(matched_slot)
             slot2_cur["active"] = True
             slot2_cur["last_activity_at"] = str(updates.get("last_activity_at") or now_iso)
             slot2_cur["updated_at"] = now_iso
-            norm_cand["slots"]["2"] = slot2_cur
+            norm_cand["slots"][matched_slot] = slot2_cur
             current_lock = _sync_lock_slots_structure(norm_cand, repo_slug=target_slug)
             locks_map[target_slug] = current_lock
             _write_locks_state(audit_state, locks_map, touched_repo_slug=target_slug)
@@ -1539,8 +1755,8 @@ def update_dev_pr_lock(
             return {
                 "status": "ok",
                 "repo_slug": target_slug,
-                "slot_id": 2,
-                "lock": _project_slot_view(current_lock, "2"),
+                "slot_id": _slot_sort_key(matched_slot),
+                "lock": _project_slot_view(current_lock, matched_slot),
             }
 
         existing_branch = str(norm_cand.get("branch_name") or "").strip()
@@ -1741,9 +1957,10 @@ def release_dev_pr_lock(
 ) -> dict[str, Any]:
     """Release one repository's pending-branch lock (`repo_slug`/`workdir`/`branch_name`), or all locks when `release_all=True`.
 
-    When two parallel slots (`slots['1']` and `slots['2']`) are active on the target repository and `release_all=False`:
-      - Releasing Slot #1 finalizes Slot #1 and promotes Slot #2 into Slot #1 (`READY_AWAITING_BASE_MERGE` -> `NEEDS_REBASE_REVERIFY`).
-      - Releasing Slot #2 finalizes Slot #2 while keeping Slot #1 untouched.
+    When parallel follower slots (`slots['2']..slots['N']`) are active on the target repository and `release_all=False`:
+      - Releasing Slot #1 finalizes Slot #1 and promotes the next follower (earliest in `landing_order`, then lowest
+        slot id) into Slot #1 (`READY_AWAITING_BASE_MERGE` -> `NEEDS_REBASE_REVERIFY`); other followers keep their slots.
+      - Releasing a follower Slot #K finalizes only that slot while keeping Slot #1 and other followers untouched.
     """
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
     state_path = p_dir / "actions_state.json"
@@ -1800,15 +2017,16 @@ def release_dev_pr_lock(
             if not release_all and bool(raw_cur.get("active")):
                 norm_cur = _sync_lock_slots_structure(raw_cur, repo_slug=slug)
                 slots_cur = dict(norm_cur.get("slots") or {})
-                if "2" in slots_cur:
+                follower_keys = _secondary_slot_keys(slots_cur)
+                if follower_keys:
                     rel_slot_key = _match_slot_key(
                         norm_cur,
                         branch_name=branch_name,
                         workdir=workdir,
                         slot_id=slot_id,
                     )
-                    if rel_slot_key == "2":
-                        slot2_rel = dict(slots_cur["2"])
+                    if rel_slot_key != "1" and rel_slot_key in follower_keys:
+                        slot2_rel = dict(slots_cur[rel_slot_key])
                         slot2_rel["repo_branches"] = {}
                         released_entries.append((slug, slot2_rel))
                         _finalize_single_released_lock(
@@ -1821,13 +2039,18 @@ def release_dev_pr_lock(
                             summary=summary,
                             now_iso=now_iso,
                         )
-                        slots_cur.pop("2", None)
+                        slots_cur.pop(rel_slot_key, None)
                         norm_cur["slots"] = slots_cur
                         locks_map[slug] = _sync_lock_slots_structure(norm_cur, repo_slug=slug)
                         last_slug = slug
                         continue
+                    if rel_slot_key != "1":
+                        # Explicit selector for an inactive follower slot: never fall through to releasing Slot #1.
+                        continue
 
-                    # Releasing Slot #1 while Slot #2 is active -> finalize Slot #1 and promote Slot #2 -> Slot #1
+                    # Releasing Slot #1 while followers are active -> finalize Slot #1 and promote the next follower
+                    # in `landing_order` (fallback: lowest slot id) into Slot #1; remaining followers keep their slots
+                    # and stay `READY_AWAITING_BASE_MERGE` until their own promotion (max 1 open GitHub PR per repo).
                     slot1_rel = dict(norm_cur)
                     slot1_rb = {
                         str(k): dict(v)
@@ -1847,10 +2070,12 @@ def release_dev_pr_lock(
                         summary=summary,
                         now_iso=now_iso,
                     )
-                    slot2_prom = dict(slots_cur["2"])
+                    promote_key = _select_promotion_slot_key(norm_cur, follower_keys)
+                    promoted_from = _slot_sort_key(promote_key)
+                    slot2_prom = dict(slots_cur[promote_key])
                     slot2_prom["slot_id"] = 1
                     slot2_prom["active"] = True
-                    slot2_prom["promoted_from_slot"] = 2
+                    slot2_prom["promoted_from_slot"] = promoted_from
                     slot2_prom["promoted_at"] = now_iso
                     slot2_prom["previous_slot1_branch"] = str(slot1_rel.get("branch_name") or "")
                     slot2_prom["previous_slot1_release_reason"] = reason
@@ -1860,6 +2085,14 @@ def release_dev_pr_lock(
                     elif reason in ("BRANCH_MERGED_INTO_MAIN", "HUMAN_VALIDATED_MANUAL_PR"):
                         slot2_prom["needs_base_rebase"] = True
                     slot2_prom["updated_at"] = now_iso
+                    remaining_followers: dict[str, dict[str, Any]] = {}
+                    for f_key in follower_keys:
+                        if f_key == promote_key:
+                            continue
+                        f_obj = dict(slots_cur[f_key])
+                        if reason in ("BRANCH_MERGED_INTO_MAIN", "HUMAN_VALIDATED_MANUAL_PR"):
+                            f_obj["needs_base_rebase"] = True
+                        remaining_followers[f_key] = f_obj
 
                     promoted_raw: dict[str, Any] = {
                         "active": True,
@@ -1884,6 +2117,8 @@ def release_dev_pr_lock(
                         "last_released_slot1": snap1,
                     }
                     promoted_raw.pop("slots", None)
+                    if remaining_followers:
+                        promoted_raw["slots"] = remaining_followers
                     promoted_norm = _sync_lock_slots_structure(promoted_raw, repo_slug=slug)
                     locks_map[slug] = promoted_norm
                     promoted_slots[slug] = promoted_norm
@@ -1891,10 +2126,11 @@ def release_dev_pr_lock(
                     continue
 
             rel_lock = raw_cur
-            if release_all and isinstance(rel_lock.get("slots"), dict) and isinstance(rel_lock["slots"].get("2"), dict):
-                s2_extra = dict(rel_lock["slots"]["2"])
-                s2_extra["repo_branches"] = {}
-                released_entries.append((slug, s2_extra))
+            if release_all and isinstance(rel_lock.get("slots"), dict):
+                for f_key in _secondary_slot_keys(rel_lock["slots"]):
+                    s2_extra = dict(rel_lock["slots"][f_key])
+                    s2_extra["repo_branches"] = {}
+                    released_entries.append((slug, s2_extra))
             released_entries.append((slug, rel_lock))
             snap = _finalize_single_released_lock(
                 released_lock=rel_lock,
@@ -2028,16 +2264,17 @@ def _sync_single_repo_lock_with_git(
 
     branch_name = str(lock_info.get("branch_name") or "").strip()
     branch_pushed = bool(lock_info.get("branch_pushed"))
-    slot2_dict = (
-        lock_info.get("slots", {}).get("2")
-        if isinstance(lock_info.get("slots"), dict) and isinstance(lock_info["slots"].get("2"), dict)
-        else {}
-    )
-    slot2_branch = str(slot2_dict.get("branch_name") or "").strip() if slot2_dict else ""
-    extra_protected = [slot2_branch] if slot2_branch else []
+    raw_slots_info = lock_info.get("slots") if isinstance(lock_info.get("slots"), dict) else {}
+    follower_branches = [
+        br
+        for f_key in _secondary_slot_keys(raw_slots_info)
+        for br in [str(raw_slots_info[f_key].get("branch_name") or "").strip()]
+        if br
+    ]
+    extra_protected = list(follower_branches)
 
     if not branch_name or not branch_pushed:
-        prot_list = [b for b in (branch_name, slot2_branch) if b]
+        prot_list = [b for b in (branch_name, *follower_branches) if b]
         repo_sync = (
             vcs.sync_and_clean_local_repo(
                 base_branch="main",
@@ -2175,7 +2412,7 @@ def _sync_single_repo_lock_with_git(
     repo_sync = (
         vcs.sync_and_clean_local_repo(
             base_branch="main",
-            protected_branches=[b for b in (branch_name, slot2_branch) if b],
+            protected_branches=[b for b in (branch_name, *follower_branches) if b],
             fetch=False,
         )
         if hasattr(vcs, "sync_and_clean_local_repo")
@@ -2565,7 +2802,21 @@ def register_lock_cli(sub: Any) -> None:
     p_acq.add_argument("--sibling-ids", nargs="*", default=[], help="Optional sibling Conversation IDs.")
     p_acq.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
     p_acq.add_argument("--workdir", default="", help="Optional target repository directory.")
-    p_acq.add_argument("--allow-slot2", "--parallel-slot", dest="allow_slot2", action="store_true", help="Allow acquiring parallel Slot #2 when overlap check passes.")
+    p_acq.add_argument(
+        "--allow-slot2",
+        "--parallel-slot",
+        "--allow-parallel-slot",
+        dest="allow_slot2",
+        action="store_true",
+        help="Allow acquiring the next free parallel follower Slot #2..#N when overlap vs ALL active slots passes (`--allow-slot2` kept as alias).",
+    )
+    p_acq.add_argument(
+        "--max-slots",
+        dest="max_slots",
+        type=int,
+        default=None,
+        help="Optional per-repo slot capacity override (clamped 1..4; default AGY_DEV_MAX_SLOTS_PER_REPO or 3).",
+    )
     p_acq.add_argument("--scheduled", action="store_true", help="Mark as scheduled run.")
 
     p_rel = sub.add_parser("release-lock", help="Release/delete a per-repository branch development lock.")
@@ -2622,6 +2873,7 @@ def dispatch_lock_cli(args: Any) -> int | None:
             workdir=getattr(args, "workdir", "") or None,
             section_anchors=getattr(args, "section_anchors", []) or None,
             allow_slot2=bool(getattr(args, "allow_slot2", False)),
+            max_slots=getattr(args, "max_slots", None),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("acquired") else 1

@@ -45,13 +45,17 @@ from lock_store import (  # noqa: E402
     PR_SUBAGENT_MODEL,
     _HEX8_CID_RE,
     _facade_attr,
+    _hydrate_anchors_from_queue,
     _is_same_conversation_id,
     _is_slot_scoped_rb_key,
     _lookup_slot_repo_branch_entry,
+    _next_free_slot_id,
     _resolve_main_git_repo_root,
     _resolve_max_repo_slots,
     _resolve_repo_slug_and_dir,
     _sanitize_home_paths,
+    _secondary_slot_keys,
+    _slot_owned_by_conversation,
     _slugify_branch_token,
     _utc_now_iso,
     acquire_dev_pr_lock,
@@ -67,7 +71,7 @@ from parallel_scope import (  # noqa: E402
     OVERLAP_NONE,
     OVERLAP_TRANSITIVE,
     TaskAnchorSpec,
-    analyze_pair_overlap,
+    analyze_candidate_against_slots,
 )
 from queue_store import (  # noqa: E402
     _auto_enqueue_blocked_task,
@@ -348,32 +352,41 @@ def start_remediation_branch_and_lock(
         or any(_is_same_conversation_id(s, cid_clean) for s in existing_siblings)
     )
     slots_existing = existing_lock.get("slots") if isinstance(existing_lock.get("slots"), dict) else {}
-    slot2_existing = slots_existing.get("2") if isinstance(slots_existing.get("2"), dict) else {}
-    same_conv_slot2 = False
-    if slot2_existing and bool(slot2_existing.get("active", True)):
-        s2_cid = str(slot2_existing.get("conversation_id") or "").strip()
-        s2_sibs = [str(s).strip() for s in (slot2_existing.get("sibling_conversation_ids") or [])]
-        same_conv_slot2 = bool(
-            s2_cid
-            and (
-                _is_same_conversation_id(s2_cid, cid_clean)
-                or any(_is_same_conversation_id(s, cid_clean) for s in s2_sibs)
-            )
-        )
+    follower_keys = _secondary_slot_keys(slots_existing)
+    same_conv_slot_key = next(
+        (k for k in follower_keys if _slot_owned_by_conversation(slots_existing[k], cid_clean)),
+        "",
+    )
+    slot2_existing: dict[str, Any] = dict(slots_existing[same_conv_slot_key]) if same_conv_slot_key else {}
+    same_conv_slot2 = bool(same_conv_slot_key)
+
+    # (B1) Auto-hydrate omitted `target_files` / `section_anchors` from the repo-scoped `dev_queue.json` item.
+    hydrated_fields: list[str] = []
+    if cid_clean and (not target_files or not section_anchors):
+        h_targets, h_anchors = _hydrate_anchors_from_queue(cid_clean, repo_slug=repo_slug, portfolio_dir=portfolio_dir)
+        if not target_files and h_targets:
+            target_files = list(h_targets)
+            hydrated_fields.append("target_files")
+        if not section_anchors and h_anchors:
+            section_anchors = list(h_anchors)
+            hydrated_fields.append("section_anchors")
 
     existing_status = str(existing_lock.get("status") or "")
     allocating_slot2 = False
     slot2_overlap_tier = ""
     slot2_landing_order: list[str] = []
     slot2_overlap_dict: dict[str, Any] = {}
+    eff_max_slots = _resolve_max_repo_slots(max_slots)
 
     if existing_lock.get("active") and not same_conv:
-        eff_max_slots = int(
-            max_slots if max_slots is not None else existing_lock.get("max_slots") or _resolve_max_repo_slots()
-        )
-        slot2_free = eff_max_slots >= 2 and (same_conv_slot2 or "2" not in slots_existing)
+        free_slot_id = _next_free_slot_id(slots_existing, eff_max_slots)
+        slot2_free = eff_max_slots >= 2 and (same_conv_slot2 or free_slot_id is not None)
         clean_tfiles = [str(f).strip() for f in (target_files or []) if str(f).strip()]
         clean_sanchors = [str(a).strip() for a in (section_anchors or []) if str(a).strip()]
+        active_slot_maps: list[dict[str, Any]] = [
+            dict(slots_existing["1"]) if isinstance(slots_existing.get("1"), dict) else dict(existing_lock),
+            *(dict(slots_existing[k]) for k in follower_keys),
+        ]
 
         if same_conv_slot2:
             allocating_slot2 = True
@@ -382,9 +395,11 @@ def start_remediation_branch_and_lock(
         elif slot2_free and force_slot2:
             allocating_slot2 = True
             slot2_overlap_tier = OVERLAP_TRANSITIVE
-        elif slot2_free and (allow_slot2 or (create_worktree and bool(clean_tfiles) and bool(existing_lock.get("target_files")))):
+        elif slot2_free and (
+            allow_slot2
+            or (create_worktree and bool(clean_tfiles) and any(bool(s.get("target_files")) for s in active_slot_maps))
+        ):
             main_git_root = _resolve_main_git_repo_root(target_repo_dir) if isinstance(target_repo_dir, Path) else None
-            slot1_spec = TaskAnchorSpec.from_mapping(existing_lock)
             cand_spec = TaskAnchorSpec(
                 conversation_id=cid_clean,
                 title=str(rca_summary or action_id or ""),
@@ -394,16 +409,27 @@ def start_remediation_branch_and_lock(
                 section_anchors=tuple(clean_sanchors),
                 prose_context=f"{rca_summary}\n{proposed_fix}",
             )
-            ov_res = analyze_pair_overlap(
-                slot1_spec,
+            multi_res = analyze_candidate_against_slots(
+                active_slot_maps,
                 cand_spec,
                 repo_dir=main_git_root,
                 repo_slug=repo_slug,
             )
-            slot2_overlap_dict = ov_res.to_dict()
-            slot2_overlap_tier = ov_res.overlap_tier
-            slot2_landing_order = list(ov_res.landing_order)
-            if ov_res.parallel_safe:
+            pairs = list(multi_res.get("pairwise") or [])
+            slot2_overlap_dict = dict(pairs[0]) if len(pairs) == 1 else {}
+            slot2_overlap_dict.update(
+                {
+                    "overlap_tier": multi_res.get("overlap_tier"),
+                    "parallel_safe": bool(multi_res.get("parallel_safe")),
+                    "landing_order": list(multi_res.get("landing_order") or []),
+                    "pairwise": pairs,
+                    "blocking_slot_ids": list(multi_res.get("blocking_slot_ids") or []),
+                    "candidate_slot_id": free_slot_id,
+                }
+            )
+            slot2_overlap_tier = str(multi_res.get("overlap_tier") or "")
+            slot2_landing_order = list(multi_res.get("landing_order") or [])
+            if bool(multi_res.get("parallel_safe")):
                 allocating_slot2 = True
 
     if existing_lock.get("active") and not allocating_slot2 and (
@@ -513,8 +539,10 @@ def start_remediation_branch_and_lock(
                     rb_br_ex = str(rb_v.get("branch_name") or "").strip()
                     if rb_br_ex:
                         excluded_branches.add(rb_br_ex)
-        if not same_conv_slot2 and isinstance(slot2_existing, dict) and bool(slot2_existing.get("active", True)):
-            s2_br_ex = str(slot2_existing.get("branch_name") or "").strip()
+        for f_key in follower_keys:
+            if f_key == same_conv_slot_key:
+                continue
+            s2_br_ex = str(slots_existing[f_key].get("branch_name") or "").strip()
             if s2_br_ex:
                 excluded_branches.add(s2_br_ex)
 
@@ -680,7 +708,7 @@ def start_remediation_branch_and_lock(
                 portfolio_dir=portfolio_dir,
             )
 
-    return {
+    out_res: dict[str, Any] = {
         "status": "ok",
         "acquired": True,
         "slot_id": int(lock_res.get("slot_id") or 1),
@@ -695,8 +723,14 @@ def start_remediation_branch_and_lock(
         "manual_pr_url": "",
         "pr_gate_ready": False,
         "worktree_path": wt_path,
+        "max_slots": int(lock_res.get("max_slots") or eff_max_slots),
+        "active_slots_count": int(lock_res.get("active_slots_count") or 1),
         "lock": lock_res.get("lock", {}),
     }
+    hydrated_all = list(dict.fromkeys([*hydrated_fields, *(lock_res.get("hydrated_from_queue") or [])]))
+    if hydrated_all:
+        out_res["hydrated_from_queue"] = hydrated_all
+    return out_res
 
 
 # ==============================================================================
@@ -1724,7 +1758,21 @@ def register_worktree_cli(sub: Any) -> None:
     p_start.add_argument("--workdir", default="", help="Optional target repository directory (defaults to active cwd repo or AGY_CONF_REPO_DIR).")
     p_start.add_argument("--worker-cid", dest="worker_cid", default="", help="Optional active worker subagent conversation ID for stall monitoring.")
     p_start.add_argument("--dev-model", dest="dev_model", default="", help="Optional actual developer model ID used on this branch (persisted on lock for cross-family review).")
-    p_start.add_argument("--allow-slot2", "--parallel-slot", dest="allow_slot2", action="store_true", help="Allow allocating parallel Slot #2 when overlap check passes.")
+    p_start.add_argument(
+        "--allow-slot2",
+        "--parallel-slot",
+        "--allow-parallel-slot",
+        dest="allow_slot2",
+        action="store_true",
+        help="Allow allocating the next free parallel follower Slot #2..#N when overlap vs ALL active slots passes (`--allow-slot2` kept as alias).",
+    )
+    p_start.add_argument(
+        "--max-slots",
+        dest="max_slots",
+        type=int,
+        default=None,
+        help="Optional per-repo slot capacity override (clamped 1..4; default AGY_DEV_MAX_SLOTS_PER_REPO or 3).",
+    )
     p_start.add_argument(
         "--reuse-active",
         "--continue-active",
@@ -1828,6 +1876,7 @@ def dispatch_worktree_cli(args: Any) -> int | None:
             worker_cid=getattr(args, "worker_cid", ""),
             section_anchors=getattr(args, "section_anchors", []) or None,
             allow_slot2=bool(getattr(args, "allow_slot2", False)),
+            max_slots=getattr(args, "max_slots", None),
             dev_model=str(getattr(args, "dev_model", "") or ""),
         )
         printed = res if getattr(args, "verbose", False) else _compact_start_remediation_output(res)

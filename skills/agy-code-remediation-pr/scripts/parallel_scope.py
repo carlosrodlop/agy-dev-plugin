@@ -6,7 +6,7 @@ Pure Python 3 standard-library module (Santa Lockdown compliant, Unix portable, 
   2. ES2022+ JavaScript import/export graph, function/class/method brace spans, and DOM/CSS token references.
   3. HTML5 (`html.parser`) landmark/`id`/`data-section` spans and CSS3 `:root`/rule/banner spans.
   4. 4-tier blast-radius overlap classification (`NONE`, `TRANSITIVE`, `INTERFACE_SHARED`, `DEEP_SHARED`)
-     with pragmatic section-level disjointness for monoliths so Slot #2 can develop safely in parallel
+     with pragmatic section-level disjointness for monoliths so follower Slots #2..#N can develop safely in parallel
      when touching disjoint functions/sections/line ranges (guarded by post-merge rebase-reverify).
   5. Deterministic `landing_order` ranking: `depends_on` -> `pr_open`/review maturity -> numeric `priority`
      -> smaller blast radius -> `conversation_id` tie-breaker.
@@ -586,9 +586,10 @@ class BatchOverlapAnalysis:
     blast_radius_by_task: dict[str, dict[str, Any]]
     pairwise: tuple[PairOverlapResult, ...]
     parallel_slot2_candidates: tuple[str, ...] = ()
+    multi_slot_candidates: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize batch overlap analysis to JSON-friendly dict."""
+        """Serialize batch overlap analysis to JSON-friendly dict (`parallel_slot2_candidates` kept as legacy alias)."""
         return {
             "status": "ok",
             "tasks_count": self.tasks_count,
@@ -596,6 +597,7 @@ class BatchOverlapAnalysis:
             "blast_radius_by_task": self.blast_radius_by_task,
             "pairwise": [p.to_dict() for p in self.pairwise],
             "parallel_slot2_candidates": list(self.parallel_slot2_candidates),
+            "multi_slot_candidates": list(self.multi_slot_candidates),
         }
 
 
@@ -2528,14 +2530,78 @@ def analyze_pair_overlap(
     )
 
 
+def analyze_candidate_against_slots(
+    active_slots: Sequence[TaskAnchorSpec | Mapping[str, Any]],
+    candidate: TaskAnchorSpec | Mapping[str, Any],
+    *,
+    repo_dir: Path | str | None = None,
+    repo_slug: str = "",
+) -> dict[str, Any]:
+    """Validate `candidate` pairwise against EVERY active slot (`1..N`) of one repository.
+
+    Returns `{parallel_safe, overlap_tier, landing_order, pairwise, blocking_slot_ids}` where `overlap_tier`
+    is the worst pairwise tier and `parallel_safe` requires every pair to be `NONE`/`TRANSITIVE`.
+    `landing_order` keeps active slots in their slot order and appends the candidate last (Slot #1 always lands first).
+    """
+    cand_spec = candidate if isinstance(candidate, TaskAnchorSpec) else TaskAnchorSpec.from_mapping(candidate)
+    r_dir = Path(repo_dir).expanduser().resolve() if repo_dir else None
+    if r_dir is not None and r_dir.is_dir():
+        structures, forward_graph = build_repository_import_graph(r_dir)
+    else:
+        structures, forward_graph = {}, {}
+    pairs: list[dict[str, Any]] = []
+    worst_tier = OVERLAP_NONE
+    blocking: list[int] = []
+    order: list[str] = []
+    for idx, raw_slot in enumerate(active_slots or ()):
+        slot_spec = raw_slot if isinstance(raw_slot, TaskAnchorSpec) else TaskAnchorSpec.from_mapping(raw_slot)
+        slot_num = idx + 1
+        if isinstance(raw_slot, Mapping):
+            with contextlib.suppress(TypeError, ValueError):
+                slot_num = int(raw_slot.get("slot_id") or slot_num)
+        res = analyze_pair_overlap(
+            slot_spec,
+            cand_spec,
+            repo_dir=r_dir,
+            repo_slug=repo_slug,
+            structures=structures,
+            forward_graph=forward_graph,
+        )
+        pair_dict = res.to_dict()
+        pair_dict["slot_id"] = slot_num
+        pairs.append(pair_dict)
+        if OVERLAP_TIER_SEVERITY.get(res.overlap_tier, 3) > OVERLAP_TIER_SEVERITY.get(worst_tier, 0):
+            worst_tier = res.overlap_tier
+        if not res.parallel_safe:
+            blocking.append(slot_num)
+        if slot_spec.conversation_id and slot_spec.conversation_id not in order:
+            order.append(slot_spec.conversation_id)
+    if len(pairs) == 1 and pairs[0].get("landing_order"):
+        order = [str(c) for c in pairs[0]["landing_order"] if str(c).strip()]
+    if cand_spec.conversation_id and cand_spec.conversation_id not in order:
+        order.append(cand_spec.conversation_id)
+    return {
+        "parallel_safe": bool(pairs) and not blocking,
+        "overlap_tier": worst_tier if pairs else OVERLAP_DEEP_SHARED,
+        "landing_order": order,
+        "pairwise": pairs,
+        "blocking_slot_ids": blocking,
+    }
+
+
 def analyze_candidates_overlap(
     tasks: Sequence[TaskAnchorSpec | Mapping[str, Any]],
     *,
     repo_dir: Path | str | None = None,
     repo_slug: str = "",
     primary_slot_id: str = "",
+    active_slot_ids: Sequence[str] = (),
 ) -> BatchOverlapAnalysis:
-    """Analyze overlap across 2+ candidate tasks, compute blast-radius metrics, and rank `landing_order`."""
+    """Analyze overlap across 2+ candidate tasks, compute blast-radius metrics, and rank `landing_order`.
+
+    `parallel_slot2_candidates` (legacy alias) are tasks parallel-safe against `primary_slot_id`, while
+    `multi_slot_candidates` are tasks parallel-safe against EVERY active slot id (`primary_slot_id` + `active_slot_ids`).
+    """
     specs = [t if isinstance(t, TaskAnchorSpec) else TaskAnchorSpec.from_mapping(t) for t in tasks]
     r_dir = Path(repo_dir).expanduser().resolve() if repo_dir else None
     if r_dir is not None and r_dir.is_dir():
@@ -2600,10 +2666,33 @@ def analyze_candidates_overlap(
             if pair_match is not None and pair_match.parallel_safe:
                 slot2_safe.append(cand_cid)
 
+    occupied_ids = [c for c in dict.fromkeys([anchor_cid, *(str(x).strip() for x in active_slot_ids)]) if c]
+    multi_safe: list[str] = []
+    for cand_cid in slot2_safe:
+        if any(_matches_cid(cand_cid, occ) for occ in occupied_ids):
+            continue
+        all_safe = True
+        for occ in occupied_ids:
+            pair_occ = next(
+                (
+                    p
+                    for p in pairwise
+                    if (_matches_cid(p.task_a_id, occ) and _matches_cid(p.task_b_id, cand_cid))
+                    or (_matches_cid(p.task_b_id, occ) and _matches_cid(p.task_a_id, cand_cid))
+                ),
+                None,
+            )
+            if pair_occ is None or not pair_occ.parallel_safe:
+                all_safe = False
+                break
+        if all_safe:
+            multi_safe.append(cand_cid)
+
     return BatchOverlapAnalysis(
         tasks_count=len(specs),
         landing_order=landing,
         blast_radius_by_task=blast_by_task,
         pairwise=tuple(pairwise),
         parallel_slot2_candidates=tuple(slot2_safe),
+        multi_slot_candidates=tuple(multi_safe),
     )
