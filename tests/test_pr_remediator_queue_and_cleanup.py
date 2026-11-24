@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -4403,6 +4404,466 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertEqual(q_final[merged_cid], "cleaned")
             self.assertEqual(q_final[superseded_done_cid], "cancelled")
             self.assertEqual(q_final[unmerged_branch_cid], "merged")
+
+    def test_cleanup_auto_discovers_rotated_orchestrators_subagents_non_queue_fix_and_stale_running(self) -> None:
+        """Verify (1a) rotated idle orchestrators, finished active/rotated subagents, non-queue merged `fix/*` chats, and (1e) stale `step_status_RUNNING` override."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            desktop_root = troot / ".gemini" / "antigravity"
+            cli_root = troot / ".gemini" / "antigravity-cli"
+            pdir.mkdir(parents=True, exist_ok=True)
+            _, clone = _init_bare_and_clone_repo(troot, name="acme-plugin")
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(clone)})
+
+            now_ts = 1_800_000_000.0
+            two_hours_ago = now_ts - 7200.0
+            two_mins_ago = now_ts - 120.0
+
+            active_orch_cid = "aa000001-1111-4111-8111-111111111111"
+            active_sub_finished = "aa000002-1111-4111-8111-111111111111"
+            active_sub_locked = "aa000003-1111-4111-8111-111111111111"
+            rotated_orch_cid = "bb000001-2222-4222-8222-222222222222"
+            rotated_sub_finished = "bb000002-2222-4222-8222-222222222222"
+            nq_merged_cid = "cc000001-3333-4333-8333-333333333333"
+            nq_unmerged_cid = "dd000001-4444-4444-8444-444444444444"
+            user_chat_cid = "ee000001-5555-4555-8555-555555555555"
+            stale_running_old = "ff000001-6666-4666-8666-666666666666"
+            stale_running_recent = "ff000002-6666-4666-8666-666666666666"
+
+            for cid in (
+                active_orch_cid,
+                active_sub_finished,
+                active_sub_locked,
+                rotated_orch_cid,
+                nq_merged_cid,
+                nq_unmerged_cid,
+                user_chat_cid,
+            ):
+                self._write_agy2_artifacts(desktop_root, cid, mtime=two_hours_ago)
+            self._write_agy2_artifacts(cli_root, rotated_sub_finished, mtime=two_hours_ago)
+
+            # Stale RUNNING step in transcript.jsonl: >=3600s + CASCADE_RUN_STATUS_IDLE -> idle; <3600s -> not_fully_idle!
+            self._write_agy2_artifacts(
+                desktop_root,
+                stale_running_old,
+                mtime=two_hours_ago,
+                steps=[{"step_index": 1, "type": "PLANNER_RESPONSE", "status": "RUNNING"}],
+            )
+            self._write_agy2_artifacts(
+                desktop_root,
+                stale_running_recent,
+                mtime=two_mins_ago,
+                steps=[{"step_index": 1, "type": "PLANNER_RESPONSE", "status": "RUNNING"}],
+            )
+
+            self._seed_summaries_db(
+                desktop_root / "conversation_summaries.db",
+                [
+                    (active_orch_cid, "CASCADE_RUN_STATUS_IDLE", "", "2026-11-24 10:00:00+00:00", "[agy-doctor] Orchestrator Recovery"),
+                    (active_sub_finished, "CASCADE_RUN_STATUS_IDLE", active_orch_cid, "2026-11-24 10:05:00+00:00", "Finished Explorer"),
+                    (active_sub_locked, "CASCADE_RUN_STATUS_IDLE", active_orch_cid, "2026-11-24 10:10:00+00:00", "Active Lock Worker"),
+                    (rotated_orch_cid, "CASCADE_RUN_STATUS_IDLE", "", "2026-11-24 08:00:00+00:00", "[agy-doctor] Orchestrator Recovery"),
+                    (rotated_sub_finished, "CASCADE_RUN_STATUS_IDLE", rotated_orch_cid, "2026-11-24 08:05:00+00:00", "Rotated Child"),
+                    (nq_merged_cid, "CASCADE_RUN_STATUS_IDLE", "", "2026-11-24 07:00:00+00:00", "Ad-hoc Bug Fix"),
+                    (nq_unmerged_cid, "CASCADE_RUN_STATUS_IDLE", "", "2026-11-24 07:30:00+00:00", "Ad-hoc Unmerged Fix"),
+                    (user_chat_cid, "CASCADE_RUN_STATUS_IDLE", "", "2026-11-24 06:00:00+00:00", "Interactive Design Brainstorm"),
+                    (stale_running_old, "CASCADE_RUN_STATUS_IDLE", "", "2026-11-24 07:00:00+00:00", "Merged Stale Step"),
+                    (stale_running_recent, "CASCADE_RUN_STATUS_IDLE", "", "2026-11-24 11:58:00+00:00", "Recent Running Step"),
+                ],
+            )
+
+            # Verify (1e) is_conversation_fully_idle behavior on stale_running_old vs stale_running_recent
+            ok_old, reason_old = prs.is_conversation_fully_idle(
+                stale_running_old,
+                antigravity_dirs=[desktop_root, cli_root],
+                min_idle_seconds=60.0,
+                now_ts=now_ts,
+            )
+            self.assertTrue(ok_old)
+            self.assertEqual(reason_old, "idle")
+
+            ok_recent, reason_recent = prs.is_conversation_fully_idle(
+                stale_running_recent,
+                antigravity_dirs=[desktop_root, cli_root],
+                min_idle_seconds=60.0,
+                now_ts=now_ts,
+            )
+            self.assertFalse(ok_recent)
+            self.assertEqual(reason_recent, "not_fully_idle:step_status_RUNNING")
+
+            # Merge fix/* branches for nq_merged_cid and stale_running_old into main; keep nq_unmerged_cid unmerged
+            for br_cid in (nq_merged_cid, stale_running_old):
+                br_name = f"fix/20261124-070000-fix-{br_cid[:8]}"
+                subprocess.run(["git", "-C", str(clone), "checkout", "-b", br_name], check=True, capture_output=True)
+                (clone / f"{br_cid[:8]}.txt").write_text("merged\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(clone), "add", f"{br_cid[:8]}.txt"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(clone), "commit", "-m", f"fix: {br_cid[:8]}"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(clone), "checkout", "main"], check=True, capture_output=True)
+                subprocess.run(
+                    ["git", "-C", str(clone), "merge", "--no-ff", br_name, "-m", f"Merge pull request #99 from acme/{br_name}"],
+                    check=True,
+                    capture_output=True,
+                )
+            subprocess.run(["git", "-C", str(clone), "push", "origin", "main"], check=True, capture_output=True)
+            unmerged_br = f"fix/20261124-073000-wip-{nq_unmerged_cid[:8]}"
+            subprocess.run(["git", "-C", str(clone), "checkout", "-b", unmerged_br], check=True, capture_output=True)
+            (clone / "wip.txt").write_text("wip\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(clone), "add", "wip.txt"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(clone), "commit", "-m", "wip"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(clone), "checkout", "main"], check=True, capture_output=True)
+
+            # Set active orchestrator and active lock protecting active_sub_locked
+            prs.set_dev_queue_orchestrator(active_orch_cid, portfolio_dir=pdir)
+            prs.acquire_dev_pr_lock(
+                conversation_id="12345678-1111-4111-8111-111111111111",
+                action_id="active-task",
+                repo_slug="acme/acme-plugin",
+                branch_name="fix/20261124-101000-active-12345678",
+                worker_cid=active_sub_locked,
+                portfolio_dir=pdir,
+                target_repo_dir=str(clone),
+            )
+
+            res = prs.cleanup_merged_conversations(
+                all_merged=True,
+                include_unaudited_check=False,
+                portfolio_dir=pdir,
+                antigravity_dirs=[desktop_root, cli_root],
+                git_client=vcs,
+                now_ts=now_ts,
+            )
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(
+                set(res["deleted"]),
+                {active_sub_finished, rotated_orch_cid, rotated_sub_finished, nq_merged_cid, stale_running_old},
+            )
+            for kept in (active_orch_cid, active_sub_locked, nq_unmerged_cid, user_chat_cid, stale_running_recent):
+                self.assertTrue((desktop_root / "conversations" / f"{kept}.db").is_file(), f"{kept} should be kept")
+
+    def test_cleanup_unified_24h_actions_72h_unaudited_cap_sidecar_events_and_orphans(self) -> None:
+        """Verify (1b) 24h NO_OP/deliverable + 72h unaudited WARN/ERROR cap, (1c) sidecar event prune, and (1d) orphan sweep."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            desktop_root = troot / ".gemini" / "antigravity"
+            pdir.mkdir(parents=True, exist_ok=True)
+
+            now_ts = 1_800_000_000.0
+            h12 = now_ts - (12 * 3600.0)
+            h25 = now_ts - (25 * 3600.0)
+            h48 = now_ts - (48 * 3600.0)
+            h75 = now_ts - (75 * 3600.0)
+            h90 = now_ts - (90 * 3600.0)
+
+            noop_25h = "11110001-1111-4111-8111-111111111111"
+            noop_12h = "11110002-1111-4111-8111-111111111111"
+            deliv_25h = "22220001-2222-4222-8222-222222222222"
+            deliv_12h = "22220002-2222-4222-8222-222222222222"
+            warn_48h = "33330001-3333-4333-8333-333333333333"
+            err_75h = "33330002-3333-4333-8333-333333333333"
+            tier2_90h = "44440001-4444-4444-8444-444444444444"
+
+            for cid, ts_v in (
+                (noop_25h, h25),
+                (noop_12h, h12),
+                (deliv_25h, h25),
+                (deliv_12h, h12),
+                (warn_48h, h48),
+                (err_75h, h75),
+                (tier2_90h, h90),
+            ):
+                self._write_agy2_artifacts(desktop_root, cid, mtime=ts_v)
+
+            # Protect tier2_90h via pending_tier2_proposals in actions_state.json
+            prs.dev_common.atomic_write_json(
+                pdir / "actions_state.json",
+                {"actions_log_audit_state": {"pending_tier2_proposals": {tier2_90h: {"status": "pending"}}}},
+            )
+
+            # Seed actions_ledger.db with transcript_parse_cache, action_deliverables_ledger, notifications_ledger
+            ledger_db = pdir / "actions_ledger.db"
+            lconn = sqlite3.connect(str(ledger_db))
+            lconn.execute(
+                "CREATE TABLE transcript_parse_cache ("
+                "conversation_id TEXT NOT NULL, is_scheduled_action INTEGER NOT NULL, "
+                "mtime_ns INTEGER NOT NULL, file_size INTEGER NOT NULL, "
+                "actions_log_doc_id TEXT NOT NULL, schema_version INTEGER NOT NULL, "
+                "parsed_json TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                "PRIMARY KEY (conversation_id, is_scheduled_action))"
+            )
+            lconn.execute(
+                "CREATE TABLE action_deliverables_ledger ("
+                "deliverable_key TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, action_id TEXT NOT NULL, "
+                "customer TEXT NOT NULL, label TEXT NOT NULL, url TEXT NOT NULL, details TEXT NOT NULL, recorded_at TEXT NOT NULL)"
+            )
+            lconn.execute(
+                "CREATE TABLE notifications_ledger ("
+                "event_id TEXT PRIMARY KEY, timestamp_utc TEXT NOT NULL, status TEXT NOT NULL, "
+                "badge TEXT NOT NULL, title TEXT NOT NULL, subject TEXT NOT NULL, body_markdown TEXT NOT NULL, "
+                "problem TEXT NOT NULL, resolutions_json TEXT NOT NULL, conversation_id TEXT NOT NULL, "
+                "email_sent INTEGER NOT NULL DEFAULT 0, recipient TEXT NOT NULL DEFAULT '', "
+                "deliverable_links_json TEXT NOT NULL DEFAULT '[]', payload_json TEXT NOT NULL)"
+            )
+            lconn.executemany(
+                "INSERT INTO transcript_parse_cache VALUES (?, 1, ?, 128, '', 1, ?, '')",
+                [
+                    (noop_25h, int(h25 * 1e9), json.dumps({"outcome": "NO_OP", "total_steps": 4})),
+                    (noop_12h, int(h12 * 1e9), json.dumps({"outcome": "NO_OP", "total_steps": 4})),
+                    (deliv_25h, int(h25 * 1e9), json.dumps({"outcome": "DELIVERABLE", "action_deliverable_op": True, "total_steps": 16})),
+                    (deliv_12h, int(h12 * 1e9), json.dumps({"outcome": "DELIVERABLE", "action_deliverable_op": True, "total_steps": 16})),
+                    (warn_48h, int(h48 * 1e9), json.dumps({"outcome": "WARN", "step_errors": ["warn"], "total_steps": 6})),
+                    (err_75h, int(h75 * 1e9), json.dumps({"outcome": "ERROR", "last_step_status": "ERROR", "total_steps": 6})),
+                    (tier2_90h, int(h90 * 1e9), json.dumps({"outcome": "ERROR", "last_step_status": "ERROR", "total_steps": 6})),
+                ],
+            )
+            lconn.execute(
+                "INSERT INTO action_deliverables_ledger VALUES ('k1', ?, 'sync', 'Acme', 'Doc', 'https://example.test/doc', '', '2026-11-23T10:00:00Z')",
+                (deliv_25h,),
+            )
+            lconn.execute(
+                "INSERT INTO notifications_ledger (event_id, timestamp_utc, status, badge, title, subject, body_markdown, problem, resolutions_json, conversation_id, payload_json) "
+                "VALUES ('ev1', '2026-11-22T10:00:00Z', 'WARN', '', '', '', '', '', '[]', ?, '{}')",
+                (warn_48h,),
+            )
+            lconn.execute(
+                "INSERT INTO notifications_ledger (event_id, timestamp_utc, status, badge, title, subject, body_markdown, problem, resolutions_json, conversation_id, payload_json) "
+                "VALUES ('ev2', '2026-11-21T07:00:00Z', 'ERROR', '', '', '', '', '', '[]', ?, '{}')",
+                (err_75h,),
+            )
+            lconn.commit()
+            lconn.close()
+
+            # Sidecar events (both 1-level and 2-level nested)
+            ev1_old = desktop_root / "sidecar_data" / "demo-sidecar" / "events" / "old.json"
+            ev1_new = desktop_root / "sidecar_data" / "demo-sidecar" / "events" / "new.json"
+            ev2_old = desktop_root / "sidecar_data" / "agy-dev-plugin" / "dev-queue-watchdog" / "events" / "old2.json"
+            for p, ts_v in ((ev1_old, h25), (ev1_new, h12), (ev2_old, h48)):
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text('{"ok":true}\n', encoding="utf-8")
+                os.utime(p, (ts_v, ts_v))
+
+            # Orphan annotations & presence files (no brain/ or conversations/)
+            orphan_cid = "99990001-9999-4999-8999-999999999999"
+            orphan_ann = desktop_root / "annotations" / f"{orphan_cid}.pbtxt"
+            orphan_pres = desktop_root / "presence" / f"{orphan_cid}.lock"
+            recent_orphan_cid = "99990002-9999-4999-8999-999999999999"
+            recent_orphan_pres = desktop_root / "presence" / f"{recent_orphan_cid}.lock"
+            orphan_ann.write_text("orphan\n", encoding="utf-8")
+            orphan_pres.write_bytes(b"orphan-lock")
+            recent_orphan_pres.write_bytes(b"fresh-lock")
+            os.utime(orphan_ann, (h25, h25))
+            os.utime(orphan_pres, (h25, h25))
+            os.utime(recent_orphan_pres, (now_ts - 5.0, now_ts - 5.0))
+
+            res = prs.cleanup_merged_conversations(
+                include_noop_actions=True,
+                include_scheduled_actions=True,
+                include_sidecar_events=True,
+                include_orphans=True,
+                include_unaudited_check=False,
+                portfolio_dir=pdir,
+                antigravity_dirs=[desktop_root],
+                now_ts=now_ts,
+                env={},
+            )
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(set(res["deleted"]), {noop_25h, deliv_25h, err_75h})
+            self.assertEqual(res["sidecar_events_pruned_count"], 2)
+            self.assertEqual(res["orphan_artifacts_pruned_count"], 2)
+            self.assertFalse(ev1_old.exists())
+            self.assertFalse(ev2_old.exists())
+            self.assertTrue(ev1_new.is_file())
+            self.assertFalse(orphan_ann.exists())
+            self.assertFalse(orphan_pres.exists())
+            self.assertTrue(recent_orphan_pres.is_file())
+            for kept in (noop_12h, deliv_12h, warn_48h, tier2_90h):
+                self.assertTrue((desktop_root / "conversations" / f"{kept}.db").is_file())
+            # actions_ledger.db itself is strictly preserved and unmutated
+            lverify = sqlite3.connect(str(ledger_db))
+            self.assertEqual(lverify.execute("SELECT COUNT(*) FROM transcript_parse_cache").fetchone()[0], 7)
+            self.assertEqual(lverify.execute("SELECT COUNT(*) FROM action_deliverables_ledger").fetchone()[0], 1)
+            self.assertEqual(lverify.execute("SELECT COUNT(*) FROM notifications_ledger").fetchone()[0], 2)
+            lverify.close()
+
+    def test_prune_ghost_summaries_fail_closed_guards_backup_and_fts_delete(self) -> None:
+        """Verify (1f) fail-closed active-Desktop/WAL guards, timestamped backup, and ghost row prune in summaries + FTS5."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            desktop_root = troot / ".gemini" / "antigravity"
+            pdir.mkdir(parents=True, exist_ok=True)
+
+            now_ts = 1_800_000_000.0
+            live_cid = "51111111-1111-4111-8111-111111111111"
+            ghost_idle = "52222222-2222-4222-8222-222222222222"
+            ghost_running = "53333333-3333-4333-8333-333333333333"
+            self._write_agy2_artifacts(desktop_root, live_cid, mtime=now_ts - 3600.0)
+
+            db_path = desktop_root / "conversation_summaries.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                "CREATE TABLE conversation_summaries ("
+                "conversation_id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT '', "
+                "parent_conversation_id TEXT NOT NULL DEFAULT '', last_modified_time TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '')"
+            )
+            conn.execute(
+                "CREATE VIRTUAL TABLE conversations_fts USING fts5(conversation_id UNINDEXED, title, tokenize='unicode61 remove_diacritics 2')"
+            )
+            conn.execute("CREATE TABLE conversation_parents (conversation_id TEXT PRIMARY KEY, parent_id TEXT NOT NULL)")
+            conn.executemany(
+                "INSERT INTO conversation_summaries VALUES (?, ?, '', '', ?)",
+                [
+                    (live_cid, "CASCADE_RUN_STATUS_IDLE", "Live Conversation"),
+                    (ghost_idle, "CASCADE_RUN_STATUS_IDLE", "Deleted Ghost"),
+                    (ghost_running, "CASCADE_RUN_STATUS_RUNNING", "Running Ghost Protected"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO conversations_fts (conversation_id, title) VALUES (?, ?)",
+                [(live_cid, "Live"), (ghost_idle, "Ghost"), (ghost_running, "Running")],
+            )
+            conn.execute("INSERT INTO conversation_parents VALUES (?, ?)", (ghost_idle, live_cid))
+            conn.commit()
+            conn.close()
+
+            # 1. Active Desktop / language_server process -> blocked
+            blocked_proc = prs.prune_ghost_conversation_summaries(
+                portfolio_dir=pdir,
+                antigravity_dirs=[desktop_root],
+                ps_output="  PID ARGS\n  1022 /Applications/Antigravity.app/Contents/MacOS/Antigravity\n",
+                now_ts=now_ts,
+            )
+            self.assertEqual(blocked_proc["status"], "blocked")
+            self.assertEqual(blocked_proc["reason"], "antigravity_process_active")
+
+            # Prompt text mentioning Antigravity does NOT trigger false positive
+            self.assertEqual(
+                prs._detect_active_antigravity_processes(
+                    ps_output='  PID ARGS\n  900 python3 /opt/tool.py -p "Check /Applications/Antigravity.app/"\n'
+                ),
+                [],
+            )
+
+            # 2. Non-empty -wal file -> blocked
+            wal_path = pathlib.Path(f"{db_path}-wal")
+            wal_path.write_bytes(b"pending-wal-frame")
+            blocked_wal = prs.prune_ghost_conversation_summaries(
+                portfolio_dir=pdir,
+                antigravity_dirs=[desktop_root],
+                ps_output="",
+                now_ts=now_ts,
+            )
+            self.assertEqual(blocked_wal["status"], "blocked")
+            self.assertIn("wal_non_empty", blocked_wal["reason"])
+            wal_path.unlink()
+
+            # 3. Held SQLite lock -> blocked
+            holder = sqlite3.connect(str(db_path))
+            holder.execute("BEGIN IMMEDIATE")
+            try:
+                blocked_lock = prs.prune_ghost_conversation_summaries(
+                    portfolio_dir=pdir,
+                    antigravity_dirs=[desktop_root],
+                    ps_output="",
+                    now_ts=now_ts,
+                )
+                self.assertEqual(blocked_lock["status"], "blocked")
+                self.assertIn("sqlite_lock_held", blocked_lock["reason"])
+            finally:
+                holder.rollback()
+                holder.close()
+
+            # 4. Offline & unlocked -> backup + prune ghost_idle only
+            pruned = prs.prune_ghost_conversation_summaries(
+                portfolio_dir=pdir,
+                antigravity_dirs=[desktop_root],
+                ps_output="",
+                now_ts=now_ts,
+            )
+            self.assertEqual(pruned["status"], "ok")
+            self.assertEqual(pruned["pruned_cids"], [ghost_idle])
+            self.assertEqual(len(pruned["backups"]), 1)
+            bak_p = pathlib.Path(pruned["backups"][0])
+            self.assertTrue(bak_p.is_file())
+            self.assertEqual(stat.S_IMODE(bak_p.stat().st_mode), 0o600)
+
+            verify_conn = sqlite3.connect(str(db_path))
+            remaining_sum = {r[0] for r in verify_conn.execute("SELECT conversation_id FROM conversation_summaries").fetchall()}
+            remaining_fts = {r[0] for r in verify_conn.execute("SELECT conversation_id FROM conversations_fts").fetchall()}
+            remaining_par = verify_conn.execute("SELECT COUNT(*) FROM conversation_parents").fetchone()[0]
+            verify_conn.close()
+            self.assertEqual(remaining_sum, {live_cid, ghost_running})
+            self.assertEqual(remaining_fts, {live_cid, ghost_running})
+            self.assertEqual(remaining_par, 0)
+
+            # 5. CLI subcommand `prune-ghost-summaries --dry-run` and flag `cleanup-merged-conversations --prune-ghost-summaries --dry-run`
+            ghost_cli = "54444444-4444-4444-8444-444444444444"
+            c_cli = sqlite3.connect(str(db_path))
+            c_cli.execute("INSERT INTO conversation_summaries VALUES (?, 'CASCADE_RUN_STATUS_IDLE', '', '', 'Ghost CLI')", (ghost_cli,))
+            c_cli.execute("INSERT INTO conversations_fts (conversation_id, title) VALUES (?, 'Ghost CLI')", (ghost_cli,))
+            c_cli.commit()
+            c_cli.close()
+
+            buf1 = io.StringIO()
+            with (
+                mock.patch("merge_watcher._detect_active_antigravity_processes", return_value=[]),
+                mock.patch.dict(os.environ, {"AGY_DEV_STATE_DIR": str(pdir), "AGY_ANTIGRAVITY_DIR": str(desktop_root)}),
+                contextlib.redirect_stdout(buf1),
+            ):
+                rc1 = prs.main(["prune-ghost-summaries", "--dry-run", "--summaries-db", str(db_path)])
+            self.assertEqual(rc1, 0)
+            self.assertEqual(json.loads(buf1.getvalue())["pruned_cids"], [ghost_cli])
+
+            buf2 = io.StringIO()
+            with (
+                mock.patch("merge_watcher._detect_active_antigravity_processes", return_value=[]),
+                mock.patch.dict(os.environ, {"AGY_DEV_STATE_DIR": str(pdir), "AGY_ANTIGRAVITY_DIR": str(desktop_root)}),
+                contextlib.redirect_stdout(buf2),
+            ):
+                rc2 = prs.main(["cleanup-merged-conversations", "--prune-ghost-summaries", "--dry-run"])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(json.loads(buf2.getvalue())["pruned_cids"], [ghost_cli])
+
+    def test_run_pr_merge_watcher_loop_triggers_immediate_post_merge_cleanup(self) -> None:
+        """Verify (2a) `run_pr_merge_watcher_loop` triggers immediate 0-LLM post-merge cleanup when lock releases as merged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            pdir = troot / "portfolio"
+            desktop_root = troot / ".gemini" / "antigravity"
+            pdir.mkdir(parents=True, exist_ok=True)
+            _, clone = _init_bare_and_clone_repo(troot, name="acme-plugin")
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(clone)})
+
+            merged_cid = "61111111-1111-4111-8111-111111111111"
+            now_ts = 1_800_000_000.0
+            self._write_agy2_artifacts(desktop_root, merged_cid, mtime=now_ts - 3600.0)
+            prs.enqueue_dev_queue_item(merged_cid, title="Merged via PR", status="merged", portfolio_dir=pdir)
+
+            with mock.patch.object(
+                prs,
+                "sync_dev_pr_lock_with_git",
+                return_value={
+                    "status": "ok",
+                    "active": False,
+                    "released": True,
+                    "reason": "BRANCH_MERGED_INTO_MAIN",
+                },
+            ):
+                loop_res = prs.run_pr_merge_watcher_loop(
+                    poll_interval_seconds=0.05,
+                    max_iterations=2,
+                    portfolio_dir=pdir,
+                    git_client=vcs,
+                    antigravity_dirs=[desktop_root],
+                    now_ts=now_ts,
+                    env={},
+                )
+            self.assertEqual(loop_res["status"], "ok")
+            self.assertTrue(loop_res["released"])
+            self.assertEqual(loop_res["post_merge_cleanup"]["status"], "ok")
+            self.assertIn(merged_cid, loop_res["post_merge_cleanup"]["deleted"])
+            self.assertFalse((desktop_root / "conversations" / f"{merged_cid}.db").exists())
 
     def test_test_local_ci_parity_workflow_auto_detection_coverage_gate_and_pr_table(self) -> None:
         """Verify `test-local --ci-parity`, `ENABLE_GHA_HOSTED_RUNNERS` auto-detection, `--fail-under` parsing, PR table rendering, and missing-coverage resilience."""

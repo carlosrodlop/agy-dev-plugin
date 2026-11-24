@@ -144,6 +144,10 @@ class TestSidecarManifestAndFrontendContracts(unittest.TestCase):
         self.assertIn("fileView", js)
         self.assertIn("/api/nav-intent/ack", js)
         self.assertIn("/api/artifact-uri", js)
+        self.assertIn("/api/cleanup/preview", js)
+        self.assertIn("/api/cleanup/execute", js)
+        self.assertIn('id="dq-clean-btn"', html)
+        self.assertIn('id="dq-cleanup-panel"', html)
 
         self.assertEqual(css.count("{"), css.count("}"), "Unbalanced CSS braces in styles.css")
         self.assertIn(":root", css)
@@ -442,6 +446,103 @@ class TestSidecarServerSecurityAndState(unittest.TestCase):
             try:
                 st, _, _ = _http_request(f"http://127.0.0.1:{port}/api/state")
                 self.assertEqual(st, 401)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2.0)
+
+    def test_http_cleanup_preview_and_execute_endpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            st_dir = root / "state"
+            agy_dir = root / "agy"
+            brain_dir = agy_dir / "brain"
+            convs_dir = agy_dir / "conversations"
+            brain_dir.mkdir(parents=True, exist_ok=True)
+            convs_dir.mkdir(parents=True, exist_ok=True)
+            fake_home = root / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
+
+            merged_cid = "81111111-1111-4111-8111-111111111111"
+            active_cid = "82222222-2222-4222-8222-222222222222"
+            old_ts = time.time() - 7200.0
+            for cid in (merged_cid, active_cid):
+                db_p = convs_dir / f"{cid}.db"
+                db_p.write_bytes(b"sqlite-stub-" + cid.encode("utf-8"))
+                os.utime(db_p, (old_ts, old_ts))
+
+            ev_old = agy_dir / "sidecar_data" / "demo-panel" / "events" / "old.json"
+            ev_old.parent.mkdir(parents=True, exist_ok=True)
+            ev_old.write_text('{"ok":true}\n', encoding="utf-8")
+            os.utime(ev_old, (time.time() - 30 * 3600.0, time.time() - 30 * 3600.0))
+
+            _write_mock_state(
+                st_dir,
+                items=[
+                    {"conversation_id": merged_cid, "priority": 20, "status": "merged", "title": "Merged item"},
+                    {"conversation_id": active_cid, "priority": 10, "status": "pending", "title": "Pending item"},
+                ],
+                locks={},
+            )
+
+            mock_token = "mock-panel-cleanup-token-0000"
+            httpd = panel_srv.create_panel_server(
+                port=0,
+                ui_token=mock_token,
+                state_dir=st_dir,
+                brain_dir=brain_dir,
+                home_dir=fake_home,
+                env={},
+            )
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{port}"
+                # Fail-closed 401 without token
+                for route in ("/api/cleanup/preview", "/api/cleanup/execute"):
+                    st_u, _, _ = _http_request(f"{base}{route}", method="POST", body={})
+                    self.assertEqual(st_u, 401)
+                    st_b, _, _ = _http_request(
+                        f"{base}{route}",
+                        method="POST",
+                        headers={"X-Sidecar-Token": "wrong-token"},
+                        body={},
+                    )
+                    self.assertEqual(st_b, 401)
+
+                # Dry-run preview returns breakdown without deleting
+                st_prev, _, body_prev = _http_request(
+                    f"{base}/api/cleanup/preview",
+                    method="POST",
+                    headers={"X-Sidecar-Token": mock_token},
+                    body={"include_unaudited_check": False},
+                )
+                self.assertEqual(st_prev, 200)
+                prev_data = json.loads(body_prev)
+                self.assertTrue(prev_data["ok"])
+                self.assertTrue(prev_data["dry_run"])
+                self.assertEqual(prev_data["deleted"], [merged_cid])
+                self.assertEqual(prev_data["sidecar_events_pruned_count"], 1)
+                self.assertTrue((convs_dir / f"{merged_cid}.db").is_file())
+                self.assertTrue(ev_old.is_file())
+
+                # Execute deletes merged + old sidecar event while keeping active_cid
+                st_exec, _, body_exec = _http_request(
+                    f"{base}/api/cleanup/execute",
+                    method="POST",
+                    headers={"X-Sidecar-Token": mock_token},
+                    body={"include_unaudited_check": False},
+                )
+                self.assertEqual(st_exec, 200)
+                exec_data = json.loads(body_exec)
+                self.assertTrue(exec_data["ok"])
+                self.assertFalse(exec_data["dry_run"])
+                self.assertEqual(exec_data["deleted"], [merged_cid])
+                self.assertEqual(exec_data["sidecar_events_pruned_count"], 1)
+                self.assertFalse((convs_dir / f"{merged_cid}.db").exists())
+                self.assertFalse(ev_old.exists())
+                self.assertTrue((convs_dir / f"{active_cid}.db").is_file())
             finally:
                 httpd.shutdown()
                 httpd.server_close()

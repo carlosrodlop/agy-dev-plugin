@@ -1235,6 +1235,109 @@ class TestDevQueueDoctor(unittest.TestCase):
             self.assertIn("status=error", err_buf.getvalue())
             self.assertIn("RuntimeError: transient fs glitch", err_buf.getvalue())
 
+    def test_watchdog_hourly_auto_cleanup_cooldown_pause_and_zero_disable(self) -> None:
+        """Verify (2b) cooldown-gated hourly 0-LLM cleanup in `watchdog.run_watchdog_cycle`, pause guard, and `0` disable."""
+        self.assertEqual(watchdog.resolve_auto_cleanup_interval(None, env={}), 3600)
+        self.assertEqual(watchdog.resolve_auto_cleanup_interval(None, env={"AGY_AUTO_CLEANUP_INTERVAL_SECONDS": "1800"}), 1800)
+        self.assertEqual(watchdog.resolve_auto_cleanup_interval(None, env={"AGY_AUTO_CLEANUP_INTERVAL_SECONDS": "0"}), 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            state_dir = root / "state"
+            agy_dir = root / ".gemini" / "antigravity"
+            brain_dir = agy_dir / "brain"
+            convs_dir = agy_dir / "conversations"
+            convs_dir.mkdir(parents=True, exist_ok=True)
+            brain_dir.mkdir(parents=True, exist_ok=True)
+
+            now_ts = 1_800_300_000.0
+            merged_cid = "71111111-1111-4111-8111-111111111111"
+            merged_db = convs_dir / f"{merged_cid}.db"
+            merged_db.write_bytes(b"sqlite-stub")
+            os.utime(merged_db, (now_ts - 7200.0, now_ts - 7200.0))
+
+            ev_old = agy_dir / "sidecar_data" / "demo-sidecar" / "events" / "old.json"
+            ev_old.parent.mkdir(parents=True, exist_ok=True)
+            ev_old.write_text("{}\n", encoding="utf-8")
+            os.utime(ev_old, (now_ts - 30 * 3600.0, now_ts - 30 * 3600.0))
+
+            _write_state_files(
+                state_dir,
+                orchestrator_id="",
+                items=[{"conversation_id": merged_cid, "priority": 50, "status": "merged", "title": "Merged item"}],
+                locks={},
+            )
+
+            # 1. Disabled when AGY_AUTO_CLEANUP_INTERVAL_SECONDS=0
+            disabled_res = watchdog.run_watchdog_cycle(
+                state_dir=state_dir,
+                antigravity_dirs=[agy_dir],
+                sync_git=False,
+                now_ts=now_ts,
+                ps_output="",
+                env={"AGY_AUTO_CLEANUP_INTERVAL_SECONDS": "0"},
+            )
+            self.assertEqual(disabled_res["auto_cleanup"]["status"], "disabled")
+            self.assertFalse(disabled_res["auto_cleanup"]["ran"])
+            self.assertTrue(merged_db.is_file())
+
+            # 2. Disabled when paused
+            watchdog._orch_ctrl.pause_orchestration(state_dir=state_dir, reason="test")
+            paused_res = watchdog.run_watchdog_cycle(
+                state_dir=state_dir,
+                antigravity_dirs=[agy_dir],
+                sync_git=False,
+                now_ts=now_ts,
+                ps_output="",
+            )
+            self.assertEqual(paused_res["status"], "paused")
+            self.assertNotIn("auto_cleanup", paused_res)
+            self.assertTrue(merged_db.is_file())
+            watchdog._orch_ctrl.resume_orchestration(state_dir=state_dir, request_wake=False)
+
+            # 3. Active & interval elapsed -> runs cleanup, then cooldown-gates within 3600s
+            ran_res = watchdog.run_watchdog_cycle(
+                state_dir=state_dir,
+                antigravity_dirs=[agy_dir],
+                sync_git=False,
+                now_ts=now_ts,
+                ps_output="",
+                env={"AGY_AUTO_CLEANUP_INTERVAL_SECONDS": "3600"},
+            )
+            self.assertEqual(ran_res["status"], "healthy")
+            self.assertTrue(ran_res["auto_cleanup"]["ran"])
+            self.assertEqual(ran_res["auto_cleanup"]["deleted_count"], 1)
+            self.assertEqual(ran_res["auto_cleanup"]["sidecar_events_pruned_count"], 1)
+            self.assertFalse(merged_db.exists())
+            self.assertFalse(ev_old.exists())
+
+            cd_res = watchdog.run_watchdog_cycle(
+                state_dir=state_dir,
+                antigravity_dirs=[agy_dir],
+                sync_git=False,
+                now_ts=now_ts + 1200.0,
+                ps_output="",
+                env={"AGY_AUTO_CLEANUP_INTERVAL_SECONDS": "3600"},
+            )
+            self.assertEqual(cd_res["auto_cleanup"]["status"], "cooldown")
+            self.assertFalse(cd_res["auto_cleanup"]["ran"])
+
+            # 4. After 3600s -> runs again
+            ev_old_2 = agy_dir / "sidecar_data" / "demo-sidecar" / "events" / "old2.json"
+            ev_old_2.write_text("{}\n", encoding="utf-8")
+            os.utime(ev_old_2, (now_ts - 30 * 3600.0, now_ts - 30 * 3600.0))
+            next_res = watchdog.run_watchdog_cycle(
+                state_dir=state_dir,
+                antigravity_dirs=[agy_dir],
+                sync_git=False,
+                now_ts=now_ts + 3601.0,
+                ps_output="",
+                env={"AGY_AUTO_CLEANUP_INTERVAL_SECONDS": "3600"},
+            )
+            self.assertTrue(next_res["auto_cleanup"]["ran"])
+            self.assertEqual(next_res["auto_cleanup"]["sidecar_events_pruned_count"], 1)
+            self.assertFalse(ev_old_2.exists())
+
 
 class TestStandbyDependencyDeadlockAndNSlotLookahead(unittest.TestCase):
     """Hermetic tests for `standby_dependency_deadlock` (optimizer + doctor) and N-slot optimizer lookahead."""

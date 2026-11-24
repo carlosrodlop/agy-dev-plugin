@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -185,6 +186,65 @@ def _maybe_auto_reload_process(
         return (False, cur_fp, err_msg)
 
 
+def _is_merged_lock_sync_result(sync_res: Mapping[str, Any]) -> bool:
+    """Return True when `sync_dev_pr_lock_with_git()` released one or more repository locks as merged."""
+    if not sync_res or not bool(sync_res.get("released")):
+        return False
+    reason = str(sync_res.get("reason") or "").strip()
+    if reason in _MERGED_LOCK_RELEASE_REASONS_SET or bool(sync_res.get("slot1_merged")):
+        return True
+    per_repo = sync_res.get("results_by_repo")
+    if isinstance(per_repo, Mapping):
+        for r_info in per_repo.values():
+            if not isinstance(r_info, Mapping) or not bool(r_info.get("released")):
+                continue
+            r_reason = str(r_info.get("reason") or "").strip()
+            if r_reason in _MERGED_LOCK_RELEASE_REASONS_SET or bool(r_info.get("slot1_merged")):
+                return True
+    return False
+
+
+def _run_post_merge_auto_cleanup(
+    *,
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    repos_dir: Path | str | None = None,
+    now_ts: float | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Execute 0-LLM post-merge cleanup safely without crashing the merge watcher or touching real `$HOME` in tests."""
+    eff_env = os.environ if env is None else env
+    has_root_override = any(
+        x is not None for x in (antigravity_dirs, brain_dir, conversations_dir, cli_dir)
+    ) or bool(str(eff_env.get("AGY_ANTIGRAVITY_DIR") or "").strip() or str(eff_env.get("AGY_ANTIGRAVITY_CLI_DIR") or "").strip())
+    if not has_root_override and ("unittest" in sys.modules or "pytest" in sys.modules):
+        return {"status": "skipped", "reason": "hermetic_test_guard"}
+    try:
+        fn = _facade_attr("cleanup_merged_conversations", cleanup_merged_conversations)
+        return fn(
+            all_merged=True,
+            include_noop_actions=True,
+            include_scheduled_actions=True,
+            include_sidecar_events=True,
+            include_orphans=True,
+            portfolio_dir=portfolio_dir,
+            brain_dir=brain_dir,
+            conversations_dir=conversations_dir,
+            cli_dir=cli_dir,
+            antigravity_dirs=antigravity_dirs,
+            git_client=git_client,
+            repos_dir=repos_dir,
+            now_ts=now_ts,
+            env=env,
+        )
+    except Exception as exc:
+        return {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
+
+
 def run_pr_merge_watcher_loop(
     poll_interval_seconds: float = 15.0,
     max_duration_seconds: float = 14400.0,
@@ -196,8 +256,16 @@ def run_pr_merge_watcher_loop(
     watched_paths_override: Sequence[Path] | None = None,
     raw_argv: Sequence[str] | None = None,
     warn_stream: TextIO | None = None,
+    auto_cleanup: bool = True,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    repos_dir: Path | str | None = None,
+    now_ts: float | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Poll `sync_dev_pr_lock_with_git()` until `dev_pr_lock` is released (PR merged into `main` or remote branch deleted), auto-reloading on clean script updates, fast-forwarding local `main`, pruning the local `fix/*` branch, and self-terminating."""
+    """Poll `sync_dev_pr_lock_with_git()` until `dev_pr_lock` is released (PR merged into `main` or remote branch deleted), auto-reloading on clean script updates, fast-forwarding local `main`, running immediate 0-LLM post-merge cleanup, and self-terminating."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
     tmp_dir = p_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -240,6 +308,7 @@ def run_pr_merge_watcher_loop(
         paused_elapsed_offset = 0.0
         iterations = 0
         last_sync: dict[str, Any] = {}
+        last_cleanup: dict[str, Any] | None = None
 
         while True:
             reloaded, baseline_fp, _ = _maybe_auto_reload_process(
@@ -284,8 +353,20 @@ def run_pr_merge_watcher_loop(
                 continue
 
             last_sync = _facade_attr("sync_dev_pr_lock_with_git", sync_dev_pr_lock_with_git)(portfolio_dir=portfolio_dir, git_client=git_client)
+            if auto_cleanup and _is_merged_lock_sync_result(last_sync):
+                last_cleanup = _run_post_merge_auto_cleanup(
+                    portfolio_dir=portfolio_dir,
+                    git_client=git_client,
+                    brain_dir=brain_dir,
+                    conversations_dir=conversations_dir,
+                    cli_dir=cli_dir,
+                    antigravity_dirs=antigravity_dirs,
+                    repos_dir=repos_dir,
+                    now_ts=now_ts,
+                    env=env,
+                )
             if not last_sync.get("active"):
-                return {
+                out_done: dict[str, Any] = {
                     "status": "ok",
                     "already_running": False,
                     "terminated": True,
@@ -294,8 +375,11 @@ def run_pr_merge_watcher_loop(
                     "iterations": iterations,
                     "last_sync": last_sync,
                 }
+                if last_cleanup is not None:
+                    out_done["post_merge_cleanup"] = last_cleanup
+                return out_done
             if max_iterations is not None and iterations >= max_iterations:
-                return {
+                out_max_iter: dict[str, Any] = {
                     "status": "ok",
                     "already_running": False,
                     "terminated": False,
@@ -304,6 +388,9 @@ def run_pr_merge_watcher_loop(
                     "iterations": iterations,
                     "last_sync": last_sync,
                 }
+                if last_cleanup is not None:
+                    out_max_iter["post_merge_cleanup"] = last_cleanup
+                return out_max_iter
             if ((time.monotonic() - start_mono) - paused_elapsed_offset) >= max_duration_seconds:
                 return {
                     "status": "ok",
@@ -685,7 +772,49 @@ _QUEUE_REF_TOKEN_RE = re.compile(
     r"\b([0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|-[a-z0-9][a-z0-9_-]{1,80})?)\b",
     re.IGNORECASE,
 )
-DEFAULT_NOOP_ACTION_RETENTION_DAYS = 7.0
+_FIX_BRANCH_CID8_RE = re.compile(r"\bfix/[A-Za-z0-9._-]+-([0-9a-f]{8})\b", re.IGNORECASE)
+_COMPANION_UUID_FILE_RE = re.compile(
+    r"^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(?:pbtxt|lock)$",
+    re.IGNORECASE,
+)
+DEFAULT_ACTION_CLEANUP_NOOP_HOURS = 24.0
+DEFAULT_ACTION_CLEANUP_DELIVERABLE_HOURS = 24.0
+DEFAULT_ACTION_CLEANUP_UNAUDITED_CAP_HOURS = 72.0
+DEFAULT_SIDECAR_EVENT_RETENTION_HOURS = 24.0
+DEFAULT_NOOP_ACTION_RETENTION_DAYS = DEFAULT_ACTION_CLEANUP_NOOP_HOURS / 24.0
+STALE_STEP_RUNNING_IDLE_SECONDS = 3600.0
+_MERGED_LOCK_RELEASE_REASONS_SET: frozenset[str] = frozenset(
+    {
+        "BRANCH_MERGED_INTO_MAIN",
+        "HUMAN_VALIDATED_MANUAL_PR",
+        "SLOT1_MERGED_SLOT2_PROMOTED",
+    }
+)
+_AUDITED_RESOLVED_VERDICTS: frozenset[str] = frozenset(
+    {
+        "HEALED",
+        "STAGE_PROPOSED",
+        "APPLIED_AND_SYNCED",
+        "VERIFIED_OK",
+        "OBSOLETE_PRUNED",
+        "OBSOLETE",
+    }
+)
+
+
+def _resolve_cleanup_hours(
+    env_var: str,
+    default_hours: float,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> float:
+    """Resolve a cleanup retention threshold in hours from environment or default (>= 0.0)."""
+    eff_env = os.environ if env is None else env
+    raw = str(eff_env.get(env_var) or "").strip()
+    if raw:
+        with contextlib.suppress(TypeError, ValueError):
+            return max(0.0, float(raw))
+    return max(0.0, float(default_hours))
 
 
 def _resolve_antigravity_dirs(
@@ -922,6 +1051,8 @@ def _load_conversation_summaries_graph(
 ) -> dict[str, Any]:
     """Read `conversation_summaries.db` strictly read-only across runtimes, gracefully ignoring missing/corrupt DBs."""
     running_cids: set[str] = set()
+    status_by_cid: dict[str, str] = {}
+    agent_name_by_cid: dict[str, str] = {}
     parent_by_cid: dict[str, str] = {}
     children_by_parent: dict[str, list[str]] = {}
     last_modified_by_cid: dict[str, str] = {}
@@ -969,8 +1100,9 @@ def _load_conversation_summaries_graph(
                     sel_parent = "COALESCE(parent_conversation_id, '')" if "parent_conversation_id" in cols else "''"
                     sel_mtime = "COALESCE(last_modified_time, '')" if "last_modified_time" in cols else "''"
                     sel_title = "COALESCE(title, '')" if "title" in cols else "''"
+                    sel_agent = "COALESCE(agent_name, '')" if "agent_name" in cols else "''"
                     sql = (
-                        f"SELECT conversation_id, {sel_status}, {sel_parent}, {sel_mtime}, {sel_title} "
+                        f"SELECT conversation_id, {sel_status}, {sel_parent}, {sel_mtime}, {sel_title}, {sel_agent} "
                         "FROM conversation_summaries"
                     )
                     for row in conn.execute(sql).fetchall():
@@ -982,8 +1114,14 @@ def _load_conversation_summaries_graph(
                         par_val = str(row[2] or "").strip().lower()
                         mod_val = str(row[3] or "").strip()
                         ttl_val = str(row[4] or "").strip()
+                        agn_val = str(row[5] or "").strip().lower()
                         if st_val in ("CASCADE_RUN_STATUS_RUNNING", "RUNNING") or st_val.endswith("_RUNNING"):
                             running_cids.add(cid)
+                            status_by_cid[cid] = st_val
+                        elif st_val and cid not in running_cids:
+                            status_by_cid.setdefault(cid, st_val)
+                        if agn_val and cid not in agent_name_by_cid:
+                            agent_name_by_cid[cid] = agn_val
                         if par_val and par_val != cid:
                             parent_by_cid.setdefault(cid, par_val)
                             ch_list = children_by_parent.setdefault(par_val, [])
@@ -1018,6 +1156,8 @@ def _load_conversation_summaries_graph(
 
     return {
         "running_cids": running_cids,
+        "status_by_cid": status_by_cid,
+        "agent_name_by_cid": agent_name_by_cid,
         "parent_by_cid": parent_by_cid,
         "children_by_parent": children_by_parent,
         "last_modified_by_cid": last_modified_by_cid,
@@ -1203,6 +1343,7 @@ def is_conversation_fully_idle(
     for r_spec in roots:
         b_dir = Path(r_spec["brain_dir"])
         c_dir = Path(r_spec["conversations_dir"])
+        ann_dir = Path(r_spec["annotations_dir"])
         pres_dir = Path(r_spec["presence_dir"])
         for cand_id in dict.fromkeys((cid, cid_lower)):
             tp = b_dir / cand_id / ".system_generated" / "logs" / "transcript.jsonl"
@@ -1210,26 +1351,37 @@ def is_conversation_fully_idle(
             mtime_artifacts.append(tp)
             for ext in (".db", ".db-wal", ".db-shm", ".db-journal", ".pb"):
                 mtime_artifacts.append(c_dir / f"{cand_id}{ext}")
-        with contextlib.suppress(OSError):
-            if pres_dir.is_dir():
-                for p_entry in pres_dir.iterdir():
-                    if _matches_companion_artifact_name(p_entry.name, cid_lower):
-                        mtime_artifacts.append(p_entry)
+        for comp_dir in (pres_dir, ann_dir):
+            with contextlib.suppress(OSError):
+                if comp_dir.is_dir():
+                    for p_entry in comp_dir.iterdir():
+                        if _matches_companion_artifact_name(p_entry.name, cid_lower):
+                            mtime_artifacts.append(p_entry)
 
-    if min_idle_seconds > 0:
-        seen_art: set[str] = set()
-        for artifact in mtime_artifacts:
-            key = str(artifact)
-            if key in seen_art:
-                continue
-            seen_art.add(key)
-            try:
-                if artifact.is_file():
-                    age = cur_ts - artifact.stat().st_mtime
-                    if age < min_idle_seconds:
-                        return False, f"not_fully_idle:recent_activity({round(age, 1)}s<{int(min_idle_seconds)}s)"
-            except OSError:
-                continue
+    min_disk_age: float | None = None
+    seen_art: set[str] = set()
+    for artifact in mtime_artifacts:
+        key = str(artifact)
+        if key in seen_art:
+            continue
+        seen_art.add(key)
+        try:
+            if artifact.is_file():
+                age = cur_ts - artifact.stat().st_mtime
+                if min_disk_age is None or age < min_disk_age:
+                    min_disk_age = age
+                if min_idle_seconds > 0 and age < min_idle_seconds:
+                    return False, f"not_fully_idle:recent_activity({round(age, 1)}s<{int(min_idle_seconds)}s)"
+        except OSError:
+            continue
+
+    summary_status = str((graph.get("status_by_cid") or {}).get(cid_lower) or "").strip().upper()
+    summary_reports_idle = summary_status in ("CASCADE_RUN_STATUS_IDLE", "IDLE")
+    allow_stale_running_override = (
+        summary_reports_idle
+        and min_disk_age is not None
+        and min_disk_age >= STALE_STEP_RUNNING_IDLE_SECONDS
+    )
 
     seen_tp: set[str] = set()
     for tpath in transcript_paths:
@@ -1250,8 +1402,27 @@ def is_conversation_fully_idle(
                 if isinstance(last_obj, dict):
                     st = str(last_obj.get("status") or "").strip().upper()
                     if st in ("RUNNING", "PENDING", "EXECUTING", "IN_PROGRESS", "QUEUED"):
+                        if allow_stale_running_override:
+                            continue
                         return False, f"not_fully_idle:step_status_{st}"
     return True, "idle"
+
+
+def _max_artifact_epoch(cid: str, roots: Sequence[Mapping[str, Any]]) -> float | None:
+    """Return latest mtime epoch across existing disk artifacts for `cid`, or `None` if absent."""
+    latest: float | None = None
+    for art in _collect_conversation_disk_artifacts(cid, roots):
+        p = Path(art["path"])
+        with contextlib.suppress(OSError):
+            if p.is_symlink():
+                mt = float(p.lstat().st_mtime)
+            elif p.exists():
+                mt = float(p.stat().st_mtime)
+            else:
+                continue
+            if latest is None or mt > latest:
+                latest = mt
+    return latest
 
 
 def collect_protected_conversation_ids(
@@ -1265,6 +1436,8 @@ def collect_protected_conversation_ids(
     antigravity_dirs: Sequence[Path | str] | None = None,
     summaries_db: Path | str | Sequence[Path | str] | None = None,
     summaries_graph: Mapping[str, Any] | None = None,
+    now_ts: float | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, list[str]]:
     """Collect protected conversation IDs/prefixes with exact reasons (orchestrator, non-done queue/prefixes, lock, RUNNING, upward ancestors, unaudited)."""
     protected: dict[str, list[str]] = {}
@@ -1339,6 +1512,22 @@ def collect_protected_conversation_ids(
         for cid in pending_t2:
             _protect_with_synthetic_prefix(str(cid), "pending_tier2_proposal")
 
+    roots = _resolve_antigravity_roots(
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=antigravity_dirs,
+    )
+    cur_now = float(now_ts if now_ts is not None else time.time())
+    unaudited_cap_seconds = (
+        _resolve_cleanup_hours(
+            "AGY_ACTION_CLEANUP_UNAUDITED_CAP_HOURS",
+            DEFAULT_ACTION_CLEANUP_UNAUDITED_CAP_HOURS,
+            env=env,
+        )
+        * 3600.0
+    )
+
     if include_unaudited_check:
         analyzer_candidates = [
             Path.home()
@@ -1370,11 +1559,14 @@ def collect_protected_conversation_ids(
                 if spec and spec.loader:
                     ca_mod = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(ca_mod)
-                    b_dir, _ = _resolve_antigravity_dirs(brain_dir=brain_dir)
+                    has_root_override = any(
+                        x is not None for x in (brain_dir, conversations_dir, cli_dir, antigravity_dirs)
+                    )
+                    agy_dir_arg = Path(roots[0]["root_dir"]) if (has_root_override and roots) else None
                     res = ca_mod.check_unaudited_action_runs(
                         limit=100,
                         portfolio_dir=p_dir,
-                        antigravity_dir=b_dir.parent if brain_dir else None,
+                        antigravity_dir=agy_dir_arg,
                         scheduled=False,
                     )
                     for key, label in (
@@ -1383,20 +1575,31 @@ def collect_protected_conversation_ids(
                         ("pending_tier2_proposals", "pending_tier2_proposal"),
                     ):
                         for item in res.get(key) or []:
-                            if isinstance(item, dict):
-                                for fld in ("conversation_id", "primary_conversation_id"):
-                                    if item.get(fld):
-                                        _protect(str(item[fld]), label)
-                                for lfld in ("sibling_conversation_ids", "all_conversation_ids"):
-                                    for scid in item.get(lfld) or []:
-                                        _protect(str(scid), label)
+                            if not isinstance(item, dict):
+                                continue
+                            cids_in_item: list[str] = []
+                            for fld in ("conversation_id", "primary_conversation_id"):
+                                if item.get(fld):
+                                    cids_in_item.append(str(item[fld]))
+                            for lfld in ("sibling_conversation_ids", "all_conversation_ids"):
+                                for scid in item.get(lfld) or []:
+                                    if scid:
+                                        cids_in_item.append(str(scid))
+                            if label != "pending_tier2_proposal" and unaudited_cap_seconds > 0:
+                                ts_epochs: list[float] = []
+                                for ts_fld in ("latest_timestamp", "timestamp", "updated_at"):
+                                    ep = _parse_iso_epoch_seconds(str(item.get(ts_fld) or ""))
+                                    if ep is not None:
+                                        ts_epochs.append(ep)
+                                for c_cand in cids_in_item:
+                                    disk_ep = _max_artifact_epoch(c_cand, roots)
+                                    if disk_ep is not None:
+                                        ts_epochs.append(disk_ep)
+                                if ts_epochs and (cur_now - max(ts_epochs)) >= unaudited_cap_seconds:
+                                    continue
+                            for c_val in cids_in_item:
+                                _protect(c_val, label)
 
-    roots = _resolve_antigravity_roots(
-        brain_dir=brain_dir,
-        conversations_dir=conversations_dir,
-        cli_dir=cli_dir,
-        antigravity_dirs=antigravity_dirs,
-    )
     graph = (
         summaries_graph
         if summaries_graph is not None
@@ -1790,27 +1993,37 @@ def _find_unmerged_local_branches_for_queue_item(
     return unmerged
 
 
-def _discover_noop_action_conversations(
+def _discover_scheduled_action_conversations(
     p_dir: Path,
     roots: Sequence[Mapping[str, Any]],
     summaries_graph: Mapping[str, Any],
     *,
-    older_than_days: float,
+    noop_hours: float,
+    deliverable_hours: float,
+    unaudited_cap_hours: float,
     now_ts: float,
     queue_items: Sequence[Mapping[str, Any]] = (),
-) -> list[str]:
-    """Discover idle scheduled `NO_OP` action root conversations older than `older_than_days` with zero deliverables/errors."""
-    cutoff_ts = float(now_ts) - max(0.0, float(older_than_days)) * 86400.0
+    include_deliverable_and_unaudited: bool = True,
+) -> list[tuple[str, str]]:
+    """Discover idle scheduled action roots classified as `noop_actions`, `deliverable_actions`, or `unaudited_expired_actions`."""
+    noop_cutoff_ts = float(now_ts) - max(0.0, float(noop_hours)) * 3600.0
+    deliverable_cutoff_ts = float(now_ts) - max(0.0, float(deliverable_hours)) * 3600.0
+    unaudited_cutoff_ts = float(now_ts) - max(0.0, float(unaudited_cap_hours)) * 3600.0
+
     parent_by_cid: Mapping[str, str] = summaries_graph.get("parent_by_cid") or {}
     last_mod_by_cid: Mapping[str, str] = summaries_graph.get("last_modified_by_cid") or {}
     titles_by_cid: Mapping[str, str] = summaries_graph.get("titles_by_cid") or {}
     running_cids: set[str] = set(summaries_graph.get("running_cids") or set())
 
-    queue_cids = [str(it.get("conversation_id") or "").strip().lower() for it in queue_items if str(it.get("conversation_id") or "").strip()]
-    discovered: list[str] = []
+    queue_cids = [
+        str(it.get("conversation_id") or "").strip().lower()
+        for it in queue_items
+        if str(it.get("conversation_id") or "").strip()
+    ]
+    discovered: list[tuple[str, str]] = []
     seen: set[str] = set()
 
-    def _is_older_than_cutoff(cid: str, extra_epochs: Sequence[float]) -> bool:
+    def _is_older_than_cutoff(cid: str, extra_epochs: Sequence[float], cutoff_ts: float) -> bool:
         epochs: list[float] = [float(e) for e in extra_epochs if e and float(e) > 0]
         mod_iso = last_mod_by_cid.get(cid, "")
         mod_ep = _parse_iso_epoch_seconds(mod_iso)
@@ -1836,6 +2049,21 @@ def _discover_noop_action_conversations(
                 return True
         return False
 
+    deliverable_cids: set[str] = set()
+    alert_cids: set[str] = set()
+    audited_resolved_cids: set[str] = set()
+
+    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
+    audit_state = (
+        state_obj.get("actions_log_audit_state")
+        if isinstance(state_obj.get("actions_log_audit_state"), dict)
+        else {}
+    )
+    legacy_audited = audit_state.get("audited_runs") if isinstance(audit_state.get("audited_runs"), dict) else {}
+    for a_cid, a_rec in legacy_audited.items():
+        if isinstance(a_rec, dict) and str(a_rec.get("resolution") or "").strip().upper() in _AUDITED_RESOLVED_VERDICTS:
+            audited_resolved_cids.add(str(a_cid).strip().lower())
+
     ledger_db = p_dir / "actions_ledger.db"
     conn = _open_sqlite_readonly(ledger_db)
     if conn is not None:
@@ -1844,8 +2072,6 @@ def _discover_noop_action_conversations(
                 str(r[0] or "").strip()
                 for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             }
-            deliverable_cids: set[str] = set()
-            alert_cids: set[str] = set()
             if "action_deliverables_ledger" in tables:
                 with contextlib.suppress(sqlite3.Error):
                     for r in conn.execute("SELECT DISTINCT LOWER(conversation_id) FROM action_deliverables_ledger").fetchall():
@@ -1859,6 +2085,13 @@ def _discover_noop_action_conversations(
                     ).fetchall():
                         if r[0]:
                             alert_cids.add(str(r[0]).strip())
+            if "action_audit_verdicts" in tables:
+                with contextlib.suppress(sqlite3.Error):
+                    for r in conn.execute(
+                        "SELECT LOWER(conversation_id), UPPER(COALESCE(resolution, '')) FROM action_audit_verdicts"
+                    ).fetchall():
+                        if r[0] and str(r[1] or "").strip() in _AUDITED_RESOLVED_VERDICTS:
+                            audited_resolved_cids.add(str(r[0]).strip())
 
             if "transcript_parse_cache" in tables:
                 cols = {
@@ -1879,8 +2112,6 @@ def _discover_noop_action_conversations(
                             or cid in seen
                             or cid in running_cids
                             or cid in parent_by_cid
-                            or cid in deliverable_cids
-                            or cid in alert_cids
                             or _matches_any_queue_item(cid)
                         ):
                             continue
@@ -1890,39 +2121,62 @@ def _discover_noop_action_conversations(
                             continue
                         if not isinstance(parsed, dict):
                             continue
-                        if (
-                            parsed.get("step_errors")
+
+                        last_st = str(parsed.get("last_step_status") or "").strip().upper()
+                        if last_st in ("RUNNING", "PENDING", "EXECUTING", "IN_PROGRESS", "QUEUED"):
+                            continue
+
+                        val_verdict = str(parsed.get("validator_verdict") or "").strip().upper()
+                        has_warn_or_error = bool(
+                            cid in alert_cids
+                            or parsed.get("step_errors")
                             or parsed.get("cmd_nonzero_exits")
                             or parsed.get("last_cmd_failed_unrecovered")
                             or parsed.get("last_tool_step_failed")
-                            or str(parsed.get("last_step_status") or "").strip().upper()
-                            in ("ERROR", "RUNNING", "PENDING", "EXECUTING", "IN_PROGRESS", "QUEUED")
-                            or str(parsed.get("validator_verdict") or "").strip().upper() == "NEEDS_REVISION"
+                            or last_st == "ERROR"
+                            or val_verdict == "NEEDS_REVISION"
+                        )
+                        is_audited = cid in audited_resolved_cids or cid[:8] in audited_resolved_cids
+
+                        has_deliverable_markers = bool(
+                            cid in deliverable_cids
                             or parsed.get("deliverable_urls")
                             or parsed.get("action_deliverable_op")
                             or parsed.get("sync_committed_or_pushed")
                             or parsed.get("remediation_branch")
                             or parsed.get("manual_pr_url")
-                        ):
-                            continue
-
+                        )
                         explicit_outcome = str(parsed.get("outcome") or "").strip().upper()
-                        if explicit_outcome:
-                            if explicit_outcome not in ("NO_OP", "NO_OP_GATE", "NOOP"):
-                                continue
-                        else:
+                        is_explicit_noop = explicit_outcome in ("NO_OP", "NO_OP_GATE", "NOOP")
+                        if not explicit_outcome:
                             scripts = [str(s) for s in (parsed.get("scripts") or [])]
                             tools = [str(t) for t in (parsed.get("tools") or [])]
                             total_steps = int(parsed.get("total_steps") or 0)
                             act_name = str(parsed.get("detected_action") or "").strip()
-                            if (
+                            implicit_deliverable = (
                                 any(s in scripts for s in ("gmail_draft_client.py", "response_validator.py"))
                                 or any("invoke_subagent" in t for t in tools)
                                 or (act_name == "morning-system-health-check")
                                 or (act_name == "agy-conf-sync" and total_steps >= 8)
                                 or total_steps >= 12
-                            ):
+                            )
+                        else:
+                            implicit_deliverable = not is_explicit_noop
+
+                        is_deliverable = has_deliverable_markers or implicit_deliverable
+                        if has_warn_or_error and not is_audited:
+                            if not include_deliverable_and_unaudited:
                                 continue
+                            cat = "unaudited_expired_actions"
+                            cutoff = unaudited_cutoff_ts
+                        elif is_deliverable or (has_warn_or_error and is_audited):
+                            if not include_deliverable_and_unaudited:
+                                continue
+                            cat = "deliverable_actions"
+                            cutoff = deliverable_cutoff_ts
+                        else:
+                            cat = "noop_actions"
+                            cutoff = noop_cutoff_ts
 
                         extra_ts: list[float] = []
                         for ts_key in ("last_ts", "first_ts"):
@@ -1937,16 +2191,16 @@ def _discover_noop_action_conversations(
                             if upd_ep is not None:
                                 extra_ts.append(upd_ep)
 
-                        if _is_older_than_cutoff(cid, extra_ts) and _collect_conversation_disk_artifacts(cid, roots):
+                        if _is_older_than_cutoff(cid, extra_ts, cutoff) and _collect_conversation_disk_artifacts(cid, roots):
                             seen.add(cid)
-                            discovered.append(cid)
+                            discovered.append((cid, cat))
         except sqlite3.Error:
             pass
         finally:
             with contextlib.suppress(sqlite3.Error):
                 conn.close()
 
-    # Fallback discovery via `conversation_summaries.db` `Scheduled Action:` titles + clean short transcripts
+    # Fallback discovery via `conversation_summaries.db` `Scheduled Action:` titles + transcripts
     for cid, title in sorted(titles_by_cid.items()):
         if (
             cid in seen
@@ -1956,12 +2210,15 @@ def _discover_noop_action_conversations(
             or _matches_any_queue_item(cid)
         ):
             continue
-        if "morning-system-health-check" in str(title).lower():
-            continue
-        if not _collect_conversation_disk_artifacts(cid, roots) or not _is_older_than_cutoff(cid, ()):
+        if not _collect_conversation_disk_artifacts(cid, roots):
             continue
 
-        transcript_ok = True
+        has_error_step = cid in alert_cids
+        has_active_step = False
+        has_deliv_marker = (
+            cid in deliverable_cids
+            or "morning-system-health-check" in str(title).lower()
+        )
         step_count = 0
         for r_spec in roots:
             tp = Path(r_spec["brain_dir"]) / cid / ".system_generated" / "logs" / "transcript.jsonl"
@@ -1970,14 +2227,13 @@ def _discover_noop_action_conversations(
             try:
                 raw_txt = tp.read_text(encoding="utf-8", errors="ignore")
             except OSError:
-                transcript_ok = False
+                has_active_step = True
                 break
             if any(
                 marker in raw_txt
                 for marker in ("docs.google.com/", "mail.google.com/", "invoke_subagent", "gmail_draft_client.py")
             ):
-                transcript_ok = False
-                break
+                has_deliv_marker = True
             for raw_ln in raw_txt.splitlines():
                 if not raw_ln.strip():
                     continue
@@ -1988,26 +2244,825 @@ def _discover_noop_action_conversations(
                     continue
                 if isinstance(st_obj, dict):
                     st_u = str(st_obj.get("status") or "").strip().upper()
-                    if st_u in ("ERROR", "RUNNING", "PENDING", "EXECUTING", "IN_PROGRESS", "QUEUED"):
-                        transcript_ok = False
-                        break
-        if transcript_ok and step_count < 12:
+                    if st_u in ("RUNNING", "PENDING", "EXECUTING", "IN_PROGRESS", "QUEUED"):
+                        has_active_step = True
+                    elif st_u == "ERROR":
+                        has_error_step = True
+        if has_active_step:
+            continue
+        is_audited = cid in audited_resolved_cids or cid[:8] in audited_resolved_cids
+        if has_error_step and not is_audited:
+            if not include_deliverable_and_unaudited:
+                continue
+            cat = "unaudited_expired_actions"
+            cutoff = unaudited_cutoff_ts
+        elif has_deliv_marker or step_count >= 12 or (has_error_step and is_audited):
+            if not include_deliverable_and_unaudited:
+                continue
+            cat = "deliverable_actions"
+            cutoff = deliverable_cutoff_ts
+        else:
+            cat = "noop_actions"
+            cutoff = noop_cutoff_ts
+
+        if _is_older_than_cutoff(cid, (), cutoff):
             seen.add(cid)
-            discovered.append(cid)
+            discovered.append((cid, cat))
 
     return discovered
 
 
+def _discover_noop_action_conversations(
+    p_dir: Path,
+    roots: Sequence[Mapping[str, Any]],
+    summaries_graph: Mapping[str, Any],
+    *,
+    older_than_days: float,
+    now_ts: float,
+    queue_items: Sequence[Mapping[str, Any]] = (),
+) -> list[str]:
+    """Discover idle scheduled `NO_OP` action root conversations older than `older_than_days` with zero deliverables/errors."""
+    pairs = _discover_scheduled_action_conversations(
+        p_dir,
+        roots,
+        summaries_graph,
+        noop_hours=max(0.0, float(older_than_days)) * 24.0,
+        deliverable_hours=DEFAULT_ACTION_CLEANUP_DELIVERABLE_HOURS,
+        unaudited_cap_hours=DEFAULT_ACTION_CLEANUP_UNAUDITED_CAP_HOURS,
+        now_ts=now_ts,
+        queue_items=queue_items,
+        include_deliverable_and_unaudited=False,
+    )
+    return [cid for cid, cat in pairs if cat == "noop_actions"]
+
+
+def _collect_disk_present_cids(roots: Sequence[Mapping[str, Any]]) -> set[str]:
+    """Collect lowercase CIDs/UUIDs that have `brain/` or `conversations/` artifacts on disk across `roots`."""
+    present: set[str] = set()
+    for r_spec in roots:
+        b_dir = Path(r_spec["brain_dir"])
+        with contextlib.suppress(OSError):
+            if b_dir.is_dir():
+                for entry in b_dir.iterdir():
+                    if entry.is_dir() and _CONVERSATION_UUID_RE.fullmatch(entry.name.strip()):
+                        present.add(entry.name.strip().lower())
+        c_dir = Path(r_spec["conversations_dir"])
+        with contextlib.suppress(OSError):
+            if c_dir.is_dir():
+                for entry in c_dir.iterdir():
+                    stem = entry.name.split(".", 1)[0].strip()
+                    if _CONVERSATION_UUID_RE.fullmatch(stem):
+                        present.add(stem.lower())
+    return present
+
+
+def _read_transcript_head_text(cid: str, roots: Sequence[Mapping[str, Any]], max_bytes: int = 16384) -> str:
+    """Read the leading `max_bytes` of `transcript.jsonl` for `cid` across `roots`."""
+    for r_spec in roots:
+        for cand_id in dict.fromkeys((cid, cid.lower())):
+            tp = Path(r_spec["brain_dir"]) / cand_id / ".system_generated" / "logs" / "transcript.jsonl"
+            if tp.is_file():
+                with contextlib.suppress(OSError), open(tp, "rb") as fh:
+                    return fh.read(max_bytes).decode("utf-8", errors="ignore")
+    return ""
+
+
+def _discover_orchestrator_roots_and_subagents(
+    q_data: Mapping[str, Any],
+    roots: Sequence[Mapping[str, Any]],
+    summaries_graph: Mapping[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Discover rotated idle orchestrator roots and all active/rotated orchestrator CIDs for subagent sweeps."""
+    active_orch_raw = str(q_data.get("orchestrator_conversation_id") or "").strip()
+    active_orch_cids: set[str] = set()
+    if active_orch_raw:
+        for resolved in _resolve_uuid_candidates_for_queue_id(active_orch_raw, roots, summaries_graph):
+            active_orch_cids.add(resolved.lower())
+
+    parent_by_cid: Mapping[str, str] = summaries_graph.get("parent_by_cid") or {}
+    titles_by_cid: Mapping[str, str] = summaries_graph.get("titles_by_cid") or {}
+    agent_name_by_cid: Mapping[str, str] = summaries_graph.get("agent_name_by_cid") or {}
+
+    candidate_roots: set[str] = set(summaries_graph.get("all_cids") or ()) | _collect_disk_present_cids(roots)
+    rotated_orchestrators: list[str] = []
+    all_orchestrators: list[str] = sorted(active_orch_cids)
+    seen_orch: set[str] = set(active_orch_cids)
+
+    for cid in sorted(candidate_roots):
+        c_low = cid.strip().lower()
+        if not c_low or c_low in seen_orch or c_low in parent_by_cid:
+            continue
+        title_l = str(titles_by_cid.get(c_low) or "").strip().lower()
+        agent_l = str(agent_name_by_cid.get(c_low) or "").strip().lower()
+        is_orch = (
+            title_l.startswith("[agy-doctor] orchestrator recovery")
+            or title_l in ("main dev queue orchestrator", "dev queue orchestrator")
+            or agent_l == "agy-dev-orchestrator"
+        )
+        if not is_orch:
+            head_txt = _read_transcript_head_text(c_low, roots)
+            if head_txt and (
+                "[agy-doctor Auto-Wake Recovery]" in head_txt
+                or ("agy-dev-orchestrator.md" in head_txt and "Previous Orchestrator CID:" in head_txt)
+            ):
+                is_orch = True
+        if is_orch:
+            seen_orch.add(c_low)
+            rotated_orchestrators.append(c_low)
+            all_orchestrators.append(c_low)
+
+    return rotated_orchestrators, all_orchestrators
+
+
+def _collect_repo_dirs_for_cleanup(
+    p_dir: Path,
+    q_data: Mapping[str, Any],
+    *,
+    git_client: GitVcsIntegrationClient | None = None,
+    repos_dir: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> list[Path]:
+    """Collect distinct local `.git` repository directories referenced by state, queue, `repos_dir`, or `git_client`."""
+    eff_env = os.environ if env is None else env
+    repo_dirs: list[Path] = []
+    seen_resolved: set[str] = set()
+
+    def _add_repo(raw_path: Path | str | None) -> None:
+        if raw_path is None:
+            return
+        s = str(raw_path).strip()
+        if not s:
+            return
+        cand = Path(s.replace("$HOME", str(Path.home()))).expanduser()
+        if not (cand / ".git").exists():
+            return
+        with contextlib.suppress(OSError):
+            key = str(cand.resolve())
+            if key not in seen_resolved:
+                seen_resolved.add(key)
+                repo_dirs.append(cand)
+
+    base_repo: Path | None = None
+    if git_client is not None:
+        base_repo = git_client.resolve_repo_dir()
+        _add_repo(base_repo)
+    elif str(eff_env.get("AGY_CONF_REPO_DIR") or "").strip():
+        _add_repo(str(eff_env["AGY_CONF_REPO_DIR"]).strip())
+    else:
+        with contextlib.suppress(Exception):
+            base_repo = GitVcsIntegrationClient().resolve_repo_dir()
+            _add_repo(base_repo)
+
+    raw_repos_dir = repos_dir or str(eff_env.get("AGY_REPOS_DIR") or "").strip() or None
+    if raw_repos_dir:
+        r_parent = Path(str(raw_repos_dir)).expanduser()
+        with contextlib.suppress(OSError):
+            if r_parent.is_dir():
+                for child in sorted(r_parent.iterdir(), key=lambda p: p.name):
+                    if child.is_dir():
+                        _add_repo(child)
+
+    def _add_hint(hint: str) -> None:
+        clean = str(hint or "").strip()
+        if not clean:
+            return
+        _add_repo(clean)
+        r_name = clean.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+        if r_name and base_repo is not None:
+            if base_repo.name == r_name:
+                _add_repo(base_repo)
+            _add_repo(base_repo.parent / r_name)
+
+    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
+    audit_state = (
+        state_obj.get("actions_log_audit_state")
+        if isinstance(state_obj.get("actions_log_audit_state"), dict)
+        else {}
+    )
+    for lock_entry in _read_locks_state(audit_state).values():
+        if not isinstance(lock_entry, dict):
+            continue
+        for key in ("target_repo_dir", "repo_slug"):
+            if lock_entry.get(key):
+                _add_hint(str(lock_entry[key]))
+        for rb_key in ("repo_branches", "last_repo_branches"):
+            rb_map = lock_entry.get(rb_key)
+            if isinstance(rb_map, dict):
+                for rb_val in rb_map.values():
+                    if isinstance(rb_val, dict):
+                        _add_hint(str(rb_val.get("target_repo_dir") or rb_val.get("repo_slug") or ""))
+
+    for q_it in q_data.get("items") or []:
+        for slug in q_it.get("repo_slugs") or []:
+            _add_hint(str(slug))
+
+    return repo_dirs
+
+
+def _collect_repo_branch_merge_index(
+    p_dir: Path,
+    q_data: Mapping[str, Any],
+    *,
+    git_client: GitVcsIntegrationClient | None = None,
+    repos_dir: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[set[str], set[str]]:
+    """Return `(merged_cid8, unmerged_cid8)` across local Git repos and inactive released locks (zero network calls)."""
+    merged_cid8: set[str] = set()
+    unmerged_cid8: set[str] = set()
+
+    repo_dirs = _collect_repo_dirs_for_cleanup(
+        p_dir,
+        q_data,
+        git_client=git_client,
+        repos_dir=repos_dir,
+        env=env,
+    )
+    for r_dir in repo_dirs:
+        base_ref = ""
+        for cand_base in ("refs/remotes/origin/main", "refs/heads/main"):
+            p_base = subprocess.run(
+                ["git", "-C", str(r_dir), "rev-parse", "--verify", cand_base],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if p_base.returncode == 0:
+                base_ref = cand_base
+                break
+        if not base_ref:
+            continue
+
+        merged_branches_in_repo: set[str] = set()
+        log_proc = subprocess.run(
+            ["git", "-C", str(r_dir), "log", "-n", "200", "--format=%s%n%b", base_ref],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if log_proc.returncode == 0 and log_proc.stdout:
+            for match in _FIX_BRANCH_CID8_RE.finditer(log_proc.stdout):
+                merged_cid8.add(match.group(1).lower())
+                merged_branches_in_repo.add(match.group(0).lower())
+
+        for merged_cmd in (
+            ["git", "-C", str(r_dir), "branch", "--merged", base_ref, "--list", "fix/*"],
+            ["git", "-C", str(r_dir), "branch", "-r", "--merged", base_ref, "--list", "origin/fix/*"],
+        ):
+            m_proc = subprocess.run(merged_cmd, capture_output=True, text=True, timeout=5, check=False)
+            if m_proc.returncode == 0 and m_proc.stdout:
+                for line in m_proc.stdout.splitlines():
+                    br = line.strip().lstrip("*+ ").removeprefix("origin/")
+                    m_cid = _FIX_BRANCH_CID8_RE.search(br)
+                    if m_cid:
+                        merged_cid8.add(m_cid.group(1).lower())
+                        merged_branches_in_repo.add(br.lower())
+
+        ref_proc = subprocess.run(
+            ["git", "-C", str(r_dir), "for-each-ref", "--format=%(refname:short)", "refs/heads/fix/", "refs/remotes/origin/fix/"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if ref_proc.returncode == 0 and ref_proc.stdout:
+            for raw_ref in ref_proc.stdout.splitlines():
+                ref_s = raw_ref.strip()
+                br_norm = ref_s.removeprefix("origin/")
+                m_cid = _FIX_BRANCH_CID8_RE.search(br_norm)
+                if not m_cid:
+                    continue
+                if br_norm.lower() in merged_branches_in_repo:
+                    continue
+                anc = subprocess.run(
+                    ["git", "-C", str(r_dir), "merge-base", "--is-ancestor", ref_s, base_ref],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                if anc.returncode != 0:
+                    unmerged_cid8.add(m_cid.group(1).lower())
+
+    # Include inactive released locks whose `last_branch_name` was merged into main
+    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
+    audit_state = (
+        state_obj.get("actions_log_audit_state")
+        if isinstance(state_obj.get("actions_log_audit_state"), dict)
+        else {}
+    )
+    for lock_entry in _read_locks_state(audit_state).values():
+        if not isinstance(lock_entry, dict) or lock_entry.get("active"):
+            continue
+        rel_reason = str(lock_entry.get("last_release_reason") or "").strip()
+        if rel_reason not in _MERGED_LOCK_RELEASE_REASONS_SET:
+            continue
+        last_br = str(lock_entry.get("last_branch_name") or "").strip()
+        m_cid = _FIX_BRANCH_CID8_RE.search(last_br)
+        if m_cid and m_cid.group(1).lower() not in unmerged_cid8:
+            merged_cid8.add(m_cid.group(1).lower())
+        last_cid = str(lock_entry.get("last_conversation_id") or "").strip().lower()
+        if _CONVERSATION_UUID_RE.fullmatch(last_cid) and last_br.startswith("fix/") and last_cid[:8] not in unmerged_cid8:
+            merged_cid8.add(last_cid[:8])
+
+    return merged_cid8, unmerged_cid8
+
+
+def _discover_non_queue_merged_conversations(
+    roots: Sequence[Mapping[str, Any]],
+    summaries_graph: Mapping[str, Any],
+    *,
+    q_items: Sequence[Mapping[str, Any]],
+    merged_cid8: set[str],
+    unmerged_cid8: set[str],
+    exclude_cids: set[str] | None = None,
+) -> list[str]:
+    """Discover non-queue conversations whose `fix/*` branches are verified merged into `main`."""
+    eligible_cid8 = merged_cid8 - unmerged_cid8
+    if not eligible_cid8:
+        return []
+
+    queue_cids = [
+        str(it.get("conversation_id") or "").strip().lower()
+        for it in q_items
+        if str(it.get("conversation_id") or "").strip()
+    ]
+    titles_by_cid: Mapping[str, str] = summaries_graph.get("titles_by_cid") or {}
+    parent_by_cid: Mapping[str, str] = summaries_graph.get("parent_by_cid") or {}
+    excluded = exclude_cids or set()
+
+    disk_cids = _collect_disk_present_cids(roots)
+    discovered: list[str] = []
+    for cid in sorted(disk_cids):
+        if cid in excluded or cid in parent_by_cid:
+            continue
+        if cid[:8] not in eligible_cid8:
+            continue
+        if any(_matches_cid(cid, q_cid) for q_cid in queue_cids):
+            continue
+        if str(titles_by_cid.get(cid) or "").strip().lower().startswith("scheduled action:"):
+            continue
+        discovered.append(cid)
+    return discovered
+
+
+def _prune_sidecar_events(
+    roots: Sequence[Mapping[str, Any]],
+    *,
+    retention_hours: float,
+    now_ts: float,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Prune `<root>/sidecar_data/*/events/*.json` and `<root>/sidecar_data/*/*/events/*.json` older than `retention_hours`."""
+    cutoff_ts = float(now_ts) - max(0.0, float(retention_hours)) * 3600.0
+    pruned_count = 0
+    pruned_bytes = 0
+    seen_roots: set[str] = set()
+    seen_files: set[str] = set()
+    by_runtime_bytes: dict[str, int] = {"desktop": 0, "cli": 0}
+
+    for r_spec in roots:
+        runtime = str(r_spec.get("label") or "desktop")
+        root_dir = Path(r_spec["root_dir"])
+        r_key = str(root_dir)
+        if r_key in seen_roots:
+            continue
+        seen_roots.add(r_key)
+        sidecar_root = root_dir / "sidecar_data"
+        if not sidecar_root.is_dir():
+            continue
+
+        event_dirs: list[Path] = []
+        with contextlib.suppress(OSError):
+            for lvl1 in sorted(sidecar_root.iterdir(), key=lambda p: p.name):
+                if lvl1.is_symlink() or not lvl1.is_dir():
+                    continue
+                ev1 = lvl1 / "events"
+                if ev1.is_dir() and not ev1.is_symlink():
+                    event_dirs.append(ev1)
+                with contextlib.suppress(OSError):
+                    for lvl2 in sorted(lvl1.iterdir(), key=lambda p: p.name):
+                        if lvl2.is_symlink() or not lvl2.is_dir():
+                            continue
+                        ev2 = lvl2 / "events"
+                        if ev2.is_dir() and not ev2.is_symlink():
+                            event_dirs.append(ev2)
+
+        for ev_dir in event_dirs:
+            with contextlib.suppress(OSError):
+                for ev_file in sorted(ev_dir.iterdir(), key=lambda p: p.name):
+                    if ev_file.is_symlink() or not ev_file.is_file() or ev_file.suffix.lower() != ".json":
+                        continue
+                    fkey = str(ev_file)
+                    if fkey in seen_files:
+                        continue
+                    seen_files.add(fkey)
+                    st = ev_file.stat()
+                    if float(st.st_mtime) <= cutoff_ts:
+                        sz = int(st.st_size)
+                        pruned_count += 1
+                        pruned_bytes += sz
+                        if runtime in by_runtime_bytes:
+                            by_runtime_bytes[runtime] += sz
+                        if not dry_run:
+                            with contextlib.suppress(OSError):
+                                ev_file.unlink(missing_ok=True)
+
+    return {
+        "count": pruned_count,
+        "bytes": pruned_bytes,
+        "retention_hours": float(retention_hours),
+        "by_runtime_bytes": by_runtime_bytes,
+    }
+
+
+def _sweep_orphan_companion_artifacts(
+    roots: Sequence[Mapping[str, Any]],
+    protected_map: dict[str, list[str]],
+    *,
+    min_idle_seconds: float,
+    now_ts: float,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Delete orphaned `annotations/*.pbtxt` and `presence/*.lock` whose UUID has no `conversations/` or `brain/` artifacts."""
+    active_disk_cids = _collect_disk_present_cids(roots)
+    pruned_count = 0
+    pruned_bytes = 0
+    by_artifact: dict[str, dict[str, int]] = {
+        "annotations": {"count": 0, "bytes": 0},
+        "presence": {"count": 0, "bytes": 0},
+    }
+    by_runtime_bytes: dict[str, int] = {"desktop": 0, "cli": 0}
+    seen_files: set[str] = set()
+
+    for r_spec in roots:
+        runtime = str(r_spec.get("label") or "desktop")
+        for dir_key, art_kind in (("annotations_dir", "annotations"), ("presence_dir", "presence")):
+            comp_dir = Path(r_spec[dir_key])
+            if not comp_dir.is_dir():
+                continue
+            with contextlib.suppress(OSError):
+                for entry in sorted(comp_dir.iterdir(), key=lambda p: p.name):
+                    if entry.is_symlink() or not entry.is_file():
+                        continue
+                    m = _COMPANION_UUID_FILE_RE.fullmatch(entry.name)
+                    if not m:
+                        continue
+                    if art_kind == "annotations" and not entry.name.lower().endswith(".pbtxt"):
+                        continue
+                    if art_kind == "presence" and not entry.name.lower().endswith(".lock"):
+                        continue
+                    uuid_low = m.group(1).lower()
+                    if uuid_low in active_disk_cids:
+                        continue
+                    if _find_protection_reasons(uuid_low, protected_map):
+                        continue
+                    ekey = str(entry)
+                    if ekey in seen_files:
+                        continue
+                    seen_files.add(ekey)
+                    st = entry.stat()
+                    if min_idle_seconds > 0 and (float(now_ts) - float(st.st_mtime)) < min_idle_seconds:
+                        continue
+                    sz = int(st.st_size)
+                    pruned_count += 1
+                    pruned_bytes += sz
+                    by_artifact[art_kind]["count"] += 1
+                    by_artifact[art_kind]["bytes"] += sz
+                    if runtime in by_runtime_bytes:
+                        by_runtime_bytes[runtime] += sz
+                    if not dry_run:
+                        with contextlib.suppress(OSError):
+                            entry.unlink(missing_ok=True)
+
+    return {
+        "count": pruned_count,
+        "bytes": pruned_bytes,
+        "by_artifact": by_artifact,
+        "by_runtime_bytes": by_runtime_bytes,
+    }
+
+
+def _strip_prompt_args_from_cmd(cmd: str) -> tuple[str, list[str]]:
+    """Split a `ps` command line while stripping prompt payloads so prompt text never triggers process matches."""
+    raw = str(cmd or "").strip()
+    if not raw:
+        return ("", [])
+    try:
+        tokens = shlex.split(raw)
+    except ValueError:
+        tokens = raw.split()
+    cleaned: list[str] = []
+    skip_next = False
+    for tok in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        low = tok.lower()
+        if low in ("-p", "--prompt", "-i", "--prompt-interactive", "--prompt-file"):
+            skip_next = True
+            continue
+        if low.startswith(("--prompt=", "--prompt-interactive=", "-p=", "-i=", "--prompt-file=")):
+            continue
+        cleaned.append(tok)
+    exe = Path(cleaned[0]).name.lower() if cleaned else ""
+    return (exe, cleaned)
+
+
+def _detect_active_antigravity_processes(
+    *,
+    ps_output: str | None = None,
+    ps_runner: Callable[[], str] | None = None,
+) -> list[str]:
+    """Return active Antigravity Desktop / `language_server` / `agy` daemon process descriptions."""
+    raw_ps = ps_output
+    if raw_ps is None:
+        if ps_runner is not None:
+            raw_ps = ps_runner()
+        else:
+            try:
+                proc = subprocess.run(
+                    ["ps", "-eo", "pid,args"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                raw_ps = proc.stdout if proc.returncode == 0 else ""
+            except (OSError, subprocess.SubprocessError):
+                raw_ps = ""
+
+    active: list[str] = []
+    for line in (raw_ps or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.upper().startswith("PID "):
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        pid_str, cmd_str = parts[0], parts[1]
+        exe, tokens = _strip_prompt_args_from_cmd(cmd_str)
+        joined_low = " ".join(tokens).lower()
+        first_tok_low = tokens[0].lower() if tokens else ""
+        is_agy_proc = (
+            "/antigravity.app/" in first_tok_low
+            or "antigravity helper" in first_tok_low
+            or exe in ("antigravity", "antigravity.exe", "language_server", "language_server_macos", "language_server_linux", "agy")
+            or exe.startswith("language_server")
+        )
+        if is_agy_proc and "pr_remediator.py" not in joined_low:
+            active.append(f"pid={pid_str}:{exe or first_tok_low}")
+    return active
+
+
+def _check_sqlite_wal_or_lock_active(db_path: Path) -> tuple[bool, str]:
+    """Fail closed if a SQLite `-wal` sidecar has pending frames or a database lock is held."""
+    wal_path = Path(f"{db_path}-wal")
+    with contextlib.suppress(OSError):
+        if wal_path.exists() and wal_path.stat().st_size > 0:
+            return True, f"wal_non_empty:{wal_path.name}"
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=0.0)
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ROLLBACK")
+        return False, "unlocked"
+    except sqlite3.OperationalError as exc:
+        return True, f"sqlite_lock_held:{exc}"
+    except sqlite3.Error as exc:
+        return True, f"sqlite_error:{exc}"
+    finally:
+        if conn is not None:
+            with contextlib.suppress(sqlite3.Error):
+                conn.close()
+
+
+def prune_ghost_conversation_summaries(
+    *,
+    dry_run: bool = False,
+    portfolio_dir: Path | str | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    ps_output: str | None = None,
+    ps_runner: Callable[[], str] | None = None,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Fail-closed offline prune of ghost rows in `conversation_summaries` and `conversations_fts` with zero disk artifacts."""
+    active_procs = _detect_active_antigravity_processes(ps_output=ps_output, ps_runner=ps_runner)
+    if active_procs:
+        return {
+            "status": "blocked",
+            "reason": "antigravity_process_active",
+            "dry_run": bool(dry_run),
+            "active_processes": active_procs,
+            "pruned_count": 0,
+            "pruned_cids": [],
+            "backups": [],
+        }
+
+    roots = _resolve_antigravity_roots(
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=antigravity_dirs,
+    )
+    db_candidates: list[Path] = []
+    if summaries_db is not None:
+        if isinstance(summaries_db, Sequence) and not isinstance(summaries_db, (str, bytes)):
+            for raw_p in summaries_db:
+                if str(raw_p or "").strip():
+                    db_candidates.append(Path(str(raw_p).strip()).expanduser())
+        elif str(summaries_db).strip():
+            db_candidates.append(Path(str(summaries_db).strip()).expanduser())
+    else:
+        for r in roots:
+            if r.get("summaries_db"):
+                db_candidates.append(Path(r["summaries_db"]))
+
+    existing_dbs: list[Path] = []
+    seen_db: set[str] = set()
+    for cand in db_candidates:
+        key = str(cand)
+        if key not in seen_db and cand.is_file():
+            seen_db.add(key)
+            existing_dbs.append(cand)
+
+    if not existing_dbs:
+        return {
+            "status": "ok",
+            "dry_run": bool(dry_run),
+            "pruned_count": 0,
+            "pruned_cids": [],
+            "backups": [],
+            "reason": "no_summaries_db_found",
+        }
+
+    for db_p in existing_dbs:
+        locked, lock_reason = _check_sqlite_wal_or_lock_active(db_p)
+        if locked:
+            return {
+                "status": "blocked",
+                "reason": lock_reason,
+                "dry_run": bool(dry_run),
+                "db_path": str(db_p),
+                "pruned_count": 0,
+                "pruned_cids": [],
+                "backups": [],
+            }
+
+    protected_map = collect_protected_conversation_ids(
+        portfolio_dir=portfolio_dir,
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=antigravity_dirs,
+        summaries_db=existing_dbs,
+        include_unaudited_check=False,
+        now_ts=now_ts,
+    )
+
+    cur_now = float(now_ts if now_ts is not None else time.time())
+    ts_slug = datetime.fromtimestamp(cur_now, tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backups: list[str] = []
+    pruned_cids_all: list[str] = []
+    seen_pruned: set[str] = set()
+
+    for db_p in existing_dbs:
+        ro_conn = _open_sqlite_readonly(db_p)
+        if ro_conn is None:
+            continue
+        ghost_cids: list[str] = []
+        has_summaries = False
+        has_fts = False
+        has_parents = False
+        try:
+            tables = {
+                str(r[0] or "").strip()
+                for r in ro_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            has_summaries = "conversation_summaries" in tables
+            has_fts = "conversations_fts" in tables
+            has_parents = "conversation_parents" in tables
+            db_cids: set[str] = set()
+            running_in_db: set[str] = set()
+            if has_summaries:
+                cols = {str(r[1] or "").strip() for r in ro_conn.execute("PRAGMA table_info(conversation_summaries)").fetchall()}
+                sel_st = "COALESCE(status, '')" if "status" in cols else "''"
+                for row in ro_conn.execute(f"SELECT conversation_id, {sel_st} FROM conversation_summaries").fetchall():
+                    c_val = str(row[0] or "").strip().lower()
+                    if not c_val:
+                        continue
+                    db_cids.add(c_val)
+                    st_u = str(row[1] or "").strip().upper()
+                    if st_u in ("CASCADE_RUN_STATUS_RUNNING", "RUNNING") or st_u.endswith("_RUNNING"):
+                        running_in_db.add(c_val)
+            if has_fts:
+                with contextlib.suppress(sqlite3.Error):
+                    for row in ro_conn.execute("SELECT DISTINCT LOWER(conversation_id) FROM conversations_fts").fetchall():
+                        if row[0]:
+                            db_cids.add(str(row[0]).strip().lower())
+            for c_val in sorted(db_cids):
+                if c_val in running_in_db or _find_protection_reasons(c_val, protected_map):
+                    continue
+                if not _collect_conversation_disk_artifacts(c_val, roots):
+                    ghost_cids.append(c_val)
+        finally:
+            with contextlib.suppress(sqlite3.Error):
+                ro_conn.close()
+
+        if not ghost_cids:
+            continue
+
+        if dry_run:
+            for c_val in ghost_cids:
+                if c_val not in seen_pruned:
+                    seen_pruned.add(c_val)
+                    pruned_cids_all.append(c_val)
+            continue
+
+        backup_path = db_p.with_name(f"{db_p.name}.bak.{ts_slug}")
+        shutil.copy2(db_p, backup_path)
+        with contextlib.suppress(OSError):
+            os.chmod(backup_path, 0o600)
+        backups.append(str(backup_path))
+
+        rw_conn: sqlite3.Connection | None = None
+        try:
+            rw_conn = sqlite3.connect(str(db_p), timeout=0.0)
+            rw_conn.execute("BEGIN IMMEDIATE")
+            for idx in range(0, len(ghost_cids), 200):
+                chunk = ghost_cids[idx : idx + 200]
+                placeholders = ",".join("?" for _ in chunk)
+                if has_fts:
+                    rw_conn.execute(
+                        f"DELETE FROM conversations_fts WHERE LOWER(conversation_id) IN ({placeholders})",
+                        chunk,
+                    )
+                if has_summaries:
+                    rw_conn.execute(
+                        f"DELETE FROM conversation_summaries WHERE LOWER(conversation_id) IN ({placeholders})",
+                        chunk,
+                    )
+                if has_parents:
+                    rw_conn.execute(
+                        f"DELETE FROM conversation_parents WHERE LOWER(conversation_id) IN ({placeholders}) "
+                        f"OR LOWER(parent_id) IN ({placeholders})",
+                        [*chunk, *chunk],
+                    )
+            rw_conn.commit()
+            for c_val in ghost_cids:
+                if c_val not in seen_pruned:
+                    seen_pruned.add(c_val)
+                    pruned_cids_all.append(c_val)
+        except sqlite3.Error as exc:
+            if rw_conn is not None:
+                with contextlib.suppress(sqlite3.Error):
+                    rw_conn.rollback()
+            return {
+                "status": "blocked",
+                "reason": f"sqlite_write_failed:{exc}",
+                "dry_run": False,
+                "db_path": str(db_p),
+                "backups": backups,
+                "pruned_count": len(pruned_cids_all),
+                "pruned_cids": pruned_cids_all,
+            }
+        finally:
+            if rw_conn is not None:
+                with contextlib.suppress(sqlite3.Error):
+                    rw_conn.close()
+
+    return {
+        "status": "ok",
+        "dry_run": bool(dry_run),
+        "pruned_count": len(pruned_cids_all),
+        "pruned_cids": pruned_cids_all,
+        "backups": backups,
+        "dbs_checked": len(existing_dbs),
+    }
+
+
 def _empty_cleanup_breakdown() -> dict[str, Any]:
     """Build a zero-initialized MB/count breakdown structure for `cleanup_merged_conversations`."""
-    artifact_keys = ("brain", "conversations_db", "conversations_pb", "annotations", "presence")
+    artifact_keys = ("brain", "conversations_db", "conversations_pb", "annotations", "presence", "sidecar_events")
     runtime_keys = ("desktop", "cli")
     category_keys = (
         "merged_roots",
         "cleaned_leaked_roots",
         "superseded_cancelled_roots",
+        "rotated_orchestrators",
+        "non_queue_merged_roots",
         "subagents",
         "noop_actions",
+        "deliverable_actions",
+        "unaudited_expired_actions",
+        "sidecar_events",
+        "orphan_artifacts",
     )
     return {
         "total_bytes": 0,
@@ -2036,20 +3091,42 @@ def cleanup_merged_conversations(
     *,
     all_merged: bool = False,
     include_noop_actions: bool = False,
+    include_scheduled_actions: bool = False,
+    include_sidecar_events: bool | None = None,
+    include_orphans: bool | None = None,
     older_than_days: float | None = None,
     cli_dir: Path | str | None = None,
     antigravity_dirs: Sequence[Path | str] | None = None,
     summaries_db: Path | str | Sequence[Path | str] | None = None,
     now_ts: float | None = None,
+    repos_dir: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Safely delete merged conversation directories/SQLite `.db`s/protobufs/annotations/presence and spawned subagents across Desktop & CLI."""
+    """Safely delete merged conversation directories/SQLite `.db`s/protobufs/annotations/presence, sidecar events, orphans, and scheduled actions across Desktop & CLI."""
     root_cids = _normalize_str_list(conversation_ids)
     subonly_cids = _normalize_str_list(subagents_only_of)
     explicit_seed_cids = _normalize_str_list([*root_cids, *subonly_cids])
-    if not explicit_seed_cids and not all_merged and not include_noop_actions:
+    eff_include_sidecar_events = (
+        bool(include_sidecar_events)
+        if include_sidecar_events is not None
+        else bool(all_merged or include_scheduled_actions)
+    )
+    eff_include_orphans = (
+        bool(include_orphans)
+        if include_orphans is not None
+        else bool(all_merged or include_scheduled_actions)
+    )
+    if (
+        not explicit_seed_cids
+        and not all_merged
+        and not include_noop_actions
+        and not include_scheduled_actions
+        and not include_sidecar_events
+        and not include_orphans
+    ):
         return {
             "status": "error",
-            "error": "Provide at least one --id, --subagents-only-of, --all-merged, or --include-noop-actions conversation ID.",
+            "error": "Provide at least one --id, --subagents-only-of, --all-merged, --include-noop-actions, or --include-actions flag.",
         }
 
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
@@ -2083,6 +3160,7 @@ def cleanup_merged_conversations(
             "unmerged": [],
         }
 
+    cur_now = float(now_ts if now_ts is not None else time.time())
     roots = _resolve_antigravity_roots(
         brain_dir=brain_dir,
         conversations_dir=conversations_dir,
@@ -2104,6 +3182,8 @@ def cleanup_merged_conversations(
         summaries_db=summaries_db,
         summaries_graph=summaries_graph,
         include_unaudited_check=include_unaudited_check,
+        now_ts=cur_now,
+        env=env,
     )
 
     candidates: list[str] = []
@@ -2112,6 +3192,7 @@ def cleanup_merged_conversations(
     breakdown = _empty_cleanup_breakdown()
     skipped: list[dict[str, Any]] = []
     queue_items_to_mark_cleaned: dict[str, list[str]] = {}
+    unmerged_cid8_global: set[str] = set()
 
     def _add_candidate(cid_val: str, category: str) -> None:
         clean = str(cid_val or "").strip().lower()
@@ -2206,23 +3287,76 @@ def cleanup_merged_conversations(
                     if not only_present or _collect_conversation_disk_artifacts(str(sub), roots):
                         _add_candidate(str(sub), "subagents")
 
+        merged_cid8, unmerged_cid8 = _collect_repo_branch_merge_index(
+            p_dir,
+            q_data,
+            git_client=git_client,
+            repos_dir=repos_dir,
+            env=env,
+        )
+        unmerged_cid8_global.update(unmerged_cid8)
+
+        rotated_orchs, all_orchs = _discover_orchestrator_roots_and_subagents(q_data, roots, summaries_graph)
+        for r_orch in rotated_orchs:
+            if r_orch[:8] in unmerged_cid8_global:
+                skipped.append({"conversation_id": r_orch, "reasons": [f"unmerged_branch_prefix:{r_orch[:8]}"]})
+                continue
+            _add_candidate(r_orch, "rotated_orchestrators")
+        for o_cid in all_orchs:
+            _expand_children_for(o_cid, "subagents")
+
+        non_queue_merged = _discover_non_queue_merged_conversations(
+            roots,
+            summaries_graph,
+            q_items=q_items,
+            merged_cid8=merged_cid8,
+            unmerged_cid8=unmerged_cid8,
+            exclude_cids=set(all_orchs),
+        )
+        for nq_cid in non_queue_merged:
+            _add_candidate(nq_cid, "non_queue_merged_roots")
+            if not _find_protection_reasons(nq_cid, protected_map):
+                _expand_children_for(nq_cid, "subagents")
+
     eff_noop_days: float | None = None
-    if include_noop_actions:
-        eff_noop_days = float(older_than_days) if older_than_days is not None else DEFAULT_NOOP_ACTION_RETENTION_DAYS
-        cur_now = float(now_ts if now_ts is not None else time.time())
-        noop_roots = _discover_noop_action_conversations(
+    if include_noop_actions or include_scheduled_actions:
+        noop_hours = (
+            float(older_than_days) * 24.0
+            if older_than_days is not None
+            else _resolve_cleanup_hours("AGY_ACTION_CLEANUP_NOOP_HOURS", DEFAULT_ACTION_CLEANUP_NOOP_HOURS, env=env)
+        )
+        deliverable_hours = _resolve_cleanup_hours(
+            "AGY_ACTION_CLEANUP_DELIVERABLE_HOURS",
+            DEFAULT_ACTION_CLEANUP_DELIVERABLE_HOURS,
+            env=env,
+        )
+        unaudited_cap_hours = _resolve_cleanup_hours(
+            "AGY_ACTION_CLEANUP_UNAUDITED_CAP_HOURS",
+            DEFAULT_ACTION_CLEANUP_UNAUDITED_CAP_HOURS,
+            env=env,
+        )
+        eff_noop_days = round(noop_hours / 24.0, 4) if older_than_days is None else float(older_than_days)
+        action_pairs = _discover_scheduled_action_conversations(
             p_dir,
             roots,
             summaries_graph,
-            older_than_days=eff_noop_days,
+            noop_hours=noop_hours,
+            deliverable_hours=deliverable_hours,
+            unaudited_cap_hours=unaudited_cap_hours,
             now_ts=cur_now,
             queue_items=q_items,
+            include_deliverable_and_unaudited=bool(include_scheduled_actions),
         )
-        for n_cid in noop_roots:
-            _add_candidate(n_cid, "noop_actions")
-            if not _find_protection_reasons(n_cid, protected_map):
-                _expand_children_for(n_cid, "noop_actions")
+        for a_cid, a_cat in action_pairs:
+            _add_candidate(a_cid, a_cat)
+            if not _find_protection_reasons(a_cid, protected_map):
+                _expand_children_for(a_cid, a_cat)
         breakdown["noop_older_than_days"] = eff_noop_days
+        breakdown["action_retention_hours"] = {
+            "noop": noop_hours,
+            "deliverable": deliverable_hours,
+            "unaudited_cap": unaudited_cap_hours,
+        }
 
     deleted: list[dict[str, Any]] = []
     freed_bytes = 0
@@ -2232,12 +3366,16 @@ def cleanup_merged_conversations(
         if reasons:
             skipped.append({"conversation_id": cid, "reasons": reasons})
             continue
+        cat = candidate_category.get(cid, "merged_roots")
+        if cat in ("subagents", "rotated_orchestrators", "non_queue_merged_roots") and cid[:8] in unmerged_cid8_global:
+            skipped.append({"conversation_id": cid, "reasons": [f"unmerged_branch_prefix:{cid[:8]}"]})
+            continue
         idle_ok, idle_reason = is_conversation_fully_idle(
             cid,
             brain_dir=brain_dir,
             conversations_dir=conversations_dir,
             min_idle_seconds=min_idle_seconds,
-            now_ts=now_ts,
+            now_ts=cur_now,
             cli_dir=cli_dir,
             antigravity_dirs=antigravity_dirs,
             summaries_db=summaries_db,
@@ -2279,7 +3417,6 @@ def cleanup_merged_conversations(
             if rt_lbl in breakdown["by_runtime"]:
                 breakdown["by_runtime"][rt_lbl]["count"] += 1
 
-        cat = candidate_category.get(cid, "merged_roots")
         if cat in breakdown["by_category"]:
             breakdown["by_category"][cat]["count"] += 1
             breakdown["by_category"][cat]["bytes"] += sz
@@ -2295,6 +3432,54 @@ def cleanup_merged_conversations(
                 "artifacts": per_kind_bytes,
             }
         )
+
+    sidecar_events_pruned: dict[str, Any] = {"count": 0, "bytes": 0, "retention_hours": 0.0, "by_runtime_bytes": {}}
+    if eff_include_sidecar_events:
+        ev_retention_hours = _resolve_cleanup_hours(
+            "AGY_SIDECAR_EVENT_RETENTION_HOURS",
+            DEFAULT_SIDECAR_EVENT_RETENTION_HOURS,
+            env=env,
+        )
+        sidecar_events_pruned = _prune_sidecar_events(
+            roots,
+            retention_hours=ev_retention_hours,
+            now_ts=cur_now,
+            dry_run=dry_run,
+        )
+        ev_cnt = int(sidecar_events_pruned["count"])
+        ev_bytes = int(sidecar_events_pruned["bytes"])
+        freed_bytes += ev_bytes
+        breakdown["discovered_counts"]["sidecar_events"] += ev_cnt
+        breakdown["by_artifact"]["sidecar_events"]["count"] += ev_cnt
+        breakdown["by_artifact"]["sidecar_events"]["bytes"] += ev_bytes
+        breakdown["by_category"]["sidecar_events"]["count"] += ev_cnt
+        breakdown["by_category"]["sidecar_events"]["bytes"] += ev_bytes
+        for rt_lbl, rt_b in sidecar_events_pruned["by_runtime_bytes"].items():
+            if rt_lbl in breakdown["by_runtime"]:
+                breakdown["by_runtime"][rt_lbl]["bytes"] += int(rt_b)
+
+    orphan_artifacts_pruned: dict[str, Any] = {"count": 0, "bytes": 0, "by_artifact": {}, "by_runtime_bytes": {}}
+    if eff_include_orphans:
+        orphan_artifacts_pruned = _sweep_orphan_companion_artifacts(
+            roots,
+            protected_map,
+            min_idle_seconds=min_idle_seconds,
+            now_ts=cur_now,
+            dry_run=dry_run,
+        )
+        or_cnt = int(orphan_artifacts_pruned["count"])
+        or_bytes = int(orphan_artifacts_pruned["bytes"])
+        freed_bytes += or_bytes
+        breakdown["discovered_counts"]["orphan_artifacts"] += or_cnt
+        breakdown["by_category"]["orphan_artifacts"]["count"] += or_cnt
+        breakdown["by_category"]["orphan_artifacts"]["bytes"] += or_bytes
+        for art_k, art_stats in orphan_artifacts_pruned["by_artifact"].items():
+            if art_k in breakdown["by_artifact"]:
+                breakdown["by_artifact"][art_k]["count"] += int(art_stats["count"])
+                breakdown["by_artifact"][art_k]["bytes"] += int(art_stats["bytes"])
+        for rt_lbl, rt_b in orphan_artifacts_pruned["by_runtime_bytes"].items():
+            if rt_lbl in breakdown["by_runtime"]:
+                breakdown["by_runtime"][rt_lbl]["bytes"] += int(rt_b)
 
     breakdown["total_bytes"] = freed_bytes
     breakdown["total_mb"] = round(freed_bytes / (1024 * 1024), 2)
@@ -2332,9 +3517,16 @@ def cleanup_merged_conversations(
         "dry_run": bool(dry_run),
         "all_merged": bool(all_merged),
         "include_noop_actions": bool(include_noop_actions),
+        "include_scheduled_actions": bool(include_scheduled_actions),
+        "include_sidecar_events": eff_include_sidecar_events,
+        "include_orphans": eff_include_orphans,
         "deleted_count": len(deleted),
         "deleted": [d["conversation_id"] for d in deleted],
         "deleted_details": deleted,
+        "sidecar_events_pruned_count": int(sidecar_events_pruned["count"]),
+        "sidecar_events_pruned_bytes": int(sidecar_events_pruned["bytes"]),
+        "orphan_artifacts_pruned_count": int(orphan_artifacts_pruned["count"]),
+        "orphan_artifacts_pruned_bytes": int(orphan_artifacts_pruned["bytes"]),
         "skipped_count": len(skipped),
         "skipped": skipped,
         "freed_bytes": freed_bytes,
@@ -2345,7 +3537,7 @@ def cleanup_merged_conversations(
 
 
 def register_watcher_cli(sub: Any) -> None:
-    """Register `watch-pr-merge`, `wait-for-unlock`, and `cleanup-merged-conversations` subcommands."""
+    """Register `watch-pr-merge`, `wait-for-unlock`, `cleanup-merged-conversations`, and `prune-ghost-summaries` subcommands."""
     p_watch = sub.add_parser(
         "watch-pr-merge",
         help="Run or spawn the self-terminating background watcher that polls origin while dev_pr_locks are active and fast-forwards main + cleans the local branch once merged.",
@@ -2369,19 +3561,28 @@ def register_watcher_cli(sub: Any) -> None:
 
     p_clean = sub.add_parser(
         "cleanup-merged-conversations",
-        help="Safely delete merged conversation directories/SQLite .db files/protobufs and spawned subagents after verifying git merge and protections.",
+        help="Safely delete merged conversation directories/SQLite .db files/protobufs, sidecar events, orphans, and spawned subagents after verifying git merge and protections.",
     )
     p_clean.add_argument("--id", "--ids", "--conversation-ids", dest="conversation_ids", nargs="*", default=[], help="Merged root conversation IDs to clean up along with spawned subagents.")
     p_clean.add_argument("--subagents-only-of", nargs="*", default=[], help="Orchestrator conversation IDs whose spawned child subagents should be cleaned up while keeping the orchestrator itself protected.")
-    p_clean.add_argument("--all-merged", action="store_true", help="Auto-discover merged, previously cleaned, and superseded-cancelled queue conversations (plus orphaned subagents).")
-    p_clean.add_argument("--include-noop-actions", action="store_true", help="Also discover idle scheduled NO_OP action conversations older than --older-than-days (default: 7).")
-    p_clean.add_argument("--older-than-days", type=float, default=None, help="Minimum age in days for --include-noop-actions discovery (default: 7).")
+    p_clean.add_argument("--all-merged", action="store_true", help="Auto-discover merged/cleaned/superseded queue items, rotated idle orchestrators, finished subagents, non-queue merged fix/* chats, sidecar events, and orphans.")
+    p_clean.add_argument("--include-noop-actions", action="store_true", help="Discover idle scheduled NO_OP action conversations older than --older-than-days (default: AGY_ACTION_CLEANUP_NOOP_HOURS=24h / 1d).")
+    p_clean.add_argument("--include-actions", "--include-scheduled-actions", dest="include_scheduled_actions", action="store_true", help="Enable unified 24h NO_OP/deliverable + 72h unaudited WARN/ERROR cap scheduled-action retention.")
+    p_clean.add_argument("--prune-ghost-summaries", dest="prune_ghost_summaries", action="store_true", help="Fail-closed offline prune of ghost rows in conversation_summaries.db (refuses if Antigravity Desktop/daemon or WAL lock is active).")
+    p_clean.add_argument("--older-than-days", type=float, default=None, help="Minimum age in days for --include-noop-actions discovery (default: AGY_ACTION_CLEANUP_NOOP_HOURS / 24).")
     p_clean.add_argument("--branch", "--branches", dest="branches", nargs="*", default=[], help="Explicit branch names or `repo_dir::branch` specs to verify merged.")
     p_clean.add_argument("--exclude-id", "--exclude-ids", dest="exclude_ids", nargs="*", default=[], help="Additional conversation IDs to protect from deletion.")
     p_clean.add_argument("--min-idle-seconds", type=float, default=60.0, help="Minimum idle age in seconds before deleting conversation artifacts (default: 60).")
     p_clean.add_argument("--confirm-merged", action="store_true", help="Allow cleanup when merged branch refs were already pruned from origin and local.")
     p_clean.add_argument("--skip-unaudited-check", action="store_true", help="Skip conversation_analyzer check-unaudited lookup (useful in isolated tests).")
     p_clean.add_argument("--dry-run", action="store_true", help="Preview candidates and freed MB breakdown without deleting files.")
+
+    p_ghost = sub.add_parser(
+        "prune-ghost-summaries",
+        help="Fail-closed offline prune of ghost rows from conversation_summaries and conversations_fts whose CIDs have zero disk artifacts.",
+    )
+    p_ghost.add_argument("--summaries-db", dest="summaries_db", default=None, help="Optional explicit conversation_summaries.db path.")
+    p_ghost.add_argument("--dry-run", action="store_true", help="Preview ghost CIDs without creating backup or modifying DB.")
 
 
 def dispatch_watcher_cli(args: Any, argv: list[str] | None = None) -> int | None:
@@ -2419,7 +3620,32 @@ def dispatch_watcher_cli(args: Any, argv: list[str] | None = None) -> int | None
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
 
+    if args.subcommand == "prune-ghost-summaries":
+        g_res = _facade_attr("prune_ghost_conversation_summaries", prune_ghost_conversation_summaries)(
+            dry_run=bool(getattr(args, "dry_run", False)),
+            summaries_db=getattr(args, "summaries_db", None),
+        )
+        print(json.dumps(g_res, indent=2, ensure_ascii=False))
+        return 0 if g_res.get("status") == "ok" else 1
+
     if args.subcommand == "cleanup-merged-conversations":
+        prune_ghosts = bool(getattr(args, "prune_ghost_summaries", False))
+        has_clean_scope = any(
+            (
+                args.conversation_ids,
+                args.subagents_only_of,
+                getattr(args, "all_merged", False),
+                getattr(args, "include_noop_actions", False),
+                getattr(args, "include_scheduled_actions", False),
+            )
+        )
+        if prune_ghosts and not has_clean_scope:
+            g_res = _facade_attr("prune_ghost_conversation_summaries", prune_ghost_conversation_summaries)(
+                dry_run=bool(args.dry_run),
+            )
+            print(json.dumps(g_res, indent=2, ensure_ascii=False))
+            return 0 if g_res.get("status") == "ok" else 1
+
         c_res = _facade_attr("cleanup_merged_conversations", cleanup_merged_conversations)(
             conversation_ids=args.conversation_ids,
             subagents_only_of=args.subagents_only_of,
@@ -2431,8 +3657,18 @@ def dispatch_watcher_cli(args: Any, argv: list[str] | None = None) -> int | None
             include_unaudited_check=not args.skip_unaudited_check,
             all_merged=bool(getattr(args, "all_merged", False)),
             include_noop_actions=bool(getattr(args, "include_noop_actions", False)),
+            include_scheduled_actions=bool(getattr(args, "include_scheduled_actions", False)),
             older_than_days=getattr(args, "older_than_days", None),
         )
+        if prune_ghosts and c_res.get("status") == "ok":
+            g_res = _facade_attr("prune_ghost_conversation_summaries", prune_ghost_conversation_summaries)(
+                dry_run=bool(args.dry_run),
+            )
+            c_res["ghost_summaries_prune"] = g_res
+            if g_res.get("status") != "ok":
+                c_res["status"] = g_res.get("status", "blocked")
+                print(json.dumps(c_res, indent=2, ensure_ascii=False))
+                return 1
         print(json.dumps(c_res, indent=2, ensure_ascii=False))
         return 0 if c_res.get("status") == "ok" else 1
 

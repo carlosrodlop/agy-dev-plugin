@@ -28,6 +28,13 @@
             aria-pressed="false"
             title="Pause new dispatches (Graceful Drain: ongoing active-lock tasks finish cleanly)"
           >⏸ Pause Dev</button>
+          <button
+            id="dq-clean-btn"
+            type="button"
+            class="dq-chip-btn dq-clean-btn"
+            data-action="cleanup-preview"
+            title="Preview 0-LLM cleanup of merged chats, idle orchestrator subagents, 24h actions, sidecar events &amp; orphans"
+          >🧹 Clean</button>
           <button id="dq-orch-btn" type="button" class="dq-chip-btn dq-hidden" title="Switch to active orchestrator conversation"></button>
           <button id="dq-board-btn" type="button" class="dq-chip-btn dq-hidden" data-action="open-board" title="Open dev_queue_board.md in File View">Board .md</button>
           <button id="dq-refresh-btn" type="button" class="dq-icon-btn" data-action="refresh" aria-label="Refresh queue snapshot" title="Refresh snapshot">↻</button>
@@ -112,6 +119,29 @@
         data-action="resume-dev"
         title="Continue orchestration and auto-wake orchestrator"
       >▶ Continue Dev</button>
+    </div>
+    <div id="dq-cleanup-panel" class="dq-cleanup-panel dq-hidden" role="region" aria-label="Cleanup dry-run preview">
+      <div class="dq-cleanup-head">
+        <div class="dq-cleanup-head-copy">
+          <strong id="dq-cleanup-title" class="dq-cleanup-title">0-LLM Cleanup Preview</strong>
+          <span id="dq-cleanup-summary" class="dq-cleanup-summary"></span>
+        </div>
+        <div class="dq-cleanup-actions">
+          <button
+            id="dq-cleanup-confirm-btn"
+            type="button"
+            class="dq-btn dq-btn-primary"
+            data-action="cleanup-execute"
+          >Confirm Clean</button>
+          <button
+            id="dq-cleanup-cancel-btn"
+            type="button"
+            class="dq-btn"
+            data-action="cleanup-cancel"
+          >Cancel</button>
+        </div>
+      </div>
+      <div id="dq-cleanup-breakdown" class="dq-cleanup-breakdown"></div>
     </div>
     <div id="dq-toast" class="dq-toast dq-hidden" role="status" aria-live="polite"></div>
     <div id="dq-error" class="dq-error dq-hidden" role="alert"></div>

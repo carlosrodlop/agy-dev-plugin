@@ -31,21 +31,27 @@ _SIDECAR_DIR = Path(__file__).resolve().parent
 _PLUGIN_ROOT = _SIDECAR_DIR.parents[1]
 _INSTALLED_PLUGIN_ROOT = Path.home() / ".gemini" / "config" / "plugins" / "agy-dev-plugin"
 
-for _cand_root in (_PLUGIN_ROOT, _INSTALLED_PLUGIN_ROOT):
+for _cand_root in (_INSTALLED_PLUGIN_ROOT, _PLUGIN_ROOT):
     for _rel in (Path("clients"), Path("skills") / "agy-code-remediation-pr" / "scripts"):
         _cand = _cand_root / _rel
         if _cand.is_dir():
             _cand_str = str(_cand)
-            if _cand_str not in sys.path:
-                sys.path.insert(0, _cand_str)
+            if _cand_str in sys.path:
+                sys.path.remove(_cand_str)
+            sys.path.insert(0, _cand_str)
 
+import dev_common  # noqa: E402
 import dev_queue_doctor  # noqa: E402
+import merge_watcher  # noqa: E402
 import orchestration_control as _orch_ctrl  # noqa: E402
 
 DEFAULT_WATCHDOG_INTERVAL_SECONDS = 300
 MIN_WATCHDOG_INTERVAL_SECONDS = 30
 DEFAULT_WATCHDOG_COOLDOWN_SECONDS = 900
 DEFAULT_CONTROL_SLICE_SECONDS = 3.0
+DEFAULT_AUTO_CLEANUP_INTERVAL_SECONDS = 3600
+AUTO_CLEANUP_STATE_FILENAME = "agy_auto_cleanup_state.json"
+AUTO_CLEANUP_LOCK_FILENAME = "agy_auto_cleanup_state.lock"
 _LOCAL_HOME_PATH_RE = re.compile(r"/(?:Users|home)/(?!testuser\b|test\b|Shared\b)[A-Za-z0-9._-]+")
 
 
@@ -82,13 +88,150 @@ def resolve_watchdog_interval(
     return DEFAULT_WATCHDOG_INTERVAL_SECONDS
 
 
+def resolve_auto_cleanup_interval(
+    interval_seconds: int | float | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> int:
+    """Resolve hourly auto-cleanup interval in seconds (`AGY_AUTO_CLEANUP_INTERVAL_SECONDS`, default `3600`, `0` disables)."""
+    eff_env = os.environ if env is None else env
+    if interval_seconds is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            val = int(round(float(interval_seconds)))
+            return 0 if val <= 0 else val
+    raw_env = str(eff_env.get("AGY_AUTO_CLEANUP_INTERVAL_SECONDS") or "").strip()
+    if raw_env:
+        with contextlib.suppress(TypeError, ValueError):
+            val = int(round(float(raw_env)))
+            return 0 if val <= 0 else val
+    return DEFAULT_AUTO_CLEANUP_INTERVAL_SECONDS
+
+
+def _maybe_run_hourly_auto_cleanup(
+    *,
+    state_dir: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    repos_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+    dry_run: bool = False,
+    now_ts: float | None = None,
+    env: Mapping[str, str] | None = None,
+    git_client: Any | None = None,
+    auto_cleanup_interval_seconds: int | float | None = None,
+) -> dict[str, Any]:
+    """Run cooldown-gated 0-LLM conversation/sidecar/orphan cleanup once per `AGY_AUTO_CLEANUP_INTERVAL_SECONDS`."""
+    eff_env = os.environ if env is None else env
+    interval = resolve_auto_cleanup_interval(auto_cleanup_interval_seconds, env=eff_env)
+    if interval <= 0:
+        return {"status": "disabled", "ran": False, "interval_seconds": 0}
+
+    has_env_agy = bool(
+        str(eff_env.get("AGY_ANTIGRAVITY_DIR") or "").strip()
+        or str(eff_env.get("AGY_ANTIGRAVITY_CLI_DIR") or "").strip()
+    )
+    if (
+        antigravity_dirs is None
+        and brain_dir is None
+        and home_dir is None
+        and not has_env_agy
+        and ("unittest" in sys.modules or "pytest" in sys.modules)
+    ):
+        return {"status": "skipped", "ran": False, "reason": "hermetic_test_guard"}
+
+    cur_now = float(now_ts if now_ts is not None else time.time())
+    st_dir = dev_common.resolve_state_dir(portfolio_dir=state_dir)
+    st_dir.mkdir(parents=True, exist_ok=True)
+    state_path = st_dir / AUTO_CLEANUP_STATE_FILENAME
+    lock_path = st_dir / AUTO_CLEANUP_LOCK_FILENAME
+
+    eff_agy_dirs: Sequence[Path | str] | None = antigravity_dirs
+    eff_brain_dir: Path | str | None = None
+    if eff_agy_dirs is None:
+        if isinstance(brain_dir, Sequence) and not isinstance(brain_dir, (str, bytes)):
+            derived = [Path(str(b)).expanduser().parent for b in brain_dir if str(b).strip()]
+            eff_agy_dirs = derived or None
+        elif brain_dir is not None:
+            eff_brain_dir = brain_dir
+        elif home_dir is not None:
+            eff_agy_dirs = [
+                Path(home_dir) / ".gemini" / "antigravity",
+                Path(home_dir) / ".gemini" / "antigravity-cli",
+            ]
+
+    try:
+        with dev_common.file_lock(lock_path):
+            prev = dev_common.atomic_read_json(state_path, default={})
+            last_ep_raw = prev.get("last_cleanup_epoch")
+            if last_ep_raw is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    last_ep = float(last_ep_raw)
+                    elapsed = cur_now - last_ep
+                    if 0.0 <= elapsed < float(interval):
+                        return {
+                            "status": "cooldown",
+                            "ran": False,
+                            "interval_seconds": interval,
+                            "next_run_in_seconds": round(float(interval) - elapsed, 1),
+                            "last_cleanup_at": str(prev.get("last_cleanup_at") or ""),
+                        }
+
+            clean_res = merge_watcher.cleanup_merged_conversations(
+                all_merged=True,
+                include_noop_actions=True,
+                include_scheduled_actions=True,
+                include_sidecar_events=True,
+                include_orphans=True,
+                dry_run=dry_run,
+                portfolio_dir=st_dir,
+                brain_dir=eff_brain_dir,
+                antigravity_dirs=eff_agy_dirs,
+                repos_dir=repos_dir,
+                git_client=git_client,
+                now_ts=cur_now,
+                env=eff_env,
+            )
+            if not dry_run and clean_res.get("status") == "ok":
+                dev_common.atomic_write_json(
+                    state_path,
+                    {
+                        "schema_version": 1,
+                        "last_cleanup_epoch": cur_now,
+                        "last_cleanup_at": _utc_now_iso(),
+                        "deleted_count": int(clean_res.get("deleted_count") or 0),
+                        "sidecar_events_pruned_count": int(clean_res.get("sidecar_events_pruned_count") or 0),
+                        "orphan_artifacts_pruned_count": int(clean_res.get("orphan_artifacts_pruned_count") or 0),
+                        "freed_bytes": int(clean_res.get("freed_bytes") or 0),
+                    },
+                )
+            return {
+                "status": str(clean_res.get("status") or "ok"),
+                "ran": True,
+                "dry_run": bool(dry_run),
+                "interval_seconds": interval,
+                "deleted_count": int(clean_res.get("deleted_count") or 0),
+                "sidecar_events_pruned_count": int(clean_res.get("sidecar_events_pruned_count") or 0),
+                "orphan_artifacts_pruned_count": int(clean_res.get("orphan_artifacts_pruned_count") or 0),
+                "freed_bytes": int(clean_res.get("freed_bytes") or 0),
+                "freed_mb": float(clean_res.get("freed_mb") or 0.0),
+            }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "ran": False,
+            "error": _sanitize_path(f"{exc.__class__.__name__}: {exc}"),
+        }
+
+
 def run_watchdog_cycle(
     *,
     state_dir: Path | str | None = None,
     brain_dir: Path | str | Sequence[Path | str] | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
     repos_dir: Path | str | None = None,
     sync_git: bool = True,
     cooldown_seconds: int = DEFAULT_WATCHDOG_COOLDOWN_SECONDS,
+    auto_cleanup_interval_seconds: int | float | None = None,
     dry_run: bool = False,
     now_ts: float | None = None,
     home_dir: Path | None = None,
@@ -202,6 +345,18 @@ def run_watchdog_cycle(
     )
 
     if not bool(diag.get("action_required")):
+        auto_cleanup = _maybe_run_hourly_auto_cleanup(
+            state_dir=state_dir,
+            brain_dir=brain_dir,
+            antigravity_dirs=antigravity_dirs,
+            repos_dir=repos_dir,
+            home_dir=home_dir,
+            dry_run=dry_run,
+            now_ts=now_ts,
+            env=env,
+            git_client=git_client,
+            auto_cleanup_interval_seconds=auto_cleanup_interval_seconds,
+        )
         return {
             "status": "healthy",
             "overall_status": str(diag.get("overall_status") or "healthy"),
@@ -212,6 +367,7 @@ def run_watchdog_cycle(
             "health_score": int(diag.get("health_score") or 100),
             "anomalies": [],
             "queue_summary": dict(diag.get("queue_summary") or {}),
+            "auto_cleanup": auto_cleanup,
         }
 
     needs_fix = bool(diag.get("needs_fix"))
@@ -255,6 +411,19 @@ def run_watchdog_cycle(
     else:
         cycle_status = str(doc_res.get("overall_status") or "degraded")
 
+    auto_cleanup = _maybe_run_hourly_auto_cleanup(
+        state_dir=state_dir,
+        brain_dir=brain_dir,
+        antigravity_dirs=antigravity_dirs,
+        repos_dir=repos_dir,
+        home_dir=home_dir,
+        dry_run=dry_run,
+        now_ts=now_ts,
+        env=env,
+        git_client=git_client,
+        auto_cleanup_interval_seconds=auto_cleanup_interval_seconds,
+    )
+
     return {
         "status": cycle_status,
         "overall_status": str(doc_res.get("overall_status") or diag.get("overall_status") or "degraded"),
@@ -270,6 +439,7 @@ def run_watchdog_cycle(
         "anomalies": list(doc_res.get("anomalies") or []),
         "remediation_actions": rem_actions,
         "wake": wake_info,
+        "auto_cleanup": auto_cleanup,
     }
 
 
