@@ -108,7 +108,18 @@ DETERMINISTIC_DEV_PRETOOL_CHECKS: tuple[dict[str, str], ...] = (
         "decision": "deny",
         "description": "Blocks './install.sh' and 'git_client.py deploy-home' execution inside isolated 'pr-worktree-*' directories so parallel workers never race $HOME deployment mid-flight.",
     },
+    {
+        "check_id": "pretool:paused-chrome-devtools",
+        "event": "PreToolUse",
+        "title": "Paused Dev Queue Chrome DevTools Blocker",
+        "target": "call_mcp_tool | mcp_*chrome*devtools* | run_command (chrome-devtools-mcp)",
+        "decision": "deny",
+        "description": "Turns off Chrome DevTools MCP tool calls and chrome-devtools-mcp CLI launches whenever Dev Queue orchestration is paused (dev_orchestration_control.json).",
+    },
 )
+
+_CHROME_DEVTOOLS_TOOL_OR_SERVER_RE = re.compile(r"chrome[-_]?devtools", re.IGNORECASE)
+_CHROME_DEVTOOLS_CMD_RE = re.compile(r"(?:chrome[-_]devtools[-_]mcp|CHROME_DEVTOOLS_MCP_JS)", re.IGNORECASE)
 
 PARALLEL_MONOLITH_MIN_LINES = 250
 PARALLEL_KNOWN_MONOLITH_BASENAMES: frozenset[str] = frozenset(
@@ -920,6 +931,10 @@ class DevLifecycleGuardrailEvaluator:
             raw_input = payload.get("tool_input") or payload.get("args") or payload.get("arguments") or {}
             args = raw_input if isinstance(raw_input, dict) else {}
 
+        paused_devtools_deny = self._check_paused_chrome_devtools(tool_name, args)
+        if paused_devtools_deny is not None:
+            return paused_devtools_deny
+
         if tool_name == "run_command":
             cmd_line = str(args.get("CommandLine") or args.get("command") or "").strip()
             if DIRECT_MAIN_PUSH_RE.search(cmd_line):
@@ -987,6 +1002,38 @@ class DevLifecycleGuardrailEvaluator:
                     return lease_deny
 
         return {"decision": "allow"}
+
+    def _is_orchestration_paused(self) -> bool:
+        """Read `<state_dir>/dev_orchestration_control.json` in <0.1ms to check Pause state."""
+        ctrl_path = self.state_dir / "dev_orchestration_control.json"
+        if not ctrl_path.is_file():
+            return False
+        raw = atomic_read_json(ctrl_path, default={})
+        return isinstance(raw, dict) and bool(raw.get("paused"))
+
+    def _check_paused_chrome_devtools(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+        """Deny Chrome DevTools MCP calls and `chrome-devtools-mcp` commands while Dev Queue is paused."""
+        if not self._is_orchestration_paused():
+            return None
+        deny_payload = {
+            "decision": "deny",
+            "reason": (
+                "Guardrail (Dev Queue Paused): Chrome DevTools automation is turned off while Dev Queue "
+                "orchestration is paused. Click 'Continue Dev' in the Dev Queue sidebar/panel or run "
+                "'agy-queue resume' to re-enable Chrome DevTools."
+            ),
+        }
+        if _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(tool_name):
+            return deny_payload
+        if tool_name == "call_mcp_tool":
+            server_name = str(args.get("ServerName") or args.get("server_name") or args.get("serverName") or "")
+            if _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(server_name):
+                return deny_payload
+        if tool_name == "run_command":
+            cmd_line = str(args.get("CommandLine") or args.get("command") or "")
+            if _CHROME_DEVTOOLS_CMD_RE.search(cmd_line):
+                return deny_payload
+        return None
 
     @staticmethod
     def _read_git_head_branch_and_sha(target_dir: Path | None, branch_name: str = "") -> tuple[str, str]:

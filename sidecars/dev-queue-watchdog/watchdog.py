@@ -24,6 +24,7 @@ import re
 import signal
 import sys
 import threading
+import time
 from typing import Any
 
 _SIDECAR_DIR = Path(__file__).resolve().parent
@@ -39,10 +40,12 @@ for _cand_root in (_PLUGIN_ROOT, _INSTALLED_PLUGIN_ROOT):
                 sys.path.insert(0, _cand_str)
 
 import dev_queue_doctor  # noqa: E402
+import orchestration_control as _orch_ctrl  # noqa: E402
 
 DEFAULT_WATCHDOG_INTERVAL_SECONDS = 300
 MIN_WATCHDOG_INTERVAL_SECONDS = 30
 DEFAULT_WATCHDOG_COOLDOWN_SECONDS = 900
+DEFAULT_CONTROL_SLICE_SECONDS = 3.0
 _LOCAL_HOME_PATH_RE = re.compile(r"/(?:Users|home)/(?!testuser\b|test\b|Shared\b)[A-Za-z0-9._-]+")
 
 
@@ -97,7 +100,95 @@ def run_watchdog_cycle(
     ps_runner: Callable[[], str] | None = None,
     git_client: Any | None = None,
 ) -> dict[str, Any]:
-    """Execute one 0-LLM watchdog cycle: fast read-only diagnosis first, then targeted fix/wake only if required."""
+    """Execute one 0-LLM watchdog cycle: honor Pause (Graceful Drain), fast-wake explicit Resume, or heal anomalies."""
+    orch_ctrl = _orch_ctrl.load_orchestration_control(state_dir=state_dir, home_dir=home_dir)
+    if bool(orch_ctrl.get("paused")):
+        return {
+            "status": "paused",
+            "overall_status": "paused",
+            "paused": True,
+            "orchestration_control": orch_ctrl,
+            "action_required": False,
+            "healed": False,
+            "woke": False,
+            "checked_at": _utc_now_iso(),
+            "health_score": 100,
+            "anomalies": [],
+            "queue_summary": {},
+        }
+
+    if _orch_ctrl.has_unhandled_resume_request(orch_ctrl):
+        resume_nonce = str(orch_ctrl.get("resume_nonce") or "").strip()
+        procs = dev_queue_doctor.inspect_live_processes(ps_output=ps_output, ps_runner=ps_runner)
+        if procs.get("wait_for_unlock_running"):
+            return {
+                "status": "resume_delegated_to_waiter",
+                "overall_status": "healthy",
+                "paused": False,
+                "orchestration_control": orch_ctrl,
+                "action_required": False,
+                "healed": False,
+                "woke": False,
+                "checked_at": _utc_now_iso(),
+                "health_score": 100,
+                "anomalies": [],
+                "queue_summary": {},
+                "wake": {
+                    "status": "delegated_to_wait_for_unlock",
+                    "woke": False,
+                    "wait_for_unlock_pids": list(procs.get("wait_for_unlock_pids") or []),
+                },
+            }
+        doc_res = dev_queue_doctor.run_queue_doctor(
+            state_dir=state_dir,
+            repos_dir=repos_dir,
+            brain_dir=brain_dir,
+            sync_git=sync_git,
+            fix=True,
+            wake=True,
+            force=True,
+            cooldown_seconds=cooldown_seconds,
+            dry_run=dry_run,
+            now_ts=now_ts,
+            ps_output=ps_output,
+            ps_runner=ps_runner,
+            git_client=git_client,
+            home_dir=home_dir,
+            env=env,
+            which_fn=which_fn,
+            popen_fn=popen_fn,
+            pid_alive_fn=pid_alive_fn,
+        )
+        wake_info = doc_res.get("wake") if isinstance(doc_res.get("wake"), dict) else {}
+        woke = bool(wake_info.get("woke"))
+        wake_st = str(wake_info.get("status") or "")
+        if not dry_run and (woke or wake_st in ("skipped_wake_in_flight", "skipped_healthy")):
+            _orch_ctrl.mark_resume_handled(
+                state_dir=state_dir,
+                home_dir=home_dir,
+                resume_nonce=resume_nonce,
+                handled_by="watchdog",
+                now_ts=now_ts,
+            )
+        rem_actions = [r for r in (doc_res.get("remediation_actions") or []) if isinstance(r, dict)]
+        healed = bool(not dry_run and any(r.get("status") == "applied" for r in rem_actions))
+        return {
+            "status": "dry_run" if dry_run else ("resumed_woke" if woke else "resumed"),
+            "overall_status": str(doc_res.get("overall_status") or "healthy"),
+            "paused": False,
+            "orchestration_control": _orch_ctrl.load_orchestration_control(state_dir=state_dir, home_dir=home_dir),
+            "action_required": True,
+            "needs_fix": True,
+            "needs_wake": True,
+            "healed": healed,
+            "woke": woke,
+            "checked_at": str(doc_res.get("generated_at") or _utc_now_iso()),
+            "health_score": int(doc_res.get("health_score") or 100),
+            "anomalies": list(doc_res.get("anomalies") or []),
+            "remediation_actions": rem_actions,
+            "wake": wake_info,
+        }
+
     diag = dev_queue_doctor.diagnose_orchestrator(
         state_dir=state_dir,
         repos_dir=repos_dir,
@@ -282,7 +373,24 @@ def main(
             if args.once:
                 return 1 if had_error else 0
 
-            if ev.wait(interval):
+            # Slice the wait interval into <=3s control checks (<0.1ms, 0 git/LLM) so clicking
+            # Continue/Resume in the Dev Queue panel wakes the orchestrator within ~3s.
+            deadline = time.monotonic() + float(interval)
+            stopped_early = False
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                slice_sec = min(remaining, DEFAULT_CONTROL_SLICE_SECONDS)
+                if ev.wait(slice_sec):
+                    stopped_early = True
+                    break
+                with contextlib.suppress(Exception):
+                    if _orch_ctrl.has_unhandled_resume_request(
+                        _orch_ctrl.load_orchestration_control(state_dir=state_override)
+                    ):
+                        break
+            if stopped_early:
                 break
         return 0
     finally:

@@ -108,9 +108,11 @@ class TestSidecarManifestAndFrontendContracts(unittest.TestCase):
         self.assertEqual(data.get("restart_policy"), "always")
         self.assertEqual(data.get("agent_permissions", {}).get("allows_user_interactions"), False)
         views = data.get("ui_config", {}).get("views", [])
-        self.assertEqual(len(views), 1)
-        self.assertEqual(views[0].get("entrypoint"), "SIDECAR_UI_ENTRYPOINT_AUX_PANE")
-        self.assertEqual(views[0].get("path"), "/")
+        entrypoints = [v.get("entrypoint") for v in views]
+        self.assertIn("SIDECAR_UI_ENTRYPOINT_AUX_PANE", entrypoints)
+        self.assertIn("SIDECAR_UI_ENTRYPOINT_SIDEBAR", entrypoints)
+        for v in views:
+            self.assertEqual(v.get("path"), "/")
 
     def test_vanilla_frontend_security_a11y_and_sdk_usage(self) -> None:
         html = INDEX_HTML.read_text(encoding="utf-8")

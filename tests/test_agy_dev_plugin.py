@@ -103,9 +103,9 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
 
     def test_deterministic_checks_catalog_and_pre_tool_use_blocks(self) -> None:
         all_checks = dev_common.get_deterministic_dev_checks()
-        self.assertEqual(len(all_checks), 8)
+        self.assertEqual(len(all_checks), 9)
         pre_checks = dev_common.get_deterministic_dev_checks("PreToolUse")
-        self.assertEqual(len(pre_checks), 7)
+        self.assertEqual(len(pre_checks), 8)
         self.assertEqual(
             {c["check_id"] for c in pre_checks},
             {
@@ -116,6 +116,7 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
                 "pretool:unvalidated-branch-push",
                 "pretool:parallel-file-lease",
                 "pretool:parallel-worker-deploy-home",
+                "pretool:paused-chrome-devtools",
             },
         )
 
@@ -2367,7 +2368,7 @@ class TestGitClientDevCommonAndRunnerCoverage(unittest.TestCase):
             out_json = io.StringIO()
             with contextlib.redirect_stdout(out_json):
                 self.assertEqual(dev_common.main(["checks", "--format", "json"]), 0)
-            self.assertEqual(json.loads(out_json.getvalue())["count"], 8)
+            self.assertEqual(json.loads(out_json.getvalue())["count"], 9)
 
             out_txt = io.StringIO()
             with contextlib.redirect_stdout(out_txt):

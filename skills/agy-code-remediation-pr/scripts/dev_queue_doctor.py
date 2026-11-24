@@ -50,6 +50,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 import dev_common  # noqa: E402
 import dev_flow_optimizer  # noqa: E402
+import orchestration_control as _orch_ctrl  # noqa: E402
 from dev_flow_optimizer import (  # noqa: E402
     DEFAULT_STALL_THRESHOLD_SECONDS,
     OPEN_QUEUE_STATUSES,
@@ -677,9 +678,11 @@ def diagnose_orchestrator(
     )
     stall_thresh = resolve_stall_threshold_seconds(stall_threshold_seconds)
     cur_ts = float(now_ts if now_ts is not None else time.time())
+    orch_ctrl = _orch_ctrl.load_orchestration_control(state_dir=resolved_state, home_dir=home_dir)
+    is_paused = bool(orch_ctrl.get("paused"))
 
     git_sync_summary: dict[str, Any] = {"performed": False}
-    if sync_git:
+    if sync_git and not is_paused:
         is_offline = os.environ.get("AGY_OFFLINE_ONLY") == "1"
         sync_res = pr_rem.sync_dev_pr_lock_with_git(
             portfolio_dir=resolved_state,
@@ -696,6 +699,8 @@ def diagnose_orchestrator(
             "locks_released": bool(sync_res.get("released")),
             "reconciled_count": int(recon_res.get("reconciled_count") or 0),
         }
+    elif sync_git and is_paused:
+        git_sync_summary = {"performed": False, "skipped_reason": "orchestration_paused"}
 
     q_data = pr_rem.load_dev_queue(portfolio_dir=resolved_state)
     items: list[dict[str, Any]] = [
@@ -709,6 +714,58 @@ def diagnose_orchestrator(
         for slug, lk in all_locks.items()
         if isinstance(lk, dict) and bool(lk.get("active"))
     }
+    orch_summary = _orch_ctrl.summarize_orchestration_phase(orch_ctrl, active_locks)
+
+    if is_paused:
+        proc_info = inspect_live_processes(ps_output=ps_output, ps_runner=ps_runner)
+        orch_transcript = inspect_transcript_tail(
+            eff_orch_cid,
+            resolved_brain_dirs,
+            now_ts=cur_ts,
+        )
+        open_items = [
+            it for it in items if str(it.get("status") or "pending").strip().lower() in OPEN_QUEUE_STATUSES
+        ]
+        pending_items = [
+            it for it in items if str(it.get("status") or "pending").strip().lower() == "pending"
+        ]
+        in_prog_items = [
+            it for it in items if str(it.get("status") or "").strip().lower() == "in_progress"
+        ]
+        pr_open_items = [
+            it for it in items if str(it.get("status") or "").strip().lower() == "pr_open"
+        ]
+        return {
+            "status": "ok",
+            "generated_at": _utc_now_iso(cur_ts),
+            "overall_status": "paused",
+            "paused": True,
+            "orchestration_control": orch_summary,
+            "needs_wake": False,
+            "needs_fix": False,
+            "action_required": False,
+            "health_score": 100,
+            "state_dir": _sanitize_path(str(resolved_state)),
+            "orchestrator": {
+                "conversation_id": eff_orch_cid,
+                "transcript": orch_transcript,
+            },
+            "processes": proc_info,
+            "queue_summary": {
+                "total_items": len(items),
+                "open_items": len(open_items),
+                "pending": len(pending_items),
+                "in_progress": len(in_prog_items),
+                "pr_open": len(pr_open_items),
+                "active_locks": len(active_locks),
+                "active_lock_repos": sorted(active_locks.keys()),
+                "runnable_unlocked_repos": [],
+                "runnable_items": [],
+            },
+            "git_sync": git_sync_summary,
+            "anomalies": [],
+            "improvements": [],
+        }
 
     q_next = pr_rem.get_next_dev_queue_item(
         portfolio_dir=resolved_state,
@@ -1072,6 +1129,8 @@ def diagnose_orchestrator(
         "status": "ok",
         "generated_at": _utc_now_iso(cur_ts),
         "overall_status": overall_status,
+        "paused": False,
+        "orchestration_control": orch_summary,
         "needs_wake": needs_wake,
         "needs_fix": needs_fix,
         "action_required": bool(needs_wake or needs_fix),
@@ -1340,6 +1399,15 @@ def trigger_orchestrator_wake(
     eff_env = os.environ if env is None else env
     eff_cooldown = max(0, int(cooldown_seconds))
     cur_ts = float(now_ts if now_ts is not None else time.time())
+    orch_ctrl = _orch_ctrl.load_orchestration_control(state_dir=resolved_state, home_dir=home_dir)
+    if bool(orch_ctrl.get("paused")):
+        return {
+            "status": "skipped_paused",
+            "woke": False,
+            "reason": "orchestration_paused",
+            "orchestration_control": orch_ctrl,
+            "cooldown_seconds": eff_cooldown,
+        }
     needs_wake = bool(diagnosis.get("needs_wake"))
     anomalies = [a for a in (diagnosis.get("anomalies") or []) if isinstance(a, dict)]
     wake_reason = (
@@ -1548,9 +1616,10 @@ def run_queue_doctor(
     eff_fix = bool(fix or heal)
     eff_wake = bool(wake or heal)
     target_state = state_dir if state_dir is not None else portfolio_dir
+    is_paused = _orch_ctrl.is_orchestration_paused(state_dir=target_state, home_dir=home_dir)
 
     remediation_actions: list[dict[str, Any]] = []
-    if eff_fix and not check_only:
+    if eff_fix and not check_only and not is_paused:
         if dry_run:
             remediation_actions.append(
                 {
@@ -1633,7 +1702,11 @@ def run_queue_doctor(
 
     exit_code = 0
     if check_only:
-        exit_code = 0 if (diag.get("overall_status") == "healthy" and not diag.get("action_required")) else 2
+        exit_code = (
+            0
+            if (diag.get("overall_status") in ("healthy", "paused") and not diag.get("action_required"))
+            else 2
+        )
     elif wake_result.get("status") == "error":
         exit_code = 1
 
@@ -1650,7 +1723,11 @@ def run_queue_doctor(
 def render_doctor_report(report: dict[str, Any], *, color: bool = True) -> str:
     """Render crisp 3-part terminal report: Diagnosis, Safe Runtime Actions & Wake, Improvements."""
     overall = str(report.get("overall_status") or "healthy").lower()
-    if overall == "healthy":
+    orch_ctrl = report.get("orchestration_control") if isinstance(report.get("orchestration_control"), dict) else {}
+    ctrl_phase = str(orch_ctrl.get("phase") or "").lower()
+    if overall == "paused":
+        badge = _color("[DRAINING]" if ctrl_phase == "draining" else "[PAUSED]", "1;33", color)
+    elif overall == "healthy":
         badge = _color("[HEALTHY]", "1;32", color)
     elif overall == "blocked":
         badge = _color("[BLOCKED]", "1;31", color)
@@ -1689,7 +1766,12 @@ def render_doctor_report(report: dict[str, Any], *, color: bool = True) -> str:
     ]
 
     anomalies = [a for a in (report.get("anomalies") or []) if isinstance(a, dict)]
-    if not anomalies:
+    if overall == "paused":
+        banner_txt = str(orch_ctrl.get("banner_text") or "PAUSED — 0 new dispatches · Watchdog silent")
+        reason_txt = str(orch_ctrl.get("reason") or "").strip()
+        extra_reason = f" ({reason_txt})" if reason_txt else ""
+        lines.append(f"  {_color('⏸', '1;33', color)} {banner_txt}{extra_reason}")
+    elif not anomalies:
         lines.append(f"  {_color('✓', '1;32', color)} Queue, locks, and orchestrator state are healthy (0 anomalies).")
     else:
         for a in anomalies:

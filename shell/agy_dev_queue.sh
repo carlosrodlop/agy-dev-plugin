@@ -16,6 +16,9 @@
 #        agy-queue show <ID> [--json]
 #        agy-queue locks [--sync-git] [--repo SLUG] [--json]
 #        agy-queue set-status <ID> <STATUS> [--notes "..."]
+#        agy-queue pause [--reason "..."] [--json]
+#        agy-queue resume [--no-wake] [--json]
+#        agy-queue status [--json]
 #        agy-doctor [--fix] [--wake] [--heal] [--check-only] [--json]
 #   2. Shell profile sourcing (Bash or Zsh):
 #        source "$HOME/.gemini/config/plugins/agy-dev-plugin/shell/agy_dev_queue.sh"

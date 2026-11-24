@@ -80,6 +80,37 @@ _git_client: Any = None
 _git_client_loaded = False
 _queue_doctor: Any = None
 _queue_doctor_loaded = False
+_orch_ctrl_mod: Any = None
+_orch_ctrl_loaded = False
+
+
+def _get_orch_control() -> Any:
+    global _orch_ctrl_mod, _orch_ctrl_loaded
+    if not _orch_ctrl_loaded:
+        _orch_ctrl_loaded = True
+        with contextlib.suppress(Exception):
+            import orchestration_control as _oc  # type: ignore[import-not-found]
+
+            _orch_ctrl_mod = _oc
+    return _orch_ctrl_mod
+
+
+def _load_orchestration_phase(state_dir: Path, locks: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    oc = _get_orch_control()
+    if oc is not None:
+        with contextlib.suppress(Exception):
+            ctrl = oc.load_orchestration_control(state_dir=state_dir)
+            return dict(oc.summarize_orchestration_phase(ctrl, locks))
+    return {
+        "paused": False,
+        "phase": "active",
+        "ongoing_count": 0,
+        "new_dispatches_blocked": False,
+        "banner_text": "",
+        "reason": "",
+        "paused_at": "",
+        "resumed_at": "",
+    }
 
 
 def _get_git_client() -> Any:
@@ -142,6 +173,9 @@ AGY_QUEUE_SUBCOMMANDS: tuple[str, ...] = (
     "show",
     "locks",
     "set-status",
+    "pause",
+    "resume",
+    "status",
 )
 
 INACTIVE_STATUSES: frozenset[str] = frozenset({"merged", "cleaned", "cancelled", "rejected"})
@@ -3038,6 +3072,7 @@ def render(
             "state_dir": str(state_dir),
             "updated_at": queue_data.get("updated_at", ""),
             "orchestrator_conversation_id": queue_data.get("orchestrator_conversation_id", ""),
+            "orchestration": _load_orchestration_phase(state_dir, locks),
             "counts": counts,
             "managed_repos": managed_list,
             "locks": active_locks_payload,
@@ -3101,6 +3136,16 @@ def render(
     else:
         header_lines.append(header_left)
         header_lines.append(summary_str)
+
+    orch_phase = _load_orchestration_phase(state_dir, locks)
+    if bool(orch_phase.get("paused")):
+        pause_banner = str(orch_phase.get("banner_text") or "PAUSED — 0 new dispatches · Watchdog silent")
+        pause_reason = str(orch_phase.get("reason") or "").strip()
+        if pause_reason:
+            pause_banner = f"{pause_banner} ({pause_reason})"
+        header_lines.append(
+            _color(_trunc(f"⏸ [[P] Continue] {pause_banner}", bar_w), "1;33", color_on)
+        )
 
     stalled_alerts: list[tuple[str, str, str]] = []
     for slug in managed_list:
@@ -3242,6 +3287,8 @@ def render(
                     "hitl_count": 0,
                     "all_pr_links": [],
                     "has_active_work": has_active_work,
+                    "orchestration_paused": bool(orch_phase.get("paused")),
+                    "orchestration_phase": str(orch_phase.get("phase") or "active"),
                     "active_locks": dict(locks),
                     "all_locks": dict(all_locks),
                     "items_snapshot": list(effective_items),
@@ -3561,6 +3608,8 @@ def render(
                 "hitl_count": len(hitl_convs),
                 "all_pr_links": all_pr_links,
                 "has_active_work": has_active_work,
+                "orchestration_paused": bool(orch_phase.get("paused")),
+                "orchestration_phase": str(orch_phase.get("phase") or "active"),
                 "active_locks": dict(locks),
                 "all_locks": dict(all_locks),
                 "items_snapshot": list(effective_items),
@@ -4278,6 +4327,7 @@ def _render_help_overlay_lines(term_w: int, color_on: bool) -> list[str]:
         "    o / O / 1-9       Open first ready PR / all ready PRs / row #N link in default browser",
         "    h + 1-9           Jump via Dev Queue Sidecar Panel (nav_intent) + clipboard/focus fallback",
         "    d                 Run interactive agy-doctor check ([w] wake · [f] safe fix)",
+        "    P                 Toggle Pause / Continue orchestration (Graceful Drain: finish ongoing, 0 new)",
         "    p / a             Toggle [compact] pending rows (<=3) / [all] inactive items",
         "    s / b             Trigger async background Git fetch+reconcile / force-sync board.md",
         "    r / R / q         Refresh snapshot / safe syntax-checked reload / quit",
@@ -4302,6 +4352,7 @@ def _build_watch_footer(
     awaiting_hitl_digit: bool,
     sync_in_flight: bool,
     status_msg: str,
+    orchestration_paused: bool = False,
 ) -> str:
     """Compose compact 1-line watch footer with conditional `[h+#]` and persistent toggle badges."""
     if filter_input_active:
@@ -4312,6 +4363,8 @@ def _build_watch_footer(
         return f"[{overlay_mode.upper()}]  [j/k/PgUp/PgDn/g/G] scroll · [Esc/Enter] back to queue · [q] close"
 
     toggles: list[str] = []
+    if orchestration_paused:
+        toggles.append("[PAUSED]")
     if compact_pending:
         toggles.append("[compact]")
     if show_all:
@@ -4321,8 +4374,9 @@ def _build_watch_footer(
     toggle_prefix = (" ".join(toggles) + "  ") if toggles else ""
 
     hitl_seg = " · [h+#] Agy" if hitl_count > 0 else ""
+    pause_hint = "[P] resume" if orchestration_paused else "[P] pause"
     core_keys = (
-        f"[Enter] inspect · [o/O] PR · [1-9] open{hitl_seg} · [/] filter · [d] doctor · "
+        f"[Enter] inspect · [o/O] PR · [1-9] open{hitl_seg} · [/] filter · {pause_hint} · [d] doctor · "
         f"[x] opt · [j/k] scroll · [p] compact · [a] all · [s] sync · [?] help · [R] reload · [q] quit"
     )
     if sync_in_flight and (not status_msg or status_msg == "↻ Syncing…"):
@@ -4354,6 +4408,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "  agy-queue show <ID> [FLAGS]   Inspect single item + live worker/reviewer telemetry\n"
         "  agy-queue locks [FLAGS]       Inspect per-repo dev_pr_locks & stall semaphore\n"
         "  agy-queue set-status <ID> <S> Transition queue item status cleanly\n"
+        "  agy-queue pause [FLAGS]       Pause new dispatches (Graceful Drain: finish ongoing)\n"
+        "  agy-queue resume [FLAGS]      Continue orchestration & auto-wake orchestrator\n"
+        "  agy-queue status [FLAGS]      Show Pause / Draining / Active orchestration status\n"
     )
     parser = argparse.ArgumentParser(
         prog="agy-queue",
@@ -4727,6 +4784,7 @@ def run_watch_loop(
                 awaiting_hitl_digit=awaiting_hitl_digit,
                 sync_in_flight=sync_ctrl.is_in_flight(),
                 status_msg=status_msg,
+                orchestration_paused=bool(layout_data.get("orchestration_paused", False)),
             )
 
             color_on = bool(layout_data.get("color_on", False))
@@ -5043,6 +5101,23 @@ def run_watch_loop(
                     scroll_offset = 0
                     status_msg = f"Pending view: {'COMPACT' if compact_pending else 'FULL'}"
                     status_until = time.monotonic() + 2.5
+                    break
+                if key == "P":
+                    oc_mod = _get_orch_control()
+                    if oc_mod is None:
+                        status_msg = "⚠ orchestration_control module unavailable"
+                    else:
+                        cur_paused = bool(oc_mod.is_orchestration_paused(state_dir=st_dir))
+                        if cur_paused:
+                            oc_mod.resume_orchestration(state_dir=st_dir, source="tui", request_wake=True)
+                            status_msg = "▶ Orchestration resumed — waking orchestrator…"
+                        else:
+                            res_p = oc_mod.pause_orchestration(state_dir=st_dir, source="tui")
+                            cur_locks, _ = _load_locks(st_dir)
+                            phase_info = oc_mod.summarize_orchestration_phase(res_p.get("control"), cur_locks)
+                            status_msg = f"⏸ {phase_info.get('banner_text') or 'PAUSED — 0 new dispatches'}"
+                    status_until = time.monotonic() + 4.5
+                    data_dirty = True
                     break
                 if key in ("j", "DOWN"):
                     if nav_total > 0:
@@ -5443,6 +5518,96 @@ def _run_subcommand_set_status(argv: list[str]) -> int:
     return 0
 
 
+def _run_subcommand_pause(argv: list[str]) -> int:
+    """Handle `agy-queue pause [--reason ...] [--state-dir DIR] [--json]`."""
+    parser = argparse.ArgumentParser(
+        prog="agy-queue pause",
+        description="Pause orchestration (Graceful Drain: finish ongoing active-lock tasks, dispatch zero new tasks).",
+    )
+    parser.add_argument("--reason", default="", help="Optional short Zero-PII reason (e.g. 'Customer focus').")
+    parser.add_argument("--state-dir", default="", help="Optional state directory override.")
+    parser.add_argument("--json", action="store_true", help="Output JSON payload.")
+    ns = parser.parse_args(argv)
+    st_dir = _resolve_state_dir(ns.state_dir)
+    oc_mod = _get_orch_control()
+    if oc_mod is None:
+        print("Error: orchestration_control module not found.", file=sys.stderr)
+        return 1
+    res = oc_mod.pause_orchestration(state_dir=st_dir, reason=ns.reason, source="cli")
+    locks, _ = _load_locks(st_dir)
+    summary = oc_mod.summarize_orchestration_phase(res.get("control"), locks)
+    out_payload = {
+        "status": "ok",
+        "paused": True,
+        "changed": bool(res.get("changed")),
+        "orchestration": summary,
+    }
+    if ns.json:
+        print(json.dumps(out_payload, indent=2, ensure_ascii=False))
+    else:
+        print(f"⏸ {summary.get('banner_text') or 'PAUSED — 0 new dispatches · Watchdog silent'}")
+    return 0
+
+
+def _run_subcommand_resume(argv: list[str]) -> int:
+    """Handle `agy-queue resume [--no-wake] [--dry-run] [--state-dir DIR] [--json]`."""
+    parser = argparse.ArgumentParser(
+        prog="agy-queue resume",
+        description="Continue orchestration and automatically wake the orchestrator.",
+    )
+    parser.add_argument("--no-wake", dest="no_wake", action="store_true", help="Unpause passively without auto-wake.")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true", help="Preview wake command without spawning.")
+    parser.add_argument("--state-dir", default="", help="Optional state directory override.")
+    parser.add_argument("--json", action="store_true", help="Output JSON payload.")
+    ns = parser.parse_args(argv)
+    st_dir = _resolve_state_dir(ns.state_dir)
+    pr_rem = _resolve_pr_remediator_script()
+    cmd = [sys.executable, str(pr_rem), "orchestration-resume", "--source", "cli", "--portfolio-dir", str(st_dir)]
+    if ns.no_wake:
+        cmd.append("--no-wake")
+    if ns.dry_run:
+        cmd.append("--dry-run")
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        err_out = (proc.stderr or proc.stdout or "").strip()
+        if err_out:
+            print(err_out, file=sys.stderr)
+        return int(proc.returncode)
+    if ns.json:
+        print((proc.stdout or "{}").strip())
+    else:
+        wake_st = ""
+        with contextlib.suppress(json.JSONDecodeError):
+            parsed = json.loads(proc.stdout or "{}")
+            wake_st = str((parsed.get("wake") or {}).get("status") or "")
+        extra = f" ({wake_st})" if wake_st else ""
+        print(f"▶ Orchestration resumed{extra}")
+    return 0
+
+
+def _run_subcommand_status(argv: list[str]) -> int:
+    """Handle `agy-queue status [--state-dir DIR] [--json]`."""
+    parser = argparse.ArgumentParser(
+        prog="agy-queue status",
+        description="Show Pause / Draining / Active orchestration status.",
+    )
+    parser.add_argument("--state-dir", default="", help="Optional state directory override.")
+    parser.add_argument("--json", action="store_true", help="Output JSON payload.")
+    ns = parser.parse_args(argv)
+    st_dir = _resolve_state_dir(ns.state_dir)
+    locks, _ = _load_locks(st_dir)
+    summary = _load_orchestration_phase(st_dir, locks)
+    if ns.json:
+        print(json.dumps({"status": "ok", "orchestration": summary}, indent=2, ensure_ascii=False))
+    else:
+        if summary.get("paused"):
+            print(f"⏸ {summary.get('banner_text') or 'PAUSED — 0 new dispatches · Watchdog silent'}")
+        else:
+            ongoing = int(summary.get("ongoing_count") or 0)
+            print(f"▶ ACTIVE — {ongoing} ongoing task(s) · new dispatches enabled")
+    return 0
+
+
 def _dispatch_subcommand(subcmd: str, rest: list[str], raw_cli_argv: list[str]) -> int:
     """Dispatch unified `agy-queue` subcommands while keeping full legacy flag compatibility."""
     if subcmd == "doctor":
@@ -5469,6 +5634,12 @@ def _dispatch_subcommand(subcmd: str, rest: list[str], raw_cli_argv: list[str]) 
         return _run_subcommand_locks(rest)
     if subcmd == "set-status":
         return _run_subcommand_set_status(rest)
+    if subcmd == "pause":
+        return _run_subcommand_pause(rest)
+    if subcmd == "resume":
+        return _run_subcommand_resume(rest)
+    if subcmd == "status":
+        return _run_subcommand_status(rest)
     return 1
 
 

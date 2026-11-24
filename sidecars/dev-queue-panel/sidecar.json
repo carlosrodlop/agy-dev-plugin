@@ -6,7 +6,7 @@
     "server.py"
   ],
   "command": "python3",
-  "description": "Compact read-only multi-repo Dev Queue & HITL Navigator panel with 1-click conversation and artifact switching plus [h#] terminal nav_intent bridge.",
+  "description": "Compact multi-repo Dev Queue & HITL Navigator panel with 1-click Pause/Continue (Graceful Drain) orchestration toggle, conversation/artifact switching, and [h#] terminal nav_intent bridge.",
   "display_name": "Dev Queue",
   "has_web_ui": true,
   "restart_policy": "always",
@@ -15,6 +15,11 @@
     "views": [
       {
         "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "path": "/",
+        "title": "Dev Queue"
+      },
+      {
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_SIDEBAR",
         "path": "/",
         "title": "Dev Queue"
       }

@@ -50,6 +50,7 @@ from lock_store import (  # noqa: E402
     get_all_dev_pr_locks,
 )
 from parallel_scope import TaskAnchorSpec, analyze_pair_overlap  # noqa: E402
+import orchestration_control as _orch_ctrl  # noqa: E402
 
 DEV_QUEUE_FILENAME = "dev_queue.json"
 DEV_QUEUE_STATUSES: tuple[str, ...] = (
@@ -1307,6 +1308,28 @@ def get_next_dev_queue_item(
     status_by_cid = {str(it.get("conversation_id") or ""): str(it.get("status") or "").lower() for it in items}
     active_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
     locked_repos = sorted(active_locks.keys())
+    orch_ctrl = _orch_ctrl.load_orchestration_control(portfolio_dir=portfolio_dir)
+    if bool(orch_ctrl.get("paused")):
+        return {
+            "status": "ok",
+            "paused": True,
+            "orchestration_control": orch_ctrl,
+            "queue_path": data.get("queue_path", ""),
+            "orchestrator_conversation_id": data.get("orchestrator_conversation_id", ""),
+            "has_next": False,
+            "next_item": None,
+            "next_pending_item": None,
+            "next_unlocked_item": None,
+            "runnable_by_repo": {},
+            "slot2_candidates": [],
+            "slot2_by_repo": {},
+            "locked_repos": locked_repos,
+            "partial_wip_by_repo": {},
+            "blocked_by_dependencies": [],
+            "blocked_by_repo_locks": [],
+            "blocked_by_partial_wip_cap": [],
+            "summary": data.get("summary", {}),
+        }
 
     def _deps_unmet(item: dict[str, Any]) -> list[str]:
         unmet: list[str] = []
@@ -1584,6 +1607,8 @@ def get_next_dev_queue_item(
 
     return {
         "status": "ok",
+        "paused": False,
+        "orchestration_control": orch_ctrl,
         "queue_path": data.get("queue_path", ""),
         "orchestrator_conversation_id": data.get("orchestrator_conversation_id", ""),
         "has_next": next_item is not None,

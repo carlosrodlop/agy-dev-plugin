@@ -57,6 +57,7 @@ from lock_store import (  # noqa: E402
     sync_dev_pr_lock_with_git,
 )
 import parallel_scope as _parallel_scope  # noqa: E402
+import orchestration_control as _orch_ctrl  # noqa: E402
 from queue_store import (  # noqa: E402
     DEV_QUEUE_DONE_STATUSES,
     _CONVERSATION_UUID_RE,
@@ -84,9 +85,9 @@ def _collect_watched_script_paths() -> list[Path]:
 
     _add(Path(__file__).with_name("pr_remediator.py"))
     _add(Path(__file__))
-    for _sibling in ("lock_store.py", "queue_store.py", "worktree_ops.py", "review_gate.py", "merge_watcher.py"):
+    for _sibling in ("lock_store.py", "queue_store.py", "worktree_ops.py", "review_gate.py", "merge_watcher.py", "orchestration_control.py"):
         _add(Path(__file__).with_name(_sibling))
-    for mod in (_git_client, dev_common, _flow_opt, _queue_doctor, _parallel_scope, _rebase_gate):
+    for mod in (_git_client, dev_common, _flow_opt, _queue_doctor, _parallel_scope, _rebase_gate, _orch_ctrl):
         mod_file = getattr(mod, "__file__", None) if mod is not None else None
         if mod_file:
             _add(mod_file)
@@ -95,7 +96,7 @@ def _collect_watched_script_paths() -> list[Path]:
     installed_plugin_root = Path.home() / ".gemini" / "config" / "plugins" / "agy-dev-plugin"
     for root in (script_plugin_root, installed_plugin_root):
         _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "pr_remediator.py")
-        for _mod_name in ("lock_store.py", "queue_store.py", "worktree_ops.py", "review_gate.py", "merge_watcher.py"):
+        for _mod_name in ("lock_store.py", "queue_store.py", "worktree_ops.py", "review_gate.py", "merge_watcher.py", "orchestration_control.py"):
             _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / _mod_name)
         _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "dev_flow_optimizer.py")
         _add(root / "skills" / "agy-code-remediation-pr" / "scripts" / "dev_queue_doctor.py")
@@ -235,6 +236,7 @@ def run_pr_merge_watcher_loop(
         lock_fd.flush()
 
         start_mono = time.monotonic()
+        paused_elapsed_offset = 0.0
         iterations = 0
         last_sync: dict[str, Any] = {}
 
@@ -259,6 +261,27 @@ def run_pr_merge_watcher_loop(
                 }
 
             iterations += 1
+            if _orch_ctrl.is_orchestration_paused(portfolio_dir=portfolio_dir):
+                if max_iterations is not None and iterations >= max_iterations:
+                    return {
+                        "status": "ok",
+                        "already_running": False,
+                        "terminated": False,
+                        "paused": True,
+                        "reason": "paused_max_iterations_reached",
+                        "released": False,
+                        "iterations": iterations,
+                        "last_sync": last_sync,
+                    }
+                pause_sleep = min(
+                    max(0.05, float(poll_interval_seconds)),
+                    _orch_ctrl.DEFAULT_PAUSED_POLL_INTERVAL_SECONDS,
+                )
+                sleep_started = time.monotonic()
+                time.sleep(pause_sleep)
+                paused_elapsed_offset += max(0.0, time.monotonic() - sleep_started)
+                continue
+
             last_sync = _facade_attr("sync_dev_pr_lock_with_git", sync_dev_pr_lock_with_git)(portfolio_dir=portfolio_dir, git_client=git_client)
             if not last_sync.get("active"):
                 return {
@@ -280,7 +303,7 @@ def run_pr_merge_watcher_loop(
                     "iterations": iterations,
                     "last_sync": last_sync,
                 }
-            if (time.monotonic() - start_mono) >= max_duration_seconds:
+            if ((time.monotonic() - start_mono) - paused_elapsed_offset) >= max_duration_seconds:
                 return {
                     "status": "ok",
                     "already_running": False,
@@ -423,6 +446,8 @@ def wait_for_unlock_or_actionable_event(
     baseline_fp = _snapshot_file_fingerprints(watched_paths)
 
     start_mono = time.monotonic()
+    paused_elapsed_offset = 0.0
+    was_paused_during_wait = False
     iterations = 0
 
     while True:
@@ -444,6 +469,46 @@ def wait_for_unlock_or_actionable_event(
             }
 
         iterations += 1
+        orch_ctrl = _orch_ctrl.load_orchestration_control(portfolio_dir=portfolio_dir)
+        if bool(orch_ctrl.get("paused")):
+            was_paused_during_wait = True
+            if max_iterations is not None and iterations >= max_iterations:
+                cur_locks_paused = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
+                return {
+                    "status": "ok",
+                    "event": "paused_max_iterations",
+                    "paused": True,
+                    "orchestration_control": orch_ctrl,
+                    "released_repos": [],
+                    "rebase_reverify_locks": [],
+                    "active_lock_repos": sorted(cur_locks_paused.keys()),
+                    "active_lock_count": len(cur_locks_paused),
+                    "stalled_locks": [],
+                    "next_unlocked_item": None,
+                    "runnable_by_repo": {},
+                    "summary": {},
+                    "iterations": iterations,
+                    "elapsed_seconds": round(max(0.0, time.monotonic() - start_mono), 2),
+                    "rearm_recommended": False,
+                }
+            pause_sleep = min(
+                max(0.05, float(poll_interval_seconds)),
+                _orch_ctrl.DEFAULT_PAUSED_POLL_INTERVAL_SECONDS,
+            )
+            sleep_started = time.monotonic()
+            time.sleep(pause_sleep)
+            paused_elapsed_offset += max(0.0, time.monotonic() - sleep_started)
+            continue
+
+        resume_triggered = bool(was_paused_during_wait or _orch_ctrl.has_unhandled_resume_request(orch_ctrl))
+        if resume_triggered:
+            _orch_ctrl.mark_resume_handled(
+                portfolio_dir=portfolio_dir,
+                resume_nonce=str(orch_ctrl.get("resume_nonce") or ""),
+                handled_by="wait_for_unlock",
+            )
+            orch_ctrl = _orch_ctrl.load_orchestration_control(portfolio_dir=portfolio_dir)
+
         sync_res = _facade_attr("sync_dev_pr_lock_with_git", sync_dev_pr_lock_with_git)(portfolio_dir=portfolio_dir, git_client=git_client)
         current_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
         current_locked_repos = set(current_locks.keys())
@@ -522,6 +587,8 @@ def wait_for_unlock_or_actionable_event(
             return {
                 "status": "ok",
                 "event": event_name,
+                "paused": False,
+                "orchestration_control": orch_ctrl,
                 "released_repos": released_repos,
                 "rebase_reverify_locks": rebase_reverify_locks,
                 "active_lock_repos": sorted(current_locked_repos),
@@ -535,6 +602,8 @@ def wait_for_unlock_or_actionable_event(
                 "rearm_recommended": rearm,
             }
 
+        if resume_triggered:
+            return _payload("orchestration_resumed", rearm=False)
         if rebase_reverify_locks:
             return _payload("slot2_needs_rebase_reverify", rearm=False)
         if released_repos:
@@ -547,7 +616,7 @@ def wait_for_unlock_or_actionable_event(
             return _payload("queue_drained", rearm=False)
         if max_iterations is not None and iterations >= max_iterations:
             return _payload("max_iterations", rearm=bool(current_locks or open_active_count > 0))
-        if (time.monotonic() - start_mono) >= max_duration_seconds:
+        if ((time.monotonic() - start_mono) - paused_elapsed_offset) >= max_duration_seconds:
             return _payload("timeout", rearm=bool(current_locks or open_active_count > 0))
 
         reloaded, baseline_fp, _ = _maybe_auto_reload_process(

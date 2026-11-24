@@ -50,6 +50,7 @@ for _cand_root in (_INSTALLED_PLUGIN_ROOT, _PLUGIN_ROOT):
             sys.path.insert(0, _cand_str)
 
 import dev_queue_tui as _tui  # noqa: E402
+import orchestration_control as _orch_ctrl  # noqa: E402
 
 BIND_HOST = "127.0.0.1"
 MAX_POST_BODY_BYTES = 8192
@@ -733,10 +734,13 @@ def build_panel_state(
         "available": board_available,
         "label": board_file.name if board_file is not None else "dev_queue_board.md",
     }
+    orch_ctrl = _orch_ctrl.load_orchestration_control(state_dir=st_dir, home_dir=home_dir)
+    orchestration_state = _orch_ctrl.summarize_orchestration_phase(orch_ctrl, locks)
 
     semantic_core = sanitize_zero_pii_payload(
         {
             "orchestrator": orchestrator_info,
+            "orchestration": orchestration_state,
             "counts": counts,
             "repos": repos_cards,
             "sections": {
@@ -989,6 +993,57 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
             ack_res = _tui.acknowledge_nav_intent(st_dir, intent_id)
             status_code = HTTPStatus.OK if ack_res.get("ok") else HTTPStatus.CONFLICT
             self._send_json(status_code, ack_res)
+            return
+
+        if route == "/api/orchestration/pause":
+            st_dir = _tui._resolve_state_dir(str(cfg.state_dir) if cfg.state_dir is not None else "")
+            reason = str(body.get("reason") or "")
+            res = _orch_ctrl.pause_orchestration(
+                state_dir=st_dir,
+                home_dir=cfg.home_dir,
+                reason=reason,
+                source="sidecar_panel",
+            )
+            locks, _ = _tui._load_locks(st_dir)
+            orch_state = _orch_ctrl.summarize_orchestration_phase(res.get("control"), locks)
+            self._send_json(
+                HTTPStatus.OK,
+                sanitize_zero_pii_payload(
+                    {
+                        "ok": True,
+                        "paused": True,
+                        "changed": bool(res.get("changed")),
+                        "chrome_devtools": res.get("chrome_devtools") or {},
+                        "orchestration": orch_state,
+                    },
+                    home_dir=cfg.home_dir,
+                ),
+            )
+            return
+
+        if route == "/api/orchestration/resume":
+            st_dir = _tui._resolve_state_dir(str(cfg.state_dir) if cfg.state_dir is not None else "")
+            res = _orch_ctrl.resume_orchestration(
+                state_dir=st_dir,
+                home_dir=cfg.home_dir,
+                source="sidecar_panel",
+                request_wake=True,
+            )
+            locks, _ = _tui._load_locks(st_dir)
+            orch_state = _orch_ctrl.summarize_orchestration_phase(res.get("control"), locks)
+            self._send_json(
+                HTTPStatus.OK,
+                sanitize_zero_pii_payload(
+                    {
+                        "ok": True,
+                        "paused": False,
+                        "changed": bool(res.get("changed")),
+                        "resume_nonce": str(res.get("resume_nonce") or ""),
+                        "orchestration": orch_state,
+                    },
+                    home_dir=cfg.home_dir,
+                ),
+            )
             return
 
         if route == "/api/artifact-uri":
