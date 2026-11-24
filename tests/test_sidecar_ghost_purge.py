@@ -125,6 +125,7 @@ def _seed_ghost_workspace(
         f"antigravity-multi-conversation-layout-v3-{live_cid}": '{"rootNode":{"type":"leaf"}}',
         f"antigravity-multi-conversation-layout-v3-{ghost_db_cid}": '{"rootNode":{"type":"leaf"}}',
         f"antigravity-multi-conversation-layout-v3-{ghost_app_only_cid}+_new": '{"rootNode":{"type":"split"}}',
+        f"antigravity-multi-conversation-layout-v3-_new+{ghost_app_only_cid}": '{"rootNode":{"type":"split"}}',
         f"antigravity-multi-conversation-layout-v3-{live_cid}+{ghost_app_only_cid}": '{"rootNode":{"type":"split"}}',
         "antigravity-multi-conversation-layout-v3-index": json.dumps(
             [
@@ -175,11 +176,11 @@ class TestGhostCountingAndAppStoragePruning(unittest.TestCase):
             self.assertEqual(res["db_ghost_cids"], ["22222222-2222-4222-8222-222222222222"])
             self.assertEqual(res["app_storage_ghost_count"], 2)
             self.assertEqual(res["total_ghost_cids"], 2)
-            # pinned(2) + layout_keys(3) + layout_index_pairs(2) + expanded_keys(1) = 8
-            self.assertEqual(res["app_storage_entries_count"], 8)
+            # pinned(2) + layout_keys(4) + layout_index_pairs(2) + expanded_keys(1) = 9
+            self.assertEqual(res["app_storage_entries_count"], 9)
             self.assertEqual(
                 res["app_storage_breakdown"],
-                {"pinned": 2, "layout_keys": 3, "layout_index_pairs": 2, "expanded_keys": 1},
+                {"pinned": 2, "layout_keys": 4, "layout_index_pairs": 2, "expanded_keys": 1},
             )
             # Strictly zero writes occurred
             self.assertEqual(paths["proto_path"].read_bytes(), proto_before)
@@ -212,7 +213,7 @@ class TestGhostCountingAndAppStoragePruning(unittest.TestCase):
 
             self.assertEqual(res["status"], "ok")
             self.assertEqual(res["pruned_cids"], [ghost_db_cid])
-            self.assertEqual(res["app_storage_entries_removed"], 8)
+            self.assertEqual(res["app_storage_entries_removed"], 9)
             self.assertEqual(res["total_ghosts_pruned_count"], 2)
             self.assertEqual(len(res["backups"]), 2)
             for bkp in res["backups"]:
@@ -229,6 +230,7 @@ class TestGhostCountingAndAppStoragePruning(unittest.TestCase):
             self.assertIn(f"queued-messages-card-expanded-{live_cid}", cleaned_app)
             self.assertNotIn(f"antigravity-multi-conversation-layout-v3-{ghost_db_cid}", cleaned_app)
             self.assertNotIn(f"antigravity-multi-conversation-layout-v3-{ghost_app_only_cid}+_new", cleaned_app)
+            self.assertNotIn(f"antigravity-multi-conversation-layout-v3-_new+{ghost_app_only_cid}", cleaned_app)
             self.assertNotIn(f"antigravity-multi-conversation-layout-v3-{live_cid}+{ghost_app_only_cid}", cleaned_app)
             self.assertNotIn(f"queued-messages-card-expanded-{ghost_app_only_cid}", cleaned_app)
 
@@ -423,7 +425,7 @@ class TestDetachedGhostPurgeWorkerAndGuards(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(res_file.stat().st_mode), 0o600)
                 saved = json.loads(res_file.read_text(encoding="utf-8"))
                 self.assertEqual(saved["pruned_count"], 1)
-                self.assertEqual(saved["app_storage_entries_removed"], 8)
+                self.assertEqual(saved["app_storage_entries_removed"], 9)
                 self.assertEqual(saved["reopened"], reopen_expected)
                 self.assertFalse(saved["acked"])
 
@@ -532,6 +534,71 @@ class TestDetachedGhostPurgeWorkerAndGuards(unittest.TestCase):
             self.assertEqual(rc_x, 0)
             self.assertFalse(json.loads(buf_cancel.getvalue())["armed"])
 
+    def test_linux_quit_targets_desktop_pids_only(self) -> None:
+        ps_out = (
+            "  PID ARGS\n"
+            "  111 /opt/Antigravity/antigravity --no-sandbox\n"
+            "  222 /usr/local/bin/agy chat --id abc\n"
+            "  333 /home/testuser/.gemini/language_server_linux --port 9000\n"
+        )
+        detected = prs._detect_active_antigravity_processes(ps_output=ps_out)
+        self.assertEqual(len(detected), 3)
+        desktop_only = prs._filter_desktop_antigravity_procs(detected)
+        self.assertEqual(desktop_only, ["pid=111:antigravity"])
+
+        killed: list[tuple[int, int]] = []
+        with mock.patch("os.kill", side_effect=lambda pid, sig: killed.append((pid, sig))):
+            ok = prs._default_quit_antigravity("linux", detected)
+        self.assertTrue(ok)
+        self.assertEqual(len(killed), 1)
+        self.assertEqual(killed[0][0], 111)
+
+    def test_restart_now_quit_timeout_still_reopens_desktop_after_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _seed_ghost_workspace(root, include_running_in_db=False, with_wal_sidecar=True)
+            prs.arm_ghost_purge(
+                mode="restart_now",
+                portfolio_dir=paths["pdir"],
+                spawn_worker=False,
+                now_ts=1_800_000_000.0,
+            )
+            ps_step = {"n": 0}
+            reopen_calls: list[str] = []
+
+            def _ps_desktop_exits_but_agy_remains() -> str:
+                ps_step["n"] += 1
+                if ps_step["n"] == 1:
+                    return (
+                        "  PID ARGS\n"
+                        "  501 /Applications/Antigravity.app/Contents/MacOS/Antigravity\n"
+                        "  502 /usr/local/bin/agy\n"
+                    )
+                # Desktop exited, leftover agy CLI process remains
+                return "  PID ARGS\n  502 /usr/local/bin/agy\n"
+
+            w_res = prs.run_ghost_purge_worker(
+                mode="restart_now",
+                poll_interval_seconds=0.01,
+                quit_timeout_seconds=10.0,
+                max_iterations=2,
+                portfolio_dir=paths["pdir"],
+                antigravity_dirs=[paths["agy_dir"]],
+                ps_runner=_ps_desktop_exits_but_agy_remains,
+                quit_fn=lambda _p, _procs: True,
+                reopen_fn=lambda p: reopen_calls.append(p) or True,
+                sleep_fn=lambda _s: None,
+                clock_fn=lambda: 1_800_000_001.0,
+                platform_name="darwin",
+            )
+            self.assertEqual(w_res["status"], "error")
+            self.assertEqual(w_res["event"], "quit_timeout")
+            self.assertTrue(w_res["reopened"])
+            self.assertEqual(reopen_calls, ["darwin"])
+            saved = json.loads((paths["pdir"] / prs.GHOST_PURGE_RESULT_FILENAME).read_text(encoding="utf-8"))
+            self.assertTrue(saved["reopened"])
+            self.assertEqual(saved["reason"], "quit_timeout")
+
 
 class TestSidecarGhostPurgeEndpointsAndUI(unittest.TestCase):
     """Verify sidecar panel state, HTTP endpoints (auth, 409 guard, ack), Zero-PII, and UI/env contracts."""
@@ -579,7 +646,7 @@ class TestSidecarGhostPurgeEndpointsAndUI(unittest.TestCase):
                 state_json = json.loads(state_text)
                 gp = state_json["ghost_purge"]
                 self.assertEqual(gp["summary"]["db_ghost_count"], 1)
-                self.assertEqual(gp["summary"]["app_storage_entries_count"], 8)
+                self.assertEqual(gp["summary"]["app_storage_entries_count"], 9)
                 self.assertFalse(gp["can_restart_now"])
                 self.assertEqual(gp["blocked_reason"], "running_conversations_active")
 
@@ -615,6 +682,16 @@ class TestSidecarGhostPurgeEndpointsAndUI(unittest.TestCase):
                 self.assertEqual(st_arm, 200)
                 arm_json = json.loads(raw_arm)
                 self.assertTrue(arm_json["ghost_purge"]["armed"]["armed"])
+
+                # POST /api/cleanup/ghosts/arm mode=restart_now while on_quit is armed fails closed with HTTP 409
+                st_armed_409, raw_armed_409 = _http_request(
+                    f"{base}/api/cleanup/ghosts/arm",
+                    method="POST",
+                    headers={"X-Sidecar-Token": mock_token},
+                    body={"mode": "restart_now"},
+                )
+                self.assertEqual(st_armed_409, 409)
+                self.assertEqual(json.loads(raw_armed_409)["blocked_reason"], "armed_already")
 
                 # POST /api/cleanup/ghosts/cancel disarms
                 st_cancel, raw_cancel = _http_request(
@@ -694,6 +771,66 @@ class TestSidecarGhostPurgeEndpointsAndUI(unittest.TestCase):
         self.assertIn(".dq-ghost-section", css)
         self.assertIn(".dq-ghost-result-banner", css)
         self.assertEqual(css.count("{"), css.count("}"))
+
+    def test_build_panel_state_mtime_ttl_cache_avoids_redundant_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = _seed_ghost_workspace(root, include_running_in_db=False)
+            fake_home = root / "home_testuser"
+            fake_home.mkdir(parents=True, exist_ok=True)
+            repo_cache: dict[str, object] = {}
+
+            with mock.patch.object(
+                panel_srv._merge_watcher,
+                "get_ghost_purge_status",
+                wraps=panel_srv._merge_watcher.get_ghost_purge_status,
+            ) as spy_status:
+                snap1 = panel_srv.build_panel_state(
+                    state_dir=paths["pdir"],
+                    brain_dir=paths["brain_dir"],
+                    conv_db_path=paths["db_path"],
+                    repo_cache=repo_cache,
+                    home_dir=fake_home,
+                    now_ts=1_800_000_000.0,
+                    env={},
+                )
+                snap2 = panel_srv.build_panel_state(
+                    state_dir=paths["pdir"],
+                    brain_dir=paths["brain_dir"],
+                    conv_db_path=paths["db_path"],
+                    repo_cache=repo_cache,
+                    home_dir=fake_home,
+                    now_ts=1_800_000_002.0,
+                    env={},
+                )
+                self.assertEqual(spy_status.call_count, 1)
+                self.assertEqual(snap1["ghost_purge"], snap2["ghost_purge"])
+
+                # Mutating armed state invalidates cache via mtime signature
+                prs.arm_ghost_purge(portfolio_dir=paths["pdir"], spawn_worker=False, now_ts=1_800_000_003.0)
+                snap3 = panel_srv.build_panel_state(
+                    state_dir=paths["pdir"],
+                    brain_dir=paths["brain_dir"],
+                    conv_db_path=paths["db_path"],
+                    repo_cache=repo_cache,
+                    home_dir=fake_home,
+                    now_ts=1_800_000_004.0,
+                    env={},
+                )
+                self.assertEqual(spy_status.call_count, 2)
+                self.assertTrue(snap3["ghost_purge"]["armed"]["armed"])
+
+                # TTL expiry also refreshes after 45s
+                panel_srv.build_panel_state(
+                    state_dir=paths["pdir"],
+                    brain_dir=paths["brain_dir"],
+                    conv_db_path=paths["db_path"],
+                    repo_cache=repo_cache,
+                    home_dir=fake_home,
+                    now_ts=1_800_000_055.0,
+                    env={},
+                )
+                self.assertEqual(spy_status.call_count, 3)
 
 
 if __name__ == "__main__":

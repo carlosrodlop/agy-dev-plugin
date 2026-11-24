@@ -29,6 +29,7 @@ import re
 import signal
 import sys
 import threading
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -774,7 +775,11 @@ def build_panel_state(
         home_dir=home_dir,
         env=env,
     )
-    ghost_purge_state = _merge_watcher.get_ghost_purge_status(**ghost_kwargs)
+    ghost_purge_state = _get_cached_ghost_purge_status(
+        ghost_kwargs,
+        repo_cache=repo_cache,
+        now_ts=now_ts,
+    )
 
     semantic_core = sanitize_zero_pii_payload(
         {
@@ -843,6 +848,100 @@ def _resolve_sidecar_agy_dirs(
         if brain_roots:
             return [Path(b).expanduser().parent for b in brain_roots]
     return None
+
+
+GHOST_PURGE_CACHE_TTL_SECONDS = 45.0
+
+
+def _stat_path_signature(path: Path) -> tuple[str, int, int]:
+    """Return `(path_str, st_mtime_ns, st_size)` without following symlinks or failing on missing paths."""
+    try:
+        st = path.stat()
+        return (str(path), int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return (str(path), 0, -1)
+
+
+def _compute_ghost_purge_cache_signature(ghost_kwargs: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Build a fast `os.stat`-only cache key covering DB, `app_storage.json`, and state/lock files."""
+    st_dir = Path(ghost_kwargs["portfolio_dir"])
+    agy_dirs = ghost_kwargs.get("antigravity_dirs")
+    summaries_db = ghost_kwargs.get("summaries_db")
+    home_dir = ghost_kwargs.get("home_dir")
+    env = ghost_kwargs.get("env")
+
+    eff_agy_dirs = agy_dirs
+    if eff_agy_dirs is None:
+        eff_agy_dirs = _merge_watcher._infer_antigravity_dirs_from_summaries_db(
+            brain_dir=None,
+            conversations_dir=None,
+            cli_dir=None,
+            antigravity_dirs=agy_dirs,
+            summaries_db=summaries_db,
+        )
+    roots = _merge_watcher._resolve_antigravity_roots(antigravity_dirs=eff_agy_dirs)
+    dbs = _merge_watcher._resolve_summaries_db_candidates(roots, summaries_db=summaries_db)
+    app_paths = _merge_watcher._resolve_app_storage_paths(
+        roots,
+        has_explicit_root_override=eff_agy_dirs is not None,
+        home_dir=home_dir,
+        env=env,
+    )
+
+    watched_files: list[Path] = [
+        st_dir / _merge_watcher.GHOST_PURGE_ARMED_FILENAME,
+        st_dir / _merge_watcher.GHOST_PURGE_RESULT_FILENAME,
+        st_dir / "actions_state.json",
+        st_dir / "dev_queue.json",
+    ]
+    for db_p in dbs:
+        watched_files.append(db_p)
+        watched_files.append(Path(f"{db_p}-wal"))
+    watched_files.extend(app_paths)
+    for r in roots:
+        for dir_key in ("brain_dir", "conversations_dir"):
+            if r.get(dir_key):
+                watched_files.append(Path(r[dir_key]))
+
+    return (
+        str(st_dir),
+        str(summaries_db or ""),
+        str(home_dir or ""),
+        tuple(_stat_path_signature(p) for p in watched_files),
+    )
+
+
+def _get_cached_ghost_purge_status(
+    ghost_kwargs: Mapping[str, Any],
+    *,
+    repo_cache: dict[str, Any] | None = None,
+    now_ts: float | None = None,
+    ttl_seconds: float = GHOST_PURGE_CACHE_TTL_SECONDS,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Return mtime + TTL cached `get_ghost_purge_status()` so 1.5s `/api/state` polls run in <5ms."""
+    cur_ts = float(now_ts if now_ts is not None else time.time())
+    sig = _compute_ghost_purge_cache_signature(ghost_kwargs)
+    if repo_cache is not None and not force_refresh:
+        cached = repo_cache.get("_ghost_purge_cache")
+        if isinstance(cached, Mapping) and cached.get("signature") == sig:
+            age = cur_ts - float(cached.get("cached_at") or 0.0)
+            exp_ts = cached.get("armed_expires_at_ts")
+            arm_unexpired = not isinstance(exp_ts, (int, float)) or cur_ts < float(exp_ts)
+            if 0.0 <= age < float(ttl_seconds) and arm_unexpired:
+                return dict(cached["value"])
+
+    fresh = _merge_watcher.get_ghost_purge_status(**ghost_kwargs, now_ts=now_ts)
+    if repo_cache is not None:
+        st_dir = Path(ghost_kwargs["portfolio_dir"])
+        arm_doc = _merge_watcher._read_unexpired_ghost_purge_arm(st_dir, now_ts=cur_ts)
+        repo_cache["_ghost_purge_cache"] = {
+            "signature": sig,
+            "cached_at": cur_ts,
+            "armed_expires_at_ts": arm_doc.get("expires_at_ts") if isinstance(arm_doc, Mapping) else None,
+            "value": fresh,
+        }
+    return fresh
 
 
 def _resolve_sidecar_ghost_kwargs(
@@ -1174,7 +1273,9 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
                 ok = str(clean_res.get("status") or "") == "ok"
                 status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
                 extra_ghost: dict[str, Any] = {}
-                if is_dry_run:
+                if not is_dry_run:
+                    cfg.repo_cache.pop("_ghost_purge_cache", None)
+                else:
                     ghost_kwargs = _resolve_sidecar_ghost_kwargs(
                         state_dir=cfg.state_dir,
                         conv_db_path=cfg.conv_db_path,
@@ -1182,7 +1283,11 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
                         home_dir=cfg.home_dir,
                         env=cfg.env,
                     )
-                    extra_ghost["ghost_purge"] = _merge_watcher.get_ghost_purge_status(**ghost_kwargs)
+                    extra_ghost["ghost_purge"] = _get_cached_ghost_purge_status(
+                        ghost_kwargs,
+                        repo_cache=cfg.repo_cache,
+                        force_refresh=True,
+                    )
                 payload = sanitize_zero_pii_payload(
                     {"ok": ok, **clean_res, **extra_ghost},
                     home_dir=cfg.home_dir,
@@ -1252,7 +1357,12 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
                     ok = str(action_res.get("status") or "") == "ok"
                     status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
 
-                ghost_state = _merge_watcher.get_ghost_purge_status(**ghost_kwargs)
+                cfg.repo_cache.pop("_ghost_purge_cache", None)
+                ghost_state = _get_cached_ghost_purge_status(
+                    ghost_kwargs,
+                    repo_cache=cfg.repo_cache,
+                    force_refresh=True,
+                )
                 payload = sanitize_zero_pii_payload(
                     {"ok": ok, **action_res, "ghost_purge": ghost_state},
                     home_dir=cfg.home_dir,

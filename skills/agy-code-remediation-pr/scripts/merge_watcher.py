@@ -3888,9 +3888,30 @@ def cancel_ghost_purge(
     }
 
 
+def _is_desktop_antigravity_proc_desc(desc: str) -> bool:
+    """Return True when a `_detect_active_antigravity_processes` entry represents the Desktop GUI app (not `agy` CLI or `language_server`)."""
+    raw = str(desc or "").strip().lower()
+    if not raw or ":" not in raw:
+        return False
+    _, label = raw.split(":", 1)
+    if label in ("agy", "language_server") or label.startswith("language_server"):
+        return False
+    return (
+        label in ("antigravity", "antigravity.exe")
+        or "/antigravity.app/" in label
+        or "antigravity helper" in label
+    )
+
+
+def _filter_desktop_antigravity_procs(active_procs: Sequence[str]) -> list[str]:
+    """Filter active process descriptions down to Antigravity Desktop GUI processes only."""
+    return [p for p in active_procs if _is_desktop_antigravity_proc_desc(p)]
+
+
 def _default_quit_antigravity(platform_name: str, active_procs: Sequence[str]) -> bool:
-    """Platform-gated graceful quit request (Darwin `osascript`, Linux `SIGTERM`)."""
+    """Platform-gated graceful quit request for Desktop GUI processes only (Darwin `osascript`, Linux `SIGTERM`)."""
     plat = platform_name.lower()
+    desktop_procs = _filter_desktop_antigravity_procs(active_procs)
     if plat == "darwin":
         try:
             proc = subprocess.run(
@@ -3905,7 +3926,7 @@ def _default_quit_antigravity(platform_name: str, active_procs: Sequence[str]) -
             return False
     if plat.startswith("linux"):
         signaled = False
-        for desc in active_procs:
+        for desc in desktop_procs:
             m = re.match(r"^pid=(\d+):", str(desc))
             if not m:
                 continue
@@ -4104,6 +4125,20 @@ def restart_and_purge(
 ) -> dict[str, Any]:
     """Fail-closed guarded trigger for detached graceful quit, ghost purge, and Antigravity reopen."""
     st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    cur_now = float(now_ts if now_ts is not None else time.time())
+    with dev_common.file_lock(st_dir / GHOST_PURGE_LOCK_FILENAME):
+        existing_arm = _read_unexpired_ghost_purge_arm(st_dir, now_ts=cur_now)
+        if existing_arm is not None:
+            return {
+                "status": "blocked",
+                "reason": "armed_already",
+                "blocked_reason": "armed_already",
+                "blocked_message": f"Blocked: ghost purge is already armed ({existing_arm.get('mode') or 'on_quit'})",
+                "armed": True,
+                "already_armed": True,
+                "arm_state": existing_arm,
+            }
+
     guard = check_ghost_purge_restart_guard(
         portfolio_dir=st_dir,
         brain_dir=brain_dir,
@@ -4222,10 +4257,12 @@ def run_ghost_purge_worker(
                 return {"status": "blocked", "event": "unsupported_platform", "result": res_doc}
 
             active_procs = _detect_active_antigravity_processes(ps_runner=ps_runner)
-            if active_procs:
-                effective_quit(plat, active_procs)
+            desktop_procs = _filter_desktop_antigravity_procs(active_procs)
+            if desktop_procs:
+                effective_quit(plat, desktop_procs)
 
         iterations = 0
+        last_prune_reason = ""
         while True:
             cur_now = float(effective_clock())
             raw_arm = dev_common.atomic_read_json(arm_path, default=None)
@@ -4274,19 +4311,29 @@ def run_ghost_purge_worker(
                         "prune_result": prune_res,
                         "result": res_doc,
                     }
+                last_prune_reason = str(prune_res.get("reason") or "")
 
             timeout_limit = float(quit_timeout_seconds if eff_mode == "restart_now" else max_duration_seconds)
             if (cur_now - start_ts) >= timeout_limit or (max_iterations is not None and iterations >= max_iterations):
                 if eff_mode == "restart_now":
+                    cur_desktop = _filter_desktop_antigravity_procs(active_procs)
+                    reopened = bool(effective_reopen(plat)) if not cur_desktop else False
                     cancel_ghost_purge(portfolio_dir=st_dir, home_dir=home_dir)
                     res_doc = _write_ghost_purge_result(
                         st_dir,
                         status="error",
                         mode="restart_now",
                         now_ts=cur_now,
-                        reason="quit_timeout",
+                        reopened=reopened,
+                        reason=last_prune_reason or "quit_timeout",
                     )
-                    return {"status": "error", "event": "quit_timeout", "iterations": iterations, "result": res_doc}
+                    return {
+                        "status": "error",
+                        "event": "quit_timeout",
+                        "iterations": iterations,
+                        "reopened": reopened,
+                        "result": res_doc,
+                    }
                 return {"status": "ok", "event": "max_iterations_or_timeout", "iterations": iterations}
 
             effective_sleep(max(0.01, float(poll_interval_seconds)))
