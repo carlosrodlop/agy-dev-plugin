@@ -417,9 +417,146 @@
     query: "",
     inFlight: false,
     pauseBusy: false,
+    cleanupBusy: false,
+    cleanupPreview: null,
     toastTimer: null,
     consumedIntentIds: new Set(),
   };
+
+  const CLEANUP_CATEGORY_LABELS = {
+    merged_roots: "Merged Queue",
+    cleaned_leaked_roots: "Cleaned Leaked",
+    superseded_cancelled_roots: "Superseded",
+    rotated_orchestrators: "Rotated Orchs",
+    non_queue_merged_roots: "Non-Queue fix/*",
+    subagents: "Subagents",
+    noop_actions: "NO_OP Actions",
+    deliverable_actions: "Action Runs",
+    unaudited_expired_actions: "Expired Warn/Err",
+    sidecar_events: "Sidecar Events",
+    orphan_artifacts: "Orphan Locks/Pbtxt",
+  };
+
+  function formatBytesCompact(bytesVal) {
+    const b = Math.max(0, Number(bytesVal) || 0);
+    if (b >= 1024 * 1024) {
+      return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+    }
+    if (b >= 1024) {
+      return `${(b / 1024).toFixed(1)} KB`;
+    }
+    return `${b} B`;
+  }
+
+  function renderCleanupPreview() {
+    const panel = document.getElementById("dq-cleanup-panel");
+    const cleanBtn = document.getElementById("dq-clean-btn");
+    const confirmBtn = document.getElementById("dq-cleanup-confirm-btn");
+    const cancelBtn = document.getElementById("dq-cleanup-cancel-btn");
+    const summaryEl = document.getElementById("dq-cleanup-summary");
+    const breakdownEl = document.getElementById("dq-cleanup-breakdown");
+    if (cleanBtn) {
+      cleanBtn.disabled = Boolean(uiState.cleanupBusy);
+      cleanBtn.textContent = uiState.cleanupBusy ? "Cleaning…" : "🧹 Clean";
+    }
+    if (!panel || !summaryEl || !breakdownEl) {
+      return;
+    }
+    const preview = uiState.cleanupPreview;
+    if (!preview) {
+      panel.classList.add("dq-hidden");
+      breakdownEl.replaceChildren();
+      summaryEl.textContent = "";
+      return;
+    }
+    panel.classList.remove("dq-hidden");
+    const bd = preview.breakdown && typeof preview.breakdown === "object" ? preview.breakdown : {};
+    const byCat = bd.by_category && typeof bd.by_category === "object" ? bd.by_category : {};
+    const totalItems =
+      Number(preview.deleted_count || 0) +
+      Number(preview.sidecar_events_pruned_count || 0) +
+      Number(preview.orphan_artifacts_pruned_count || 0);
+    const totalBytes = Number(preview.freed_bytes || bd.total_bytes || 0);
+
+    summaryEl.textContent =
+      totalItems > 0
+        ? `${totalItems} item${totalItems === 1 ? "" : "s"} · ${formatBytesCompact(totalBytes)} reclaimable`
+        : "Workspace clean · 0 reclaimable items";
+
+    if (confirmBtn) {
+      confirmBtn.disabled = Boolean(uiState.cleanupBusy) || totalItems === 0;
+      confirmBtn.textContent = uiState.cleanupBusy ? "Cleaning…" : "Confirm Clean";
+    }
+    if (cancelBtn) {
+      cancelBtn.disabled = Boolean(uiState.cleanupBusy);
+    }
+
+    const frag = document.createDocumentFragment();
+    for (const [catKey, label] of Object.entries(CLEANUP_CATEGORY_LABELS)) {
+      const entry = byCat[catKey];
+      const count = entry ? Number(entry.count || 0) : 0;
+      const bytes = entry ? Number(entry.bytes || 0) : 0;
+      if (count <= 0 && bytes <= 0) {
+        continue;
+      }
+      const chip = el("span", "dq-cleanup-chip");
+      chip.appendChild(el("span", "dq-cleanup-chip-label", label));
+      chip.appendChild(el("span", "dq-cleanup-chip-val", `${count} (${formatBytesCompact(bytes)})`));
+      frag.appendChild(chip);
+    }
+    if (!frag.childNodes.length) {
+      frag.appendChild(el("span", "dq-card-sub", "No stale conversations, sidecar events, or orphan artifacts found."));
+    }
+    breakdownEl.replaceChildren(frag);
+  }
+
+  async function previewCleanup() {
+    if (uiState.cleanupBusy) {
+      return;
+    }
+    uiState.cleanupBusy = true;
+    renderCleanupPreview();
+    try {
+      const res = await apiFetch("/api/cleanup/preview", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      uiState.cleanupPreview = res;
+    } catch (err) {
+      showToast(`Unable to preview cleanup: ${err.message || "error"}`);
+    } finally {
+      uiState.cleanupBusy = false;
+      renderCleanupPreview();
+    }
+  }
+
+  async function executeCleanup() {
+    if (uiState.cleanupBusy) {
+      return;
+    }
+    uiState.cleanupBusy = true;
+    renderCleanupPreview();
+    try {
+      const res = await apiFetch("/api/cleanup/execute", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      const totalCleaned =
+        Number(res.deleted_count || 0) +
+        Number(res.sidecar_events_pruned_count || 0) +
+        Number(res.orphan_artifacts_pruned_count || 0);
+      const freedLabel = formatBytesCompact(res.freed_bytes || 0);
+      uiState.cleanupPreview = null;
+      showToast(`🧹 Cleaned ${totalCleaned} item${totalCleaned === 1 ? "" : "s"} (${freedLabel} freed)`);
+      uiState.etag = "";
+      await pollState(true);
+    } catch (err) {
+      showToast(`Unable to execute cleanup: ${err.message || "error"}`);
+    } finally {
+      uiState.cleanupBusy = false;
+      renderCleanupPreview();
+    }
+  }
 
   function formatPauseMeta(orch) {
     if (!orch || typeof orch !== "object") {
@@ -883,6 +1020,13 @@
         setOrchestrationPaused(!curPaused);
       } else if (action === "resume-dev") {
         setOrchestrationPaused(false);
+      } else if (action === "cleanup-preview") {
+        previewCleanup();
+      } else if (action === "cleanup-execute") {
+        executeCleanup();
+      } else if (action === "cleanup-cancel") {
+        uiState.cleanupPreview = null;
+        renderCleanupPreview();
       } else if (action === "open-conv") {
         triggerConversationToggle(actionBtn.dataset.convId, actionBtn.dataset.label);
       } else if (action === "open-board") {
@@ -941,6 +1085,8 @@
       matchesRepoFilter,
       formatPauseMeta,
       setOrchestrationPaused,
+      previewCleanup,
+      executeCleanup,
       pollState,
     };
   }

@@ -50,6 +50,7 @@ for _cand_root in (_INSTALLED_PLUGIN_ROOT, _PLUGIN_ROOT):
             sys.path.insert(0, _cand_str)
 
 import dev_queue_tui as _tui  # noqa: E402
+import merge_watcher as _merge_watcher  # noqa: E402
 import orchestration_control as _orch_ctrl  # noqa: E402
 
 BIND_HOST = "127.0.0.1"
@@ -812,6 +813,38 @@ def build_panel_state(
     }
 
 
+def _resolve_sidecar_cleanup_kwargs(cfg: DevQueuePanelConfig) -> dict[str, Any]:
+    """Build hermetic `cleanup_merged_conversations` arguments derived strictly from server config."""
+    st_dir = _tui._resolve_state_dir(str(cfg.state_dir) if cfg.state_dir is not None else "")
+    agy_dirs: list[Path] | None = None
+    if cfg.brain_dir is not None:
+        brain_roots = resolve_sidecar_brain_dirs(cfg.brain_dir, env=cfg.env, home_dir=cfg.home_dir)
+        if brain_roots:
+            agy_dirs = [Path(b).expanduser().parent for b in brain_roots]
+    elif cfg.home_dir is not None:
+        agy_dirs = [
+            Path(cfg.home_dir).expanduser() / ".gemini" / "antigravity",
+            Path(cfg.home_dir).expanduser() / ".gemini" / "antigravity-cli",
+        ]
+    elif cfg.env and str(cfg.env.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR") or "").strip():
+        brain_roots = resolve_sidecar_brain_dirs(None, env=cfg.env, home_dir=cfg.home_dir)
+        if brain_roots:
+            agy_dirs = [Path(b).expanduser().parent for b in brain_roots]
+
+    return {
+        "all_merged": True,
+        "include_noop_actions": True,
+        "include_scheduled_actions": True,
+        "include_sidecar_events": True,
+        "include_orphans": True,
+        "portfolio_dir": st_dir,
+        "antigravity_dirs": agy_dirs,
+        "summaries_db": cfg.conv_db_path,
+        "repos_dir": cfg.repos_dir or None,
+        "env": cfg.env,
+    }
+
+
 class DevQueuePanelConfig:
     """Immutable runtime configuration for `DevQueuePanelHTTPServer`."""
 
@@ -1089,6 +1122,31 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "artifact_not_found"})
                 return
             self._send_json(HTTPStatus.OK, resolved)
+            return
+
+        if route in ("/api/cleanup/preview", "/api/cleanup/execute"):
+            is_dry_run = route == "/api/cleanup/preview"
+            try:
+                cleanup_kwargs = _resolve_sidecar_cleanup_kwargs(cfg)
+                cleanup_kwargs["dry_run"] = is_dry_run
+                if "include_unaudited_check" in body:
+                    cleanup_kwargs["include_unaudited_check"] = bool(body.get("include_unaudited_check"))
+                clean_res = _merge_watcher.cleanup_merged_conversations(**cleanup_kwargs)
+                ok = str(clean_res.get("status") or "") == "ok"
+                status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
+                payload = sanitize_zero_pii_payload(
+                    {"ok": ok, **clean_res},
+                    home_dir=cfg.home_dir,
+                )
+                self._send_json(status_code, payload)
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": sanitize_zero_pii_text(f"{exc.__class__.__name__}: {exc}", home_dir=cfg.home_dir),
+                    },
+                )
             return
 
         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
