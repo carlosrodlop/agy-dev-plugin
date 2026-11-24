@@ -341,7 +341,7 @@
     if (card.is_uuid) {
       actions.appendChild(
         buildActionButton(
-          kind === "hitl" ? "Open HITL Chat" : "Open Chat",
+          kind === "hitl" ? "Open Blocked Chat" : "Open Chat",
           "open-conv",
           { convId: card.conversation_id, label: primaryTitle },
           kind === "hitl",

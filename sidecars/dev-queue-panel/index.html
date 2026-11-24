@@ -35,23 +35,53 @@
       </div>
 
       <nav class="dq-kpi-bar" aria-label="Queue summary filters">
-        <button id="dq-kpi-all" type="button" class="dq-kpi active" data-section-filter="all">
+        <button
+          id="dq-kpi-all"
+          type="button"
+          class="dq-kpi active"
+          data-section-filter="all"
+          title="All open queue items and repository lock states"
+        >
           <span class="dq-kpi-label">All</span>
           <span id="dq-count-all" class="dq-kpi-num">0</span>
         </button>
-        <button id="dq-kpi-hitl" type="button" class="dq-kpi dq-kpi-hitl" data-section-filter="hitl_blocked">
-          <span class="dq-kpi-label">HITL</span>
+        <button
+          id="dq-kpi-hitl"
+          type="button"
+          class="dq-kpi dq-kpi-hitl"
+          data-section-filter="hitl_blocked"
+          title="Blocked before PR: needs human decision in Antigravity chat (/hitl-review) or escalated after 3 failed review rounds (not pushed to GitHub)"
+        >
+          <span class="dq-kpi-label">Blocked</span>
           <span id="dq-count-hitl" class="dq-kpi-num">0</span>
         </button>
-        <button id="dq-kpi-pr" type="button" class="dq-kpi dq-kpi-pr" data-section-filter="pr_open">
+        <button
+          id="dq-kpi-pr"
+          type="button"
+          class="dq-kpi dq-kpi-pr"
+          data-section-filter="pr_open"
+          title="Validated &amp; pushed (PASS &gt;90/100): ready for manual GitHub PR review and merge"
+        >
           <span class="dq-kpi-label">PR Ready</span>
           <span id="dq-count-pr" class="dq-kpi-num">0</span>
         </button>
-        <button id="dq-kpi-run" type="button" class="dq-kpi dq-kpi-run" data-section-filter="in_progress">
+        <button
+          id="dq-kpi-run"
+          type="button"
+          class="dq-kpi dq-kpi-run"
+          data-section-filter="in_progress"
+          title="Currently developing, iterating, or undergoing independent PR review"
+        >
           <span class="dq-kpi-label">Active</span>
           <span id="dq-count-run" class="dq-kpi-num">0</span>
         </button>
-        <button id="dq-kpi-pending" type="button" class="dq-kpi" data-section-filter="pending">
+        <button
+          id="dq-kpi-pending"
+          type="button"
+          class="dq-kpi"
+          data-section-filter="pending"
+          title="Queued tasks waiting for an unlocked repository slot or prerequisite merge"
+        >
           <span class="dq-kpi-label">Pending</span>
           <span id="dq-count-pending" class="dq-kpi-num">0</span>
         </button>
@@ -89,7 +119,7 @@
     <main id="dq-main" class="dq-main">
       <section id="dq-sec-hitl" class="dq-section dq-section-hitl dq-hidden" aria-labelledby="dq-h-hitl">
         <div class="dq-section-head">
-          <h2 id="dq-h-hitl" class="dq-section-title">HITL Action Required</h2>
+          <h2 id="dq-h-hitl" class="dq-section-title">Blocked · Needs Input</h2>
           <span id="dq-badge-hitl" class="dq-section-count">0</span>
         </div>
         <div id="dq-list-hitl" class="dq-card-list"></div>

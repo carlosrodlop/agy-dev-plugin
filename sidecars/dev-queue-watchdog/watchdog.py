@@ -248,6 +248,8 @@ def run_watchdog_cycle(
         cycle_status = "woke"
     elif healed:
         cycle_status = "healed"
+    elif wake_status == "skipped_all_models_exhausted":
+        cycle_status = "quota_exhausted"
     elif wake_status in ("skipped_cooldown", "skipped_wake_in_flight"):
         cycle_status = "cooldown"
     else:
@@ -280,6 +282,12 @@ def _format_cycle_log_line(result: dict[str, Any]) -> str:
     wake_info = result.get("wake") if isinstance(result.get("wake"), dict) else {}
     transport = str(wake_info.get("transport") or "")
     extra = f" transport={transport}" if transport else ""
+    sel_model = str(wake_info.get("selected_wake_model") or "")
+    if sel_model:
+        extra += f" model={sel_model}"
+    next_reset = str(wake_info.get("next_reset_at") or "")
+    if wake_info.get("status") == "skipped_all_models_exhausted" and next_reset:
+        extra += f" next_reset={next_reset}"
     if result.get("error"):
         extra += f" error={result['error']}"
     return f"[{ts}] [dev-queue-watchdog] status={st} healed={healed} woke={woke}{extra}"

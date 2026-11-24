@@ -94,6 +94,7 @@ def _get_queue_store() -> Any:
 
 PR_DEVELOPER_SUBAGENT_NAME = "agy-code-developer"
 PR_REVIEWER_SUBAGENT_NAME = "agy-code-pr-reviewer"
+PR_DEV_DEFAULT_MODEL = "flash"
 PR_SUBAGENT_MODEL = "pro"
 PR_REVIEW_PASS_MIN_SCORE = 91
 MAX_PR_REVIEW_ITERATIONS = 3

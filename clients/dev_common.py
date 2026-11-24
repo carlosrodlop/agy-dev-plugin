@@ -1930,6 +1930,41 @@ def evaluate_session_start(
     ).evaluate_session_start(payload)
 
 
+def _load_model_quota_module() -> Any:
+    """Import sibling `model_quota.py` reliably whether `dev_common` was loaded via `sys.path` or `spec_from_file_location`."""
+    clients_dir = str(Path(__file__).resolve().parent)
+    if clients_dir not in sys.path:
+        sys.path.insert(0, clients_dir)
+    existing = sys.modules.get("model_quota")
+    if existing is not None:
+        return existing
+    import model_quota as _mq  # noqa: PLC0415
+
+    return _mq
+
+
+_mq = _load_model_quota_module()
+MODEL_QUOTA_COOLDOWNS_FILENAME = _mq.MODEL_QUOTA_COOLDOWNS_FILENAME
+DEFAULT_DEV_MODEL = _mq.DEFAULT_DEV_MODEL
+DEFAULT_REVIEWER_MODEL = _mq.DEFAULT_REVIEWER_MODEL
+DEFAULT_LOW_QUOTA_THRESHOLD_PCT = _mq.DEFAULT_LOW_QUOTA_THRESHOLD_PCT
+DEFAULT_QUOTA_SNAPSHOT_TTL_SECONDS = _mq.DEFAULT_QUOTA_SNAPSHOT_TTL_SECONDS
+DEFAULT_MODEL_FALLBACK_ORDER = _mq.DEFAULT_MODEL_FALLBACK_ORDER
+DEFAULT_DEV_ECO_FALLBACK_ORDER = _mq.DEFAULT_DEV_ECO_FALLBACK_ORDER
+DEFAULT_REVIEWER_MODEL_FALLBACK_ORDER = _mq.DEFAULT_REVIEWER_MODEL_FALLBACK_ORDER
+parse_model_list = _mq.parse_model_list
+parse_quota_percent = _mq.parse_quota_percent
+resolve_low_quota_threshold_pct = _mq.resolve_low_quota_threshold_pct
+resolve_model_fallback_config = _mq.resolve_model_fallback_config
+load_model_quota_state = _mq.load_model_quota_state
+record_model_quota_cooldown = _mq.record_model_quota_cooldown
+record_swarm_quota_snapshot = _mq.record_swarm_quota_snapshot
+map_model_to_subagent_tier = _mq.map_model_to_subagent_tier
+select_next_optimal_model = _mq.select_next_optimal_model
+parse_reset_duration_seconds = _mq.parse_reset_duration_seconds
+detect_quota_exhaustion_in_lines = _mq.detect_quota_exhaustion_in_lines
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI parser for `dev_common.py`."""
     parser = argparse.ArgumentParser(

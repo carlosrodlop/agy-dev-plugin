@@ -413,11 +413,15 @@ def spawn_pr_merge_watcher_daemon(
         }
 
 
+MAX_SAFE_STALL_THRESHOLD_SECONDS = 3600
+
+
 def wait_for_unlock_or_actionable_event(
     poll_interval_seconds: float = 15.0,
     max_duration_seconds: float = 3600.0,
     max_iterations: int | None = None,
     stall_threshold_seconds: int | float | None = None,
+    allow_excessive_stall_seconds: bool = False,
     orchestrator_conversation_id: str = "",
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
@@ -429,6 +433,24 @@ def wait_for_unlock_or_actionable_event(
     warn_stream: TextIO | None = None,
 ) -> dict[str, Any]:
     """0-LLM reactive watcher that polls `sync_dev_pr_lock_with_git()`, auto-reloads on clean script updates, and exits the moment a repo unlocks, runnable work appears, or a worker stalls."""
+    requested_stall_seconds = stall_threshold_seconds
+    effective_stall_seconds = stall_threshold_seconds
+    stall_threshold_clamped = False
+    if (
+        stall_threshold_seconds is not None
+        and not allow_excessive_stall_seconds
+        and float(stall_threshold_seconds) > float(MAX_SAFE_STALL_THRESHOLD_SECONDS)
+    ):
+        effective_stall_seconds = MAX_SAFE_STALL_THRESHOLD_SECONDS
+        stall_threshold_clamped = True
+        target_warn = warn_stream if warn_stream is not None else sys.stderr
+        with contextlib.suppress(OSError):
+            target_warn.write(
+                f"[wait-for-unlock] Warning: --stall-seconds={int(round(float(stall_threshold_seconds)))} exceeds "
+                f"safe ceiling ({MAX_SAFE_STALL_THRESHOLD_SECONDS}s); clamping to {MAX_SAFE_STALL_THRESHOLD_SECONDS}s "
+                f"(pass --allow-excessive-stall-seconds to override).\n"
+            )
+
     initial_locks = get_all_dev_pr_locks(portfolio_dir=portfolio_dir)
     initial_locked_repos = set(initial_locks.keys())
     initial_lock_ids = {slug: str(lk.get("lock_id") or "") for slug, lk in initial_locks.items()}
@@ -542,25 +564,33 @@ def wait_for_unlock_or_actionable_event(
         stalled_locks: list[dict[str, Any]] = []
         rebase_reverify_locks: list[dict[str, Any]] = []
         for slug, lk in sorted(current_locks.items()):
-            if str(lk.get("status") or "").strip().upper() == SLOT_STATUS_NEEDS_REBASE_REVERIFY:
-                rebase_reverify_locks.append(
-                    {
-                        "repo_slug": slug,
-                        "slot_id": int(lk.get("slot_id") or 1),
-                        "branch_name": str(lk.get("branch_name") or ""),
-                        "conversation_id": str(lk.get("conversation_id") or ""),
-                        "worktree_path": str(lk.get("worktree_path") or ""),
-                        "base_sha": str(lk.get("base_sha") or ""),
-                    }
-                )
             slot_candidates: list[tuple[int, dict[str, Any]]] = [(1, lk)]
             s2_lk = lk.get("slots", {}).get("2") if isinstance(lk.get("slots"), dict) else None
             if isinstance(s2_lk, dict) and bool(s2_lk.get("active", True)):
                 slot_candidates.append((2, s2_lk))
             for s_num, slot_entry in slot_candidates:
+                slot_st_u = str(slot_entry.get("status") or "").strip().upper()
+                if (
+                    slot_st_u == SLOT_STATUS_NEEDS_REBASE_REVERIFY
+                    or bool(slot_entry.get("needs_base_rebase"))
+                    or bool(slot_entry.get("base_stale"))
+                ):
+                    rebase_reverify_locks.append(
+                        {
+                            "repo_slug": slug,
+                            "slot_id": s_num,
+                            "status": slot_st_u,
+                            "needs_base_rebase": bool(slot_entry.get("needs_base_rebase")),
+                            "base_stale": bool(slot_entry.get("base_stale")),
+                            "branch_name": str(slot_entry.get("branch_name") or ""),
+                            "conversation_id": str(slot_entry.get("conversation_id") or ""),
+                            "worktree_path": str(slot_entry.get("worktree_path") or ""),
+                            "base_sha": str(slot_entry.get("base_sha") or ""),
+                        }
+                    )
                 st_info = detect_stalled_lock(
                     slot_entry,
-                    threshold_seconds=stall_threshold_seconds,
+                    threshold_seconds=effective_stall_seconds,
                     brain_dir=effective_brain,
                 )
                 if st_info.get("stalled"):
@@ -571,6 +601,7 @@ def wait_for_unlock_or_actionable_event(
                             "branch_name": str(slot_entry.get("branch_name") or ""),
                             "conversation_id": str(slot_entry.get("conversation_id") or ""),
                             "worker_cid": str(st_info.get("worker_cid") or ""),
+                            "reviewer_subagent_id": str(st_info.get("reviewer_subagent_id") or ""),
                             "idle_seconds": int(st_info.get("idle_seconds") or 0),
                             "idle_label": str(st_info.get("idle_label") or ""),
                         }
@@ -584,7 +615,7 @@ def wait_for_unlock_or_actionable_event(
         elapsed_seconds = round(max(0.0, time.monotonic() - start_mono), 2)
 
         def _payload(event_name: str, *, rearm: bool = False) -> dict[str, Any]:
-            return {
+            out_payload: dict[str, Any] = {
                 "status": "ok",
                 "event": event_name,
                 "paused": False,
@@ -601,6 +632,11 @@ def wait_for_unlock_or_actionable_event(
                 "elapsed_seconds": elapsed_seconds,
                 "rearm_recommended": rearm,
             }
+            if stall_threshold_clamped:
+                out_payload["stall_threshold_clamped"] = True
+                out_payload["requested_stall_seconds"] = int(round(float(requested_stall_seconds or 0)))
+                out_payload["effective_stall_seconds"] = int(round(float(effective_stall_seconds or 0)))
+            return out_payload
 
         if resume_triggered:
             return _payload("orchestration_resumed", rearm=False)
@@ -2325,7 +2361,8 @@ def register_watcher_cli(sub: Any) -> None:
     p_wait.add_argument("--interval", type=float, default=15.0, help="Polling interval in seconds (default: 15).")
     p_wait.add_argument("--max-duration", type=float, default=3600.0, help="Maximum wait duration in seconds before returning timeout with rearm_recommended (default: 3600).")
     p_wait.add_argument("--max-iterations", type=int, default=None, help="Optional maximum poll iterations before exiting.")
-    p_wait.add_argument("--stall-seconds", dest="stall_seconds", type=int, default=None, help="Override stalled-worker idle threshold in seconds (default: 900).")
+    p_wait.add_argument("--stall-seconds", dest="stall_seconds", type=int, default=None, help="Override stalled-worker idle threshold in seconds (default: 900, safe ceiling: 3600).")
+    p_wait.add_argument("--allow-excessive-stall-seconds", dest="allow_excessive_stall_seconds", action="store_true", help="Allow --stall-seconds above the safe 3600s ceiling without clamping.")
     p_wait.add_argument("--orchestrator-id", dest="orchestrator_id", default="", help="Active orchestrator conversation ID.")
     p_wait.add_argument("--brain-dir", dest="brain_dir", default=None, help="Optional Antigravity brain directory override for worker transcript mtime checks.")
 
@@ -2373,6 +2410,7 @@ def dispatch_watcher_cli(args: Any, argv: list[str] | None = None) -> int | None
             max_duration_seconds=args.max_duration,
             max_iterations=args.max_iterations,
             stall_threshold_seconds=getattr(args, "stall_seconds", None),
+            allow_excessive_stall_seconds=bool(getattr(args, "allow_excessive_stall_seconds", False)),
             orchestrator_conversation_id=getattr(args, "orchestrator_id", ""),
             brain_dir=getattr(args, "brain_dir", None),
             raw_argv=raw_cli_argv,

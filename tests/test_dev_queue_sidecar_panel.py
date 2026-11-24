@@ -124,6 +124,14 @@ class TestSidecarManifestAndFrontendContracts(unittest.TestCase):
         self.assertIn('<link rel="stylesheet" href="/styles.css">', html)
         self.assertNotIn("onclick=", html.lower())
         self.assertNotIn("javascript:", html.lower())
+        # Verify distinct Blocked vs PR Ready chip labels & explanatory tooltips
+        self.assertIn('data-section-filter="hitl_blocked"', html)
+        self.assertIn('<span class="dq-kpi-label">Blocked</span>', html)
+        self.assertIn("Blocked before PR:", html)
+        self.assertIn('<span class="dq-kpi-label">PR Ready</span>', html)
+        self.assertIn("ready for manual GitHub PR review and merge", html)
+        self.assertIn("Blocked · Needs Input", html)
+        self.assertIn("Open Blocked Chat", js)
 
         ids = re.findall(r'\bid="([^"]+)"', html)
         self.assertEqual(len(ids), len(set(ids)), "Duplicate HTML IDs found in index.html")

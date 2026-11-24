@@ -37,6 +37,7 @@ import git_client as _git_client  # noqa: E402
 from git_client import GitVcsIntegrationClient, stamp_repo_version_manifests  # noqa: E402
 from lock_store import (  # noqa: E402
     MAX_PR_REVIEW_ITERATIONS,
+    PR_DEV_DEFAULT_MODEL,
     PR_DEVELOPER_SUBAGENT_NAME,
     PR_REVIEW_PASS_MIN_SCORE,
     PR_REVIEWER_SUBAGENT_NAME,
@@ -107,27 +108,55 @@ def build_code_developer_subagent_plan(
     anchored_context: str = "",
     workdir: str = "",
     repo_slug: str = "",
+    review_iteration: int = 1,
+    portfolio_dir: Path | str | None = None,
+    live_quotas: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the `subagent_definition` and `subagent_invocation` for `agy-code-developer`.
 
-    Supports optional model tiering (`flash` for bounded/pre-anchored tasks or `pro` [default]
-    for complex multi-module/security work) while keeping `agy-code-pr-reviewer` on `pro`.
-    Executes Local-First Review staging using pure native `git` (RCA -> Create Timestamped Branch & Acquire per-repo `dev_pr_locks` entry ->
-    Propose Changes on Branch & Run Local Unit Tests -> Stage Locally via `push-branch`/`prepare-review` WITHOUT pushing to `origin`)
-    and returns the branch details + `agy-code-pr-reviewer` invocation plan.
+    Defaults to `flash` (`PR_DEV_DEFAULT_MODEL`) on Round 1 for token savings and automatically
+    escalates to `pro` (`PR_SUBAGENT_MODEL`) on Round 2+ remediation (`review_iteration >= 2`)
+    or when explicitly requested, while applying unlimited-first, preventive low-quota Eco
+    (`<= 25%`), and 429 cooldown fallback via `dev_common.select_next_optimal_model()`.
     """
     cid_clean = str(conversation_id or "").strip()
     files_list = [str(f).strip() for f in (target_files or []) if str(f).strip()]
     sib_list = [str(s).strip() for s in (sibling_ids or []) if str(s).strip()]
-    resolved_model = str(model or "").strip().lower() or PR_SUBAGENT_MODEL
-    if resolved_model not in ("pro", "flash", "inherit", "flash_lite"):
-        resolved_model = PR_SUBAGENT_MODEL
+    eff_round = max(1, int(review_iteration or 1))
+    explicit_model = str(model or "").strip()
+    escalated_from_flash = bool(not explicit_model and eff_round >= 2)
+    target_model = explicit_model or (PR_SUBAGENT_MODEL if eff_round >= 2 else PR_DEV_DEFAULT_MODEL)
+
+    routing = dev_common.select_next_optimal_model(
+        role="developer",
+        preferred_model=target_model,
+        live_quotas=live_quotas,
+        state_dir=portfolio_dir,
+        review_iteration=eff_round,
+    )
+    routing["escalated_from_flash"] = escalated_from_flash
+    routing["review_iteration"] = eff_round
+
+    if routing.get("all_exhausted"):
+        resolved_model = dev_common.map_model_to_subagent_tier(target_model, default=PR_DEV_DEFAULT_MODEL)
+    elif routing.get("mode") == "normal" and target_model.lower() in ("pro", "flash", "flash_lite", "inherit"):
+        resolved_model = target_model.lower()
+    else:
+        resolved_model = str(routing.get("subagent_model") or PR_DEV_DEFAULT_MODEL)
+
     sched_flag = " --scheduled" if scheduled else ""
     files_arg = (" --target-files " + " ".join(f'"{f}"' for f in files_list)) if files_list else ""
     sib_arg = (" --sibling-ids " + " ".join(sib_list)) if sib_list else ""
     workdir_arg = f' --workdir "{workdir.strip()}"' if str(workdir or "").strip() else ""
     repo_line = f"- **Target Repository**: `{repo_slug.strip()}`\n" if str(repo_slug or "").strip() else ""
     anchored_clean = str(anchored_context or "").strip()
+    routing_note = ""
+    if routing.get("requires_swarm_dispatch") and routing.get("selected_model"):
+        routing_note = (
+            f"- **Model Routing ({routing.get('mode')})**: Target `{target_model}` routed to "
+            f"`{routing['selected_model']}` (invoke via `swarm(action=\"add\", ..., model=\"{routing['selected_model']}\")` "
+            f"or fallback tier `Model=\"{resolved_model}\"`).\n"
+        )
 
     system_prompt = (
         f"You are `{PR_DEVELOPER_SUBAGENT_NAME}`, the dedicated VCS-Interoperable Native Git Code Developer Agent "
@@ -144,12 +173,13 @@ def build_code_developer_subagent_plan(
         f"4. Once targeted tests pass, run the single-pass final local gate (`pr_remediator.py test-local --workdir <WORKTREE_PATH> --with-pre-commit`) until `passed == true` so deterministic `verification_results` are persisted on `dev_pr_lock`.\n"
         f"5. Stage the branch locally for independent review (Local-First Review — commits locally WITHOUT pushing to `origin` yet):\n"
         f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py prepare-review --workdir <WORKTREE_PATH> --title \"fix(<scope>): <summary>\" --executive-summary \"...\"`\n"
-        f"6. Return the JSON output (including `branch_name`, `branch_timestamp`, `staged_head_sha`, `reviewer_subagent_definition`, and `reviewer_subagent_invocation`) so `{PR_REVIEWER_SUBAGENT_NAME}` (`Model=\"pro\"`) can audit locally and publish ONLY upon `PASS (>90/100)`."
+        f"6. Return the JSON output (including `branch_name`, `branch_timestamp`, `staged_head_sha`, `reviewer_subagent_definition`, and `reviewer_subagent_invocation`) so `{PR_REVIEWER_SUBAGENT_NAME}` (`Model=\"pro\"` or optimal fallback when quota is low/exhausted) can audit locally and publish ONLY upon `PASS (>90/100)`."
     )
 
     task_prompt = (
         f"A code/skill change requires a native `git` timestamped branch proposal:\n"
         + repo_line
+        + routing_note
         + f"- **Incident / Conversation ID**: `{cid_clean}`\n"
         f"- **Action / Trigger ID**: `{action_id or 'code-change'}`\n"
         + (f"- **Sibling Conversation IDs**: `{', '.join(sib_list)}`\n" if sib_list else "")
@@ -168,6 +198,7 @@ def build_code_developer_subagent_plan(
     )
 
     return {
+        "model_routing": routing,
         "subagent_definition": {
             "Name": PR_DEVELOPER_SUBAGENT_NAME,
             "Description": (
@@ -201,12 +232,44 @@ def build_pr_reviewer_subagent_plan(
     scheduled: bool = True,
     workdir: str = "",
     repo_slug: str = "",
+    model: str = "",
+    portfolio_dir: Path | str | None = None,
+    live_quotas: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the `subagent_definition` and `subagent_invocation` for `agy-code-pr-reviewer` (`Model="pro"`)."""
+    """Build the `subagent_definition`, `subagent_invocation`, and `model_routing` for `agy-code-pr-reviewer`."""
     _ = pr_number, issue_number, scheduled, pr_url, issue_url
     resolved_ts = branch_timestamp or ""
     wd_flag = f' --workdir "{workdir.strip()}"' if str(workdir or "").strip() else ""
     repo_line = f"- **Target Repository**: `{repo_slug.strip()}`\n" if str(repo_slug or "").strip() else ""
+
+    preferred = str(model or "").strip() or PR_SUBAGENT_MODEL
+    routing = dev_common.select_next_optimal_model(
+        role="reviewer",
+        preferred_model=preferred,
+        live_quotas=live_quotas,
+        state_dir=portfolio_dir,
+    )
+    if routing.get("all_exhausted"):
+        subagent_model = dev_common.map_model_to_subagent_tier(preferred, default=PR_SUBAGENT_MODEL)
+    elif routing.get("mode") == "normal" and preferred.lower() in ("pro", "flash", "flash_lite", "inherit"):
+        subagent_model = preferred.lower()
+    else:
+        subagent_model = str(routing.get("subagent_model") or PR_SUBAGENT_MODEL)
+
+    selected_model = str(routing.get("selected_model") or preferred)
+    model_flag = (
+        f' --reviewer-model "{selected_model}"'
+        if selected_model and selected_model.lower() != PR_SUBAGENT_MODEL
+        else ""
+    )
+    routing_note = ""
+    if routing.get("mode") not in ("normal", ""):
+        routing_note = (
+            f"- **Reviewer Model Routing ({routing.get('mode')})**: Preferred `{preferred}` routed to "
+            f"`{selected_model}` (pass `--reviewer-model \"{selected_model}\"` to `record-review`; "
+            f"if `requires_swarm_dispatch`, dispatch via `swarm(action=\"add\", ..., model=\"{selected_model}\")`).\n"
+        )
+
     system_prompt = (
         f"You are `{PR_REVIEWER_SUBAGENT_NAME}`, an independent Native Git Branch Quality & Security Evaluator Agent "
         f"(Maker-Checker pattern) for `agy-dev-plugin` and companion repositories (`agy-tam-plugin`, `g-control-tower`, etc.).\n"
@@ -222,13 +285,14 @@ def build_pr_reviewer_subagent_plan(
         f"   - Criterion C (20 pts): Security & Zero-PII Guardrails — Zero hardcoded customer names, emails, `/Users/<user>/` paths, or secrets.\n"
         f"   - Criterion D (15 pts): Code Style, Typing & Documentation — Clean English docstrings, type hints, and plugin / `$HOME` parity.\n"
         f"3. Record your structured verdict via `record-review` (which publishes `origin/<branch>`, starts `watch-pr-merge`, and surfaces `manual_pr_url` ONLY if `PASS` and `score > 90` with zero PR Ready emails; otherwise keeps the branch local and returns `developer_remediation_plan` for auto-iteration up to {MAX_PR_REVIEW_ITERATIONS} rounds, dispatching a `[🟥]` KO escalation alert only at round >= {MAX_PR_REVIEW_ITERATIONS} when `--send-email` is passed):\n"
-        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review --branch <BRANCH_NAME>{wd_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary \"...\" --send-email`\n"
+        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review --branch <BRANCH_NAME>{wd_flag}{model_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary \"...\" --send-email`\n"
         f"4. Return the JSON evaluation summary (`ready_for_human_pr`, `needs_reiteration`, `manual_pr_url` only when `ready_for_human_pr == true`, or `developer_remediation_plan` otherwise)."
     )
 
     task_prompt = (
         f"Evaluate the locally staged timestamped branch `{branch_name}` (Timestamp: `{resolved_ts}`):\n"
         + repo_line
+        + routing_note
         + f"- **Conversation ID**: `{conversation_id}`\n"
         f"- **Proposed Branch**: `{branch_name}` (Local-First Review — NOT yet published to `origin`)\n"
         f"- **Branch Timestamp**: `{resolved_ts}`\n"
@@ -238,12 +302,13 @@ def build_pr_reviewer_subagent_plan(
         f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch \"{branch_name}\"{wd_flag}` to inspect the exact local diff and files changed via native `git`.\n"
         f"2. Score the branch changes (0-100) across Resolution Accuracy, Unit Tests, Zero-PII Security, and Code Quality, and give your verdict (`PASS`, `WARN`, or `NEEDS_REVISION`).\n"
         f"3. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review "
-        f"--branch \"{branch_name}\"{wd_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <SCORE> "
+        f"--branch \"{branch_name}\"{wd_flag}{model_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <SCORE> "
         f"--summary \"<Your detailed technical review comment>\" --send-email`.\n"
         f"4. Return the full JSON evaluation summary (never surface any PR URL unless `ready_for_human_pr == true`)."
     )
 
     return {
+        "model_routing": routing,
         "subagent_definition": {
             "Name": PR_REVIEWER_SUBAGENT_NAME,
             "Description": (
@@ -258,7 +323,7 @@ def build_pr_reviewer_subagent_plan(
         "subagent_invocation": {
             "TypeName": PR_REVIEWER_SUBAGENT_NAME,
             "Role": "Independent Native Git Branch Reviewer",
-            "Model": PR_SUBAGENT_MODEL,
+            "Model": subagent_model,
             "Prompt": task_prompt,
         },
     }
@@ -1130,6 +1195,7 @@ def push_remediation_branch_and_build_reviewer_plan(
         scheduled=scheduled,
         workdir=str(target_repo_dir),
         repo_slug=resolved_repo_slug,
+        portfolio_dir=portfolio_dir,
     )
 
     return {
@@ -1159,6 +1225,7 @@ def push_remediation_branch_and_build_reviewer_plan(
         "files_count": diff_res.get("files_count", 0),
         "verification_results": valid_vr,
         "lock": updated_lock.get("lock", {}),
+        "reviewer_model_routing": reviewer_plan["model_routing"],
         "reviewer_subagent_definition": reviewer_plan["subagent_definition"],
         "reviewer_subagent_invocation": reviewer_plan["subagent_invocation"],
     }
@@ -1183,17 +1250,20 @@ def _build_developer_remediation_plan(
     rca_summary: str,
     proposed_fix: str,
     target_files: list[str] | None = None,
+    portfolio_dir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Build a structured remediation brief so the orchestrator can auto-iterate `agy-code-developer`."""
+    """Build a structured remediation brief escalating `agy-code-developer` to `pro` (or optimal fallback) on Round 2+."""
+    next_dev_round = max(2, int(review_iteration or 1) + 1)
     anchored = (
         f"Review Round {review_iteration}/{MAX_PR_REVIEW_ITERATIONS} FAILED PR Readiness Gate "
         f"({verdict} {score}/100 — requires PASS >= {PR_REVIEW_PASS_MIN_SCORE}/100).\n"
         f"- Worktree / Branch: `{workdir}` on `{branch_name}` (reuse active lock/worktree).\n"
+        f"- Escalated Remediation Round: Round {next_dev_round} auto-escalated from `flash` to high-reasoning tier.\n"
         f"- Reviewer Critique to Fix:\n{reviewer_feedback}\n"
         f"- Required Steps: (1) address all reviewer findings in `{workdir}`, (2) add/update hermetic tests, "
         f"(3) run `pre-commit run --all-files` + `pr_remediator.py test-local --workdir \"{workdir}\"`, "
         f"(4) re-stage via `pr_remediator.py prepare-review --workdir \"{workdir}\" --title \"...\"`, "
-        f"(5) re-invoke `agy-code-pr-reviewer` (`Model=\"pro\"`)."
+        f"(5) re-invoke `agy-code-pr-reviewer` (`Model=\"pro\"` or quota fallback)."
     )
     dev_subagent = build_code_developer_subagent_plan(
         conversation_id=conversation_id,
@@ -1205,6 +1275,8 @@ def _build_developer_remediation_plan(
         anchored_context=anchored,
         workdir=workdir,
         repo_slug=repo_slug,
+        review_iteration=next_dev_round,
+        portfolio_dir=portfolio_dir,
     )
     return {
         "conversation_id": conversation_id,
@@ -1213,6 +1285,7 @@ def _build_developer_remediation_plan(
         "branch_name": branch_name,
         "workdir": _sanitize_home_paths(workdir),
         "review_iteration": review_iteration,
+        "next_dev_round": next_dev_round,
         "max_review_iterations": MAX_PR_REVIEW_ITERATIONS,
         "verdict": verdict,
         "score": score,
@@ -1223,8 +1296,9 @@ def _build_developer_remediation_plan(
             "Add or update deterministic hermetic unit tests covering every fix.",
             f"Run `pre-commit run --all-files` and `pr_remediator.py test-local --workdir \"{_sanitize_home_paths(workdir)}\"`.",
             f"Re-stage locally via `pr_remediator.py prepare-review --workdir \"{_sanitize_home_paths(workdir)}\" --title \"...\"`.",
-            "Re-invoke independent `agy-code-pr-reviewer` (`Model=\"pro\"`) until `ready_for_human_pr == true`.",
+            "Re-invoke independent `agy-code-pr-reviewer` (`Model=\"pro\"` or optimal fallback) until `ready_for_human_pr == true`.",
         ],
+        "developer_model_routing": dev_subagent["model_routing"],
         "developer_subagent_definition": dev_subagent["subagent_definition"],
         "developer_subagent_invocation": dev_subagent["subagent_invocation"],
     }
@@ -1257,6 +1331,7 @@ def record_pr_review_evaluation(
     executive_summary: str = "",
     branch_name: str = "",
     reviewer_subagent_id: str = "",
+    reviewer_model: str = "",
     send_email: bool = False,
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
@@ -1419,6 +1494,7 @@ def record_pr_review_evaluation(
     current_iteration = int(lock_info.get("review_iteration") or 0) + 1
     existing_history = list(lock_info.get("review_history") or [])
     now_iso = _utc_now_iso()
+    effective_reviewer_model = str(reviewer_model or "").strip() or PR_SUBAGENT_MODEL
     review_entry = {
         "iteration": current_iteration,
         "verdict": norm_verdict,
@@ -1426,6 +1502,7 @@ def record_pr_review_evaluation(
         "gate_passed": gate_passed,
         "summary": _sanitize_home_paths(summary.strip()),
         "reviewer_subagent_id": reviewer_subagent_id.strip(),
+        "reviewer_model": effective_reviewer_model,
         "head_sha": head_sha,
         "evaluated_at_utc": now_iso,
     }
@@ -1455,9 +1532,9 @@ def record_pr_review_evaluation(
         max_review_iterations=MAX_PR_REVIEW_ITERATIONS,
     )
 
-    created_by_label = f"{PR_DEVELOPER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL}) · {PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL})"
+    created_by_label = f"{PR_DEVELOPER_SUBAGENT_NAME} ({PR_DEV_DEFAULT_MODEL}) · {PR_REVIEWER_SUBAGENT_NAME} ({effective_reviewer_model})"
     validator_banner_label = (
-        f"{PR_REVIEWER_SUBAGENT_NAME} ({PR_SUBAGENT_MODEL}) [{norm_verdict} {score_int}/100 · Round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS}]"
+        f"{PR_REVIEWER_SUBAGENT_NAME} ({effective_reviewer_model}) [{norm_verdict} {score_int}/100 · Round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS}]"
     )
     recorded_subagents = _normalize_str_list(
         [*(lock_info.get("subagent_conversation_ids") or []), reviewer_subagent_id.strip()]
@@ -1499,10 +1576,11 @@ def record_pr_review_evaluation(
             rca_summary=rca_summary,
             proposed_fix=proposed_fix,
             target_files=list(lock_info.get("target_files") or []),
+            portfolio_dir=portfolio_dir,
         )
 
         review_markdown = (
-            f"### {'🚨' if circuit_breaker_tripped else '🔁'} Branch Review Gate NOT Passed (`{PR_REVIEWER_SUBAGENT_NAME}` · `{PR_SUBAGENT_MODEL}`)\n\n"
+            f"### {'🚨' if circuit_breaker_tripped else '🔁'} Branch Review Gate NOT Passed (`{PR_REVIEWER_SUBAGENT_NAME}` · `{effective_reviewer_model}`)\n\n"
             f"- **Branch Status**: `{lock_status_next}` (NOT pushed to `origin`, `manual_pr_url` suppressed)\n"
             f"- **Local Branch**: `{resolved_branch}` (Timestamp `{resolved_ts}`)\n"
             f"- **Verdict**: **{badge}** (`{score_int}/100` — requires `PASS >= {PR_REVIEW_PASS_MIN_SCORE}/100`)\n"
@@ -1535,6 +1613,7 @@ def record_pr_review_evaluation(
                     "reviewer_score": score_int,
                     "reviewer_summary": summary.strip(),
                     "reviewer_subagent_id": reviewer_subagent_id.strip(),
+                    "last_reviewer_model": effective_reviewer_model,
                     "subagent_conversation_ids": recorded_subagents,
                     "review_markdown": review_markdown,
                 },
@@ -1942,6 +2021,7 @@ def record_pr_review_evaluation(
                 "reviewer_score": score_int,
                 "reviewer_summary": summary.strip(),
                 "reviewer_subagent_id": reviewer_subagent_id.strip(),
+                "last_reviewer_model": effective_reviewer_model,
                 "subagent_conversation_ids": recorded_subagents,
                 "review_markdown": review_markdown,
             },
@@ -2910,7 +2990,8 @@ def register_review_cli(sub: Any) -> None:
     p_plan_dev.add_argument("--target-files", nargs="*", default=[], help="Affected files.")
     p_plan_dev.add_argument("--sibling-ids", nargs="*", default=[], help="Grouped sibling Conversation IDs.")
     p_plan_dev.add_argument("--scheduled", action="store_true", help="Mark as scheduled run.")
-    p_plan_dev.add_argument("--model", choices=("pro", "flash", "inherit"), default="", help="Optional developer model tier.")
+    p_plan_dev.add_argument("--model", choices=("pro", "flash", "flash_lite", "inherit"), default="", help="Optional developer model tier (defaults to flash Round 1, pro Round 2+).")
+    p_plan_dev.add_argument("--review-iteration", dest="review_iteration", type=int, default=1, help="Development/review iteration number (>=2 auto-escalates flash -> pro).")
     p_plan_dev.add_argument("--anchored-context", default="", help="Optional pre-anchored file line ranges and contracts.")
     p_plan_dev.add_argument("--repo", dest="repo_slug", default="", help="Optional target owner/repo slug.")
     p_plan_dev.add_argument("--workdir", default="", help="Optional target repository directory.")
@@ -2949,6 +3030,7 @@ def register_review_cli(sub: Any) -> None:
     p_rev.add_argument("--summary", required=True, help="Detailed review evaluation summary.")
     p_rev.add_argument("--executive-summary", default="", help="Optional Executive Summary override.")
     p_rev.add_argument("--subagent-id", default="", help="Reviewer subagent conversationId.")
+    p_rev.add_argument("--reviewer-model", dest="reviewer_model", default="", help="Optional actual reviewer model ID (e.g. pro or fallback model ID).")
     p_rev.add_argument(
         "--send-email",
         action="store_true",
@@ -3001,6 +3083,23 @@ def register_review_cli(sub: Any) -> None:
         help="Retained for backward CLI compatibility (deprecated no-op; PR Ready emails are disabled).",
     )
 
+    p_quota = sub.add_parser(
+        "quota-status",
+        help="Inspect or update 0600 model_quota_cooldowns.json and compute deterministic optimal/low-quota fallback model routing.",
+    )
+    p_quota.add_argument(
+        "--role",
+        choices=("developer", "reviewer", "orchestrator", "wake"),
+        default="developer",
+        help="Target role for model recommendation (default: developer).",
+    )
+    p_quota.add_argument("--preferred-model", dest="preferred_model", default="", help="Optional preferred model override.")
+    p_quota.add_argument("--review-iteration", dest="review_iteration", type=int, default=1, help="Review/dev iteration number.")
+    p_quota.add_argument("--record-swarm-json", dest="record_swarm_json", default="", help="Optional raw JSON string (or @path) from swarm(action='models', all=true) to persist.")
+    p_quota.add_argument("--record-cooldown-model", dest="record_cooldown_model", default="", help="Optional exhausted model ID to record in cooldown ledger.")
+    p_quota.add_argument("--resets-at", dest="resets_at", default="", help="Optional ISO-8601 UTC reset timestamp for --record-cooldown-model.")
+    p_quota.add_argument("--resets-in-seconds", dest="resets_in_seconds", type=int, default=None, help="Optional reset duration in seconds for --record-cooldown-model.")
+
 
 def dispatch_review_cli(args: Any) -> int | None:
     """Handle review-gate CLI subcommands; return exit code or None if unhandled."""
@@ -3017,6 +3116,7 @@ def dispatch_review_cli(args: Any) -> int | None:
             anchored_context=getattr(args, "anchored_context", ""),
             workdir=getattr(args, "workdir", ""),
             repo_slug=getattr(args, "repo_slug", ""),
+            review_iteration=int(getattr(args, "review_iteration", 1) or 1),
         )
         print(json.dumps({"status": "ok", **res}, indent=2, ensure_ascii=False))
         return 0
@@ -3061,6 +3161,7 @@ def dispatch_review_cli(args: Any) -> int | None:
             executive_summary=getattr(args, "executive_summary", ""),
             branch_name=args.branch,
             reviewer_subagent_id=args.subagent_id,
+            reviewer_model=getattr(args, "reviewer_model", ""),
             send_email=args.send_email,
             workdir=getattr(args, "workdir", "") or None,
             repo_slug=getattr(args, "repo_slug", ""),
@@ -3119,5 +3220,51 @@ def dispatch_review_cli(args: Any) -> int | None:
         )
         print(json.dumps(rbr_res, indent=2, ensure_ascii=False))
         return 0 if rbr_res.get("status") == "ok" else 1
+
+    if args.subcommand == "quota-status":
+        snapshot_res: dict[str, Any] | None = None
+        cooldown_res: dict[str, Any] | None = None
+        raw_swarm = str(getattr(args, "record_swarm_json", "") or "").strip()
+        if raw_swarm:
+            try:
+                if raw_swarm.startswith("@"):
+                    payload_obj = json.loads(Path(raw_swarm[1:]).expanduser().read_text(encoding="utf-8"))
+                else:
+                    payload_obj = json.loads(raw_swarm)
+                if isinstance(payload_obj, dict):
+                    snapshot_res = dev_common.record_swarm_quota_snapshot(payload_obj)
+            except (OSError, json.JSONDecodeError) as exc:
+                print(json.dumps({"status": "error", "error": f"Invalid --record-swarm-json: {exc}"}, indent=2))
+                return 1
+        cd_model = str(getattr(args, "record_cooldown_model", "") or "").strip()
+        if cd_model:
+            cooldown_res = dev_common.record_model_quota_cooldown(
+                cd_model,
+                resets_at=str(getattr(args, "resets_at", "") or ""),
+                resets_in_seconds=getattr(args, "resets_in_seconds", None),
+                source="cli",
+            )
+        state = dev_common.load_model_quota_state()
+        routing = dev_common.select_next_optimal_model(
+            role=str(getattr(args, "role", "developer") or "developer"),
+            preferred_model=str(getattr(args, "preferred_model", "") or ""),
+            review_iteration=int(getattr(args, "review_iteration", 1) or 1),
+        )
+        out = {
+            "status": "ok",
+            "routing": routing,
+            "state": {
+                "updated_at": state.get("updated_at", ""),
+                "active_cooldowns": state.get("cooldowns", {}),
+                "snapshot_fresh": bool((state.get("quota_snapshot") or {}).get("fresh")),
+                "snapshot_recorded_at": (state.get("quota_snapshot") or {}).get("recorded_at", ""),
+            },
+        }
+        if snapshot_res is not None:
+            out["snapshot_recorded"] = snapshot_res
+        if cooldown_res is not None:
+            out["cooldown_recorded"] = cooldown_res
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
 
     return None
