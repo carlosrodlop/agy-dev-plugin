@@ -139,6 +139,23 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _resolve_panel_max_slots(explicit_max_slots: Any = None) -> int:
+    """Resolve per-repository slot capacity (`[1..4]`, default `3`) via the TUI resolver with a local clamp fallback."""
+    resolver = getattr(_tui, "_resolve_max_repo_slots", None)
+    if callable(resolver):
+        try:
+            return int(resolver(explicit_max_slots))
+        except Exception:
+            pass
+    val = 3
+    if explicit_max_slots not in (None, "") and not isinstance(explicit_max_slots, bool):
+        try:
+            val = int(explicit_max_slots)
+        except (TypeError, ValueError):
+            val = 3
+    return min(max(val, 1), 4)
+
+
 def sanitize_zero_pii_text(text: str, *, home_dir: Path | None = None) -> str:
     """Replace local `/Users/<user>` or `/home/<user>` segments with `$HOME`."""
     if not text:
@@ -528,12 +545,15 @@ def build_panel_state(
         pulls_u = _tui._repo_pulls_url(slug, repo_web_bases)
         lk = locks.get(slug)
         if not lk:
+            free_max = _resolve_panel_max_slots(None)
             repos_cards.append(
                 {
                     "slug": slug,
                     "label": lbl,
                     "locked": False,
-                    "slot_occupancy": "0/2",
+                    "slot_occupancy": f"0/{free_max}",
+                    "max_slots": free_max,
+                    "active_slots_count": 0,
                     "state_tag": "FREE",
                     "is_human_ready": False,
                     "is_stalled": False,
@@ -545,7 +565,9 @@ def build_panel_state(
             )
             continue
 
-        occ = str(lk.get("slot_occupancy") or f"{lk.get('active_slots_count', 1)}/{lk.get('max_slots', 2)}")
+        active_slot_entries = _tui._iter_active_lock_slots(lk)
+        max_slots = max(_resolve_panel_max_slots(lk.get("max_slots")), len(active_slot_entries))
+        occ = str(lk.get("slot_occupancy") or f"{len(active_slot_entries) or 1}/{max_slots}")
         lp_primary = lock_progress_cache.get(slug) or {}
         is_human_ready = bool(lp_primary.get("is_human_ready"))
         _, lock_pr_url, _, _ = _tui._resolve_lock_human_pr_link(
@@ -558,16 +580,19 @@ def build_panel_state(
         safe_pr_url = _tui._sanitize_full_url(lock_pr_url) if is_human_ready else ""
         slots_out: list[dict[str, Any]] = []
         any_stalled = False
-        for slot_entry in _tui._iter_active_lock_slots(lk):
+        for slot_entry in active_slot_entries:
             s_num = int(slot_entry.get("slot_id") or 1)
             s_lp = lock_progress_cache.get(_tui._slot_progress_cache_key(slug, slot_entry)) or {}
             s_stalled = bool(s_lp.get("is_stalled"))
             any_stalled = any_stalled or s_stalled
             s_cid = str(slot_entry.get("conversation_id") or "").strip()
             s_worker = str(slot_entry.get("worker_cid") or "").strip()
+            s_landing = slot_entry.get("landing_order")
+            s_landing_num = s_landing if isinstance(s_landing, int) and not isinstance(s_landing, bool) else s_num
             slots_out.append(
                 {
                     "slot_id": s_num,
+                    "slot_label": f"S{s_num}",
                     "status": str(slot_entry.get("status") or ""),
                     "branch_name": str(slot_entry.get("branch_name") or ""),
                     "conversation_id": s_cid,
@@ -580,6 +605,9 @@ def build_panel_state(
                     "idle_label": str(s_lp.get("idle_label") or ""),
                     "is_stalled": s_stalled,
                     "is_human_ready": bool(s_lp.get("is_human_ready")) and s_num == 1,
+                    "is_awaiting_base": bool(s_lp.get("is_awaiting_base")),
+                    "landing_order": s_landing_num,
+                    "overlap_tier": str(slot_entry.get("overlap_tier") or ""),
                 }
             )
         state_tag = (
@@ -593,6 +621,8 @@ def build_panel_state(
                 "label": lbl,
                 "locked": True,
                 "slot_occupancy": occ,
+                "max_slots": max_slots,
+                "active_slots_count": len(slots_out),
                 "state_tag": state_tag,
                 "is_human_ready": is_human_ready,
                 "is_stalled": any_stalled,

@@ -448,6 +448,127 @@ class TestSidecarServerSecurityAndState(unittest.TestCase):
                 thread.join(timeout=2.0)
 
 
+def _panel_n_slot_lock(n_slots: int, *, max_slots: int | None, cid_prefix: str) -> dict[str, object]:
+    """Build a hermetic N-slot lock: Slot #1 mirrored at top level, Slots #2..#N `READY_AWAITING_BASE_MERGE`."""
+    slots: dict[str, dict[str, object]] = {}
+    for s_id in range(1, n_slots + 1):
+        slots[str(s_id)] = {
+            "slot_id": s_id,
+            "active": True,
+            "status": "DEVELOPING" if s_id == 1 else "READY_AWAITING_BASE_MERGE",
+            "branch_name": f"fix/20261123-1{s_id}0000-task-s{s_id}",
+            "conversation_id": f"{cid_prefix}{s_id}11111-1111-4222-8333-444444444444",
+            "landing_order": s_id,
+            "overlap_tier": "disjoint" if s_id == 1 else "same_file_disjoint_sections",
+            "last_activity_at": "2026-11-23T12:00:00Z",
+        }
+    lock: dict[str, object] = {
+        "active": True,
+        "slot_id": 1,
+        **{k: v for k, v in slots["1"].items() if k != "slot_id"},
+        "slots": slots,
+    }
+    if max_slots is not None:
+        lock["max_slots"] = max_slots
+    return lock
+
+
+class TestSidecarPanelNSlots(unittest.TestCase):
+    """Verify `[active/max]` occupancy (default 3, cap 4), sorted `S1..S4` slot rows, and legacy 2-slot compat."""
+
+    def setUp(self) -> None:
+        env_patch = mock.patch.dict(os.environ, {}, clear=False)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        os.environ.pop("AGY_DEV_MAX_SLOTS_PER_REPO", None)
+
+    def test_resolve_panel_max_slots_clamp(self) -> None:
+        self.assertEqual(panel_srv._resolve_panel_max_slots(None), 3)
+        self.assertEqual(panel_srv._resolve_panel_max_slots(2), 2)
+        self.assertEqual(panel_srv._resolve_panel_max_slots(7), 4)
+
+    def test_build_panel_state_three_four_legacy_and_free_repo_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            st_dir = root / "state"
+            fake_home = root / "home"
+            fake_home.mkdir(parents=True, exist_ok=True)
+            four_lock = _panel_n_slot_lock(4, max_slots=4, cid_prefix="bb")
+            # Shuffle slot insertion order to prove the panel sorts by `slot_id`.
+            four_lock["slots"] = dict(reversed(list(four_lock["slots"].items())))  # type: ignore[union-attr]
+            _write_mock_state(
+                st_dir,
+                items=[
+                    {
+                        "conversation_id": "dddddddd-1111-4222-8333-444444444444",
+                        "priority": 30,
+                        "status": "pending",
+                        "title": "Queued follow-up",
+                        "repo_slugs": ["owner/repo-free"],
+                    }
+                ],
+                locks={
+                    "owner/repo-three": _panel_n_slot_lock(3, max_slots=None, cid_prefix="aa"),
+                    "owner/repo-four": four_lock,
+                    "owner/repo-legacy": {
+                        "active": True,
+                        "status": "DEVELOPING",
+                        "branch_name": "fix/20261123-110000-legacy-s1",
+                        "conversation_id": "ee111111-1111-4222-8333-444444444444",
+                        "last_activity_at": "2026-11-23T12:00:00Z",
+                        "slots": {
+                            "2": {
+                                "active": True,
+                                "status": "READY_AWAITING_BASE_MERGE",
+                                "branch_name": "fix/20261123-120000-legacy-s2",
+                                "conversation_id": "ee222222-1111-4222-8333-444444444444",
+                            }
+                        },
+                    },
+                },
+            )
+            snap = panel_srv.build_panel_state(
+                state_dir=st_dir,
+                conv_db_path=root / "missing.db",
+                brain_dir=root / "brain",
+                home_dir=fake_home,
+                env={},
+            )
+            cards = {c["slug"]: c for c in snap["repos"]}
+
+            three = cards["owner/repo-three"]
+            self.assertEqual(three["slot_occupancy"], "3/3")
+            self.assertEqual(three["max_slots"], 3)
+            self.assertEqual(three["active_slots_count"], 3)
+            self.assertEqual([s["slot_label"] for s in three["slots"]], ["S1", "S2", "S3"])
+
+            four = cards["owner/repo-four"]
+            self.assertEqual(four["slot_occupancy"], "4/4")
+            self.assertEqual([s["slot_id"] for s in four["slots"]], [1, 2, 3, 4])
+            self.assertEqual([s["landing_order"] for s in four["slots"]], [1, 2, 3, 4])
+            self.assertEqual(four["slots"][3]["status"], "READY_AWAITING_BASE_MERGE")
+            self.assertEqual(four["slots"][3]["overlap_tier"], "same_file_disjoint_sections")
+            self.assertFalse(any(s["is_human_ready"] for s in four["slots"][1:]), "only Slot #1 may be PR-ready")
+
+            legacy = cards["owner/repo-legacy"]
+            self.assertEqual(legacy["slot_occupancy"], "2/3")
+            self.assertEqual([s["slot_label"] for s in legacy["slots"]], ["S1", "S2"])
+            self.assertEqual(legacy["slots"][1]["landing_order"], 2)
+
+            free = cards["owner/repo-free"]
+            self.assertFalse(free["locked"])
+            self.assertEqual(free["slot_occupancy"], "0/3")
+            self.assertEqual(free["max_slots"], 3)
+
+    def test_app_js_renders_dynamic_slot_occupancy_without_hardcoded_two(self) -> None:
+        js = APP_JS.read_text(encoding="utf-8")
+        self.assertNotIn('"1/2"', js)
+        self.assertIn("DEFAULT_MAX_REPO_SLOTS = 3", js)
+        self.assertIn("MAX_REPO_SLOTS_CAP = 4", js)
+        self.assertIn("function sortedRepoSlots(", js)
+        self.assertIn("function repoSlotOccupancy(", js)
+        self.assertIn("slot.slot_label", js)
+
 class TestNavIntentBridgeInTui(unittest.TestCase):
     """Verify `0600` atomic `dev_queue_nav_intent.json` lifecycle and `--open-hitl` CLI wiring."""
 

@@ -659,7 +659,7 @@ def _iter_active_lock_slots(lk: dict[str, Any]) -> list[dict[str, Any]]:
         or str(lk.get("conversation_id") or "").strip()
         or str(lk.get("status") or "").strip()
     ):
-        top_slot = {k: v for k, v in lk.items() if k != "slots"}
+        top_slot = {k: v for k, v in lk.items() if k not in ("slots", "slots_list")}
         try:
             top_sid = int(lk.get("slot_id") or 1)
         except (TypeError, ValueError):
@@ -672,19 +672,79 @@ def _iter_active_lock_slots(lk: dict[str, Any]) -> list[dict[str, Any]]:
     return [collected[k] for k in sorted(collected)]
 
 
+DEFAULT_MAX_REPO_SLOTS: int = int(getattr(_dev_common, "DEFAULT_MAX_REPO_SLOTS", 3) or 3)
+MAX_REPO_SLOTS_CAP: int = int(getattr(_dev_common, "MAX_REPO_SLOTS_CAP", 4) or 4)
+
+
+def _resolve_max_repo_slots(explicit_max_slots: Any = None) -> int:
+    """Resolve per-repository slot capacity clamped to `[1..MAX_REPO_SLOTS_CAP]` (default `DEFAULT_MAX_REPO_SLOTS`)."""
+    if _dev_common is not None and hasattr(_dev_common, "resolve_max_repo_slots"):
+        try:
+            return int(_dev_common.resolve_max_repo_slots(explicit_max_slots))
+        except Exception:
+            pass
+    for raw in (explicit_max_slots, str(os.environ.get("AGY_DEV_MAX_SLOTS_PER_REPO") or "").strip()):
+        if raw is None or raw == "" or isinstance(raw, bool):
+            continue
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if val >= 1:
+            return min(val, MAX_REPO_SLOTS_CAP)
+    return DEFAULT_MAX_REPO_SLOTS
+
+
+def _slot_label(slot_id: Any) -> str:
+    """Return the compact slot label (`S1`..`S4`) for a slot identifier."""
+    try:
+        return f"S{int(slot_id)}"
+    except (TypeError, ValueError):
+        return "S1"
+
+
+def _lock_slot_occupancy(lk: dict[str, Any]) -> str:
+    """Return `active/max` slot occupancy for a repository lock (default capacity `DEFAULT_MAX_REPO_SLOTS`)."""
+    if not isinstance(lk, dict):
+        return f"0/{DEFAULT_MAX_REPO_SLOTS}"
+    occ = str(lk.get("slot_occupancy") or "").strip()
+    if occ:
+        return occ
+    try:
+        active_n = int(lk.get("active_slots_count") or len(_iter_active_lock_slots(lk)) or 1)
+    except (TypeError, ValueError):
+        active_n = 1
+    max_n = max(_resolve_max_repo_slots(lk.get("max_slots")), active_n)
+    return f"{active_n}/{max_n}"
+
+
+def _secondary_slot_progress(slug: str, lock_progress_cache: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
+    """Return `(slot_id, progress)` pairs for Slots #2..#N of `slug` from a slot-keyed progress cache, sorted by slot."""
+    prefix = f"{slug}#slot"
+    out: list[tuple[int, dict[str, Any]]] = []
+    for p_key, lp_val in lock_progress_cache.items():
+        if not isinstance(p_key, str) or not p_key.startswith(prefix) or not isinstance(lp_val, dict):
+            continue
+        try:
+            s_num = int(p_key[len(prefix) :])
+        except ValueError:
+            continue
+        if s_num >= 2:
+            out.append((s_num, lp_val))
+    out.sort(key=lambda pair: pair[0])
+    return out
+
+
 def _normalize_repo_lock_slots(slug: str, info: dict[str, Any]) -> dict[str, Any]:
-    """Normalize an active repository lock with multi-slot occupancy (`1/2`, `2/2`) and `base_stale` flags."""
+    """Normalize an active repository lock with N-slot occupancy (`1/3`, `3/4`) and `base_stale` flags."""
     if not isinstance(info, dict) or not bool(info.get("active")):
         return dict(info or {})
     norm = dict(info)
     active_slots = _iter_active_lock_slots(norm)
-    try:
-        raw_max = int(norm.get("max_slots") or 2)
-    except (TypeError, ValueError):
-        raw_max = 2
-    max_slots = max(len(active_slots), raw_max, 2)
+    max_slots = max(len(active_slots), _resolve_max_repo_slots(norm.get("max_slots")))
     slots_map = {str(s["slot_id"]): s for s in active_slots}
     norm["slots"] = slots_map
+    norm["slots_list"] = list(active_slots)
     norm["max_slots"] = max_slots
     norm["active_slots_count"] = len(active_slots)
     norm["slot_occupancy"] = f"{len(active_slots)}/{max_slots}"
@@ -1561,7 +1621,7 @@ def _detect_stalled_lock_info(
 
 
 def _slot_progress_cache_key(slug: str, lk: dict[str, Any]) -> str:
-    """Build a slot-isolated cache key so Slot #1 and Slot #2 never share progress entries."""
+    """Build a slot-isolated cache key (`slug`, `slug#slot2`..`slug#slotN`) so slots never share progress entries."""
     try:
         s_num = int(lk.get("slot_id") or 1)
     except (TypeError, ValueError):
@@ -2569,7 +2629,7 @@ def _write_live_antigravity_board(
             lbl = label_map.get(slug, slug)
             lk = locks.get(slug)
             if lk:
-                occ = str(lk.get("slot_occupancy") or f"{lk.get('active_slots_count', 1)}/{lk.get('max_slots', 2)}")
+                occ = _lock_slot_occupancy(lk)
                 lp = lock_progress_cache.get(slug) or {}
                 is_pr = bool(lp.get("is_human_ready"))
                 is_stalled = bool(lp.get("is_stalled"))
@@ -2589,14 +2649,14 @@ def _write_live_antigravity_board(
                     tag = f"{int(lp.get('pct') or 0)}%"  # type: ignore[arg-type]
                 if not is_pr and not is_stalled and int(lp.get("idle_seconds") or 0) >= IDLE_AMBER_THRESHOLD_SECONDS:
                     tag = f"{tag} · idle {lp.get('idle_label') or ''}".strip()
-                s2_lp = lock_progress_cache.get(f"{slug}#slot2")
-                if isinstance(s2_lp, dict):
-                    s2_tag = (
-                        "READY_AWAITING_BASE_MERGE"
-                        if s2_lp.get("is_awaiting_base")
-                        else ("NEEDS_REBASE_REVERIFY" if s2_lp.get("is_needs_rebase") else str(s2_lp.get("tag") or f"{int(s2_lp.get('pct') or 0)}%"))
-                    )
-                    tag = f"{tag} · S2:{s2_tag}"
+                for sn_id, sn_lp in _secondary_slot_progress(slug, lock_progress_cache):
+                    if sn_lp.get("is_awaiting_base"):
+                        sn_tag = "READY_AWAITING_BASE_MERGE"
+                    elif sn_lp.get("is_needs_rebase"):
+                        sn_tag = "NEEDS_REBASE_REVERIFY"
+                    else:
+                        sn_tag = str(sn_lp.get("tag") or f"{int(sn_lp.get('pct') or 0)}%")  # type: ignore[arg-type]
+                    tag = f"{tag} · {_slot_label(sn_id)}:{sn_tag}"
                 _, u, lock_has_pr, _ = _resolve_lock_human_pr_link(
                     slug,
                     lk,
@@ -3043,10 +3103,15 @@ def render(
                 continue
             lp_primary = lock_progress_cache.get(slug, {})
             telem_primary = _extract_lock_telemetry_fields(lp_primary, lk)
+            secondary_lps = _secondary_slot_progress(slug, lock_progress_cache)
             active_locks_payload[slug] = {
                 **lk,
                 **telem_primary,
                 "progress": lp_primary,
+                "slots_progress": {
+                    "1": lp_primary,
+                    **{str(sn_id): sn_lp for sn_id, sn_lp in secondary_lps},
+                },
                 **(
                     {"slot2_progress": lock_progress_cache[f"{slug}#slot2"]}
                     if f"{slug}#slot2" in lock_progress_cache
@@ -3166,7 +3231,7 @@ def render(
             lbl = label_map.get(slug, slug)
             lk = locks.get(slug)
             if lk:
-                occ = str(lk.get("slot_occupancy") or f"{lk.get('active_slots_count', 1)}/{lk.get('max_slots', 2)}")
+                occ = _lock_slot_occupancy(lk)
                 lp = lock_progress_cache.get(slug) or {}
                 is_human_pr = bool(lp.get("is_human_ready"))
                 is_stalled = bool(lp.get("is_stalled"))
@@ -3200,34 +3265,33 @@ def render(
                     and lp_idle_secs >= IDLE_AMBER_THRESHOLD_SECONDS
                 )
 
-                s2_lp = lock_progress_cache.get(f"{slug}#slot2")
-                s2_suffix_plain = ""
-                s2_is_amber = False
-                s2_idle_lbl = ""
-                if isinstance(s2_lp, dict):
-                    if s2_lp.get("is_stalled"):
-                        s2_short = str(s2_lp.get("tag") or "STALL")
-                    elif s2_lp.get("is_awaiting_base"):
-                        s2_short = "await"
-                    elif s2_lp.get("is_needs_rebase"):
-                        s2_short = "rebase"
-                    elif s2_lp.get("is_agent_review"):
-                        s2_short = "rev"
+                sn_suffixes: list[tuple[str, bool, str]] = []
+                any_sn_amber = False
+                for sn_id, sn_lp in _secondary_slot_progress(slug, lock_progress_cache):
+                    if sn_lp.get("is_stalled"):
+                        sn_short = str(sn_lp.get("tag") or "STALL")
+                    elif sn_lp.get("is_awaiting_base"):
+                        sn_short = "await"
+                    elif sn_lp.get("is_needs_rebase"):
+                        sn_short = "rebase"
+                    elif sn_lp.get("is_agent_review"):
+                        sn_short = "rev"
                     else:
-                        s2_short = f"{int(s2_lp.get('pct') or 0)}%"  # type: ignore[arg-type]
-                    s2_idle_s = int(s2_lp.get("idle_seconds") or 0)
-                    s2_idle_lbl = str(s2_lp.get("idle_label") or "")
-                    s2_is_amber = (
-                        not bool(s2_lp.get("is_stalled"))
-                        and not bool(s2_lp.get("is_awaiting_base"))
-                        and not bool(s2_lp.get("is_needs_rebase"))
-                        and s2_idle_s >= IDLE_AMBER_THRESHOLD_SECONDS
+                        sn_short = f"{int(sn_lp.get('pct') or 0)}%"  # type: ignore[arg-type]
+                    sn_idle_s = int(sn_lp.get("idle_seconds") or 0)  # type: ignore[arg-type]
+                    sn_idle_lbl = str(sn_lp.get("idle_label") or "")
+                    sn_is_amber = (
+                        not bool(sn_lp.get("is_stalled"))
+                        and not bool(sn_lp.get("is_awaiting_base"))
+                        and not bool(sn_lp.get("is_needs_rebase"))
+                        and sn_idle_s >= IDLE_AMBER_THRESHOLD_SECONDS
                     )
-                    s2_suffix_plain = f"·S2:{s2_short}"
+                    any_sn_amber = any_sn_amber or sn_is_amber
+                    sn_suffixes.append((f"·{_slot_label(sn_id)}:{sn_short}", sn_is_amber, sn_idle_lbl))
 
                 dot_code = (
                     "1;33"
-                    if (is_human_pr or is_amber_pill or s2_is_amber)
+                    if (is_human_pr or is_amber_pill or any_sn_amber)
                     else ("1;31" if is_stalled else ("1;35" if (is_esc or is_needs_rebase) else "1;36"))
                 )
                 dot = _color("●", dot_code, color_on)
@@ -3239,15 +3303,15 @@ def render(
                     extra_urls=_collect_lock_extra_urls(lk, item_urls_by_cid),
                 )
                 styled_name = _color(lbl, "1;33" if is_human_pr else ("1;31" if is_stalled else "1"), color_on)
-                occ_styled = _color(f"[{occ}]", "1;36" if occ.startswith("2/") else "2", color_on)
+                occ_styled = _color(f"[{occ}]", "1;36" if not occ.startswith(("0/", "1/")) else "2", color_on)
                 tag_code = "1;33" if is_human_pr else ("1;35" if (is_stalled or is_needs_rebase) else "2")
                 pill_inner = _color(f"({base_tag}", tag_code, color_on)
                 if is_amber_pill and lp_idle_lbl:
                     pill_inner += _color(f" · idle {lp_idle_lbl}", "1;33", color_on)
-                if s2_suffix_plain:
-                    pill_inner += _color(s2_suffix_plain, tag_code, color_on)
-                    if s2_is_amber and s2_idle_lbl:
-                        pill_inner += _color(f" · idle {s2_idle_lbl}", "1;33", color_on)
+                for sn_suffix_plain, sn_is_amber, sn_idle_lbl in sn_suffixes:
+                    pill_inner += _color(sn_suffix_plain, tag_code, color_on)
+                    if sn_is_amber and sn_idle_lbl:
+                        pill_inner += _color(f" · idle {sn_idle_lbl}", "1;33", color_on)
                 pill_inner += _color(")", tag_code, color_on)
                 repo_pills.append(
                     f"{dot} {_osc8_link(styled_name, repo_u, use_osc8)} "
@@ -5429,7 +5493,7 @@ def _run_subcommand_locks(argv: list[str]) -> int:
     bar_w = min(shutil.get_terminal_size((124, 40)).columns, 220)
     lines = [_color("═" * bar_w, "2;36", color_on), _color(f"ACTIVE REPOSITORY LOCKS ({len(out_locks)})", "1;36", color_on)]
     for slug, info in out_locks.items():
-        occ = str(info.get("slot_occupancy") or "1/2")
+        occ = _lock_slot_occupancy(info)
         lines.append(_color("─" * bar_w, "2", color_on))
         lines.append(f"  {_color(slug, '1;33', color_on)}  [{occ}]")
         for s_item in info.get("active_slots") or []:

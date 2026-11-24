@@ -2261,5 +2261,165 @@ class TestDevQueueTui(unittest.TestCase):
             self.assertIn("[cli_proposal.md](file://", board_path.read_text(encoding="utf-8"))
 
 
+def _n_slot_lock(n_slots: int, *, max_slots: int | None, cid_prefix: str) -> dict[str, object]:
+    """Build a hermetic N-slot repository lock (Slot #1 mirrored at top level, Slots #2..#N awaiting base merge)."""
+    slots: dict[str, dict[str, object]] = {}
+    for s_id in range(1, n_slots + 1):
+        slots[str(s_id)] = {
+            "slot_id": s_id,
+            "active": True,
+            "status": "DEVELOPING" if s_id == 1 else "READY_AWAITING_BASE_MERGE",
+            "branch_name": f"fix/20270115-0{s_id}0000-task-s{s_id}",
+            "conversation_id": f"{cid_prefix}{s_id}11111-2222-4333-8444-555555555555",
+            "target_files": [f"src/module_{s_id}.py"],
+            "section_anchors": [f"def handler_{s_id}"],
+            "landing_order": s_id,
+            "overlap_tier": "disjoint",
+            "last_activity_at": "2027-01-15T09:59:00Z",
+        }
+    lock: dict[str, object] = {
+        "active": True,
+        "slot_id": 1,
+        **{k: v for k, v in slots["1"].items() if k != "slot_id"},
+        "active_slots_count": n_slots,
+        "slots": slots,
+    }
+    if max_slots is not None:
+        lock["max_slots"] = max_slots
+    return lock
+
+
+def _legacy_two_slot_lock() -> dict[str, object]:
+    """Legacy lock shape: flat Slot #1 fields plus only `slots["2"]` and no `max_slots`."""
+    return {
+        "active": True,
+        "status": "DEVELOPING",
+        "branch_name": "fix/20270115-010000-legacy-s1",
+        "conversation_id": "ee111111-2222-4333-8444-555555555555",
+        "last_activity_at": "2027-01-15T09:59:00Z",
+        "slots": {
+            "2": {
+                "active": True,
+                "status": "READY_AWAITING_BASE_MERGE",
+                "branch_name": "fix/20270115-020000-legacy-s2",
+                "conversation_id": "ee222222-2222-4333-8444-555555555555",
+                "last_activity_at": "2027-01-15T09:59:00Z",
+            }
+        },
+    }
+
+
+class TestDevQueueTuiNSlots(unittest.TestCase):
+    """N-slot (`1..4`, default 3) occupancy, `S1..S4` labels, and legacy 2-slot lock compatibility."""
+
+    def setUp(self) -> None:
+        env_patch = mock.patch.dict(os.environ, {}, clear=False)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        os.environ.pop("AGY_DEV_MAX_SLOTS_PER_REPO", None)
+
+    def test_resolve_max_repo_slots_clamps_and_defaults_to_three(self) -> None:
+        self.assertEqual(tui.DEFAULT_MAX_REPO_SLOTS, 3)
+        self.assertEqual(tui.MAX_REPO_SLOTS_CAP, 4)
+        self.assertEqual(tui._resolve_max_repo_slots(None), 3)
+        self.assertEqual(tui._resolve_max_repo_slots(2), 2)
+        self.assertEqual(tui._resolve_max_repo_slots("4"), 4)
+        self.assertEqual(tui._resolve_max_repo_slots(9), 4)
+        self.assertEqual(tui._resolve_max_repo_slots(0), 3)
+        self.assertEqual(tui._resolve_max_repo_slots("bad"), 3)
+        with mock.patch.dict(os.environ, {"AGY_DEV_MAX_SLOTS_PER_REPO": "1"}):
+            self.assertEqual(tui._resolve_max_repo_slots(None), 1)
+        self.assertEqual([tui._slot_label(i) for i in range(1, 5)], ["S1", "S2", "S3", "S4"])
+
+    def test_normalize_three_four_and_legacy_two_slot_locks(self) -> None:
+        three = tui._normalize_repo_lock_slots("owner/repo-three", _n_slot_lock(3, max_slots=None, cid_prefix="aa"))
+        self.assertEqual(three["max_slots"], 3)
+        self.assertEqual(three["active_slots_count"], 3)
+        self.assertEqual(three["slot_occupancy"], "3/3")
+        self.assertEqual(sorted(three["slots"]), ["1", "2", "3"])
+        self.assertEqual([s["slot_id"] for s in three["slots_list"]], [1, 2, 3])
+
+        four = tui._normalize_repo_lock_slots("owner/repo-four", _n_slot_lock(4, max_slots=4, cid_prefix="bb"))
+        self.assertEqual(four["slot_occupancy"], "4/4")
+        self.assertEqual([s["slot_id"] for s in four["slots_list"]], [1, 2, 3, 4])
+        self.assertEqual(tui._lock_slot_occupancy(four), "4/4")
+
+        over = tui._normalize_repo_lock_slots("owner/repo-over", _n_slot_lock(3, max_slots=2, cid_prefix="cc"))
+        self.assertEqual(over["slot_occupancy"], "3/3", "capacity never under-reports active slots")
+
+        legacy = tui._normalize_repo_lock_slots("owner/repo-legacy", _legacy_two_slot_lock())
+        self.assertEqual([s["slot_id"] for s in legacy["slots_list"]], [1, 2])
+        self.assertEqual(legacy["slot_occupancy"], "2/3")
+        self.assertEqual(legacy["slots"]["1"]["branch_name"], "fix/20270115-010000-legacy-s1")
+        legacy_explicit = tui._normalize_repo_lock_slots("owner/repo-legacy", {**_legacy_two_slot_lock(), "max_slots": 2})
+        self.assertEqual(legacy_explicit["slot_occupancy"], "2/2")
+        self.assertEqual(tui._lock_slot_occupancy({"active": True, "status": "DEVELOPING"}), "1/3")
+
+    def test_secondary_slot_progress_sorted_across_n_slots(self) -> None:
+        cache: dict[str, dict[str, object]] = {
+            "owner/repo#slot4": {"pct": 40},
+            "owner/repo": {"pct": 10},
+            "owner/repo#slot2": {"pct": 20},
+            "owner/repo#slot3": {"pct": 30},
+            "owner/repo-other#slot2": {"pct": 99},
+            "owner/repo#slotX": {"pct": 0},
+        }
+        pairs = tui._secondary_slot_progress("owner/repo", cache)
+        self.assertEqual([p[0] for p in pairs], [2, 3, 4])
+        self.assertEqual([p[1]["pct"] for p in pairs], [20, 30, 40])
+
+    def test_render_header_json_and_locks_cli_for_three_four_and_legacy_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            _write_state(
+                state_dir,
+                items=[],
+                locks={
+                    "owner/repo-three": _n_slot_lock(3, max_slots=3, cid_prefix="aa"),
+                    "owner/repo-four": _n_slot_lock(4, max_slots=4, cid_prefix="bb"),
+                    "owner/repo-legacy": _legacy_two_slot_lock(),
+                },
+            )
+            now_ts = tui._flow_opt.parse_iso_timestamp("2027-01-15T10:00:00Z")
+            out_txt, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, no_color=True, plain_urls=True, no_opt=True),
+                brain_dir="",
+                is_tty_override=False,
+                term_width_override=220,
+                now_ts_override=now_ts,
+            )
+            self.assertIn("[3/3]", out_txt)
+            self.assertIn("[4/4]", out_txt)
+            self.assertIn("[2/3]", out_txt)
+            self.assertIn("·S2:await", out_txt)
+            self.assertIn("·S3:await", out_txt)
+            self.assertIn("·S4:await", out_txt)
+            self.assertNotIn("/2]", out_txt)
+
+            json_txt, _, _, _, _, _ = tui.render(
+                _make_args(state_dir, json=True, no_opt=True),
+                brain_dir="",
+                is_tty_override=False,
+                now_ts_override=now_ts,
+            )
+            payload = json.loads(json_txt)
+            four_lk = payload["locks"]["owner/repo-four"]
+            self.assertEqual(four_lk["slot_occupancy"], "4/4")
+            self.assertEqual(sorted(four_lk["slots_progress"]), ["1", "2", "3", "4"])
+            self.assertEqual([s["slot_id"] for s in four_lk["slots_list"]], [1, 2, 3, 4])
+            self.assertIn("slot2_progress", four_lk, "legacy slot2_progress key preserved")
+            legacy_lk = payload["locks"]["owner/repo-legacy"]
+            self.assertEqual(sorted(legacy_lk["slots_progress"]), ["1", "2"])
+
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                rc = tui._run_subcommand_locks(["--state-dir", str(state_dir), "--no-color"])
+            self.assertEqual(rc, 0)
+            locks_out = buf.getvalue()
+            self.assertIn("owner/repo-four  [4/4]", locks_out)
+            self.assertIn("Slot #4", locks_out)
+            self.assertIn("owner/repo-legacy  [2/3]", locks_out)
+
+
 if __name__ == "__main__":
     unittest.main()

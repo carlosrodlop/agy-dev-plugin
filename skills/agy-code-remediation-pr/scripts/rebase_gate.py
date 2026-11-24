@@ -6,7 +6,7 @@ Pure Python 3 standard-library module using native `/usr/bin/git` (`shell=False`
   2. `probe_merge_tree_conflicts`: in-memory `git merge-tree --write-tree` dry-run conflict probe
      (with safe graceful fallback to classic 3-way `git merge-tree` on older Git versions).
   3. `compute_cross_impact_files`: computes `files(B) ∪ files(merged_A)` so selective verification covers
-     both the rebased Slot #2 branch (`B`) and every file modified by merged Slot #1 (`A`).
+     both the rebased follower Slot #2..#N branch (`B`) and every file modified by merged Slot #1 (`A`).
   4. `rebase_and_reverify`: executes dry-run conflict probe + `git rebase` + cross-impact verification,
      returning deterministic outcomes:
        - `AUTO_PROMOTED_ZERO_LLM`

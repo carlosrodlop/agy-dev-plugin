@@ -91,6 +91,7 @@ _ANOMALY_CODES_OWNED_BY_DOCTOR: frozenset[str] = frozenset(
         "wake_process_crash",
         "stale_follower_needs_rebase",
         "quota_exhausted",
+        "standby_dependency_deadlock",
     }
 )
 
@@ -955,7 +956,7 @@ def diagnose_orchestrator(
             )
         )
 
-    # 2. Stalled workers & reviewers across Slot #1 and Slot #2 (including AWAITING_AGENT_REVIEW)
+    # 2. Stalled workers & reviewers across every active slot #1..#N (including AWAITING_AGENT_REVIEW)
     for slug, slot_num, slot_lk in active_lock_slots:
         st_u = str(slot_lk.get("status") or "").strip().upper()
         if st_u not in ("DEVELOPING", "NEEDS_REVISION_ITERATING", "AWAITING_AGENT_REVIEW") or bool(
@@ -1244,6 +1245,34 @@ def diagnose_orchestrator(
                     safe_fix_action="agy-doctor --fix",
                     requires_wake=False,
                     auto_fixable=True,
+                )
+            )
+        elif f_code == "standby_dependency_deadlock":
+            dl_hints = [str(h) for h in (ev.get("remediation_hints") or []) if str(h).strip()]
+            dl_blockers = ", ".join(
+                f"{str(cid)[:8]}({st})"
+                for cid, st in dict(ev.get("blocking_dependency_statuses") or {}).items()
+            )
+            anomalies.append(
+                _make_anomaly(
+                    code="standby_dependency_deadlock",
+                    severity=str(f.get("severity") or "medium"),
+                    title=str(
+                        f.get("title") or "Pending item(s) deadlocked on standby/cancelled/rejected dependencies"
+                    ),
+                    cause=(
+                        f"{int(ev.get('count') or 0)} pending item(s) ({int(ev.get('free_repo_count') or 0)} on free "
+                        f"repo(s)) depend on item(s) that will never merge on their own: {dl_blockers or 'n/a'}. "
+                        "`queue-next` skips them forever until a human re-activates the blocker or rewrites `depends_on`."
+                    ),
+                    evidence={**ev, "remediation_hints": dl_hints},
+                    safe_fix_action=(
+                        dl_hints[0]
+                        if dl_hints
+                        else "pr_remediator.py queue-add --id <cid> --replace-depends-on <ids...> | --clear-depends-on"
+                    ),
+                    requires_wake=False,
+                    auto_fixable=False,
                 )
             )
         elif f_code == "stale_follower_needs_rebase":
