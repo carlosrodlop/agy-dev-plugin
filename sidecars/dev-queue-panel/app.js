@@ -419,6 +419,8 @@
     pauseBusy: false,
     cleanupBusy: false,
     cleanupPreview: null,
+    ghostBusy: false,
+    ghostConfirmRestart: false,
     toastTimer: null,
     consumedIntentIds: new Set(),
   };
@@ -448,6 +450,261 @@
     return `${b} B`;
   }
 
+  function getEffectiveGhostPurge() {
+    if (uiState.cleanupPreview && uiState.cleanupPreview.ghost_purge && typeof uiState.cleanupPreview.ghost_purge === "object") {
+      return uiState.cleanupPreview.ghost_purge;
+    }
+    if (uiState.snapshot && uiState.snapshot.ghost_purge && typeof uiState.snapshot.ghost_purge === "object") {
+      return uiState.snapshot.ghost_purge;
+    }
+    return null;
+  }
+
+  function renderGhostResultBanner() {
+    const banner = document.getElementById("dq-ghost-result-banner");
+    const titleEl = document.getElementById("dq-ghost-result-title");
+    const metaEl = document.getElementById("dq-ghost-result-meta");
+    const dismissBtn = document.getElementById("dq-ghost-result-dismiss-btn");
+    if (!banner || !titleEl || !metaEl) {
+      return;
+    }
+    const gp = getEffectiveGhostPurge();
+    const lastRes = gp && gp.last_result && typeof gp.last_result === "object" ? gp.last_result : null;
+    if (!lastRes || lastRes.acked) {
+      banner.classList.add("dq-hidden");
+      banner.classList.remove("is-error");
+      titleEl.textContent = "";
+      metaEl.textContent = "";
+      return;
+    }
+    const isOk = String(lastRes.status || "") === "ok";
+    banner.classList.remove("dq-hidden");
+    banner.classList.toggle("is-error", !isOk);
+    if (isOk) {
+      const dbCount = Number(lastRes.pruned_count || 0);
+      const appCount = Number(lastRes.app_storage_entries_removed || 0);
+      const bkpCount = Number(lastRes.backups_count || 0);
+      titleEl.textContent = `Ghost purge completed (${dbCount} DB · ${appCount} app_storage entries)`;
+      const parts = [];
+      if (lastRes.mode) {
+        parts.push(`mode: ${lastRes.mode}`);
+      }
+      if (bkpCount > 0) {
+        parts.push(`${bkpCount} backup${bkpCount === 1 ? "" : "s"} created`);
+      }
+      if (lastRes.completed_at) {
+        parts.push(String(lastRes.completed_at));
+      }
+      metaEl.textContent = parts.join(" · ");
+    } else {
+      titleEl.textContent = "Ghost purge did not complete";
+      metaEl.textContent = String(lastRes.reason || lastRes.status || "blocked");
+    }
+    if (dismissBtn) {
+      dismissBtn.disabled = Boolean(uiState.ghostBusy);
+    }
+  }
+
+  function renderGhostPurgeControls() {
+    const section = document.getElementById("dq-ghost-section");
+    const summaryEl = document.getElementById("dq-ghost-summary");
+    const breakdownEl = document.getElementById("dq-ghost-breakdown");
+    const armBtn = document.getElementById("dq-ghost-arm-btn");
+    const restartBtn = document.getElementById("dq-ghost-restart-btn");
+    const armedBanner = document.getElementById("dq-ghost-armed-banner");
+    const armedText = document.getElementById("dq-ghost-armed-text");
+    const cancelBtn = document.getElementById("dq-ghost-cancel-btn");
+    const confirmRow = document.getElementById("dq-ghost-confirm-row");
+    const confirmBtn = document.getElementById("dq-ghost-restart-confirm-btn");
+    const confirmCancelBtn = document.getElementById("dq-ghost-restart-cancel-btn");
+    if (!section || !summaryEl || !breakdownEl) {
+      return;
+    }
+    const gp = getEffectiveGhostPurge();
+    if (!gp) {
+      summaryEl.textContent = "Unavailable";
+      breakdownEl.replaceChildren();
+      if (armedBanner) {
+        armedBanner.classList.add("dq-hidden");
+      }
+      if (confirmRow) {
+        confirmRow.classList.add("dq-hidden");
+      }
+      if (armBtn) {
+        armBtn.disabled = true;
+      }
+      if (restartBtn) {
+        restartBtn.disabled = true;
+      }
+      return;
+    }
+
+    const sum = gp.summary && typeof gp.summary === "object" ? gp.summary : {};
+    const armed = gp.armed && typeof gp.armed === "object" ? gp.armed : {};
+    const isArmed = Boolean(armed.armed);
+    const totalGhosts = Number(sum.total_ghost_cids || 0);
+    const dbGhosts = Number(sum.db_ghost_count || 0);
+    const appEntries = Number(sum.app_storage_entries_count || 0);
+    const hasGhosts = Boolean(sum.has_ghosts) || totalGhosts > 0 || appEntries > 0;
+    const canRestart = Boolean(gp.can_restart_now);
+    const blockedMsg = String(gp.blocked_message || gp.blocked_reason || "");
+
+    summaryEl.textContent = hasGhosts
+      ? `${totalGhosts} ghost CID${totalGhosts === 1 ? "" : "s"} (${dbGhosts} DB · ${appEntries} app_storage)`
+      : "0 ghost entries detected";
+
+    const appBd = sum.app_storage_breakdown && typeof sum.app_storage_breakdown === "object" ? sum.app_storage_breakdown : {};
+    const chipItems = [
+      ["DB Ghosts", dbGhosts],
+      ["Pinned", Number(appBd.pinned || 0)],
+      ["Layouts", Number(appBd.layout_keys || 0)],
+      ["Layout Index", Number(appBd.layout_index_pairs || 0)],
+      ["Expanded Cards", Number(appBd.expanded_keys || 0)],
+    ];
+    const frag = document.createDocumentFragment();
+    for (const [lbl, count] of chipItems) {
+      if (count <= 0) {
+        continue;
+      }
+      const chip = el("span", "dq-cleanup-chip");
+      chip.appendChild(el("span", "dq-cleanup-chip-label", lbl));
+      chip.appendChild(el("span", "dq-cleanup-chip-val", String(count)));
+      frag.appendChild(chip);
+    }
+    if (!frag.childNodes.length && blockedMsg) {
+      frag.appendChild(el("span", "dq-card-sub", blockedMsg));
+    } else if (frag.childNodes.length && !canRestart && blockedMsg) {
+      frag.appendChild(el("span", "dq-card-sub", blockedMsg));
+    }
+    breakdownEl.replaceChildren(frag);
+
+    if (armBtn) {
+      armBtn.disabled = Boolean(uiState.ghostBusy) || isArmed || !hasGhosts;
+      armBtn.textContent = isArmed ? "Armed" : "Arm on Quit";
+      armBtn.title = isArmed
+        ? "Ghost purge is already armed"
+        : hasGhosts
+          ? "Arm detached 0-LLM worker to purge ghost sidebar entries on Antigravity quit"
+          : "No ghost sidebar entries detected";
+    }
+    if (restartBtn) {
+      restartBtn.disabled = Boolean(uiState.ghostBusy) || isArmed || !canRestart || !hasGhosts;
+      if (!canRestart && blockedMsg) {
+        restartBtn.title = blockedMsg;
+      } else if (!hasGhosts) {
+        restartBtn.title = "No ghost sidebar entries detected";
+      } else {
+        restartBtn.title = "Gracefully quit Antigravity, purge sidebar ghosts, and reopen";
+      }
+    }
+    if (armedBanner && armedText) {
+      armedBanner.classList.toggle("dq-hidden", !isArmed);
+      if (isArmed) {
+        const modeLabel = armed.mode === "restart_now" ? "Restart & Purge armed" : "Armed on Quit";
+        const expLabel = armed.expires_at ? ` · expires ${String(armed.expires_at)}` : "";
+        armedText.textContent = `${modeLabel}${expLabel}`;
+      } else {
+        armedText.textContent = "";
+      }
+    }
+    if (cancelBtn) {
+      cancelBtn.disabled = Boolean(uiState.ghostBusy);
+    }
+    if (confirmRow) {
+      const showConfirm = Boolean(uiState.ghostConfirmRestart) && canRestart && !isArmed;
+      confirmRow.classList.toggle("dq-hidden", !showConfirm);
+    }
+    if (confirmBtn) {
+      confirmBtn.disabled = Boolean(uiState.ghostBusy);
+    }
+    if (confirmCancelBtn) {
+      confirmCancelBtn.disabled = Boolean(uiState.ghostBusy);
+    }
+  }
+
+  function applyGhostPurgeResponse(res) {
+    if (!res || typeof res !== "object" || !res.ghost_purge) {
+      return;
+    }
+    if (uiState.cleanupPreview && typeof uiState.cleanupPreview === "object") {
+      uiState.cleanupPreview.ghost_purge = res.ghost_purge;
+    }
+    if (uiState.snapshot && typeof uiState.snapshot === "object") {
+      uiState.snapshot.ghost_purge = res.ghost_purge;
+    }
+  }
+
+  async function armGhostPurge(mode = "on_quit") {
+    if (uiState.ghostBusy) {
+      return;
+    }
+    uiState.ghostBusy = true;
+    renderGhostPurgeControls();
+    try {
+      const res = await apiFetch("/api/cleanup/ghosts/arm", {
+        method: "POST",
+        body: JSON.stringify({ mode }),
+      });
+      uiState.ghostConfirmRestart = false;
+      applyGhostPurgeResponse(res);
+      showToast(mode === "restart_now" ? "Restart & Purge initiated — Antigravity will reopen shortly" : "Ghost purge armed on next Antigravity quit");
+      uiState.etag = "";
+      await pollState(true);
+    } catch (err) {
+      showToast(`Ghost purge blocked: ${err.message || "conflict"}`);
+      uiState.ghostConfirmRestart = false;
+    } finally {
+      uiState.ghostBusy = false;
+      renderGhostPurgeControls();
+      renderGhostResultBanner();
+    }
+  }
+
+  async function cancelGhostPurge() {
+    if (uiState.ghostBusy) {
+      return;
+    }
+    uiState.ghostBusy = true;
+    renderGhostPurgeControls();
+    try {
+      const res = await apiFetch("/api/cleanup/ghosts/cancel", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      applyGhostPurgeResponse(res);
+      showToast("Ghost purge disarmed");
+      uiState.etag = "";
+      await pollState(true);
+    } catch (err) {
+      showToast(`Unable to cancel ghost purge: ${err.message || "error"}`);
+    } finally {
+      uiState.ghostBusy = false;
+      renderGhostPurgeControls();
+    }
+  }
+
+  async function ackGhostPurgeResult() {
+    if (uiState.ghostBusy) {
+      return;
+    }
+    uiState.ghostBusy = true;
+    renderGhostResultBanner();
+    try {
+      const res = await apiFetch("/api/cleanup/ghosts/ack-result", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      applyGhostPurgeResponse(res);
+      uiState.etag = "";
+      await pollState(true);
+    } catch (err) {
+      showToast(`Unable to dismiss result: ${err.message || "error"}`);
+    } finally {
+      uiState.ghostBusy = false;
+      renderGhostResultBanner();
+    }
+  }
+
   function renderCleanupPreview() {
     const panel = document.getElementById("dq-cleanup-panel");
     const cleanBtn = document.getElementById("dq-clean-btn");
@@ -467,6 +724,7 @@
       panel.classList.add("dq-hidden");
       breakdownEl.replaceChildren();
       summaryEl.textContent = "";
+      renderGhostPurgeControls();
       return;
     }
     panel.classList.remove("dq-hidden");
@@ -508,6 +766,7 @@
       frag.appendChild(el("span", "dq-card-sub", "No stale conversations, sidecar events, or orphan artifacts found."));
     }
     breakdownEl.replaceChildren(frag);
+    renderGhostPurgeControls();
   }
 
   async function previewCleanup() {
@@ -829,6 +1088,8 @@
     }
 
     renderOrchestrationControl(snap.orchestration);
+    renderGhostResultBanner();
+    renderGhostPurgeControls();
 
     const sections = snap.sections || {};
     const rawHitl = Array.isArray(sections.hitl_blocked) ? sections.hitl_blocked : [];
@@ -1026,7 +1287,22 @@
         executeCleanup();
       } else if (action === "cleanup-cancel") {
         uiState.cleanupPreview = null;
+        uiState.ghostConfirmRestart = false;
         renderCleanupPreview();
+      } else if (action === "ghost-arm") {
+        armGhostPurge("on_quit");
+      } else if (action === "ghost-cancel") {
+        cancelGhostPurge();
+      } else if (action === "ghost-restart-prompt") {
+        uiState.ghostConfirmRestart = true;
+        renderGhostPurgeControls();
+      } else if (action === "ghost-restart-confirm") {
+        armGhostPurge("restart_now");
+      } else if (action === "ghost-restart-cancel") {
+        uiState.ghostConfirmRestart = false;
+        renderGhostPurgeControls();
+      } else if (action === "ghost-ack-result") {
+        ackGhostPurgeResult();
       } else if (action === "open-conv") {
         triggerConversationToggle(actionBtn.dataset.convId, actionBtn.dataset.label);
       } else if (action === "open-board") {
@@ -1087,6 +1363,9 @@
       setOrchestrationPaused,
       previewCleanup,
       executeCleanup,
+      armGhostPurge,
+      cancelGhostPurge,
+      ackGhostPurgeResult,
       pollState,
     };
   }
