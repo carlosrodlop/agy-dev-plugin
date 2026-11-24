@@ -1922,6 +1922,21 @@ def register_queue_cli(sub: Any) -> None:
     p_qopt.add_argument("--brain-dir", dest="brain_dir", default=None, help="Optional Antigravity brain directory override for read-only transcript telemetry.")
     p_qopt.add_argument("--stall-seconds", dest="stall_seconds", type=int, default=None, help="Override stalled-worker idle threshold in seconds (default: 900).")
 
+    p_qcomp = sub.add_parser(
+        "queue-compact",
+        help="0-LLM deterministic PR compaction detector & atomic lock-safe executor (Same-Repo, Partial-WIP & Split-Phase; defaults to --dry-run).",
+    )
+    p_qcomp.add_argument("--apply", action="store_true", help="Atomically apply detected compactions under file_lock with 0600 backup and DAG invariant validation (default: dry-run).")
+    p_qcomp.add_argument("--tier", choices=("1", "all"), default="all", help="Compaction tier filter: '1' (high-ROI chains/subsets only) or 'all' (Tier 1 + Tier 2, default).")
+    p_qcomp.add_argument("--repo", dest="repo_slug", default="", help="Optional target repository slug/substring filter.")
+    p_qcomp.add_argument("--ids", nargs="*", default=[], help="Optional explicit pair of conversation IDs (or prefixes) to evaluate/compact.")
+    p_qcomp.add_argument("--max-files", dest="max_files", type=int, default=None, help="Override combined target-file ceiling (default: 16 / AGY_DEV_COMPACT_MAX_FILES).")
+    p_qcomp.add_argument("--repos-dir", dest="repos_dir", default="", help="Optional parent directory of managed local git repositories for Split-Phase disk ownership checks.")
+    p_qcomp.add_argument("--orchestrator-id", dest="orchestrator_id", default="", help="Optional active orchestrator conversation ID.")
+    p_qcomp.add_argument("--respect-pause", dest="respect_pause", action="store_true", help="Skip compaction cleanly when orchestration is PAUSED (Graceful Drain).")
+    p_qcomp.add_argument("--no-refresh-board", dest="no_refresh_board", action="store_true", help="Skip refreshing dev_queue_board.md after --apply.")
+    p_qcomp.add_argument("--json", dest="as_json", action="store_true", help="Emit structured JSON report (default output format).")
+
     p_qdoc = sub.add_parser(
         "queue-doctor",
         help="0-LLM orchestrator diagnosis, safe runtime auto-heal (--fix), cooldown+PID-gated wake-up (--wake), and PR-only improvement advisor.",
@@ -2031,6 +2046,23 @@ def dispatch_queue_cli(args: Any) -> int | None:
             brain_dir=getattr(args, "brain_dir", None),
             orchestrator_cid=getattr(args, "orchestrator_id", ""),
             stall_threshold_seconds=getattr(args, "stall_seconds", None),
+        )
+        print(json.dumps(q_res, indent=2, ensure_ascii=False))
+        return 0 if q_res.get("status") == "ok" else 1
+
+    if args.subcommand == "queue-compact":
+        from queue_compactor import compact_dev_queue
+
+        q_res = _facade_attr("compact_dev_queue", compact_dev_queue)(
+            apply=bool(getattr(args, "apply", False)),
+            tier=str(getattr(args, "tier", "all") or "all"),
+            repo_slug=str(getattr(args, "repo_slug", "") or ""),
+            item_ids=list(getattr(args, "ids", []) or []) or None,
+            repos_dir=getattr(args, "repos_dir", "") or None,
+            max_combined_files=getattr(args, "max_files", None),
+            orchestrator_id=str(getattr(args, "orchestrator_id", "") or ""),
+            respect_pause=bool(getattr(args, "respect_pause", False)),
+            refresh_board=not bool(getattr(args, "no_refresh_board", False)),
         )
         print(json.dumps(q_res, indent=2, ensure_ascii=False))
         return 0 if q_res.get("status") == "ok" else 1

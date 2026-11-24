@@ -1893,6 +1893,23 @@ def _render_optimizer_overlay_lines(
             rec_txt = str(f.get("recommendation") or "").strip()
             if rec_txt:
                 lines.append(f"     {_trunc(rec_txt, max(40, bar_w - 6))}")
+            if str(f.get("code") or "") == "pr_compaction_candidates":
+                ev = f.get("evidence") if isinstance(f.get("evidence"), dict) else {}
+                for plan in (ev.get("plans") or [])[:5]:
+                    if not isinstance(plan, dict):
+                        continue
+                    t_lbl = f"T{plan.get('tier', 2)}"
+                    a8 = str(plan.get("absorber_id") or "")[:8]
+                    b8 = str(plan.get("absorbed_id") or "")[:8]
+                    r_sh = str(plan.get("target_repo") or "").split("/")[-1]
+                    pat = str(plan.get("pattern") or "")
+                    fcnt = int(plan.get("combined_file_count") or 0)
+                    if pat == "split_phase_multi_repo":
+                        s_sh = str(plan.get("split_repo") or "").split("/")[-1]
+                        p_txt = f"[{t_lbl}] {a8} <- {b8} ({r_sh} split from {s_sh} · {fcnt}f)"
+                    else:
+                        p_txt = f"[{t_lbl}] {a8} <- {b8} ({r_sh} · {fcnt}f)"
+                    lines.append(f"     {_color('• ' + _trunc(p_txt, max(40, bar_w - 8)), '0;36', color_on)}")
             hint = str(f.get("auto_action_hint") or "").strip()
             if hint:
                 lines.append(f"     {_color('→ ' + _trunc(hint, max(40, bar_w - 8)), '2;36', color_on)}")

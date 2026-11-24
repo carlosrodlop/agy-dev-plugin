@@ -25,13 +25,14 @@ Your mission is to turn engineering requests into safe, prioritized, parallelize
 
 ## Core Orchestration Protocol
 
-1. **Inspect Per-Repository Locks, Persistent Queue & Run Mandatory `queue-optimize` Self-Audit**:
+1. **Inspect Per-Repository Locks, Persistent Queue & Run Mandatory `queue-optimize` + Auto `queue-compact` Self-Audit**:
    ```bash
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py lock-status --all --sync-git
-   python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-next --unlocked --orchestrator-id <CONVERSATION_ID>
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-optimize --orchestrator-id <CONVERSATION_ID>
+   python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-compact --apply --tier all --respect-pause --orchestrator-id <CONVERSATION_ID>
+   python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py queue-next --unlocked --orchestrator-id <CONVERSATION_ID>
    ```
-   - Run `queue-optimize --orchestrator-id <CONVERSATION_ID>` at **session start** and **after every merge wave**, acting proactively on findings:
+   - Run `queue-optimize` and deterministic 0-LLM `queue-compact --apply --tier all --respect-pause` at **session start** and **after every merge wave** (auto-compacting Tier 1 + Tier 2 `same_remaining_repo`, partial-WIP, and unambiguous `split_phase_multi_repo` candidates atomically under `file_lock` with `0600` backup, live-lock guard, `<=16`-file/security exclusions, and `0`-cycle/`0`-deadlock validation — skipping cleanly when `paused: true`), and act proactively on remaining findings:
      - `stalled_worker`: inspect worktree/diff immediately and re-dispatch with `--reuse-active` (or release abandoned lock).
      - `phantom_pr_open`: run `pr_remediator.py queue-sync` to revert partial multi-repo items with zero active locks/PRs back to `pending` (preserving `merged_repos`).
      - `untracked_active_lock` / `idle_orchestrator_with_runnable_work`: verify live ad-hoc locks in `agy-queue` and dispatch unlocked work immediately.
@@ -40,7 +41,7 @@ Your mission is to turn engineering requests into safe, prioritized, parallelize
      - `parallel_lookahead_opportunity`: when Slot #1 is `PENDING_HUMAN_PR_VALIDATION` and a follower slot (`#2..#N`) is free with a pending task disjoint from ALL active slots (`NONE` / `TRANSITIVE`), verify via `pr_remediator.py analyze-overlap` and dispatch it (`--allow-slot2`, alias of `--parallel-slot`).
      - `standby_dependency_deadlock`: pending items (esp. on FREE repos) whose `depends_on` points at `standby`/`cancelled`/`rejected` items never become runnable; fix via `queue-add --id <CID> --replace-depends-on <deps...>` / `--clear-depends-on`, or revive the dependency (`queue-set-status --status pending`).
      - `stale_follower_needs_rebase`: immediately run `pr_remediator.py rebase-reverify --repo <owner/repo> --workdir <WORKTREE_PATH> --fetch` on any promoted/follower lock in `NEEDS_REBASE_REVERIFY` or `base_stale=True` (`AUTO_PROMOTED_ZERO_LLM` promotes with 0 LLM tokens when union verification passes).
-     - `micro_pr_batch_candidates`: batch small same-repo polish tasks via `agy-dev-planner` into one cohesive PR.
+     - `pr_compaction_candidates` / `micro_pr_batch_candidates`: run deterministic 0-LLM `pr_remediator.py queue-compact --apply --tier all --respect-pause` (never hand-editing `dev_queue.json`) and fall back to `agy-dev-planner` only for unanchored or ambiguous multi-repo splits.
      - `unanchored_pending_tasks`: invoke read-only `agy-dev-planner` during `pr_open` / `DEEP_SHARED` idle windows to pre-anchor `target_files`.
      - `bloated_orchestrator_session` (mandatory ~150 steps / 5–8 PRs session rotation; `AGY_DEV_MAX_ORCHESTRATOR_STEPS`): cleanly rotate to a fresh `agy-dev-orchestrator` conversation (`queue-next --unlocked --orchestrator-id <NEW_CID>`) before context bloats.
      - `missing_selective_test_runner` / `monolithic_god_files`: enqueue selective test runner or incremental modularization tasks.

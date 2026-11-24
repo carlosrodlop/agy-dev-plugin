@@ -1989,6 +1989,8 @@ def format_compact_opt_hint(analysis: dict[str, Any], max_width: int = 120) -> s
         elif code == "micro_pr_batch_candidates":
             repo_short = str(ev.get("repo_slug") or "").split("/")[-1]
             bits.append(f"batch {ev.get('count', 2)} PRs in {repo_short}")
+        elif code == "pr_compaction_candidates":
+            bits.append(f"compact -{ev.get('total_prs_saved', 1)} PRs ({ev.get('plan_count', 1)} grp)")
         elif code == "repo_contention_hotspot":
             h_repos = ev.get("hotspot_repos") or []
             if h_repos and isinstance(h_repos[0], dict):
@@ -2092,8 +2094,25 @@ def analyze_dev_flow_optimizations(
     findings.extend(_detect_stale_follower_needs_rebase(active_locks))
     findings.extend(_detect_parallel_lookahead_opportunity(items, active_locks, repo_dirs))
     findings.extend(_detect_standby_dependency_deadlock(items, active_locks))
-    # 2. Micro-PR batch candidates
+    # 2. Micro-PR batch candidates + 0-LLM structural PR compaction candidates
     findings.extend(_detect_micro_pr_batch_candidates(items))
+    try:
+        from queue_compactor import (
+            build_compaction_optimizer_finding,
+            detect_pr_compaction_candidates,
+        )
+
+        comp_det = detect_pr_compaction_candidates(
+            items,
+            active_locks=active_locks,
+            repo_dirs=repo_dirs or None,
+            tier="all",
+        )
+        comp_finding = build_compaction_optimizer_finding(comp_det)
+        if comp_finding is not None:
+            findings.append(comp_finding)
+    except Exception:
+        pass
     # 3. Repo contention hotspots
     findings.extend(_detect_repo_contention_hotspots(items))
     # 4. Unanchored pending tasks
