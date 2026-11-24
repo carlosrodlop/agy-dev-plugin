@@ -19,12 +19,14 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import time
 from typing import Any, TextIO
 import urllib.parse
+import uuid
 
 for _cand_clients in (
     Path(__file__).resolve().parents[3] / "clients",
@@ -2839,38 +2841,52 @@ def _check_sqlite_wal_or_lock_active(db_path: Path) -> tuple[bool, str]:
                 conn.close()
 
 
-def prune_ghost_conversation_summaries(
-    *,
-    dry_run: bool = False,
-    portfolio_dir: Path | str | None = None,
-    brain_dir: Path | str | None = None,
-    conversations_dir: Path | str | None = None,
-    cli_dir: Path | str | None = None,
-    antigravity_dirs: Sequence[Path | str] | None = None,
-    summaries_db: Path | str | Sequence[Path | str] | None = None,
-    ps_output: str | None = None,
-    ps_runner: Callable[[], str] | None = None,
-    now_ts: float | None = None,
-) -> dict[str, Any]:
-    """Fail-closed offline prune of ghost rows in `conversation_summaries` and `conversations_fts` with zero disk artifacts."""
-    active_procs = _detect_active_antigravity_processes(ps_output=ps_output, ps_runner=ps_runner)
-    if active_procs:
-        return {
-            "status": "blocked",
-            "reason": "antigravity_process_active",
-            "dry_run": bool(dry_run),
-            "active_processes": active_procs,
-            "pruned_count": 0,
-            "pruned_cids": [],
-            "backups": [],
-        }
+DEFAULT_GHOST_PURGE_ARM_TTL_SECONDS = 86400
+GHOST_PURGE_ARM_TTL_ENV = "AGY_GHOST_PURGE_ARM_TTL_SECONDS"
+GHOST_PURGE_ARMED_FILENAME = "ghost_purge_armed.json"
+GHOST_PURGE_RESULT_FILENAME = "ghost_purge_last_result.json"
+GHOST_PURGE_LOCK_FILENAME = "ghost_purge_armed.lock"
+GHOST_PURGE_WORKER_LOCK_FILENAME = "ghost_purge_worker.lock"
+GHOST_PURGE_BLOCKING_LOCK_STATUSES: frozenset[str] = frozenset(
+    {
+        "DEVELOPING",
+        "NEEDS_REVISION_ITERATING",
+        "AWAITING_AGENT_REVIEW",
+    }
+)
+_LAYOUT_V3_KEY_PREFIX = "antigravity-multi-conversation-layout-v3-"
+_LAYOUT_V3_INDEX_KEY = "antigravity-multi-conversation-layout-v3-index"
+_PINNED_ORDER_KEY = "pinned_conversations_order"
+_QUEUED_EXPANDED_PREFIX = "queued-messages-card-expanded-"
+_ANY_UUID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
 
-    roots = _resolve_antigravity_roots(
-        brain_dir=brain_dir,
-        conversations_dir=conversations_dir,
-        cli_dir=cli_dir,
-        antigravity_dirs=antigravity_dirs,
-    )
+
+def _resolve_ghost_purge_arm_ttl_seconds(
+    ttl_seconds: float | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> int:
+    """Resolve `AGY_GHOST_PURGE_ARM_TTL_SECONDS` (default 86400s / 24h, minimum 1s)."""
+    if ttl_seconds is not None and not isinstance(ttl_seconds, bool):
+        with contextlib.suppress(TypeError, ValueError):
+            return max(1, int(float(ttl_seconds)))
+    eff_env = os.environ if env is None else env
+    raw = str(eff_env.get(GHOST_PURGE_ARM_TTL_ENV) or "").strip()
+    if raw:
+        with contextlib.suppress(TypeError, ValueError):
+            return max(1, int(float(raw)))
+    return DEFAULT_GHOST_PURGE_ARM_TTL_SECONDS
+
+
+def _resolve_summaries_db_candidates(
+    roots: Sequence[Mapping[str, Any]],
+    *,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+) -> list[Path]:
+    """Resolve unique existing `conversation_summaries.db` file paths from override or roots."""
     db_candidates: list[Path] = []
     if summaries_db is not None:
         if isinstance(summaries_db, Sequence) and not isinstance(summaries_db, (str, bytes)):
@@ -2891,13 +2907,528 @@ def prune_ghost_conversation_summaries(
         if key not in seen_db and cand.is_file():
             seen_db.add(key)
             existing_dbs.append(cand)
+    return existing_dbs
 
-    if not existing_dbs:
+
+def _resolve_app_storage_paths(
+    roots: Sequence[Mapping[str, Any]],
+    *,
+    app_storage_path: Path | str | Sequence[Path | str] | None = None,
+    has_explicit_root_override: bool = False,
+    home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    platform_name: str | None = None,
+) -> list[Path]:
+    """Resolve existing cross-platform `app_storage.json` files while keeping test overrides hermetic."""
+    eff_env = os.environ if env is None else env
+    candidates: list[Path] = []
+    if app_storage_path is not None:
+        if isinstance(app_storage_path, Sequence) and not isinstance(app_storage_path, (str, bytes)):
+            for raw_p in app_storage_path:
+                if str(raw_p or "").strip():
+                    candidates.append(Path(str(raw_p).strip()).expanduser())
+        elif str(app_storage_path).strip():
+            candidates.append(Path(str(app_storage_path).strip()).expanduser())
+    else:
+        env_app = str(eff_env.get("AGY_APP_STORAGE_PATH") or "").strip()
+        if env_app:
+            candidates.append(Path(env_app).expanduser())
+        else:
+            for r in roots:
+                root_dir = Path(r["root_dir"])
+                candidates.append(root_dir / "app_storage.json")
+            if not has_explicit_root_override or home_dir is not None:
+                base_home = Path(home_dir).expanduser() if home_dir is not None else Path.home()
+                plat = (platform_name or sys.platform).lower()
+                if plat == "darwin":
+                    candidates.append(base_home / "Library" / "Application Support" / "Antigravity" / "app_storage.json")
+                elif plat.startswith("win"):
+                    appdata = str(eff_env.get("APPDATA") or "").strip()
+                    roaming = Path(appdata).expanduser() if appdata else (base_home / "AppData" / "Roaming")
+                    candidates.append(roaming / "Antigravity" / "app_storage.json")
+                else:
+                    xdg_cfg = str(eff_env.get("XDG_CONFIG_HOME") or "").strip()
+                    cfg_root = Path(xdg_cfg).expanduser() if xdg_cfg else (base_home / ".config")
+                    candidates.append(cfg_root / "Antigravity" / "app_storage.json")
+
+    existing: list[Path] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        key = str(cand)
+        if key not in seen and cand.is_file():
+            seen.add(key)
+            existing.append(cand)
+    return existing
+
+
+def _has_valid_roots_on_disk(roots: Sequence[Mapping[str, Any]]) -> bool:
+    """Return True when at least one Antigravity root or artifact directory exists on disk."""
+    for r in roots:
+        for key in ("root_dir", "brain_dir", "conversations_dir"):
+            p = r.get(key)
+            if p and Path(p).is_dir():
+                return True
+    return False
+
+
+def _is_ghost_cid(
+    cid: str,
+    *,
+    roots: Sequence[Mapping[str, Any]],
+    protected_map: Mapping[str, list[str]],
+    running_cids: set[str],
+) -> bool:
+    """Return True when `cid` is neither running, protected, nor backed by any disk artifact."""
+    c_val = str(cid or "").strip().lower()
+    if not c_val:
+        return False
+    if c_val in running_cids or _find_protection_reasons(c_val, protected_map):
+        return False
+    return not _collect_conversation_disk_artifacts(c_val, roots)
+
+
+def _scan_summaries_db_ghosts(
+    db_p: Path,
+    *,
+    roots: Sequence[Mapping[str, Any]],
+    protected_map: Mapping[str, list[str]],
+) -> dict[str, Any]:
+    """Read-only scan of one `conversation_summaries.db` returning ghost CIDs, running CIDs, and table flags."""
+    ro_conn = _open_sqlite_readonly(db_p)
+    if ro_conn is None:
+        return {
+            "opened": False,
+            "ghost_cids": [],
+            "running_cids": set(),
+            "has_summaries": False,
+            "has_fts": False,
+            "has_parents": False,
+        }
+
+    ghost_cids: list[str] = []
+    running_in_db: set[str] = set()
+    has_summaries = False
+    has_fts = False
+    has_parents = False
+    try:
+        tables = {
+            str(r[0] or "").strip()
+            for r in ro_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        has_summaries = "conversation_summaries" in tables
+        has_fts = "conversations_fts" in tables
+        has_parents = "conversation_parents" in tables
+        db_cids: set[str] = set()
+        if has_summaries:
+            cols = {str(r[1] or "").strip() for r in ro_conn.execute("PRAGMA table_info(conversation_summaries)").fetchall()}
+            sel_st = "COALESCE(status, '')" if "status" in cols else "''"
+            for row in ro_conn.execute(f"SELECT conversation_id, {sel_st} FROM conversation_summaries").fetchall():
+                c_val = str(row[0] or "").strip().lower()
+                if not c_val:
+                    continue
+                db_cids.add(c_val)
+                st_u = str(row[1] or "").strip().upper()
+                if st_u in ("CASCADE_RUN_STATUS_RUNNING", "RUNNING") or st_u.endswith("_RUNNING"):
+                    running_in_db.add(c_val)
+        if has_fts:
+            with contextlib.suppress(sqlite3.Error):
+                for row in ro_conn.execute("SELECT DISTINCT LOWER(conversation_id) FROM conversations_fts").fetchall():
+                    if row[0]:
+                        db_cids.add(str(row[0]).strip().lower())
+        if has_parents:
+            with contextlib.suppress(sqlite3.Error):
+                for row in ro_conn.execute("SELECT conversation_id, parent_id FROM conversation_parents").fetchall():
+                    for raw_col in row:
+                        c_val = str(raw_col or "").strip().lower()
+                        if c_val:
+                            db_cids.add(c_val)
+        for c_val in sorted(db_cids):
+            if _is_ghost_cid(
+                c_val,
+                roots=roots,
+                protected_map=protected_map,
+                running_cids=running_in_db,
+            ):
+                ghost_cids.append(c_val)
+    finally:
+        with contextlib.suppress(sqlite3.Error):
+            ro_conn.close()
+
+    return {
+        "opened": True,
+        "ghost_cids": ghost_cids,
+        "running_cids": running_in_db,
+        "has_summaries": has_summaries,
+        "has_fts": has_fts,
+        "has_parents": has_parents,
+    }
+
+
+def _extract_uuids_from_value(value: Any) -> list[str]:
+    """Extract lowercase UUID strings recursively from nested lists/strings."""
+    if isinstance(value, str):
+        return [u.lower() for u in _ANY_UUID_RE.findall(value)]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        found: list[str] = []
+        for item in value:
+            found.extend(_extract_uuids_from_value(item))
+        return found
+    return []
+
+
+def _parse_json_list_or_raw(raw_val: Any) -> tuple[list[Any] | None, bool]:
+    """Return `(parsed_list, was_json_string)` for list-or-JSON-string values in `app_storage.json`."""
+    if isinstance(raw_val, list):
+        return list(raw_val), False
+    if isinstance(raw_val, str):
+        with contextlib.suppress(json.JSONDecodeError, TypeError, ValueError):
+            parsed = json.loads(raw_val)
+            if isinstance(parsed, list):
+                return parsed, True
+    return None, False
+
+
+def _inspect_app_storage_ghosts(
+    storage_path: Path,
+    *,
+    roots: Sequence[Mapping[str, Any]],
+    protected_map: Mapping[str, list[str]],
+    running_cids: set[str],
+) -> dict[str, Any]:
+    """Read-only inspection of ghost references in `app_storage.json` returning updated dict in memory."""
+    breakdown = {"pinned": 0, "layout_keys": 0, "layout_index_pairs": 0, "expanded_keys": 0}
+    empty_res: dict[str, Any] = {
+        "changed": False,
+        "updated_data": None,
+        "ghost_cids": [],
+        "entries_removed": 0,
+        "breakdown": breakdown,
+    }
+    try:
+        raw_obj = json.loads(storage_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return empty_res
+    if not isinstance(raw_obj, dict):
+        return empty_res
+
+    updated = dict(raw_obj)
+    ghost_set: set[str] = set()
+
+    def _check_ghost(uid: str) -> bool:
+        if _is_ghost_cid(uid, roots=roots, protected_map=protected_map, running_cids=running_cids):
+            ghost_set.add(uid.lower())
+            return True
+        return False
+
+    # 1. pinned_conversations_order
+    if _PINNED_ORDER_KEY in updated:
+        pinned_list, was_str = _parse_json_list_or_raw(updated[_PINNED_ORDER_KEY])
+        if pinned_list is not None:
+            kept_pinned: list[Any] = []
+            for entry in pinned_list:
+                entry_uuids = _extract_uuids_from_value(entry)
+                if entry_uuids and any(_check_ghost(u) for u in entry_uuids):
+                    breakdown["pinned"] += 1
+                else:
+                    kept_pinned.append(entry)
+            if breakdown["pinned"] > 0:
+                updated[_PINNED_ORDER_KEY] = (
+                    json.dumps(kept_pinned, separators=(",", ":"), ensure_ascii=False)
+                    if was_str
+                    else kept_pinned
+                )
+
+    # 2. antigravity-multi-conversation-layout-v3-index
+    if _LAYOUT_V3_INDEX_KEY in updated:
+        idx_list, was_str = _parse_json_list_or_raw(updated[_LAYOUT_V3_INDEX_KEY])
+        if idx_list is not None:
+            kept_idx: list[Any] = []
+            for pair in idx_list:
+                pair_uuids = _extract_uuids_from_value(pair)
+                if pair_uuids and any(_check_ghost(u) for u in pair_uuids):
+                    breakdown["layout_index_pairs"] += 1
+                else:
+                    kept_idx.append(pair)
+            if breakdown["layout_index_pairs"] > 0:
+                updated[_LAYOUT_V3_INDEX_KEY] = (
+                    json.dumps(kept_idx, separators=(",", ":"), ensure_ascii=False)
+                    if was_str
+                    else kept_idx
+                )
+
+    # 3. antigravity-multi-conversation-layout-v3-<uuid>* and queued-messages-card-expanded-<uuid>
+    keys_to_delete: list[str] = []
+    for k in list(updated.keys()):
+        if k.startswith(_LAYOUT_V3_KEY_PREFIX) and k != _LAYOUT_V3_INDEX_KEY:
+            suffix = k[len(_LAYOUT_V3_KEY_PREFIX) :]
+            uuids = [u.lower() for u in _ANY_UUID_RE.findall(suffix)]
+            if uuids and any(_check_ghost(u) for u in uuids):
+                keys_to_delete.append(k)
+                breakdown["layout_keys"] += 1
+        elif k.startswith(_QUEUED_EXPANDED_PREFIX):
+            suffix = k[len(_QUEUED_EXPANDED_PREFIX) :]
+            uuids = [u.lower() for u in _ANY_UUID_RE.findall(suffix)]
+            if uuids and any(_check_ghost(u) for u in uuids):
+                keys_to_delete.append(k)
+                breakdown["expanded_keys"] += 1
+    for k in keys_to_delete:
+        updated.pop(k, None)
+
+    entries_removed = sum(breakdown.values())
+    changed = entries_removed > 0
+    return {
+        "changed": changed,
+        "updated_data": updated if changed else None,
+        "ghost_cids": sorted(ghost_set),
+        "entries_removed": entries_removed,
+        "breakdown": breakdown,
+    }
+
+
+def _prune_app_storage_ghosts(
+    app_storage_paths: Sequence[Path],
+    *,
+    roots: Sequence[Mapping[str, Any]],
+    protected_map: Mapping[str, list[str]],
+    running_cids: set[str],
+    dry_run: bool,
+    ts_slug: str,
+) -> dict[str, Any]:
+    """Prune ghost UUIDs from `app_storage.json` with `0600` timestamped backup and atomic replace."""
+    agg_breakdown = {"pinned": 0, "layout_keys": 0, "layout_index_pairs": 0, "expanded_keys": 0}
+    backups: list[str] = []
+    ghost_cids: set[str] = set()
+    files_modified = 0
+    entries_removed = 0
+
+    for storage_path in app_storage_paths:
+        inspected = _inspect_app_storage_ghosts(
+            storage_path,
+            roots=roots,
+            protected_map=protected_map,
+            running_cids=running_cids,
+        )
+        if not inspected["changed"]:
+            continue
+        files_modified += 1
+        entries_removed += int(inspected["entries_removed"])
+        ghost_cids.update(inspected["ghost_cids"])
+        for bk, bv in inspected["breakdown"].items():
+            agg_breakdown[bk] = agg_breakdown.get(bk, 0) + int(bv)
+        if not dry_run and inspected["updated_data"] is not None:
+            backup_path = storage_path.with_name(f"{storage_path.name}.bak.{ts_slug}")
+            shutil.copy2(storage_path, backup_path)
+            with contextlib.suppress(OSError):
+                os.chmod(backup_path, 0o600)
+            backups.append(str(backup_path))
+            dev_common.atomic_write_json(storage_path, inspected["updated_data"], mode=0o600)
+
+    return {
+        "files_checked": len(app_storage_paths),
+        "files_modified": files_modified,
+        "backups": backups,
+        "ghost_cids": sorted(ghost_cids),
+        "entries_removed": entries_removed,
+        "breakdown": agg_breakdown,
+    }
+
+
+def _infer_antigravity_dirs_from_summaries_db(
+    *,
+    brain_dir: Path | str | None,
+    conversations_dir: Path | str | None,
+    cli_dir: Path | str | None,
+    antigravity_dirs: Sequence[Path | str] | None,
+    summaries_db: Path | str | Sequence[Path | str] | None,
+) -> list[Path] | None:
+    """Infer hermetic Antigravity root directories from explicit `summaries_db` when no root override is given."""
+    if any(x is not None for x in (brain_dir, conversations_dir, cli_dir, antigravity_dirs)):
+        return None
+    if summaries_db is None:
+        return None
+    if str(os.environ.get("AGY_ANTIGRAVITY_DIR") or "").strip() or str(os.environ.get("AGY_ANTIGRAVITY_CLI_DIR") or "").strip():
+        return None
+    raw_items: Sequence[Path | str] = (
+        summaries_db
+        if isinstance(summaries_db, Sequence) and not isinstance(summaries_db, (str, bytes))
+        else [summaries_db]
+    )
+    inferred: list[Path] = []
+    seen: set[str] = set()
+    for raw_p in raw_items:
+        s = str(raw_p or "").strip()
+        if not s:
+            continue
+        parent = Path(s).expanduser().parent
+        key = str(parent)
+        if key not in seen:
+            seen.add(key)
+            inferred.append(parent)
+    return inferred or None
+
+
+def count_ghost_sidebar_entries(
+    *,
+    portfolio_dir: Path | str | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    app_storage_path: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Read-only count of ghost sidebar entries across `conversation_summaries.db` and `app_storage.json` (zero writes)."""
+    eff_agy_dirs = antigravity_dirs
+    if eff_agy_dirs is None:
+        eff_agy_dirs = _infer_antigravity_dirs_from_summaries_db(
+            brain_dir=brain_dir,
+            conversations_dir=conversations_dir,
+            cli_dir=cli_dir,
+            antigravity_dirs=antigravity_dirs,
+            summaries_db=summaries_db,
+        )
+    has_explicit_root_override = any(
+        x is not None for x in (brain_dir, conversations_dir, cli_dir, eff_agy_dirs)
+    )
+    roots = _resolve_antigravity_roots(
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=eff_agy_dirs,
+    )
+    existing_dbs = _resolve_summaries_db_candidates(roots, summaries_db=summaries_db)
+    existing_app_storage = _resolve_app_storage_paths(
+        roots,
+        app_storage_path=app_storage_path,
+        has_explicit_root_override=has_explicit_root_override,
+        home_dir=home_dir,
+        env=env,
+    )
+
+    protected_map = collect_protected_conversation_ids(
+        portfolio_dir=portfolio_dir,
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=eff_agy_dirs,
+        summaries_db=existing_dbs,
+        include_unaudited_check=False,
+        now_ts=now_ts,
+        env=env,
+    )
+
+    db_ghosts: set[str] = set()
+    running_cids: set[str] = set()
+    for db_p in existing_dbs:
+        scan = _scan_summaries_db_ghosts(db_p, roots=roots, protected_map=protected_map)
+        db_ghosts.update(scan["ghost_cids"])
+        running_cids.update(scan["running_cids"])
+
+    app_ghosts: set[str] = set()
+    app_entries = 0
+    app_breakdown = {"pinned": 0, "layout_keys": 0, "layout_index_pairs": 0, "expanded_keys": 0}
+    if existing_app_storage and (_has_valid_roots_on_disk(roots) or bool(existing_dbs)):
+        for st_p in existing_app_storage:
+            insp = _inspect_app_storage_ghosts(
+                st_p,
+                roots=roots,
+                protected_map=protected_map,
+                running_cids=running_cids,
+            )
+            app_ghosts.update(insp["ghost_cids"])
+            app_entries += int(insp["entries_removed"])
+            for bk, bv in insp["breakdown"].items():
+                app_breakdown[bk] = app_breakdown.get(bk, 0) + int(bv)
+
+    all_ghosts = sorted(db_ghosts | app_ghosts)
+    return {
+        "status": "ok",
+        "total_ghost_cids": len(all_ghosts),
+        "ghost_cids": all_ghosts,
+        "db_ghost_count": len(db_ghosts),
+        "db_ghost_cids": sorted(db_ghosts),
+        "app_storage_ghost_count": len(app_ghosts),
+        "app_storage_ghost_cids": sorted(app_ghosts),
+        "app_storage_entries_count": app_entries,
+        "app_storage_breakdown": app_breakdown,
+        "has_ghosts": bool(all_ghosts or app_entries > 0),
+        "dbs_checked": len(existing_dbs),
+        "app_storage_files_checked": len(existing_app_storage),
+    }
+
+
+def prune_ghost_conversation_summaries(
+    *,
+    dry_run: bool = False,
+    include_app_storage: bool = True,
+    portfolio_dir: Path | str | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    app_storage_path: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    ps_output: str | None = None,
+    ps_runner: Callable[[], str] | None = None,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Fail-closed offline prune of ghost rows in `conversation_summaries.db` and `app_storage.json` with `0600` backups."""
+    active_procs = _detect_active_antigravity_processes(ps_output=ps_output, ps_runner=ps_runner)
+    if active_procs:
+        return {
+            "status": "blocked",
+            "reason": "antigravity_process_active",
+            "dry_run": bool(dry_run),
+            "active_processes": active_procs,
+            "pruned_count": 0,
+            "pruned_cids": [],
+            "app_storage_entries_removed": 0,
+            "backups": [],
+        }
+
+    eff_agy_dirs = antigravity_dirs
+    if eff_agy_dirs is None:
+        eff_agy_dirs = _infer_antigravity_dirs_from_summaries_db(
+            brain_dir=brain_dir,
+            conversations_dir=conversations_dir,
+            cli_dir=cli_dir,
+            antigravity_dirs=antigravity_dirs,
+            summaries_db=summaries_db,
+        )
+    has_explicit_root_override = any(
+        x is not None for x in (brain_dir, conversations_dir, cli_dir, eff_agy_dirs)
+    )
+    roots = _resolve_antigravity_roots(
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=eff_agy_dirs,
+    )
+    existing_dbs = _resolve_summaries_db_candidates(roots, summaries_db=summaries_db)
+    existing_app_storage = (
+        _resolve_app_storage_paths(
+            roots,
+            app_storage_path=app_storage_path,
+            has_explicit_root_override=has_explicit_root_override,
+            home_dir=home_dir,
+            env=env,
+        )
+        if include_app_storage
+        else []
+    )
+
+    if not existing_dbs and not existing_app_storage:
         return {
             "status": "ok",
             "dry_run": bool(dry_run),
             "pruned_count": 0,
             "pruned_cids": [],
+            "app_storage_entries_removed": 0,
             "backups": [],
             "reason": "no_summaries_db_found",
         }
@@ -2912,6 +3443,7 @@ def prune_ghost_conversation_summaries(
                 "db_path": str(db_p),
                 "pruned_count": 0,
                 "pruned_cids": [],
+                "app_storage_entries_removed": 0,
                 "backups": [],
             }
 
@@ -2920,10 +3452,11 @@ def prune_ghost_conversation_summaries(
         brain_dir=brain_dir,
         conversations_dir=conversations_dir,
         cli_dir=cli_dir,
-        antigravity_dirs=antigravity_dirs,
+        antigravity_dirs=eff_agy_dirs,
         summaries_db=existing_dbs,
         include_unaudited_check=False,
         now_ts=now_ts,
+        env=env,
     )
 
     cur_now = float(now_ts if now_ts is not None else time.time())
@@ -2931,49 +3464,17 @@ def prune_ghost_conversation_summaries(
     backups: list[str] = []
     pruned_cids_all: list[str] = []
     seen_pruned: set[str] = set()
+    running_in_all_dbs: set[str] = set()
 
     for db_p in existing_dbs:
-        ro_conn = _open_sqlite_readonly(db_p)
-        if ro_conn is None:
+        scan = _scan_summaries_db_ghosts(db_p, roots=roots, protected_map=protected_map)
+        running_in_all_dbs.update(scan["running_cids"])
+        if not scan["opened"]:
             continue
-        ghost_cids: list[str] = []
-        has_summaries = False
-        has_fts = False
-        has_parents = False
-        try:
-            tables = {
-                str(r[0] or "").strip()
-                for r in ro_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            }
-            has_summaries = "conversation_summaries" in tables
-            has_fts = "conversations_fts" in tables
-            has_parents = "conversation_parents" in tables
-            db_cids: set[str] = set()
-            running_in_db: set[str] = set()
-            if has_summaries:
-                cols = {str(r[1] or "").strip() for r in ro_conn.execute("PRAGMA table_info(conversation_summaries)").fetchall()}
-                sel_st = "COALESCE(status, '')" if "status" in cols else "''"
-                for row in ro_conn.execute(f"SELECT conversation_id, {sel_st} FROM conversation_summaries").fetchall():
-                    c_val = str(row[0] or "").strip().lower()
-                    if not c_val:
-                        continue
-                    db_cids.add(c_val)
-                    st_u = str(row[1] or "").strip().upper()
-                    if st_u in ("CASCADE_RUN_STATUS_RUNNING", "RUNNING") or st_u.endswith("_RUNNING"):
-                        running_in_db.add(c_val)
-            if has_fts:
-                with contextlib.suppress(sqlite3.Error):
-                    for row in ro_conn.execute("SELECT DISTINCT LOWER(conversation_id) FROM conversations_fts").fetchall():
-                        if row[0]:
-                            db_cids.add(str(row[0]).strip().lower())
-            for c_val in sorted(db_cids):
-                if c_val in running_in_db or _find_protection_reasons(c_val, protected_map):
-                    continue
-                if not _collect_conversation_disk_artifacts(c_val, roots):
-                    ghost_cids.append(c_val)
-        finally:
-            with contextlib.suppress(sqlite3.Error):
-                ro_conn.close()
+        ghost_cids = list(scan["ghost_cids"])
+        has_summaries = bool(scan["has_summaries"])
+        has_fts = bool(scan["has_fts"])
+        has_parents = bool(scan["has_parents"])
 
         if not ghost_cids:
             continue
@@ -3031,20 +3532,818 @@ def prune_ghost_conversation_summaries(
                 "backups": backups,
                 "pruned_count": len(pruned_cids_all),
                 "pruned_cids": pruned_cids_all,
+                "app_storage_entries_removed": 0,
             }
         finally:
             if rw_conn is not None:
                 with contextlib.suppress(sqlite3.Error):
                     rw_conn.close()
 
+    app_storage_res: dict[str, Any] = {
+        "files_checked": 0,
+        "files_modified": 0,
+        "backups": [],
+        "ghost_cids": [],
+        "entries_removed": 0,
+        "breakdown": {"pinned": 0, "layout_keys": 0, "layout_index_pairs": 0, "expanded_keys": 0},
+    }
+    if include_app_storage and existing_app_storage and (_has_valid_roots_on_disk(roots) or bool(existing_dbs)):
+        app_storage_res = _prune_app_storage_ghosts(
+            existing_app_storage,
+            roots=roots,
+            protected_map=protected_map,
+            running_cids=running_in_all_dbs,
+            dry_run=dry_run,
+            ts_slug=ts_slug,
+        )
+        backups.extend(app_storage_res["backups"])
+
+    all_pruned = sorted(set(pruned_cids_all) | set(app_storage_res["ghost_cids"]))
     return {
         "status": "ok",
         "dry_run": bool(dry_run),
         "pruned_count": len(pruned_cids_all),
         "pruned_cids": pruned_cids_all,
+        "total_ghosts_pruned_count": len(all_pruned),
+        "app_storage_pruned": app_storage_res,
+        "app_storage_entries_removed": int(app_storage_res["entries_removed"]),
         "backups": backups,
         "dbs_checked": len(existing_dbs),
     }
+
+
+def _resolve_ghost_purge_state_dir(
+    *,
+    portfolio_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> Path:
+    """Resolve the state directory storing `ghost_purge_armed.json` and `ghost_purge_last_result.json`."""
+    return dev_common.resolve_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+
+
+def _iter_active_lock_slots_for_guard(lock_data: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Return active slot entries from a flat or multi-slot `dev_pr_lock` dictionary."""
+    if not isinstance(lock_data, Mapping) or not bool(lock_data.get("active")):
+        return []
+    slots_map = lock_data.get("slots")
+    if isinstance(slots_map, Mapping) and slots_map:
+        out: list[Mapping[str, Any]] = []
+        for s_val in slots_map.values():
+            if isinstance(s_val, Mapping) and bool(s_val.get("active", True)):
+                out.append(s_val)
+        if out:
+            return out
+    return [lock_data]
+
+
+def check_ghost_purge_restart_guard(
+    *,
+    portfolio_dir: Path | str | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Fail-closed check refusing `restart_and_purge` when any conversation is `RUNNING` or any repo lock is in `DEVELOPING`/`NEEDS_REVISION_ITERATING`/`AWAITING_AGENT_REVIEW`."""
+    st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    all_locks = get_all_dev_pr_locks(portfolio_dir=st_dir)
+    blocking_locks: list[tuple[str, str]] = []
+    for slug, lk in sorted(all_locks.items()):
+        for slot in _iter_active_lock_slots_for_guard(lk):
+            st_u = str(slot.get("status") or "").strip().upper()
+            if st_u in GHOST_PURGE_BLOCKING_LOCK_STATUSES:
+                blocking_locks.append((slug, st_u))
+
+    roots = _resolve_antigravity_roots(
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=antigravity_dirs,
+    )
+    existing_dbs = _resolve_summaries_db_candidates(roots, summaries_db=summaries_db)
+    running_cids: set[str] = set()
+    for db_p in existing_dbs:
+        ro_conn = _open_sqlite_readonly(db_p)
+        if ro_conn is None:
+            continue
+        try:
+            tables = {
+                str(r[0] or "").strip()
+                for r in ro_conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            if "conversation_summaries" in tables:
+                cols = {str(r[1] or "").strip() for r in ro_conn.execute("PRAGMA table_info(conversation_summaries)").fetchall()}
+                if "conversation_id" in cols and "status" in cols:
+                    for row in ro_conn.execute("SELECT conversation_id, COALESCE(status, '') FROM conversation_summaries").fetchall():
+                        c_val = str(row[0] or "").strip().lower()
+                        st_u = str(row[1] or "").strip().upper()
+                        if c_val and (st_u in ("CASCADE_RUN_STATUS_RUNNING", "RUNNING") or st_u.endswith("_RUNNING")):
+                            running_cids.add(c_val)
+        finally:
+            with contextlib.suppress(sqlite3.Error):
+                ro_conn.close()
+
+    running_count = len(running_cids)
+    active_lock_repos = sorted({slug for slug, _ in blocking_locks})
+    active_lock_statuses = sorted({st for _, st in blocking_locks})
+
+    if running_count > 0 and blocking_locks:
+        return {
+            "can_restart_now": False,
+            "blocked_reason": "running_conversations_and_active_locks",
+            "blocked_message": (
+                f"Blocked: {running_count} RUNNING conversation(s) and "
+                f"{len(blocking_locks)} active repo lock(s) ({', '.join(active_lock_statuses)})"
+            ),
+            "running_count": running_count,
+            "active_lock_repos": active_lock_repos,
+            "active_lock_statuses": active_lock_statuses,
+        }
+    if running_count > 0:
+        return {
+            "can_restart_now": False,
+            "blocked_reason": "running_conversations_active",
+            "blocked_message": f"Blocked: {running_count} RUNNING conversation(s) active",
+            "running_count": running_count,
+            "active_lock_repos": [],
+            "active_lock_statuses": [],
+        }
+    if blocking_locks:
+        return {
+            "can_restart_now": False,
+            "blocked_reason": "active_dev_locks",
+            "blocked_message": (
+                f"Blocked: active repo lock(s) in {', '.join(active_lock_statuses)} "
+                f"({', '.join(active_lock_repos)})"
+            ),
+            "running_count": 0,
+            "active_lock_repos": active_lock_repos,
+            "active_lock_statuses": active_lock_statuses,
+        }
+    return {
+        "can_restart_now": True,
+        "blocked_reason": "",
+        "blocked_message": "",
+        "running_count": 0,
+        "active_lock_repos": [],
+        "active_lock_statuses": [],
+    }
+
+
+def _read_unexpired_ghost_purge_arm(
+    st_dir: Path,
+    *,
+    now_ts: float | None = None,
+) -> dict[str, Any] | None:
+    """Read `ghost_purge_armed.json` if armed and unexpired; return None otherwise."""
+    arm_path = st_dir / GHOST_PURGE_ARMED_FILENAME
+    raw = dev_common.atomic_read_json(arm_path, default=None)
+    if not isinstance(raw, Mapping) or not bool(raw.get("armed")):
+        return None
+    cur_now = float(now_ts if now_ts is not None else time.time())
+    expires_ts = raw.get("expires_at_ts")
+    if isinstance(expires_ts, (int, float)) and float(expires_ts) <= cur_now:
+        return None
+    return dict(raw)
+
+
+def _is_ghost_purge_worker_running(st_dir: Path) -> bool:
+    """Return True when the single-flight `ghost_purge_worker.lock` is held by a live worker."""
+    lock_path = st_dir / "tmp" / GHOST_PURGE_WORKER_LOCK_FILENAME
+    if not lock_path.exists():
+        return False
+    try:
+        probe_fd = open(lock_path, "a+", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(probe_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(probe_fd.fileno(), fcntl.LOCK_UN)
+            return False
+        except OSError:
+            return True
+    finally:
+        with contextlib.suppress(OSError):
+            probe_fd.close()
+
+
+def _spawn_ghost_purge_worker_daemon(
+    *,
+    mode: str = "on_quit",
+    portfolio_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    app_storage_path: Path | str | Sequence[Path | str] | None = None,
+    force_spawn: bool = False,
+    popen_fn: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Spawn a detached single-flight `prune-ghost-summaries --ghost-purge-worker` process."""
+    if not force_spawn and (
+        "unittest" in sys.modules
+        or "pytest" in sys.modules
+        or os.environ.get("AGY_OFFLINE_ONLY") == "1"
+        or os.environ.get("PRE_COMMIT_HOOK") == "1"
+    ):
+        return {
+            "status": "skipped",
+            "spawned": False,
+            "reason": "hermetic_or_offline_mode",
+        }
+
+    st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    if _is_ghost_purge_worker_running(st_dir):
+        return {
+            "status": "ok",
+            "spawned": False,
+            "already_running": True,
+        }
+
+    cmd = [
+        sys.executable,
+        str(Path(__file__).with_name("pr_remediator.py").resolve()),
+        "prune-ghost-summaries",
+        "--ghost-purge-worker",
+        "--mode",
+        str(mode or "on_quit"),
+        "--portfolio-dir",
+        str(st_dir),
+    ]
+    if summaries_db is not None and isinstance(summaries_db, (str, Path)) and str(summaries_db).strip():
+        cmd.extend(["--summaries-db", str(summaries_db)])
+    if app_storage_path is not None and isinstance(app_storage_path, (str, Path)) and str(app_storage_path).strip():
+        cmd.extend(["--app-storage", str(app_storage_path)])
+
+    spawner = popen_fn if popen_fn is not None else subprocess.Popen
+    try:
+        proc = spawner(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return {
+            "status": "ok",
+            "spawned": True,
+            "already_running": False,
+            "pid": getattr(proc, "pid", None),
+        }
+    except OSError as exc:
+        return {
+            "status": "error",
+            "spawned": False,
+            "error": str(exc),
+        }
+
+
+def arm_ghost_purge(
+    *,
+    mode: str = "on_quit",
+    ttl_seconds: float | None = None,
+    portfolio_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    app_storage_path: Path | str | Sequence[Path | str] | None = None,
+    spawn_worker: bool = True,
+    force_spawn: bool = False,
+    fail_if_already_armed: bool = False,
+    pre_write_guard: Callable[[], dict[str, Any]] | None = None,
+    popen_fn: Callable[..., Any] | None = None,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Single-flight arming of `ghost_purge_armed.json` (`0600`) with TTL and detached worker spawn."""
+    clean_mode = "restart_now" if str(mode or "").strip().lower() in ("restart_now", "restart_and_purge") else "on_quit"
+    st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    arm_path = st_dir / GHOST_PURGE_ARMED_FILENAME
+    lock_path = st_dir / GHOST_PURGE_LOCK_FILENAME
+    cur_now = float(now_ts if now_ts is not None else time.time())
+    resolved_ttl = _resolve_ghost_purge_arm_ttl_seconds(ttl_seconds, env=env)
+
+    already_armed = False
+    with dev_common.file_lock(lock_path):
+        existing = _read_unexpired_ghost_purge_arm(st_dir, now_ts=cur_now)
+        if existing is not None:
+            if fail_if_already_armed:
+                return {
+                    "status": "blocked",
+                    "reason": "armed_already",
+                    "blocked_reason": "armed_already",
+                    "blocked_message": f"Blocked: ghost purge is already armed ({existing.get('mode') or 'on_quit'})",
+                    "armed": True,
+                    "already_armed": True,
+                    "arm_state": existing,
+                }
+            already_armed = True
+            arm_doc = existing
+        else:
+            if pre_write_guard is not None:
+                guard = pre_write_guard()
+                if not guard.get("can_restart_now"):
+                    return {
+                        "status": "blocked",
+                        "reason": guard["blocked_reason"],
+                        "blocked_reason": guard["blocked_reason"],
+                        "blocked_message": guard["blocked_message"],
+                        "running_count": guard["running_count"],
+                        "active_lock_repos": guard["active_lock_repos"],
+                        "armed": False,
+                    }
+            exp_ts = cur_now + float(resolved_ttl)
+            arm_doc = {
+                "schema_version": 1,
+                "armed": True,
+                "mode": clean_mode,
+                "arm_id": uuid.uuid4().hex[:16],
+                "armed_at": datetime.fromtimestamp(cur_now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "armed_at_ts": round(cur_now, 3),
+                "ttl_seconds": resolved_ttl,
+                "expires_at": datetime.fromtimestamp(exp_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "expires_at_ts": round(exp_ts, 3),
+                "status": "armed",
+            }
+            dev_common.atomic_write_json(arm_path, arm_doc, mode=0o600)
+
+    spawn_res: dict[str, Any] = {"status": "skipped", "spawned": False}
+    if spawn_worker:
+        spawn_res = _spawn_ghost_purge_worker_daemon(
+            mode=str(arm_doc.get("mode") or clean_mode),
+            portfolio_dir=st_dir,
+            home_dir=home_dir,
+            summaries_db=summaries_db,
+            app_storage_path=app_storage_path,
+            force_spawn=force_spawn,
+            popen_fn=popen_fn,
+        )
+
+    return {
+        "status": "ok",
+        "armed": True,
+        "already_armed": already_armed,
+        "arm_state": arm_doc,
+        "worker": spawn_res,
+    }
+
+
+def cancel_ghost_purge(
+    *,
+    portfolio_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Disarm `ghost_purge_armed.json` cleanly under file lock."""
+    st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    arm_path = st_dir / GHOST_PURGE_ARMED_FILENAME
+    lock_path = st_dir / GHOST_PURGE_LOCK_FILENAME
+    was_armed = False
+    with dev_common.file_lock(lock_path):
+        raw = dev_common.atomic_read_json(arm_path, default=None)
+        if isinstance(raw, Mapping) and bool(raw.get("armed")):
+            was_armed = True
+        with contextlib.suppress(OSError):
+            arm_path.unlink(missing_ok=True)
+    return {
+        "status": "ok",
+        "armed": False,
+        "cancelled": was_armed,
+    }
+
+
+def _is_desktop_antigravity_proc_desc(desc: str) -> bool:
+    """Return True when a `_detect_active_antigravity_processes` entry represents the Desktop GUI app (not `agy` CLI or `language_server`)."""
+    raw = str(desc or "").strip().lower()
+    if not raw or ":" not in raw:
+        return False
+    _, label = raw.split(":", 1)
+    if label in ("agy", "language_server") or label.startswith("language_server"):
+        return False
+    return (
+        label in ("antigravity", "antigravity.exe")
+        or "/antigravity.app/" in label
+        or "antigravity helper" in label
+    )
+
+
+def _filter_desktop_antigravity_procs(active_procs: Sequence[str]) -> list[str]:
+    """Filter active process descriptions down to Antigravity Desktop GUI processes only."""
+    return [p for p in active_procs if _is_desktop_antigravity_proc_desc(p)]
+
+
+def _default_quit_antigravity(platform_name: str, active_procs: Sequence[str]) -> bool:
+    """Platform-gated graceful quit request for Desktop GUI processes only (Darwin `osascript`, Linux `SIGTERM`)."""
+    plat = platform_name.lower()
+    desktop_procs = _filter_desktop_antigravity_procs(active_procs)
+    if plat == "darwin":
+        try:
+            proc = subprocess.run(
+                ["osascript", "-e", 'tell application "Antigravity" to quit'],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            return proc.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+    if plat.startswith("linux"):
+        signaled = False
+        for desc in desktop_procs:
+            m = re.match(r"^pid=(\d+):", str(desc))
+            if not m:
+                continue
+            pid = int(m.group(1))
+            if pid <= 1 or pid == os.getpid():
+                continue
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
+                signaled = True
+        return signaled
+    return False
+
+
+def _default_reopen_antigravity(platform_name: str) -> bool:
+    """Platform-gated detached reopen of Antigravity Desktop (`open -a Antigravity` or `antigravity`)."""
+    plat = platform_name.lower()
+    if plat == "darwin":
+        try:
+            subprocess.Popen(
+                ["open", "-a", "Antigravity"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return True
+        except OSError:
+            return False
+    if plat.startswith("linux"):
+        bin_path = shutil.which("antigravity")
+        if not bin_path:
+            return False
+        try:
+            subprocess.Popen(
+                [bin_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _write_ghost_purge_result(
+    st_dir: Path,
+    *,
+    status: str,
+    mode: str,
+    now_ts: float,
+    prune_res: Mapping[str, Any] | None = None,
+    reopened: bool = False,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Write atomic `0600` `ghost_purge_last_result.json` with Zero-PII summary fields."""
+    pr = prune_res or {}
+    doc: dict[str, Any] = {
+        "schema_version": 1,
+        "status": str(status),
+        "mode": str(mode),
+        "reason": str(reason or pr.get("reason") or ""),
+        "completed_at": datetime.fromtimestamp(now_ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "completed_at_ts": round(now_ts, 3),
+        "pruned_count": int(pr.get("pruned_count") or 0),
+        "total_ghosts_pruned_count": int(pr.get("total_ghosts_pruned_count") or pr.get("pruned_count") or 0),
+        "app_storage_entries_removed": int(pr.get("app_storage_entries_removed") or 0),
+        "backups_count": len(pr.get("backups") or []),
+        "reopened": bool(reopened),
+        "acked": False,
+    }
+    dev_common.atomic_write_json(st_dir / GHOST_PURGE_RESULT_FILENAME, doc, mode=0o600)
+    return doc
+
+
+def ack_ghost_purge_result(
+    *,
+    portfolio_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Mark `ghost_purge_last_result.json` as acknowledged/dismissed (`0600`)."""
+    st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    res_path = st_dir / GHOST_PURGE_RESULT_FILENAME
+    raw = dev_common.atomic_read_json(res_path, default=None)
+    if not isinstance(raw, Mapping):
+        return {"status": "ok", "acked": False, "last_result": None}
+    cur_now = float(now_ts if now_ts is not None else time.time())
+    updated = dict(raw)
+    updated["acked"] = True
+    updated["acked_at"] = datetime.fromtimestamp(cur_now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    dev_common.atomic_write_json(res_path, updated, mode=0o600)
+    return {"status": "ok", "acked": True, "last_result": updated}
+
+
+def get_ghost_purge_status(
+    *,
+    portfolio_dir: Path | str | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    app_storage_path: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Return complete read-only `ghost_purge` snapshot for sidecar state and CLI inspection."""
+    st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    cur_now = float(now_ts if now_ts is not None else time.time())
+    summary = count_ghost_sidebar_entries(
+        portfolio_dir=st_dir,
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=antigravity_dirs,
+        summaries_db=summaries_db,
+        app_storage_path=app_storage_path,
+        home_dir=home_dir,
+        env=env,
+        now_ts=cur_now,
+    )
+    guard = check_ghost_purge_restart_guard(
+        portfolio_dir=st_dir,
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=antigravity_dirs,
+        summaries_db=summaries_db,
+        home_dir=home_dir,
+    )
+    arm_doc = _read_unexpired_ghost_purge_arm(st_dir, now_ts=cur_now)
+    armed_payload = (
+        {
+            "armed": True,
+            "mode": str(arm_doc.get("mode") or "on_quit"),
+            "arm_id": str(arm_doc.get("arm_id") or ""),
+            "armed_at": str(arm_doc.get("armed_at") or ""),
+            "expires_at": str(arm_doc.get("expires_at") or ""),
+            "ttl_seconds": int(arm_doc.get("ttl_seconds") or _resolve_ghost_purge_arm_ttl_seconds(env=env)),
+        }
+        if arm_doc is not None
+        else {
+            "armed": False,
+            "mode": "",
+            "arm_id": "",
+            "armed_at": "",
+            "expires_at": "",
+            "ttl_seconds": _resolve_ghost_purge_arm_ttl_seconds(env=env),
+        }
+    )
+    raw_last = dev_common.atomic_read_json(st_dir / GHOST_PURGE_RESULT_FILENAME, default=None)
+    last_result = dict(raw_last) if isinstance(raw_last, Mapping) else None
+
+    return {
+        "summary": {
+            "total_ghost_cids": int(summary["total_ghost_cids"]),
+            "db_ghost_count": int(summary["db_ghost_count"]),
+            "app_storage_ghost_count": int(summary["app_storage_ghost_count"]),
+            "app_storage_entries_count": int(summary["app_storage_entries_count"]),
+            "app_storage_breakdown": dict(summary["app_storage_breakdown"]),
+            "has_ghosts": bool(summary["has_ghosts"]),
+            "dbs_checked": int(summary["dbs_checked"]),
+            "app_storage_files_checked": int(summary["app_storage_files_checked"]),
+        },
+        "armed": armed_payload,
+        "can_restart_now": bool(guard["can_restart_now"]),
+        "blocked_reason": str(guard["blocked_reason"]),
+        "blocked_message": str(guard["blocked_message"]),
+        "running_count": int(guard["running_count"]),
+        "active_lock_repos": list(guard["active_lock_repos"]),
+        "last_result": last_result,
+    }
+
+
+def restart_and_purge(
+    *,
+    ttl_seconds: float | None = None,
+    portfolio_dir: Path | str | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    app_storage_path: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    spawn_worker: bool = True,
+    force_spawn: bool = False,
+    popen_fn: Callable[..., Any] | None = None,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Fail-closed guarded trigger for detached graceful quit, ghost purge, and Antigravity reopen."""
+    st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    arm_res = arm_ghost_purge(
+        mode="restart_now",
+        ttl_seconds=ttl_seconds,
+        portfolio_dir=st_dir,
+        home_dir=home_dir,
+        env=env,
+        summaries_db=summaries_db,
+        app_storage_path=app_storage_path,
+        spawn_worker=spawn_worker,
+        force_spawn=force_spawn,
+        fail_if_already_armed=True,
+        pre_write_guard=lambda: check_ghost_purge_restart_guard(
+            portfolio_dir=st_dir,
+            brain_dir=brain_dir,
+            conversations_dir=conversations_dir,
+            cli_dir=cli_dir,
+            antigravity_dirs=antigravity_dirs,
+            summaries_db=summaries_db,
+            home_dir=home_dir,
+        ),
+        popen_fn=popen_fn,
+        now_ts=now_ts,
+    )
+    if arm_res.get("status") != "ok":
+        return arm_res
+    return {
+        **arm_res,
+        "mode": "restart_now",
+        "can_restart_now": True,
+    }
+
+
+def run_ghost_purge_worker(
+    *,
+    mode: str = "on_quit",
+    poll_interval_seconds: float = 2.0,
+    max_duration_seconds: float = 86400.0,
+    quit_timeout_seconds: float = 60.0,
+    max_iterations: int | None = None,
+    portfolio_dir: Path | str | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    app_storage_path: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    ps_runner: Callable[[], str] | None = None,
+    quit_fn: Callable[[str, list[str]], bool] | None = None,
+    reopen_fn: Callable[[str], bool] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    clock_fn: Callable[[], float] | None = None,
+    platform_name: str | None = None,
+) -> dict[str, Any]:
+    """Detached 0-LLM ghost-purge worker loop for `on_quit` and guarded `restart_now` modes."""
+    st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    tmp_dir = st_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    worker_lock_path = tmp_dir / GHOST_PURGE_WORKER_LOCK_FILENAME
+    lock_fd = open(worker_lock_path, "a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {"status": "skipped", "reason": "worker_already_running"}
+
+        plat = (platform_name or sys.platform).lower()
+        effective_clock = clock_fn if clock_fn is not None else time.time
+        effective_sleep = sleep_fn if sleep_fn is not None else time.sleep
+        effective_quit = quit_fn if quit_fn is not None else _default_quit_antigravity
+        effective_reopen = reopen_fn if reopen_fn is not None else _default_reopen_antigravity
+        arm_path = st_dir / GHOST_PURGE_ARMED_FILENAME
+
+        start_ts = float(effective_clock())
+        clean_mode = "restart_now" if str(mode or "").strip().lower() in ("restart_now", "restart_and_purge") else "on_quit"
+
+        if clean_mode == "restart_now":
+            guard = check_ghost_purge_restart_guard(
+                portfolio_dir=st_dir,
+                brain_dir=brain_dir,
+                conversations_dir=conversations_dir,
+                cli_dir=cli_dir,
+                antigravity_dirs=antigravity_dirs,
+                summaries_db=summaries_db,
+                home_dir=home_dir,
+            )
+            if not guard["can_restart_now"]:
+                cancel_ghost_purge(portfolio_dir=st_dir, home_dir=home_dir)
+                res_doc = _write_ghost_purge_result(
+                    st_dir,
+                    status="blocked",
+                    mode="restart_now",
+                    now_ts=float(effective_clock()),
+                    reason=str(guard["blocked_reason"]),
+                )
+                return {"status": "blocked", "event": "guard_blocked", "result": res_doc}
+
+            if plat != "darwin" and not plat.startswith("linux"):
+                cancel_ghost_purge(portfolio_dir=st_dir, home_dir=home_dir)
+                res_doc = _write_ghost_purge_result(
+                    st_dir,
+                    status="blocked",
+                    mode="restart_now",
+                    now_ts=float(effective_clock()),
+                    reason=f"unsupported_platform:{plat}",
+                )
+                return {"status": "blocked", "event": "unsupported_platform", "result": res_doc}
+
+            active_procs = _detect_active_antigravity_processes(ps_runner=ps_runner)
+            desktop_procs = _filter_desktop_antigravity_procs(active_procs)
+            if desktop_procs:
+                effective_quit(plat, desktop_procs)
+
+        iterations = 0
+        last_prune_reason = ""
+        while True:
+            cur_now = float(effective_clock())
+            raw_arm = dev_common.atomic_read_json(arm_path, default=None)
+            if not isinstance(raw_arm, Mapping) or not bool(raw_arm.get("armed")):
+                return {"status": "ok", "event": "cancelled", "iterations": iterations}
+
+            exp_ts = raw_arm.get("expires_at_ts")
+            if isinstance(exp_ts, (int, float)) and float(exp_ts) <= cur_now:
+                cancel_ghost_purge(portfolio_dir=st_dir, home_dir=home_dir)
+                return {"status": "ok", "event": "expired", "iterations": iterations}
+
+            eff_mode = "restart_now" if str(raw_arm.get("mode") or clean_mode) == "restart_now" else "on_quit"
+            iterations += 1
+            active_procs = _detect_active_antigravity_processes(ps_runner=ps_runner)
+            if not active_procs:
+                prune_res = prune_ghost_conversation_summaries(
+                    dry_run=False,
+                    include_app_storage=True,
+                    portfolio_dir=st_dir,
+                    brain_dir=brain_dir,
+                    conversations_dir=conversations_dir,
+                    cli_dir=cli_dir,
+                    antigravity_dirs=antigravity_dirs,
+                    summaries_db=summaries_db,
+                    app_storage_path=app_storage_path,
+                    home_dir=home_dir,
+                    env=env,
+                    ps_output="",
+                    now_ts=cur_now,
+                )
+                if prune_res.get("status") == "ok":
+                    reopened = bool(effective_reopen(plat)) if eff_mode == "restart_now" else False
+                    res_doc = _write_ghost_purge_result(
+                        st_dir,
+                        status="ok",
+                        mode=eff_mode,
+                        now_ts=cur_now,
+                        prune_res=prune_res,
+                        reopened=reopened,
+                    )
+                    cancel_ghost_purge(portfolio_dir=st_dir, home_dir=home_dir)
+                    return {
+                        "status": "ok",
+                        "event": "purged_and_reopened" if eff_mode == "restart_now" else "purged_on_quit",
+                        "iterations": iterations,
+                        "prune_result": prune_res,
+                        "result": res_doc,
+                    }
+                last_prune_reason = str(prune_res.get("reason") or "")
+
+            timeout_limit = float(quit_timeout_seconds if eff_mode == "restart_now" else max_duration_seconds)
+            if (cur_now - start_ts) >= timeout_limit or (max_iterations is not None and iterations >= max_iterations):
+                if eff_mode == "restart_now":
+                    cur_desktop = _filter_desktop_antigravity_procs(active_procs)
+                    reopened = bool(effective_reopen(plat)) if not cur_desktop else False
+                    cancel_ghost_purge(portfolio_dir=st_dir, home_dir=home_dir)
+                    res_doc = _write_ghost_purge_result(
+                        st_dir,
+                        status="error",
+                        mode="restart_now",
+                        now_ts=cur_now,
+                        reopened=reopened,
+                        reason=last_prune_reason or "quit_timeout",
+                    )
+                    return {
+                        "status": "error",
+                        "event": "quit_timeout",
+                        "iterations": iterations,
+                        "reopened": reopened,
+                        "result": res_doc,
+                    }
+                return {"status": "ok", "event": "max_iterations_or_timeout", "iterations": iterations}
+
+            effective_sleep(max(0.01, float(poll_interval_seconds)))
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            lock_fd.close()
 
 
 def _empty_cleanup_breakdown() -> dict[str, Any]:
@@ -3579,10 +4878,24 @@ def register_watcher_cli(sub: Any) -> None:
 
     p_ghost = sub.add_parser(
         "prune-ghost-summaries",
-        help="Fail-closed offline prune of ghost rows from conversation_summaries and conversations_fts whose CIDs have zero disk artifacts.",
+        help="Fail-closed offline prune or detached worker control for ghost rows in conversation_summaries.db and app_storage.json.",
     )
     p_ghost.add_argument("--summaries-db", dest="summaries_db", default=None, help="Optional explicit conversation_summaries.db path.")
-    p_ghost.add_argument("--dry-run", action="store_true", help="Preview ghost CIDs without creating backup or modifying DB.")
+    p_ghost.add_argument("--app-storage", dest="app_storage", default=None, help="Optional explicit app_storage.json path.")
+    p_ghost.add_argument("--portfolio-dir", dest="portfolio_dir", default=None, help="Optional state/portfolio directory override.")
+    p_ghost.add_argument("--no-app-storage", dest="no_app_storage", action="store_true", help="Skip app_storage.json cleanup when pruning DB ghosts.")
+    p_ghost.add_argument("--count-only", dest="count_only", action="store_true", help="Read-only ghost count across conversation_summaries.db and app_storage.json.")
+    p_ghost.add_argument("--arm-ghost-purge", dest="arm_ghost_purge", action="store_true", help="Arm detached 0-LLM worker to purge ghost entries after Antigravity quits.")
+    p_ghost.add_argument("--restart-and-purge", dest="restart_and_purge", action="store_true", help="Fail-closed guarded graceful quit, ghost purge, and Antigravity reopen via detached worker.")
+    p_ghost.add_argument("--cancel-ghost-purge", dest="cancel_ghost_purge", action="store_true", help="Cancel any armed ghost purge and disarm the detached worker.")
+    p_ghost.add_argument("--ghost-purge-worker", dest="ghost_purge_worker", action="store_true", help="Internal detached 0-LLM ghost-purge worker loop.")
+    p_ghost.add_argument("--mode", dest="ghost_mode", default="on_quit", choices=("on_quit", "restart_now"), help="Ghost purge worker mode (default: on_quit).")
+    p_ghost.add_argument("--poll-interval", dest="ghost_poll_interval", type=float, default=2.0, help="Worker poll interval in seconds (default: 2.0).")
+    p_ghost.add_argument("--max-duration", dest="ghost_max_duration", type=float, default=86400.0, help="Maximum on_quit worker lifetime in seconds (default: 86400).")
+    p_ghost.add_argument("--quit-timeout", dest="ghost_quit_timeout", type=float, default=60.0, help="Maximum restart_now quit wait in seconds (default: 60).")
+    p_ghost.add_argument("--max-iterations", dest="ghost_max_iterations", type=int, default=None, help="Optional maximum worker poll iterations.")
+    p_ghost.add_argument("--ttl-seconds", dest="ghost_ttl_seconds", type=float, default=None, help="Optional arm TTL override in seconds (default: AGY_GHOST_PURGE_ARM_TTL_SECONDS / 86400).")
+    p_ghost.add_argument("--dry-run", action="store_true", help="Preview ghost CIDs without creating backup or modifying files.")
 
 
 def dispatch_watcher_cli(args: Any, argv: list[str] | None = None) -> int | None:
@@ -3621,12 +4934,59 @@ def dispatch_watcher_cli(args: Any, argv: list[str] | None = None) -> int | None
         return 0 if res.get("status") == "ok" else 1
 
     if args.subcommand == "prune-ghost-summaries":
-        g_res = _facade_attr("prune_ghost_conversation_summaries", prune_ghost_conversation_summaries)(
-            dry_run=bool(getattr(args, "dry_run", False)),
-            summaries_db=getattr(args, "summaries_db", None),
-        )
+        p_dir = getattr(args, "portfolio_dir", None)
+        s_db = getattr(args, "summaries_db", None)
+        a_st = getattr(args, "app_storage", None)
+        if getattr(args, "count_only", False):
+            g_res = _facade_attr("count_ghost_sidebar_entries", count_ghost_sidebar_entries)(
+                portfolio_dir=p_dir,
+                summaries_db=s_db,
+                app_storage_path=a_st,
+            )
+        elif getattr(args, "cancel_ghost_purge", False):
+            g_res = _facade_attr("cancel_ghost_purge", cancel_ghost_purge)(
+                portfolio_dir=p_dir,
+            )
+        elif getattr(args, "ghost_purge_worker", False):
+            g_res = _facade_attr("run_ghost_purge_worker", run_ghost_purge_worker)(
+                mode=str(getattr(args, "ghost_mode", "on_quit") or "on_quit"),
+                poll_interval_seconds=float(getattr(args, "ghost_poll_interval", 2.0) or 2.0),
+                max_duration_seconds=float(getattr(args, "ghost_max_duration", 86400.0) or 86400.0),
+                quit_timeout_seconds=float(getattr(args, "ghost_quit_timeout", 60.0) or 60.0),
+                max_iterations=getattr(args, "ghost_max_iterations", None),
+                portfolio_dir=p_dir,
+                summaries_db=s_db,
+                app_storage_path=a_st,
+            )
+        elif getattr(args, "arm_ghost_purge", False):
+            g_res = _facade_attr("arm_ghost_purge", arm_ghost_purge)(
+                mode="on_quit",
+                ttl_seconds=getattr(args, "ghost_ttl_seconds", None),
+                portfolio_dir=p_dir,
+                summaries_db=s_db,
+                app_storage_path=a_st,
+                spawn_worker=True,
+                force_spawn=True,
+            )
+        elif getattr(args, "restart_and_purge", False):
+            g_res = _facade_attr("restart_and_purge", restart_and_purge)(
+                ttl_seconds=getattr(args, "ghost_ttl_seconds", None),
+                portfolio_dir=p_dir,
+                summaries_db=s_db,
+                app_storage_path=a_st,
+                spawn_worker=True,
+                force_spawn=True,
+            )
+        else:
+            g_res = _facade_attr("prune_ghost_conversation_summaries", prune_ghost_conversation_summaries)(
+                dry_run=bool(getattr(args, "dry_run", False)),
+                include_app_storage=not bool(getattr(args, "no_app_storage", False)),
+                portfolio_dir=p_dir,
+                summaries_db=s_db,
+                app_storage_path=a_st,
+            )
         print(json.dumps(g_res, indent=2, ensure_ascii=False))
-        return 0 if g_res.get("status") == "ok" else 1
+        return 0 if g_res.get("status") in ("ok", "skipped") else 1
 
     if args.subcommand == "cleanup-merged-conversations":
         prune_ghosts = bool(getattr(args, "prune_ghost_summaries", False))

@@ -29,6 +29,7 @@ import re
 import signal
 import sys
 import threading
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -767,6 +768,18 @@ def build_panel_state(
     }
     orch_ctrl = _orch_ctrl.load_orchestration_control(state_dir=st_dir, home_dir=home_dir)
     orchestration_state = _orch_ctrl.summarize_orchestration_phase(orch_ctrl, locks)
+    ghost_kwargs = _resolve_sidecar_ghost_kwargs(
+        state_dir=st_dir,
+        conv_db_path=conv_db_path,
+        brain_dir=brain_dir,
+        home_dir=home_dir,
+        env=env,
+    )
+    ghost_purge_state = _get_cached_ghost_purge_status(
+        ghost_kwargs,
+        repo_cache=repo_cache,
+        now_ts=now_ts,
+    )
 
     semantic_core = sanitize_zero_pii_payload(
         {
@@ -782,6 +795,7 @@ def build_panel_state(
             },
             "board": board_info,
             "opt_hint": opt_hint,
+            "ghost_purge": ghost_purge_state,
         },
         home_dir=home_dir,
     )
@@ -813,23 +827,120 @@ def build_panel_state(
     }
 
 
+def _resolve_sidecar_agy_dirs(
+    *,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
+    env: Mapping[str, str] | None = None,
+    home_dir: Path | None = None,
+) -> list[Path] | None:
+    """Resolve Antigravity runtime root directories from explicit brain/env/home overrides."""
+    if brain_dir is not None:
+        brain_roots = resolve_sidecar_brain_dirs(brain_dir, env=env, home_dir=home_dir)
+        if brain_roots:
+            return [Path(b).expanduser().parent for b in brain_roots]
+    elif home_dir is not None:
+        return [
+            Path(home_dir).expanduser() / ".gemini" / "antigravity",
+            Path(home_dir).expanduser() / ".gemini" / "antigravity-cli",
+        ]
+    elif env and str(env.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR") or "").strip():
+        brain_roots = resolve_sidecar_brain_dirs(None, env=env, home_dir=home_dir)
+        if brain_roots:
+            return [Path(b).expanduser().parent for b in brain_roots]
+    return None
+
+
+GHOST_PURGE_CACHE_TTL_SECONDS = 45.0
+
+
+def _stat_path_signature(path: Path) -> tuple[str, int, int]:
+    """Return `(path_str, st_mtime_ns, st_size)` without following symlinks or failing on missing paths."""
+    try:
+        st = path.stat()
+        return (str(path), int(st.st_mtime_ns), int(st.st_size))
+    except OSError:
+        return (str(path), 0, -1)
+
+
+def _compute_ghost_purge_cache_signature(ghost_kwargs: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Build a fast `os.stat` cache key over local control files only (excluding volatile Antigravity DB/WAL/app_storage)."""
+    st_dir = Path(ghost_kwargs["portfolio_dir"])
+    summaries_db = ghost_kwargs.get("summaries_db")
+    home_dir = ghost_kwargs.get("home_dir")
+    agy_dirs = ghost_kwargs.get("antigravity_dirs")
+
+    watched_files: list[Path] = [
+        st_dir / _merge_watcher.GHOST_PURGE_ARMED_FILENAME,
+        st_dir / _merge_watcher.GHOST_PURGE_RESULT_FILENAME,
+        st_dir / "actions_state.json",
+        st_dir / "dev_queue.json",
+    ]
+    return (
+        str(st_dir),
+        str(summaries_db or ""),
+        str(home_dir or ""),
+        tuple(str(x) for x in (agy_dirs or ())),
+        tuple(_stat_path_signature(p) for p in watched_files),
+    )
+
+
+def _get_cached_ghost_purge_status(
+    ghost_kwargs: Mapping[str, Any],
+    *,
+    repo_cache: dict[str, Any] | None = None,
+    now_ts: float | None = None,
+    ttl_seconds: float = GHOST_PURGE_CACHE_TTL_SECONDS,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Return mtime + TTL cached `get_ghost_purge_status()` so 1.5s `/api/state` polls run in <5ms."""
+    cur_ts = float(now_ts if now_ts is not None else time.time())
+    sig = _compute_ghost_purge_cache_signature(ghost_kwargs)
+    if repo_cache is not None and not force_refresh:
+        cached = repo_cache.get("_ghost_purge_cache")
+        if isinstance(cached, Mapping) and cached.get("signature") == sig:
+            age = cur_ts - float(cached.get("cached_at") or 0.0)
+            exp_ts = cached.get("armed_expires_at_ts")
+            arm_unexpired = not isinstance(exp_ts, (int, float)) or cur_ts < float(exp_ts)
+            if 0.0 <= age < float(ttl_seconds) and arm_unexpired:
+                return dict(cached["value"])
+
+    fresh = _merge_watcher.get_ghost_purge_status(**ghost_kwargs, now_ts=now_ts)
+    if repo_cache is not None:
+        st_dir = Path(ghost_kwargs["portfolio_dir"])
+        arm_doc = _merge_watcher._read_unexpired_ghost_purge_arm(st_dir, now_ts=cur_ts)
+        repo_cache["_ghost_purge_cache"] = {
+            "signature": sig,
+            "cached_at": cur_ts,
+            "armed_expires_at_ts": arm_doc.get("expires_at_ts") if isinstance(arm_doc, Mapping) else None,
+            "value": fresh,
+        }
+    return fresh
+
+
+def _resolve_sidecar_ghost_kwargs(
+    *,
+    state_dir: Path | str | None = None,
+    conv_db_path: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build hermetic ghost-purge status/guard/arm arguments derived strictly from panel config."""
+    st_dir = _tui._resolve_state_dir(str(state_dir) if state_dir is not None else "")
+    agy_dirs = _resolve_sidecar_agy_dirs(brain_dir=brain_dir, env=env, home_dir=home_dir)
+    return {
+        "portfolio_dir": st_dir,
+        "antigravity_dirs": agy_dirs,
+        "summaries_db": conv_db_path,
+        "home_dir": home_dir,
+        "env": env,
+    }
+
+
 def _resolve_sidecar_cleanup_kwargs(cfg: DevQueuePanelConfig) -> dict[str, Any]:
     """Build hermetic `cleanup_merged_conversations` arguments derived strictly from server config."""
     st_dir = _tui._resolve_state_dir(str(cfg.state_dir) if cfg.state_dir is not None else "")
-    agy_dirs: list[Path] | None = None
-    if cfg.brain_dir is not None:
-        brain_roots = resolve_sidecar_brain_dirs(cfg.brain_dir, env=cfg.env, home_dir=cfg.home_dir)
-        if brain_roots:
-            agy_dirs = [Path(b).expanduser().parent for b in brain_roots]
-    elif cfg.home_dir is not None:
-        agy_dirs = [
-            Path(cfg.home_dir).expanduser() / ".gemini" / "antigravity",
-            Path(cfg.home_dir).expanduser() / ".gemini" / "antigravity-cli",
-        ]
-    elif cfg.env and str(cfg.env.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR") or "").strip():
-        brain_roots = resolve_sidecar_brain_dirs(None, env=cfg.env, home_dir=cfg.home_dir)
-        if brain_roots:
-            agy_dirs = [Path(b).expanduser().parent for b in brain_roots]
+    agy_dirs = _resolve_sidecar_agy_dirs(brain_dir=cfg.brain_dir, env=cfg.env, home_dir=cfg.home_dir)
 
     return {
         "all_merged": True,
@@ -1134,8 +1245,99 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
                 clean_res = _merge_watcher.cleanup_merged_conversations(**cleanup_kwargs)
                 ok = str(clean_res.get("status") or "") == "ok"
                 status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
+                extra_ghost: dict[str, Any] = {}
+                if not is_dry_run:
+                    cfg.repo_cache.pop("_ghost_purge_cache", None)
+                else:
+                    ghost_kwargs = _resolve_sidecar_ghost_kwargs(
+                        state_dir=cfg.state_dir,
+                        conv_db_path=cfg.conv_db_path,
+                        brain_dir=cfg.brain_dir,
+                        home_dir=cfg.home_dir,
+                        env=cfg.env,
+                    )
+                    extra_ghost["ghost_purge"] = _get_cached_ghost_purge_status(
+                        ghost_kwargs,
+                        repo_cache=cfg.repo_cache,
+                        force_refresh=True,
+                    )
                 payload = sanitize_zero_pii_payload(
-                    {"ok": ok, **clean_res},
+                    {"ok": ok, **clean_res, **extra_ghost},
+                    home_dir=cfg.home_dir,
+                )
+                self._send_json(status_code, payload)
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": sanitize_zero_pii_text(f"{exc.__class__.__name__}: {exc}", home_dir=cfg.home_dir),
+                    },
+                )
+            return
+
+        if route in (
+            "/api/cleanup/ghosts/arm",
+            "/api/cleanup/ghosts/cancel",
+            "/api/cleanup/ghosts/ack-result",
+        ):
+            try:
+                ghost_kwargs = _resolve_sidecar_ghost_kwargs(
+                    state_dir=cfg.state_dir,
+                    conv_db_path=cfg.conv_db_path,
+                    brain_dir=cfg.brain_dir,
+                    home_dir=cfg.home_dir,
+                    env=cfg.env,
+                )
+                if route == "/api/cleanup/ghosts/arm":
+                    raw_mode = str(body.get("mode") or ("restart_now" if body.get("restart_now") else "on_quit")).strip().lower()
+                    ttl_raw = body.get("ttl_seconds")
+                    ttl_val: float | None = None
+                    if ttl_raw is not None and not isinstance(ttl_raw, bool):
+                        try:
+                            ttl_val = float(ttl_raw)
+                        except (TypeError, ValueError):
+                            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_ttl_seconds"})
+                            return
+                    if raw_mode in ("restart_now", "restart_and_purge"):
+                        action_res = _merge_watcher.restart_and_purge(
+                            ttl_seconds=ttl_val,
+                            **ghost_kwargs,
+                        )
+                    else:
+                        action_res = _merge_watcher.arm_ghost_purge(
+                            mode="on_quit",
+                            ttl_seconds=ttl_val,
+                            portfolio_dir=ghost_kwargs["portfolio_dir"],
+                            home_dir=ghost_kwargs["home_dir"],
+                            env=ghost_kwargs["env"],
+                            summaries_db=ghost_kwargs["summaries_db"],
+                        )
+                    ok = str(action_res.get("status") or "") == "ok"
+                    status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
+                elif route == "/api/cleanup/ghosts/cancel":
+                    action_res = _merge_watcher.cancel_ghost_purge(
+                        portfolio_dir=ghost_kwargs["portfolio_dir"],
+                        home_dir=ghost_kwargs["home_dir"],
+                    )
+                    ok = str(action_res.get("status") or "") == "ok"
+                    status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
+                else:
+                    action_res = _merge_watcher.ack_ghost_purge_result(
+                        portfolio_dir=ghost_kwargs["portfolio_dir"],
+                        home_dir=ghost_kwargs["home_dir"],
+                    )
+                    ok = str(action_res.get("status") or "") == "ok"
+                    status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
+
+                cfg.repo_cache.pop("_ghost_purge_cache", None)
+                ghost_state = _get_cached_ghost_purge_status(
+                    ghost_kwargs,
+                    repo_cache=cfg.repo_cache,
+                    force_refresh=True,
+                )
+                payload = sanitize_zero_pii_payload(
+                    {"ok": ok, **action_res, "ghost_purge": ghost_state},
                     home_dir=cfg.home_dir,
                 )
                 self._send_json(status_code, payload)

@@ -292,6 +292,134 @@ button {
   font-family: var(--dq-mono);
 }
 
+.dq-ghost-result-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  background: var(--dq-pr-tint);
+  border-bottom: 1px solid var(--dq-pr-border);
+}
+
+.dq-ghost-result-banner.is-error {
+  background: var(--dq-danger-tint);
+  border-bottom-color: color-mix(in srgb, var(--dq-danger) 40%, var(--dq-border));
+}
+
+.dq-ghost-result-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.dq-ghost-result-title {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.dq-ghost-result-meta {
+  font-size: 11px;
+  color: var(--dq-fg-muted);
+}
+
+.dq-ghost-section {
+  border-top: 1px solid var(--dq-border);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dq-ghost-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dq-ghost-head-copy {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.dq-ghost-title {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.dq-ghost-summary {
+  font-size: 11px;
+  color: var(--dq-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.dq-ghost-actions,
+.dq-ghost-confirm-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.dq-ghost-actions .dq-btn:disabled,
+.dq-ghost-confirm-actions .dq-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.dq-ghost-armed-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--dq-r-sm);
+  background: var(--dq-warn-tint);
+  border: 1px solid color-mix(in srgb, var(--dq-warning) 38%, var(--dq-border));
+  font-size: 11px;
+}
+
+.dq-ghost-armed-text {
+  color: var(--dq-warning);
+  font-weight: 600;
+}
+
+.dq-ghost-confirm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  border-radius: var(--dq-r-sm);
+  background: var(--dq-danger-tint);
+  border: 1px solid color-mix(in srgb, var(--dq-danger) 36%, var(--dq-border));
+  font-size: 11px;
+}
+
+.dq-ghost-confirm-text {
+  font-weight: 600;
+}
+
+.dq-btn-warn {
+  border-color: color-mix(in srgb, var(--dq-warning) 44%, var(--dq-border));
+  background: var(--dq-warn-tint);
+  color: var(--dq-warning);
+}
+
+.dq-btn-danger {
+  border-color: color-mix(in srgb, var(--dq-danger) 50%, var(--dq-border));
+  background: var(--dq-danger);
+  color: var(--dq-primary-fg);
+}
+
 .dq-pause-banner {
   display: flex;
   align-items: center;

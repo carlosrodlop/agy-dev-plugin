@@ -120,6 +120,19 @@
         title="Continue orchestration and auto-wake orchestrator"
       >▶ Continue Dev</button>
     </div>
+    <div id="dq-ghost-result-banner" class="dq-ghost-result-banner dq-hidden" role="status" aria-live="polite">
+      <div class="dq-ghost-result-copy">
+        <strong id="dq-ghost-result-title" class="dq-ghost-result-title"></strong>
+        <span id="dq-ghost-result-meta" class="dq-ghost-result-meta"></span>
+      </div>
+      <button
+        id="dq-ghost-result-dismiss-btn"
+        type="button"
+        class="dq-btn"
+        data-action="ghost-ack-result"
+        title="Dismiss ghost purge result banner"
+      >Dismiss</button>
+    </div>
     <div id="dq-cleanup-panel" class="dq-cleanup-panel dq-hidden" role="region" aria-label="Cleanup dry-run preview">
       <div class="dq-cleanup-head">
         <div class="dq-cleanup-head-copy">
@@ -142,6 +155,58 @@
         </div>
       </div>
       <div id="dq-cleanup-breakdown" class="dq-cleanup-breakdown"></div>
+      <div id="dq-ghost-section" class="dq-ghost-section">
+        <div class="dq-ghost-head">
+          <div class="dq-ghost-head-copy">
+            <strong class="dq-ghost-title">Sidebar Ghost Purge</strong>
+            <span id="dq-ghost-summary" class="dq-ghost-summary"></span>
+          </div>
+          <div class="dq-ghost-actions">
+            <button
+              id="dq-ghost-arm-btn"
+              type="button"
+              class="dq-btn"
+              data-action="ghost-arm"
+              title="Arm detached 0-LLM worker to purge ghost sidebar entries on Antigravity quit"
+            >Arm on Quit</button>
+            <button
+              id="dq-ghost-restart-btn"
+              type="button"
+              class="dq-btn dq-btn-warn"
+              data-action="ghost-restart-prompt"
+              title="Gracefully quit Antigravity, purge sidebar ghosts, and reopen"
+            >Restart &amp; Purge Now</button>
+          </div>
+        </div>
+        <div id="dq-ghost-breakdown" class="dq-cleanup-breakdown"></div>
+        <span class="dq-card-sub">Prunes conversation_summaries.db &amp; app_storage.json; leaves agyhub_summaries_proto.pb untouched.</span>
+        <div id="dq-ghost-armed-banner" class="dq-ghost-armed-banner dq-hidden" role="status">
+          <span id="dq-ghost-armed-text" class="dq-ghost-armed-text"></span>
+          <button
+            id="dq-ghost-cancel-btn"
+            type="button"
+            class="dq-btn"
+            data-action="ghost-cancel"
+          >Cancel</button>
+        </div>
+        <div id="dq-ghost-confirm-row" class="dq-ghost-confirm-row dq-hidden" role="region" aria-label="Confirm Restart and Purge">
+          <span class="dq-ghost-confirm-text">Quit Antigravity, purge ghost sidebar entries, and reopen?</span>
+          <div class="dq-ghost-confirm-actions">
+            <button
+              id="dq-ghost-restart-confirm-btn"
+              type="button"
+              class="dq-btn dq-btn-danger"
+              data-action="ghost-restart-confirm"
+            >Confirm Restart &amp; Purge</button>
+            <button
+              id="dq-ghost-restart-cancel-btn"
+              type="button"
+              class="dq-btn"
+              data-action="ghost-restart-cancel"
+            >Cancel</button>
+          </div>
+        </div>
+      </div>
     </div>
     <div id="dq-toast" class="dq-toast dq-hidden" role="status" aria-live="polite"></div>
     <div id="dq-error" class="dq-error dq-hidden" role="alert"></div>

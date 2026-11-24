@@ -27,6 +27,7 @@ ALL_TEST_MODULES = [
     "tests.test_parallel_subagent_orchestration",
     "tests.test_pr_remediator_preview_staging",
     "tests.test_pr_remediator_queue_and_cleanup",
+    "tests.test_sidecar_ghost_purge",
 ]
 
 DOCS_SMOKE_TARGETS = [
@@ -90,6 +91,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_parallel_subagent_orchestration.py": "tests.test_parallel_subagent_orchestration",
     "tests/test_pr_remediator_preview_staging.py": "tests.test_pr_remediator_preview_staging",
     "tests/test_pr_remediator_queue_and_cleanup.py": "tests.test_pr_remediator_queue_and_cleanup",
+    "tests/test_sidecar_ghost_purge.py": "tests.test_sidecar_ghost_purge",
 }
 
 
@@ -309,6 +311,20 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_dev_queue_sidecar_panel" not in selected:
                 selected.append("tests.test_dev_queue_sidecar_panel")
+        if (
+            norm.endswith(
+                (
+                    "merge_watcher.py",
+                    "pr_remediator.py",
+                    "test_sidecar_ghost_purge.py",
+                    "selective_test_runner.py",
+                    "dev_common.py",
+                )
+            )
+            or norm.startswith("sidecars/dev-queue-panel/")
+        ):
+            if "tests.test_sidecar_ghost_purge" not in selected:
+                selected.append("tests.test_sidecar_ghost_purge")
         if (
             norm.endswith(
                 (
