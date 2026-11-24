@@ -16,7 +16,7 @@ Provides zero-dependency stdlib primitives for `agy-dev-plugin` scripts:
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 import contextlib
 from dataclasses import asdict, dataclass, field
@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import time
@@ -59,11 +60,6 @@ def resolve_max_repo_slots(explicit_max_slots: Any = None, *, env: Any = None) -
         if val >= 1:
             return min(val, MAX_REPO_SLOTS_CAP)
     return DEFAULT_MAX_REPO_SLOTS
-
-
-def iter_active_lock_slots(lock_data: Any) -> list[dict[str, Any]]:
-    """Return ordered active slot dicts (`slot_id` 1..N) from a multi-slot or legacy flat repository lock."""
-    return DevLifecycleGuardrailEvaluator._extract_active_slots_from_lock(lock_data if isinstance(lock_data, dict) else {})
 
 DIRECT_MAIN_PUSH_RE = re.compile(
     r"\bgit\s+(?:-[A-Za-z]+\s+\S+\s+)*push\b(?![^\n;]*--delete\b)[^\n;|&]*\b(?:origin\s+)?(?:HEAD:)?(?:refs/heads/)?(?:main|master)\b"
@@ -393,7 +389,7 @@ def _load_optional_module(module_path: Path, mod_name: str) -> Any | None:
         sys.modules[mod_name] = mod
         spec.loader.exec_module(mod)
         return mod
-    except Exception:
+    except (ImportError, OSError, SyntaxError, ValueError, TypeError, AttributeError, RuntimeError):
         if previous is None:
             sys.modules.pop(mod_name, None)
         else:
@@ -440,7 +436,7 @@ def try_restart_control_tower_api(
         if wc_mod is not None and hasattr(wc_mod, "restart_pro_api_server"):
             try:
                 return bool(wc_mod.restart_pro_api_server(portfolio_dir=portfolio_dir))
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                 pass
     ct_dir = _resolve_companion_control_tower_dir(home_dir=home_dir)
     if ct_dir is None:
@@ -455,7 +451,7 @@ def try_restart_control_tower_api(
             check=False,
         )
         return proc.returncode == 0
-    except Exception:
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -473,7 +469,7 @@ def try_stop_dev_api_server(
                 res = wc_mod.stop_dev_api_server(portfolio_dir=portfolio_dir)
                 if isinstance(res, dict):
                     return res
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                 pass
     return {"status": "skipped", "stopped": False}
 
@@ -498,7 +494,7 @@ def try_build_control_tower_ui_url(
                         ensure_server=ensure_server,
                     )
                 )
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError):
                 pass
     host = str(os.environ.get("AGY_PRO_HOST") or "agy.localhost").strip()
     port = str(os.environ.get("AGY_PRO_PORT") or "8787").strip()
@@ -581,7 +577,7 @@ def try_inspect_antigravity_conversation(
                 res = wc_mod.inspect_antigravity_conversation(conversation_id)
                 if isinstance(res, dict) and res.get("status") == "ok":
                     return res
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error, json.JSONDecodeError):
                 pass
 
     tpath = resolve_transcript_path(conversation_id, brain_dir=brain_dir, home_dir=home_dir)
@@ -632,7 +628,7 @@ def try_sync_actions_ledger_verdicts(
         if verdict_updates:
             out = store.sync_audit_verdicts(verdict_updates)
         return out if isinstance(out, dict) else dict(verdict_updates or {})
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error):
         return dict(verdict_updates or {})
 
 
@@ -748,7 +744,7 @@ def try_send_branch_review_notification(
                 check=False,
             )
             return {"sent": proc.returncode == 0, "transport": "AGY_DEV_NOTIFY_CMD"}
-        except Exception as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             return {"sent": False, "transport": "AGY_DEV_NOTIFY_CMD", "error": str(exc)}
 
     base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
@@ -770,7 +766,7 @@ def try_send_branch_review_notification(
     if errors_only_override is None:
         gdc_mod = _load_optional_module(gmail_client, "_agy_dev_optional_gmail_draft_client")
         if gdc_mod is not None and hasattr(gdc_mod, "is_error_only_email_policy_enabled"):
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(OSError, RuntimeError, ValueError, TypeError):
                 errors_only = bool(gdc_mod.is_error_only_email_policy_enabled())
 
     if status == "OK" and errors_only:
@@ -828,7 +824,7 @@ def try_send_branch_review_notification(
         if fallback_without_target_url:
             result["fallback_without_target_url"] = True
         return result
-    except Exception as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         return {"sent": False, "transport": "gmail_draft_client", "error": str(exc)}
 
 
@@ -911,6 +907,222 @@ def resolve_repo_slug_from_path(candidate: Path | str) -> str:
                                 return slug
             return cand.name.lower()
     return ""
+
+
+_HEX8_CID_RE = re.compile(r"^[0-9a-f]{8}$")
+_BASE_STALE_LOCK_STATUSES: frozenset[str] = frozenset(
+    {
+        "NEEDS_REBASE_REVERIFY",
+        "NEEDS_AGENT_SEMANTIC_FIX",
+        "NEEDS_AGENT_CONFLICT_RESOLUTION",
+    }
+)
+
+
+def cids_match(cid_a: str, cid_b: str) -> bool:
+    """Return True on exact match or when one ID is an 8-char hex / >=8-char prefix of the other."""
+    a = str(cid_a or "").strip().lower()
+    b = str(cid_b or "").strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if _HEX8_CID_RE.fullmatch(a) and b.startswith(a):
+        return True
+    if _HEX8_CID_RE.fullmatch(b) and a.startswith(b):
+        return True
+    if len(a) >= 8 and len(b) >= 8 and a[:8] == b[:8]:
+        return a.startswith(b) or b.startswith(a)
+    return False
+
+
+def load_json_dict(path: Path, *, strict: bool = False) -> dict[str, Any]:
+    """Read a JSON object from `path`, raising on empty/corrupt files only when `strict=True`."""
+    if strict:
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return {}
+        if not raw_text.strip():
+            raise json.JSONDecodeError("Empty JSON state file", raw_text, 0)
+        data = json.loads(raw_text)
+        return data if isinstance(data, dict) else {}
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+def is_lock_base_stale(lk: Mapping[str, Any]) -> bool:
+    """Return True when a lock or slot has `base_stale=True`, `needs_base_rebase=True`, or rebase-required status."""
+    if bool(lk.get("base_stale")) or bool(lk.get("needs_base_rebase")):
+        return True
+    status_u = str(lk.get("status") or "").strip().upper()
+    return status_u in _BASE_STALE_LOCK_STATUSES
+
+
+def iter_active_lock_slots(lock_info: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return ordered active slot dicts (`slot_id` 1..N) from multi-slot or flat `lock_info`."""
+    if not isinstance(lock_info, Mapping) or not lock_info or not bool(lock_info.get("active", True)):
+        return []
+    raw_slots = lock_info.get("slots")
+    collected: dict[int, dict[str, Any]] = {}
+    if isinstance(raw_slots, Mapping):
+        for raw_k, raw_v in raw_slots.items():
+            if not isinstance(raw_v, Mapping) or not bool(raw_v.get("active", True)):
+                continue
+            try:
+                s_id = int(raw_v.get("slot_id") or raw_k)
+            except (TypeError, ValueError):
+                continue
+            if s_id < 1:
+                continue
+            s_entry = dict(raw_v)
+            s_entry["slot_id"] = s_id
+            s_entry["active"] = True
+            s_entry["base_stale"] = is_lock_base_stale(s_entry)
+            s_entry.setdefault("target_repo_dir", str(lock_info.get("target_repo_dir") or ""))
+            collected[s_id] = s_entry
+
+    if 1 not in collected and (
+        not isinstance(raw_slots, Mapping)
+        or not raw_slots
+        or str(lock_info.get("branch_name") or "").strip()
+        or str(lock_info.get("conversation_id") or "").strip()
+        or str(lock_info.get("status") or "").strip()
+    ):
+        top_slot = {k: v for k, v in lock_info.items() if k not in ("slots", "slots_list")}
+        try:
+            top_sid = int(lock_info.get("slot_id") or 1)
+        except (TypeError, ValueError):
+            top_sid = 1
+        top_slot["slot_id"] = top_sid
+        top_slot["active"] = True
+        top_slot["base_stale"] = is_lock_base_stale(top_slot)
+        collected.setdefault(top_sid, top_slot)
+
+    return [collected[k] for k in sorted(collected)]
+
+
+def normalize_repo_lock_slots(slug: str, info: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize an active repository lock with N-slot occupancy (`1/3`, `3/4`) and `base_stale` flags."""
+    if not isinstance(info, Mapping) or not bool(info.get("active")):
+        return dict(info or {})
+    norm = dict(info)
+    active_slots = iter_active_lock_slots(norm)
+    max_slots = max(len(active_slots), resolve_max_repo_slots(norm.get("max_slots")))
+    slots_map = {str(s["slot_id"]): s for s in active_slots}
+    norm["slots"] = slots_map
+    norm["slots_list"] = list(active_slots)
+    norm["max_slots"] = max_slots
+    norm["active_slots_count"] = len(active_slots)
+    norm["slot_occupancy"] = f"{len(active_slots)}/{max_slots}"
+    primary = slots_map.get("1") or (active_slots[0] if active_slots else norm)
+    norm["base_stale"] = is_lock_base_stale(primary)
+    if slug and not norm.get("repo_slug"):
+        norm["repo_slug"] = slug
+    return norm
+
+
+def load_dev_locks_from_dir(
+    state_dir: Path | str,
+    *,
+    strict: bool = False,
+    normalize_slots: bool = True,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Load `(active_locks, all_locks)` across `dev_pr_lock.json` and `actions_state.json`."""
+    st_dir = Path(state_dir).expanduser()
+    active: dict[str, dict[str, Any]] = {}
+    all_locks: dict[str, dict[str, Any]] = {}
+    for candidate in (st_dir / "dev_pr_lock.json", st_dir / "actions_state.json"):
+        data = load_json_dict(candidate, strict=strict)
+        raw_map: Any = None
+        if candidate.name == "dev_pr_lock.json":
+            raw_map = data.get("dev_pr_locks") or data.get("locks")
+        else:
+            audit_st = data.get("actions_log_audit_state")
+            if isinstance(audit_st, dict):
+                raw_map = audit_st.get("dev_pr_locks")
+                if not raw_map and isinstance(audit_st.get("dev_pr_lock"), dict):
+                    legacy = audit_st["dev_pr_lock"]
+                    slug = str(legacy.get("repo_slug") or legacy.get("repo") or "default")
+                    raw_map = {slug: legacy}
+        if isinstance(raw_map, dict):
+            for slug, info in raw_map.items():
+                if isinstance(info, dict):
+                    slug_key = str(slug)
+                    if info.get("active"):
+                        norm_info = (
+                            normalize_repo_lock_slots(slug_key, info)
+                            if normalize_slots
+                            else dict(info)
+                        )
+                        all_locks[slug_key] = norm_info
+                        active[slug_key] = norm_info
+                    else:
+                        all_locks[slug_key] = dict(info)
+                        active.pop(slug_key, None)
+    return (active, all_locks)
+
+
+def discover_managed_repo_dirs(
+    all_locks: Mapping[str, Mapping[str, Any]],
+    *,
+    repos_dir: Path | str | None = None,
+    allow_ambient_cwd: bool = False,
+    home_dir: Path | None = None,
+) -> dict[str, Path]:
+    """Discover deduplicated local Git repository roots from `all_locks` and optional `repos_dir`."""
+    discovered: dict[str, Path] = {}
+    seen_paths: set[Path] = set()
+    home_str = str((home_dir or Path.home()).expanduser())
+
+    def _register_repo(path: Path, slug_hint: str = "") -> None:
+        if not path.is_dir() or not (path / ".git").exists():
+            return
+        resolved = path.resolve()
+        if resolved in seen_paths:
+            return
+        slug = slug_hint.strip() or resolved.name
+        if slug not in discovered:
+            discovered[slug] = resolved
+            seen_paths.add(resolved)
+
+    for lock_slug, lk in all_locks.items():
+        if not isinstance(lk, Mapping):
+            continue
+        td = str(lk.get("target_repo_dir") or "").replace("$HOME", home_str).strip()
+        if td:
+            _register_repo(Path(td).expanduser(), slug_hint=str(lock_slug))
+        for rb_key in ("repo_branches", "last_repo_branches"):
+            rb = lk.get(rb_key)
+            if isinstance(rb, Mapping):
+                for rb_slug, info in rb.items():
+                    if isinstance(info, Mapping):
+                        rtd = str(info.get("target_repo_dir") or "").replace("$HOME", home_str).strip()
+                        if rtd:
+                            _register_repo(Path(rtd).expanduser(), slug_hint=str(rb_slug))
+
+    if repos_dir is not None and str(repos_dir).strip():
+        r_root = Path(str(repos_dir).replace("$HOME", home_str)).expanduser()
+        if r_root.is_dir():
+            if (r_root / ".git").exists():
+                _register_repo(r_root)
+            else:
+                with contextlib.suppress(OSError):
+                    for child in sorted(r_root.iterdir()):
+                        if child.is_dir() and (child / ".git").exists():
+                            _register_repo(child)
+
+    if allow_ambient_cwd and not discovered:
+        cwd = Path.cwd().resolve()
+        if (cwd / ".git").exists():
+            _register_repo(cwd)
+
+    return discovered
 
 
 class DevLifecycleGuardrailEvaluator:
@@ -2097,7 +2309,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if not sys.stdin.isatty():
                 raw_stdin = sys.stdin.read()
-        except Exception:
+        except (OSError, ValueError):
             raw_stdin = ""
         try:
             payload = json.loads(raw_stdin) if raw_stdin.strip() else {}

@@ -886,25 +886,31 @@ class TestDevQueueTui(unittest.TestCase):
             self.assertNotEqual(updated_item["status"], "merged")
             self.assertEqual(updated_item["status"], "pending")
 
-            # Verify --fetch flag is passed to queue-sync ONLY when offline=False
-            with mock.patch.object(tui.subprocess, "run") as mock_run:
-                mock_run.return_value = mock.Mock(
-                    returncode=0,
-                    stdout=json.dumps({"status": "ok", "reconciled_count": 2, "reconciled_items": [{}, {}]}),
-                    stderr="",
-                )
+            # Verify in-process queue_store reconciliation passes fetch=True ONLY when offline=False (zero pr_remediator subprocesses)
+            qs_mod = tui._get_queue_store()
+            self.assertIsNotNone(qs_mod)
+            with (
+                mock.patch.object(tui.subprocess, "run") as mock_run,
+                mock.patch.object(
+                    qs_mod,
+                    "reconcile_dev_queue_with_git",
+                    return_value={"status": "ok", "reconciled_count": 2, "reconciled_items": [{}, {}]},
+                ) as mock_recon,
+            ):
+                mock_run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
                 msg_online = tui._run_live_sync(state_dir, {"acme/repo-a": repo_a}, offline=False)
-                self.assertIn("Sync OK (1 repos fetched", msg_online)
-                queue_sync_calls = [c.args[0] for c in mock_run.call_args_list if "queue-sync" in c.args[0]]
-                self.assertEqual(len(queue_sync_calls), 1)
-                self.assertIn("--fetch", queue_sync_calls[0])
+                self.assertIn("Sync OK (1 repos fetched, 2 PRs reconciled)", msg_online)
+                self.assertEqual(mock_recon.call_count, 1)
+                self.assertTrue(mock_recon.call_args.kwargs.get("fetch"))
+                self.assertFalse(any("pr_remediator" in " ".join(map(str, c.args[0])) for c in mock_run.call_args_list))
 
                 mock_run.reset_mock()
+                mock_recon.reset_mock()
                 msg_off = tui._run_live_sync(state_dir, {"acme/repo-a": repo_a}, offline=True)
-                self.assertIn("Offline sync OK (0 repos fetched", msg_off)
-                queue_sync_off = [c.args[0] for c in mock_run.call_args_list if "queue-sync" in c.args[0]]
-                self.assertEqual(len(queue_sync_off), 1)
-                self.assertNotIn("--fetch", queue_sync_off[0])
+                self.assertIn("Offline sync OK (0 repos fetched, 2 PRs reconciled)", msg_off)
+                self.assertEqual(mock_recon.call_count, 1)
+                self.assertFalse(mock_recon.call_args.kwargs.get("fetch"))
+                self.assertEqual(mock_run.call_count, 0)
 
     def test_json_mode_applies_status_repo_all_filters_sorting_and_sidebar_title_enrichment(self) -> None:
         """`--json` honors `--status`, `--repo`, `--all`, priority sorting, `counts`, `locks`, and `sidebar_title`."""
@@ -1413,6 +1419,16 @@ class TestDevQueueTui(unittest.TestCase):
         watched = tui._collect_watched_script_paths()
         self.assertGreaterEqual(len(watched), 1)
         self.assertEqual(watched[0], Path(tui.__file__).resolve())
+        watched_names = {p.name for p in watched}
+        for mod_name in (
+            "tui_models.py",
+            "tui_state.py",
+            "tui_progress.py",
+            "tui_render.py",
+            "tui_board.py",
+            "tui_watch.py",
+        ):
+            self.assertIn(mod_name, watched_names)
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1654,7 +1670,7 @@ class TestDevQueueTui(unittest.TestCase):
             self.assertIn("HITL — ANTIGRAVITY APP VALIDATION", joined_scrolled)
             self.assertIn("Queued task item 22", joined_scrolled)
 
-            # Compact pending mode keeps at most 3 PENDING rows + all HITL_BLOCK rows
+            # Compact pending mode keeps at most 3 PENDING rows + all HITL_BLOCK rows via QueueRowView.status (zero ANSI scraping)
             vp_compact = tui._compose_priority_viewport(
                 layout["header_lines"],  # type: ignore[arg-type]
                 layout["active_row_lines"],  # type: ignore[arg-type]
@@ -1665,12 +1681,35 @@ class TestDevQueueTui(unittest.TestCase):
                 footer="[q] quit",
                 scroll_offset=0,
                 compact_pending=True,
+                middle_rows=layout["middle_rows"],  # type: ignore[arg-type]
             )
             joined_compact = "\n".join(vp_compact)
             self.assertIn("Approve Architecture Contract", joined_compact)
             self.assertIn("Queued task item 03", joined_compact)
             self.assertNotIn("Queued task item 04", joined_compact)
             self.assertIn("[p] full", joined_compact)
+
+            # Verify _filter_compact_middle_rows filters directly on QueueRowView.status even without status text in raw_line
+            masked_rows = [
+                tui.QueueRowView(
+                    idx=i,
+                    priority=10 + i,
+                    status="hitl_blocked" if i == 5 else "pending",
+                    raw_status="hitl_blocked" if i == 5 else "pending",
+                    band="middle",
+                    display_id=f"row{i}",
+                    conversation_id=f"cid-{i}",
+                    sidebar_title="",
+                    title=f"Masked {i}",
+                    repos_str="repo",
+                    repos_md="repo",
+                    raw_line=f"\033[33mMASKED_ROW_{i}\033[0m",
+                )
+                for i in range(1, 7)
+            ]
+            compact_masked = tui._filter_compact_middle_rows(masked_rows, max_pending=3)
+            self.assertEqual(len(compact_masked), 4)
+            self.assertIn("MASKED_ROW_5", compact_masked[-1])
 
             # Interactive watch hotkeys: [j], Down (\x1b[B), [k], Up (\x1b[A), [p], [o] (1 PR), [O] (all 2 PRs), [q]
             r_fd, w_fd = os.pipe()
@@ -1738,24 +1777,34 @@ class TestDevQueueTui(unittest.TestCase):
                     }
                 },
             )
-            with mock.patch.object(tui.subprocess, "run") as mock_run:
-                mock_run.return_value = mock.Mock(
-                    returncode=0,
-                    stdout=json.dumps({"status": "ok", "queue_reconciliation": {"reconciled_count": 1}}),
-                    stderr="",
-                )
+            ls_mod = tui._get_lock_store()
+            qs_mod = tui._get_queue_store()
+            self.assertIsNotNone(ls_mod)
+            self.assertIsNotNone(qs_mod)
+            with (
+                mock.patch.object(tui.subprocess, "run") as mock_run,
+                mock.patch.object(
+                    ls_mod,
+                    "sync_dev_pr_lock_with_git",
+                    return_value={"status": "ok", "queue_reconciliation": {"reconciled_count": 1}},
+                ) as mock_lock_sync,
+                mock.patch.object(
+                    qs_mod,
+                    "reconcile_dev_queue_with_git",
+                    return_value={"status": "ok", "reconciled_count": 0},
+                ) as mock_q_recon,
+            ):
                 msg_dedup = tui._run_live_sync(
                     state_dir,
                     {"acme/repo-a": repo_a, "acme/repo-b": repo_b},
                     offline=False,
                 )
                 self.assertIn("Sync OK (1 repos fetched, 1 PRs reconciled)", msg_dedup)
-                cmds = [c.args[0] for c in mock_run.call_args_list]
-                self.assertEqual(len(cmds), 1)
-                self.assertIn("lock-status", cmds[0])
-                self.assertIn("--sync-git", cmds[0])
+                self.assertEqual(mock_lock_sync.call_count, 1)
+                self.assertEqual(mock_q_recon.call_count, 0)
+                self.assertEqual(mock_run.call_count, 0)
 
-            # 2. Active lock on repo-a + unlocked pr_open on repo-b -> lock-status + scoped queue-sync --repo acme/repo-b --fetch
+            # 2. Active lock on repo-a + unlocked pr_open on repo-b -> lock_store sync + scoped reconcile_dev_queue_with_git(repo_slug="acme/repo-b", fetch=True)
             _write_state(
                 state_dir,
                 items=[
@@ -1778,23 +1827,30 @@ class TestDevQueueTui(unittest.TestCase):
                     }
                 },
             )
-            with mock.patch.object(tui.subprocess, "run") as mock_run:
-                mock_run.return_value = mock.Mock(
-                    returncode=0,
-                    stdout=json.dumps({"status": "ok", "reconciled_count": 0}),
-                    stderr="",
-                )
+            with (
+                mock.patch.object(tui.subprocess, "run") as mock_run,
+                mock.patch.object(
+                    ls_mod,
+                    "sync_dev_pr_lock_with_git",
+                    return_value={"status": "ok", "queue_reconciliation": {"reconciled_count": 0}},
+                ) as mock_lock_sync,
+                mock.patch.object(
+                    qs_mod,
+                    "reconcile_dev_queue_with_git",
+                    return_value={"status": "ok", "reconciled_count": 0},
+                ) as mock_q_recon,
+            ):
                 msg_split = tui._run_live_sync(
                     state_dir,
                     {"acme/repo-a": repo_a, "acme/repo-b": repo_b},
                     offline=False,
                 )
                 self.assertIn("Sync OK (2 repos fetched", msg_split)
-                cmds_split = [c.args[0] for c in mock_run.call_args_list]
-                self.assertEqual(len(cmds_split), 2)
-                self.assertIn("lock-status", cmds_split[0])
-                self.assertIn("queue-sync", cmds_split[1])
-                self.assertIn("acme/repo-b", cmds_split[1])
+                self.assertEqual(mock_lock_sync.call_count, 1)
+                self.assertEqual(mock_q_recon.call_count, 1)
+                self.assertEqual(mock_q_recon.call_args.kwargs.get("repo_slug"), "acme/repo-b")
+                self.assertTrue(mock_q_recon.call_args.kwargs.get("fetch"))
+                self.assertEqual(mock_run.call_count, 0)
 
             # 3. Single-flight controller never spawns overlapping threads and formats live sync badge
             gate = threading.Event()

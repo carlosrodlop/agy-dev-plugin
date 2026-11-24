@@ -470,61 +470,14 @@ def _make_finding(
     }
 
 
-_HEX8_CID_RE = re.compile(r"^[0-9a-f]{8}$")
-
-
 def _cids_match(cid_a: str, cid_b: str) -> bool:
-    """Return True on exact match or when one side is an 8-char hex short ID prefix of the other."""
-    a = str(cid_a or "").strip().lower()
-    b = str(cid_b or "").strip().lower()
-    if not a or not b:
-        return False
-    if a == b:
-        return True
-    if _HEX8_CID_RE.fullmatch(a) and b.startswith(a):
-        return True
-    if _HEX8_CID_RE.fullmatch(b) and a.startswith(b):
-        return True
-    return False
+    """Return True on exact match or when one side is an 8-char hex / >=8-char prefix of the other."""
+    return dev_common.cids_match(cid_a, cid_b)
 
 
 def _iter_active_lock_slots(lock_info: dict[str, Any]) -> list[dict[str, Any]]:
     """Return ordered active slot dicts (`slot_id` 1, 2, ...) from multi-slot or flat `lock_info`."""
-    if not isinstance(lock_info, dict) or not bool(lock_info.get("active", True)):
-        return []
-    raw_slots = lock_info.get("slots")
-    collected: dict[int, dict[str, Any]] = {}
-    if isinstance(raw_slots, dict):
-        for raw_k, raw_v in raw_slots.items():
-            if not isinstance(raw_v, dict) or not bool(raw_v.get("active", True)):
-                continue
-            try:
-                s_id = int(raw_v.get("slot_id") or raw_k)
-            except (TypeError, ValueError):
-                continue
-            if s_id < 1:
-                continue
-            entry = dict(raw_v)
-            entry["slot_id"] = s_id
-            entry["active"] = True
-            entry.setdefault("target_repo_dir", str(lock_info.get("target_repo_dir") or ""))
-            collected[s_id] = entry
-    if 1 not in collected and (
-        not isinstance(raw_slots, dict)
-        or not raw_slots
-        or str(lock_info.get("branch_name") or "").strip()
-        or str(lock_info.get("conversation_id") or "").strip()
-        or str(lock_info.get("status") or "").strip()
-    ):
-        top_entry = {k: v for k, v in lock_info.items() if k != "slots"}
-        try:
-            top_sid = int(lock_info.get("slot_id") or 1)
-        except (TypeError, ValueError):
-            top_sid = 1
-        top_entry["slot_id"] = top_sid
-        top_entry["active"] = True
-        collected.setdefault(top_sid, top_entry)
-    return [collected[k] for k in sorted(collected)]
+    return dev_common.iter_active_lock_slots(lock_info)
 
 
 def _slot_matches_cid(slot_info: dict[str, Any], cid: str) -> bool:
@@ -1984,95 +1937,23 @@ def _discover_managed_repo_dirs(
     allow_ambient_cwd: bool = False,
 ) -> dict[str, Path]:
     """Discover deduplicated local git repository roots from explicit `repos_dir` and recorded locks."""
-    discovered: dict[str, Path] = {}
-    seen_paths: set[Path] = set()
-    home_str = str(Path.home())
-
-    def _register_repo(path: Path, slug_hint: str = "") -> None:
-        if not path.is_dir() or not (path / ".git").exists():
-            return
-        resolved = path.resolve()
-        if resolved in seen_paths:
-            return
-        slug = slug_hint.strip() or resolved.name
-        if slug not in discovered:
-            discovered[slug] = resolved
-            seen_paths.add(resolved)
-
-    for lock_slug, lk in all_locks.items():
-        if not isinstance(lk, dict):
-            continue
-        td = str(lk.get("target_repo_dir") or "").replace("$HOME", home_str).strip()
-        if td:
-            _register_repo(Path(td).expanduser(), slug_hint=str(lock_slug))
-        for rb_key in ("repo_branches", "last_repo_branches"):
-            rb = lk.get(rb_key)
-            if isinstance(rb, dict):
-                for rb_slug, info in rb.items():
-                    if isinstance(info, dict):
-                        rtd = str(info.get("target_repo_dir") or "").replace("$HOME", home_str).strip()
-                        if rtd:
-                            _register_repo(Path(rtd).expanduser(), slug_hint=str(rb_slug))
-
-    if repos_dir is not None and str(repos_dir).strip():
-        r_root = Path(str(repos_dir).replace("$HOME", home_str)).expanduser()
-        if r_root.is_dir():
-            if (r_root / ".git").exists():
-                _register_repo(r_root)
-            else:
-                with contextlib.suppress(OSError):
-                    for child in sorted(r_root.iterdir()):
-                        if child.is_dir() and (child / ".git").exists():
-                            _register_repo(child)
-
-    if allow_ambient_cwd and not discovered:
-        cwd = Path.cwd().resolve()
-        if (cwd / ".git").exists():
-            _register_repo(cwd)
-
-    return discovered
+    return dev_common.discover_managed_repo_dirs(
+        all_locks,
+        repos_dir=repos_dir,
+        allow_ambient_cwd=allow_ambient_cwd,
+    )
 
 
 def _load_state_from_dir(state_dir: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     """Read `dev_queue.json` and `dev_pr_locks` from `state_dir` without side effects."""
-    queue_data: dict[str, Any] = {"items": [], "orchestrator_conversation_id": ""}
-    q_path = state_dir / "dev_queue.json"
-    if q_path.is_file():
-        with contextlib.suppress(OSError, json.JSONDecodeError):
-            raw = json.loads(q_path.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                queue_data = raw
-
-    active_locks: dict[str, dict[str, Any]] = {}
-    all_locks: dict[str, dict[str, Any]] = {}
-    for fname in ("dev_pr_lock.json", "actions_state.json"):
-        fpath = state_dir / fname
-        if not fpath.is_file():
-            continue
-        with contextlib.suppress(OSError, json.JSONDecodeError):
-            data = json.loads(fpath.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                continue
-            raw_map: Any = None
-            if fname == "dev_pr_lock.json":
-                raw_map = data.get("dev_pr_locks")
-            else:
-                audit_st = data.get("actions_log_audit_state")
-                if isinstance(audit_st, dict):
-                    raw_map = audit_st.get("dev_pr_locks")
-                    if not raw_map and isinstance(audit_st.get("dev_pr_lock"), dict):
-                        legacy = audit_st["dev_pr_lock"]
-                        slug = str(legacy.get("repo_slug") or legacy.get("repo") or "default")
-                        raw_map = {slug: legacy}
-            if isinstance(raw_map, dict):
-                for slug, info in raw_map.items():
-                    if isinstance(info, dict):
-                        slug_s = str(slug)
-                        all_locks[slug_s] = info
-                        if info.get("active"):
-                            active_locks[slug_s] = info
-                        else:
-                            active_locks.pop(slug_s, None)
+    queue_data = dev_common.load_json_dict(state_dir / "dev_queue.json", strict=False)
+    if not queue_data:
+        queue_data = {"items": [], "orchestrator_conversation_id": ""}
+    active_locks, all_locks = dev_common.load_dev_locks_from_dir(
+        state_dir,
+        strict=False,
+        normalize_slots=False,
+    )
     return (queue_data, active_locks, all_locks)
 
 
@@ -2158,16 +2039,7 @@ def analyze_dev_flow_optimizations(
         all_locks = dict(preloaded_all_locks if preloaded_all_locks is not None else preloaded_active_locks)
         queue_orch_cid = ""
     else:
-        if portfolio_dir is not None:
-            state_dir = Path(portfolio_dir).expanduser().resolve()
-        else:
-            env_state = str(os.environ.get("AGY_DEV_STATE_DIR") or "").strip()
-            if env_state:
-                state_dir = Path(env_state).expanduser().resolve()
-            else:
-                default_dev = Path.home() / ".local" / "share" / "agy-dev-plugin"
-                compat_dir = Path.home() / ".local" / "share" / "wiz-customer-portfolio"
-                state_dir = compat_dir if (not (default_dev / "actions_state.json").is_file() and (compat_dir / "actions_state.json").is_file()) else default_dev
+        state_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
         queue_data, active_locks, all_locks = _load_state_from_dir(state_dir)
         items = [it for it in (queue_data.get("items") or []) if isinstance(it, dict)]
         queue_orch_cid = str(queue_data.get("orchestrator_conversation_id") or "").strip()
