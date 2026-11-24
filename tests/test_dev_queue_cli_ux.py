@@ -589,13 +589,14 @@ class TestTerminalFormattingCliHygieneAndSubcommands(unittest.TestCase):
                 self.assertEqual(tui.main(["sync", "--state-dir", str(state_dir), "--offline", "--json"]), 0)
             self.assertEqual(json.loads(buf_sync.getvalue())["status"], "ok")
 
-            # `set-status <prefix> standby --notes ...`
+            # `set-status <prefix> standby --notes ...` runs in-process without spawning pr_remediator.py
             buf_set = io.StringIO()
-            with contextlib.redirect_stdout(buf_set):
+            with mock.patch.object(tui.subprocess, "run") as spy_sub, contextlib.redirect_stdout(buf_set):
                 self.assertEqual(
                     tui.main(["set-status", "c0c153ec", "standby", "--notes", "Deferred for UX test", "--state-dir", str(state_dir)]),
                     0,
                 )
+            self.assertEqual(spy_sub.call_count, 0)
             q_updated = json.loads((state_dir / "dev_queue.json").read_text(encoding="utf-8"))
             self.assertEqual(q_updated["items"][0]["status"], "standby")
 
@@ -718,12 +719,49 @@ class TestPureViewportRepaintAndInteractiveOverlays(unittest.TestCase):
         self.assertIn("[all]", footer_with_hitl)
         self.assertIn("[filter:gateway]", footer_with_hitl)
 
-        # Verify selective_test_runner routes TUI/UX edits to tests.test_dev_queue_cli_ux
+        # Verify selective_test_runner routes TUI/UX edits (including all tui_*.py modules) and BATS
         self.assertIn("tests.test_dev_queue_cli_ux", srunner.ALL_TEST_MODULES)
-        self.assertIn(
-            "tests.test_dev_queue_cli_ux",
-            srunner.select_test_modules(["skills/agy-dev-queue-orchestrator/scripts/dev_queue_tui.py"]),
-        )
+        for rel_tui in (
+            "skills/agy-dev-queue-orchestrator/scripts/dev_queue_tui.py",
+            "skills/agy-dev-queue-orchestrator/scripts/tui_models.py",
+            "skills/agy-dev-queue-orchestrator/scripts/tui_state.py",
+            "skills/agy-dev-queue-orchestrator/scripts/tui_progress.py",
+            "skills/agy-dev-queue-orchestrator/scripts/tui_render.py",
+            "skills/agy-dev-queue-orchestrator/scripts/tui_board.py",
+            "skills/agy-dev-queue-orchestrator/scripts/tui_watch.py",
+        ):
+            routed = srunner.select_test_modules([rel_tui])
+            self.assertIn("tests.test_dev_queue_cli_ux", routed)
+            self.assertIn("tests.test_dev_queue_tui", routed)
+            self.assertTrue(srunner.should_run_bats([rel_tui]))
+
+        # Verify lean facade size (<25 KB), @dataclass view-models, and render_dashboard() parity
+        tui_path = REPO_ROOT / "skills" / "agy-dev-queue-orchestrator" / "scripts" / "dev_queue_tui.py"
+        self.assertLess(tui_path.stat().st_size, 25_000)
+        for vm_name in ("QueueRowView", "RepoPillView", "DashboardSnapshot", "RenderResult", "WatchState"):
+            self.assertTrue(hasattr(tui, vm_name), f"Missing view-model {vm_name}")
+        with tempfile.TemporaryDirectory() as tmp_vm:
+            st_vm = Path(tmp_vm) / "state"
+            _write_state(st_vm, items=[])
+            rr = tui.render_dashboard(_make_args(st_vm), is_tty_override=False, term_width_override=120)
+            self.assertIsInstance(rr, tui.RenderResult)
+            legacy_tuple = tui.render(_make_args(st_vm), is_tty_override=False, term_width_override=120)
+            self.assertEqual(rr.state_dir, legacy_tuple[4])
+
+        # Verify shared dev_common helpers (`cids_match`, `load_dev_locks_from_dir`, `discover_managed_repo_dirs`)
+        self.assertTrue(dev_common.cids_match("c0c153ec", "c0c153ec-p2-dev-queue-tui-modularize"))
+        self.assertFalse(dev_common.cids_match("c0c153ec-aaaa", "c0c153ec-bbbb"))
+        with tempfile.TemporaryDirectory() as tmp_dc:
+            st_dc = Path(tmp_dc) / "state"
+            _write_state(
+                st_dc,
+                items=[],
+                locks={"acme/repo-x": {"active": True, "status": "DEVELOPING", "conversation_id": "abcd1234"}},
+            )
+            act_lks, all_lks = dev_common.load_dev_locks_from_dir(st_dc)
+            self.assertIn("acme/repo-x", act_lks)
+            self.assertEqual(act_lks["acme/repo-x"]["slot_occupancy"], "1/3")
+            self.assertIn("acme/repo-x", all_lks)
 
 
 if __name__ == "__main__":
