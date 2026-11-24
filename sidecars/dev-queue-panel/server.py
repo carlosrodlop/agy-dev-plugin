@@ -863,30 +863,11 @@ def _stat_path_signature(path: Path) -> tuple[str, int, int]:
 
 
 def _compute_ghost_purge_cache_signature(ghost_kwargs: Mapping[str, Any]) -> tuple[Any, ...]:
-    """Build a fast `os.stat`-only cache key covering DB, `app_storage.json`, and state/lock files."""
+    """Build a fast `os.stat` cache key over local control files only (excluding volatile Antigravity DB/WAL/app_storage)."""
     st_dir = Path(ghost_kwargs["portfolio_dir"])
-    agy_dirs = ghost_kwargs.get("antigravity_dirs")
     summaries_db = ghost_kwargs.get("summaries_db")
     home_dir = ghost_kwargs.get("home_dir")
-    env = ghost_kwargs.get("env")
-
-    eff_agy_dirs = agy_dirs
-    if eff_agy_dirs is None:
-        eff_agy_dirs = _merge_watcher._infer_antigravity_dirs_from_summaries_db(
-            brain_dir=None,
-            conversations_dir=None,
-            cli_dir=None,
-            antigravity_dirs=agy_dirs,
-            summaries_db=summaries_db,
-        )
-    roots = _merge_watcher._resolve_antigravity_roots(antigravity_dirs=eff_agy_dirs)
-    dbs = _merge_watcher._resolve_summaries_db_candidates(roots, summaries_db=summaries_db)
-    app_paths = _merge_watcher._resolve_app_storage_paths(
-        roots,
-        has_explicit_root_override=eff_agy_dirs is not None,
-        home_dir=home_dir,
-        env=env,
-    )
+    agy_dirs = ghost_kwargs.get("antigravity_dirs")
 
     watched_files: list[Path] = [
         st_dir / _merge_watcher.GHOST_PURGE_ARMED_FILENAME,
@@ -894,19 +875,11 @@ def _compute_ghost_purge_cache_signature(ghost_kwargs: Mapping[str, Any]) -> tup
         st_dir / "actions_state.json",
         st_dir / "dev_queue.json",
     ]
-    for db_p in dbs:
-        watched_files.append(db_p)
-        watched_files.append(Path(f"{db_p}-wal"))
-    watched_files.extend(app_paths)
-    for r in roots:
-        for dir_key in ("brain_dir", "conversations_dir"):
-            if r.get(dir_key):
-                watched_files.append(Path(r[dir_key]))
-
     return (
         str(st_dir),
         str(summaries_db or ""),
         str(home_dir or ""),
+        tuple(str(x) for x in (agy_dirs or ())),
         tuple(_stat_path_signature(p) for p in watched_files),
     )
 

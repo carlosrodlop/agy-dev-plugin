@@ -3811,6 +3811,8 @@ def arm_ghost_purge(
     app_storage_path: Path | str | Sequence[Path | str] | None = None,
     spawn_worker: bool = True,
     force_spawn: bool = False,
+    fail_if_already_armed: bool = False,
+    pre_write_guard: Callable[[], dict[str, Any]] | None = None,
     popen_fn: Callable[..., Any] | None = None,
     now_ts: float | None = None,
 ) -> dict[str, Any]:
@@ -3826,9 +3828,31 @@ def arm_ghost_purge(
     with dev_common.file_lock(lock_path):
         existing = _read_unexpired_ghost_purge_arm(st_dir, now_ts=cur_now)
         if existing is not None:
+            if fail_if_already_armed:
+                return {
+                    "status": "blocked",
+                    "reason": "armed_already",
+                    "blocked_reason": "armed_already",
+                    "blocked_message": f"Blocked: ghost purge is already armed ({existing.get('mode') or 'on_quit'})",
+                    "armed": True,
+                    "already_armed": True,
+                    "arm_state": existing,
+                }
             already_armed = True
             arm_doc = existing
         else:
+            if pre_write_guard is not None:
+                guard = pre_write_guard()
+                if not guard.get("can_restart_now"):
+                    return {
+                        "status": "blocked",
+                        "reason": guard["blocked_reason"],
+                        "blocked_reason": guard["blocked_reason"],
+                        "blocked_message": guard["blocked_message"],
+                        "running_count": guard["running_count"],
+                        "active_lock_repos": guard["active_lock_repos"],
+                        "armed": False,
+                    }
             exp_ts = cur_now + float(resolved_ttl)
             arm_doc = {
                 "schema_version": 1,
@@ -4125,40 +4149,6 @@ def restart_and_purge(
 ) -> dict[str, Any]:
     """Fail-closed guarded trigger for detached graceful quit, ghost purge, and Antigravity reopen."""
     st_dir = _resolve_ghost_purge_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
-    cur_now = float(now_ts if now_ts is not None else time.time())
-    with dev_common.file_lock(st_dir / GHOST_PURGE_LOCK_FILENAME):
-        existing_arm = _read_unexpired_ghost_purge_arm(st_dir, now_ts=cur_now)
-        if existing_arm is not None:
-            return {
-                "status": "blocked",
-                "reason": "armed_already",
-                "blocked_reason": "armed_already",
-                "blocked_message": f"Blocked: ghost purge is already armed ({existing_arm.get('mode') or 'on_quit'})",
-                "armed": True,
-                "already_armed": True,
-                "arm_state": existing_arm,
-            }
-
-    guard = check_ghost_purge_restart_guard(
-        portfolio_dir=st_dir,
-        brain_dir=brain_dir,
-        conversations_dir=conversations_dir,
-        cli_dir=cli_dir,
-        antigravity_dirs=antigravity_dirs,
-        summaries_db=summaries_db,
-        home_dir=home_dir,
-    )
-    if not guard["can_restart_now"]:
-        return {
-            "status": "blocked",
-            "reason": guard["blocked_reason"],
-            "blocked_reason": guard["blocked_reason"],
-            "blocked_message": guard["blocked_message"],
-            "running_count": guard["running_count"],
-            "active_lock_repos": guard["active_lock_repos"],
-            "armed": False,
-        }
-
     arm_res = arm_ghost_purge(
         mode="restart_now",
         ttl_seconds=ttl_seconds,
@@ -4169,9 +4159,21 @@ def restart_and_purge(
         app_storage_path=app_storage_path,
         spawn_worker=spawn_worker,
         force_spawn=force_spawn,
+        fail_if_already_armed=True,
+        pre_write_guard=lambda: check_ghost_purge_restart_guard(
+            portfolio_dir=st_dir,
+            brain_dir=brain_dir,
+            conversations_dir=conversations_dir,
+            cli_dir=cli_dir,
+            antigravity_dirs=antigravity_dirs,
+            summaries_db=summaries_db,
+            home_dir=home_dir,
+        ),
         popen_fn=popen_fn,
         now_ts=now_ts,
     )
+    if arm_res.get("status") != "ok":
+        return arm_res
     return {
         **arm_res,
         "mode": "restart_now",

@@ -794,6 +794,14 @@ class TestSidecarGhostPurgeEndpointsAndUI(unittest.TestCase):
                     now_ts=1_800_000_000.0,
                     env={},
                 )
+                # Mutate volatile Antigravity runtime files (-wal & app_storage.json) within the 45s TTL window
+                wal_path = Path(f"{paths['db_path']}-wal")
+                wal_path.write_bytes(b"active-wal-frame-update")
+                app_text = paths["app_storage_path"].read_text(encoding="utf-8")
+                paths["app_storage_path"].write_text(app_text, encoding="utf-8")
+                os.utime(wal_path, (1_800_000_001.5, 1_800_000_001.5))
+                os.utime(paths["app_storage_path"], (1_800_000_001.5, 1_800_000_001.5))
+
                 snap2 = panel_srv.build_panel_state(
                     state_dir=paths["pdir"],
                     brain_dir=paths["brain_dir"],
