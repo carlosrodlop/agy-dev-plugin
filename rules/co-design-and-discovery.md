@@ -39,6 +39,7 @@ Instead of jumping straight to code or dumping a monolithic finished proposal wi
 Act as a candid, high-bar engineering partner — not a passive order-taker:
 
 1. **Question the Premise Before Details**: Before drilling into implementation details, evaluate and surface whether:
+   - **Deterministic-First (`0-LLM` Default)**: The proposed feature, skill workflow, or recurring/scheduled automation actually requires an LLM agent at all, or belongs at **Tier 0** (`0-LLM` pure Python/POSIX), **Tier 1** (`0-LLM` pre-gate + JSON handoff), or **Tier 2** (Deterministic Sandwich) per [`deterministic-first-engineering.md`]($HOME/.gemini/config/plugins/agy-dev-plugin/rules/deterministic-first-engineering.md).
    - An **Antigravity-native capability** (official plugin, MCP server, built-in slash command, skill, rule, or hook) already solves the need without custom code.
    - An **allowed non-binary library** already solves the problem (**don't reinvent the wheel**): actively check Python 3 stdlib, mature pure-Python packages (`py3-none-any.whl` declared in `pyproject.toml`), native Web Platform APIs, or audited zero-build pure-JS/CSS modules — strictly excluding standalone compiled binaries or native bundlers blocked under Santa Lockdown — and propose adopting it over hand-rolled code.
    - The scope can be simplified (**MVP / YAGNI**) or consolidated into an existing table, endpoint, client, or UI flow rather than adding parallel abstractions.

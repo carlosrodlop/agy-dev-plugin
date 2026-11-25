@@ -16,6 +16,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ALL_TEST_MODULES = [
     "tests.test_agy_dev_plugin",
+    "tests.test_deterministic_first_audit",
     "tests.test_dev_queue_cli_ux",
     "tests.test_dev_queue_doctor",
     "tests.test_dev_queue_planning",
@@ -91,6 +92,7 @@ BATS_TRIGGER_PREFIXES = (
     "agents/",
 )
 ISOLATED_TEST_FILE_MODULES = {
+    "tests/test_deterministic_first_audit.py": "tests.test_deterministic_first_audit",
     "tests/test_dev_queue_cli_ux.py": "tests.test_dev_queue_cli_ux",
     "tests/test_dev_queue_doctor.py": "tests.test_dev_queue_doctor",
     "tests/test_dev_queue_planning.py": "tests.test_dev_queue_planning",
@@ -520,6 +522,21 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_native_conversation_cleanup" not in selected:
                 selected.append("tests.test_native_conversation_cleanup")
+
+        if (
+            norm.endswith(
+                (
+                    "project_audit.py",
+                    "qa_static_audit.py",
+                    "test_deterministic_first_audit.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith(("rules/", "skills/agy-project-standards/"))
+            or norm in ("agents/agy-dev-planner.md", "agents/agy-code-pr-reviewer.md", "README.md")
+        ):
+            if "tests.test_deterministic_first_audit" not in selected:
+                selected.append("tests.test_deterministic_first_audit")
 
         if norm not in ISOLATED_TEST_FILE_MODULES and "tests.test_agy_dev_plugin" not in selected:
             selected.append("tests.test_agy_dev_plugin")
