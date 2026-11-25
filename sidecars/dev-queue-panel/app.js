@@ -78,11 +78,16 @@
       card.display_id,
       card.hotkey,
       card.effective_status,
+      card.input_source,
+      card.waiting_kind,
+      card.waiting_tool,
+      card.question_preview,
       card.title,
       card.sidebar_title,
       card.repos_label,
       card.notes,
       card.stage_label,
+      ...(Array.isArray(card.questions) ? card.questions : []),
       ...(Array.isArray(card.repo_slugs) ? card.repo_slugs : []),
     ];
     return parts.some((p) => String(p || "").toLowerCase().includes(q));
@@ -311,7 +316,7 @@
   function renderQueueCard(card, kind) {
     let extraCls = "";
     if (kind === "hitl") {
-      extraCls = " is-hitl";
+      extraCls = card.input_source === "live_prompt" ? " is-hitl is-live-prompt" : " is-hitl";
     } else if (kind === "pr") {
       extraCls = " is-pr";
     } else if (card.is_stalled) {
@@ -324,20 +329,31 @@
     if (card.hotkey) {
       badges.appendChild(el("span", "dq-badge dq-badge-hitl dq-badge-mono", `[${card.hotkey}]`));
     }
-    const prioText =
-      card.effective_priority && card.effective_priority !== card.priority
-        ? `P${card.effective_priority}<-P${card.priority}`
-        : `P${card.priority}`;
-    badges.appendChild(el("span", "dq-badge dq-badge-mono", prioText));
+    if (card.priority !== null && card.priority !== undefined && card.priority !== "") {
+      const prioText =
+        card.effective_priority && card.effective_priority !== card.priority
+          ? `P${card.effective_priority}<-P${card.priority}`
+          : `P${card.priority}`;
+      badges.appendChild(el("span", "dq-badge dq-badge-mono", prioText));
+    }
     if (card.repos_label) {
       badges.appendChild(el("span", "dq-badge", card.repos_label));
     }
     if (card.display_id) {
       badges.appendChild(el("span", "dq-badge dq-badge-mono", card.display_id));
     }
+    if (card.waiting_kind === "approval" && card.waiting_tool) {
+      badges.appendChild(el("span", "dq-badge dq-badge-mono", card.waiting_tool));
+    }
     top.appendChild(badges);
 
-    if (card.progress_label) {
+    if (card.waiting_kind === "ask_question") {
+      const qCount = Number(card.question_count || 0);
+      const qLabel = qCount > 0 ? `QUESTION (${qCount})` : "QUESTION";
+      top.appendChild(el("span", "dq-badge dq-badge-question", qLabel));
+    } else if (card.waiting_kind === "approval") {
+      top.appendChild(el("span", "dq-badge dq-badge-approval", "APPROVAL"));
+    } else if (card.progress_label) {
       const progCls = card.is_stalled
         ? "dq-badge dq-badge-danger"
         : kind === "pr"
@@ -354,6 +370,16 @@
 
     if (card.sidebar_title && card.title && card.sidebar_title !== card.title) {
       root.appendChild(el("p", "dq-card-sub", card.title));
+    }
+    if (card.question_preview) {
+      const qCount = Number(card.question_count || 0);
+      const moreSuffix = qCount > 1 ? ` (+${qCount - 1} more)` : "";
+      root.appendChild(el("p", "dq-card-sub dq-question-preview", `${card.question_preview}${moreSuffix}`));
+    } else if (card.waiting_kind === "approval") {
+      const approvalSub = card.waiting_tool
+        ? `Awaiting approval for ${card.waiting_tool}`
+        : "Awaiting user approval in Antigravity";
+      root.appendChild(el("p", "dq-card-sub dq-question-preview", approvalSub));
     }
     if (kind === "hitl" && card.notes && card.notes !== card.title) {
       root.appendChild(el("p", "dq-card-sub", card.notes));
@@ -373,9 +399,19 @@
       }
     }
     if (card.is_uuid) {
+      let openLabel = "Open Chat";
+      if (kind === "hitl") {
+        if (card.waiting_kind === "ask_question") {
+          openLabel = "Answer Chat";
+        } else if (card.waiting_kind === "approval" || card.input_source === "live_prompt") {
+          openLabel = "Review Prompt";
+        } else {
+          openLabel = "Open Blocked Chat";
+        }
+      }
       actions.appendChild(
         buildActionButton(
-          kind === "hitl" ? "Open Blocked Chat" : "Open Chat",
+          openLabel,
           "open-conv",
           { convId: card.conversation_id, label: primaryTitle },
           kind === "hitl",
@@ -1806,6 +1842,7 @@
       matchesCardFilter,
       matchesRepoFilter,
       matchesPlanningItemFilter,
+      renderQueueCard,
       renderPlanningView,
       formatPauseMeta,
       setOrchestrationPaused,

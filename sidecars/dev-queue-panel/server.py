@@ -533,7 +533,12 @@ def build_panel_state(
                 if val_cid:
                     all_lookup_cids.append(val_cid)
 
-    ag_titles = _tui._load_conversation_titles(all_lookup_cids, db_path=conv_db_path)
+    ag_titles = _tui._load_conversation_titles(all_lookup_cids, db_path=conv_db_path, home_dir=home_dir)
+    waiting_convs = _tui.load_waiting_user_conversations(
+        db_path=conv_db_path,
+        brain_dir=brain_roots,
+        home_dir=home_dir,
+    )
     display_ids = _tui._build_display_ids(active_items)
 
     orch_live_txt, _ = _tui._resolve_orchestrator_liveness(
@@ -755,6 +760,8 @@ def build_panel_state(
             hitl_idx += 1
             card["hitl_index"] = hitl_idx
             card["hotkey"] = f"h{hitl_idx}"
+            card["input_source"] = "hitl_blocked"
+            card["waiting_input"] = False
             sec_hitl.append(card)
         elif is_human_pr and safe_pr_url:
             human_pr_urls_map[cid_full] = safe_pr_url
@@ -772,6 +779,70 @@ def build_panel_state(
             sec_in_progress.append(card)
         else:
             sec_pending.append(card)
+
+    for w in waiting_convs:
+        w_cid = str(w.get("conversation_id") or "").strip()
+        if not w_cid:
+            continue
+        matched_hitl = next(
+            (c for c in sec_hitl if _tui._cids_match(str(c.get("conversation_id") or ""), w_cid)),
+            None,
+        )
+        if matched_hitl is not None:
+            matched_hitl["waiting_input"] = True
+            matched_hitl["waiting_kind"] = str(w.get("waiting_kind") or "")
+            matched_hitl["waiting_tool"] = str(w.get("waiting_tool") or "")
+            matched_hitl["question_count"] = int(w.get("question_count") or 0)
+            matched_hitl["question_preview"] = str(w.get("question_preview") or "")
+            matched_hitl["questions"] = list(w.get("questions") or [])
+            if not matched_hitl.get("sidebar_title") and w.get("sidebar_title"):
+                matched_hitl["sidebar_title"] = str(w.get("sidebar_title") or "")
+            continue
+
+        hitl_idx += 1
+        w_disp = str(w.get("display_id") or w_cid[:8])
+        w_sidebar = str(w.get("sidebar_title") or "")
+        w_title = w_sidebar or str(w.get("title") or w_disp)
+        sec_hitl.append(
+            {
+                "row": 0,
+                "conversation_id": w_cid,
+                "is_uuid": _tui._is_uuid(w_cid),
+                "display_id": w_disp,
+                "priority": None,
+                "effective_priority": None,
+                "effective_status": "waiting_input",
+                "input_source": "live_prompt",
+                "waiting_input": True,
+                "waiting_kind": str(w.get("waiting_kind") or ""),
+                "waiting_tool": str(w.get("waiting_tool") or ""),
+                "question_count": int(w.get("question_count") or 0),
+                "question_preview": str(w.get("question_preview") or ""),
+                "questions": list(w.get("questions") or []),
+                "last_modified_time": str(w.get("last_modified_time") or ""),
+                "title": w_title,
+                "sidebar_title": w_sidebar,
+                "repos_label": "",
+                "repo_slugs": [],
+                "merged_repos": [],
+                "depends_on": [],
+                "notes": "",
+                "progress_pct": 0,
+                "progress_label": "",
+                "idle_label": "",
+                "is_stalled": False,
+                "stage_label": "",
+                "worker_cid": "",
+                "worker_is_uuid": False,
+                "reviewer_cid": "",
+                "reviewer_is_uuid": False,
+                "pr_url": "",
+                "pr_label": "",
+                "artifacts": list_conversation_artifacts(w_cid, brain_roots),
+                "hitl_index": hitl_idx,
+                "hotkey": f"h{hitl_idx}",
+            }
+        )
 
     board_file = _tui._resolve_board_artifact_path(st_dir, board_override)
     board_available = bool(board_file is not None and board_file.is_file() and board_file.suffix.lower() == ".md")

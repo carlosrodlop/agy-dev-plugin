@@ -346,7 +346,15 @@ class TestTerminalFormattingCliHygieneAndSubcommands(unittest.TestCase):
                 },
             )
 
-            with mock.patch.dict(os.environ, {"NO_COLOR": "", "TERM": "xterm-256color"}, clear=False):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "NO_COLOR": "",
+                    "TERM": "xterm-256color",
+                    "AGY_CONVERSATION_SUMMARIES_DB": str(Path(tmp) / "missing_summaries.db"),
+                },
+                clear=False,
+            ):
                 out_123, _, _, _, _, _ = tui.render(
                     _make_args(state_dir, no_color=False, plain_urls=False),
                     is_tty_override=True,
@@ -673,7 +681,14 @@ class TestPureViewportRepaintAndInteractiveOverlays(unittest.TestCase):
                 os.close(w_fd)
                 w_fd = -1
                 buf = io.StringIO()
-                with mock.patch.object(tui, "render", wraps=tui.render) as spy_render:
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"AGY_CONVERSATION_SUMMARIES_DB": str(Path(tmp) / "missing_summaries.db")},
+                        clear=False,
+                    ),
+                    mock.patch.object(tui, "render", wraps=tui.render) as spy_render,
+                ):
                     rc = tui.run_watch_loop(
                         _make_args(state_dir, watch=10.0, no_color=True, plain_urls=True, no_auto_sync=True),
                         stream=buf,

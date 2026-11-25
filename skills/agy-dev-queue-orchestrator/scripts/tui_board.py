@@ -196,7 +196,7 @@ def _write_live_antigravity_board(
             "",
             f"> **Updated**: `{now_str}` · **Orchestrator**: {orch_md} · "
             f"`PRs: {counts.get('pr_open', 0)}` · `In progress: {counts.get('in_progress', 0)}` · "
-            f"`Pending: {counts.get('pending', 0)}` · `HITL: {counts.get('hitl_blocked', 0)}` · "
+            f"`Pending: {counts.get('pending', 0)}` · `HITL: {max(counts.get('hitl_blocked', 0), len(hitl_rows))}` · "
             f"`Merged: {counts.get('merged', 0)}`",
             "",
             "## 1. Conversations awaiting validation (`HITL_BLOCK` — 1-click in Antigravity)",

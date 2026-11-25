@@ -171,6 +171,7 @@ from tui_state import (  # noqa: F401, E402
     _nav_intent_lock,
     _normalize_repo_lock_slots,
     _parse_remote_to_web_info,
+    _parse_waiting_step_from_raw_summary,
     _resolve_board_artifact_path,
     _resolve_brain_dirs,
     _resolve_cli_version,
@@ -191,6 +192,7 @@ from tui_state import (  # noqa: F401, E402
     _wait_for_nav_intent_ack,
     acknowledge_nav_intent,
     is_lock_human_ready,
+    load_waiting_user_conversations,
     read_active_nav_intent,
     write_nav_intent,
 )
