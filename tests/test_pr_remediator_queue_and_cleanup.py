@@ -1928,8 +1928,25 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             self.assertEqual(q_pass["status"], "pr_open")
             self.assertEqual(q_pass["pr_urls"], [rev_pass["manual_pr_url"]])
 
-            # Step 7: Subsequent commit + prepare-review invalidates reviewed_head_sha, pr_gate_ready, and manual_pr_url
+            # Step 7: Subsequent commit without re-running test-local triggers pre_review_gate SHA-parity fail-fast;
+            # after re-running test-local, prepare-review invalidates reviewed_head_sha, pr_gate_ready, and manual_pr_url
             (wt_path / "gate_impl.py").write_text("GATE_VERSION = 3\n", encoding="utf-8")
+            staged3_stale = prs.push_remediation_branch_and_build_reviewer_plan(
+                title="feat(pr-gate): follow-up tweak",
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                git_client=vcs_a,
+            )
+            self.assertEqual(staged3_stale["status"], "error")
+            self.assertEqual(staged3_stale["step"], "pre_review_gate")
+            self.assertFalse(staged3_stale["pre_review_gate"]["sha_parity"]["passed"])
+            val_v3 = prs.run_local_validation_suite(
+                workdir=wt_path,
+                portfolio_dir=pdir,
+                pre_commit_status="pass",
+                run_bats=False,
+            )
+            self.assertTrue(val_v3["passed"])
             staged3 = prs.push_remediation_branch_and_build_reviewer_plan(
                 title="feat(pr-gate): follow-up tweak",
                 workdir=wt_path,

@@ -8,6 +8,8 @@ PR review scoring/circuit-breaker, branch evaluation, and parallel overlap/rebas
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable, Sequence
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -1046,6 +1048,32 @@ def push_remediation_branch_and_build_reviewer_plan(
         branch_name=resolved_head,
         pre_commit_state=pre_commit_state,
     )
+    pre_review_gate = evaluate_pre_review_fail_fast_gate(
+        target_repo_dir if (target_repo_dir / ".git").exists() else None,
+        changed_files=diff_res.get("files", []),
+        lock_info=lock_info,
+        verification_results=valid_vr,
+        head_branch=resolved_head,
+        head_sha=str(diff_res.get("head_sha") or ""),
+        pre_commit_state=pre_commit_state,
+    )
+    if not pre_review_gate.get("passed"):
+        err_msgs = list(pre_review_gate.get("error_messages") or [])
+        return {
+            "status": "error",
+            "step": "pre_review_gate",
+            "repo_slug": resolved_repo_slug,
+            "slot_id": slot_num,
+            "branch_name": resolved_head,
+            "base_branch": base_branch,
+            "branch_pushed": False,
+            "pr_gate_ready": False,
+            "manual_pr_url": "",
+            "pr_url": "",
+            "pre_review_gate": pre_review_gate,
+            "error": "; ".join(err_msgs) or "Pre-review fail-fast gate failed.",
+        }
+
     final_body = build_canonical_pr_description(
         commit_title=commit_title,
         executive_summary=preserved_exec_summary,
@@ -1288,6 +1316,7 @@ def push_remediation_branch_and_build_reviewer_plan(
         "files_count": diff_res.get("files_count", 0),
         "risk_classification": reviewer_plan["risk_classification"],
         "verification_results": valid_vr,
+        "pre_review_gate": pre_review_gate,
         "lock": updated_lock.get("lock", {}),
         "reviewer_model_routing": reviewer_plan["model_routing"],
         "reviewer_subagent_definition": reviewer_plan["subagent_definition"],
@@ -2498,6 +2527,329 @@ def evaluate_branch_and_release_lock(
 
 
 
+_PRE_REVIEW_DOC_EXTENSIONS = (".md", ".txt", ".rst", ".adoc", ".png", ".svg", ".jpg", ".jpeg", ".gif", ".webp", ".pdf")
+_PRE_REVIEW_DOC_BASENAMES = frozenset({"license", "license.md", "license.txt", "copying"})
+_PROJECT_AUDIT_MOD_CACHE: dict[str, Any] = {}
+
+
+def _load_project_audit_module() -> Any | None:
+    """Load `project_audit.py` from repo or installed plugin root without mutating sys.path globally."""
+    cached = _PROJECT_AUDIT_MOD_CACHE.get("mod")
+    if cached is not None:
+        return cached
+    candidates = (
+        Path(__file__).resolve().parents[2] / "agy-project-standards" / "scripts" / "project_audit.py",
+        Path.home() / ".gemini" / "config" / "plugins" / "agy-dev-plugin" / "skills" / "agy-project-standards" / "scripts" / "project_audit.py",
+    )
+    for cand in candidates:
+        if not cand.is_file():
+            continue
+        spec = importlib.util.spec_from_file_location("agy_project_audit_mod", str(cand))
+        if spec is None or spec.loader is None:
+            continue
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            sys.modules[spec.name] = mod
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(spec.name, None)
+            continue
+        _PROJECT_AUDIT_MOD_CACHE["mod"] = mod
+        return mod
+    return None
+
+
+def _norm_diff_rel_path(rel: Any) -> str:
+    """Normalize diff relative path (string or `{filename|path}` dict) to POSIX string without leading `./`."""
+    raw = rel.get("filename") or rel.get("path") or "" if isinstance(rel, dict) else rel
+    norm = str(raw or "").strip().replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
+def _is_doc_only_diff_path(rel: str) -> bool:
+    """Return True when `rel` is documentation or static image media (no code/config execution)."""
+    norm = _norm_diff_rel_path(rel).lower()
+    if not norm:
+        return False
+    base = norm.rsplit("/", 1)[-1]
+    return base in _PRE_REVIEW_DOC_BASENAMES or norm.endswith(_PRE_REVIEW_DOC_EXTENSIONS)
+
+
+def _is_test_diff_path(rel: str) -> bool:
+    """Return True when `rel` is a unit/integration/BATS test file."""
+    norm = _norm_diff_rel_path(rel).lower()
+    if not norm:
+        return False
+    base = norm.rsplit("/", 1)[-1]
+    return (
+        norm.startswith("tests/")
+        or "/tests/" in norm
+        or norm.endswith(".bats")
+        or (base.startswith("test_") and base.endswith(".py"))
+        or base.endswith("_test.py")
+    )
+
+
+def _extract_audit_findings_dicts(findings: Sequence[Any]) -> list[dict[str, Any]]:
+    """Normalize `AuditFinding` objects or dicts into compact JSON-serializable dicts."""
+    out: list[dict[str, Any]] = []
+    for item in findings:
+        if isinstance(item, dict):
+            out.append(
+                {
+                    "severity": str(item.get("severity") or "error"),
+                    "rule_id": str(item.get("rule_id") or "audit"),
+                    "file": _norm_diff_rel_path(str(item.get("file") or "")),
+                    "line": int(item.get("line") or 0),
+                    "message": _sanitize_home_paths(str(item.get("message") or "")),
+                }
+            )
+        else:
+            out.append(
+                {
+                    "severity": str(getattr(item, "severity", "error") or "error"),
+                    "rule_id": str(getattr(item, "rule_id", "audit") or "audit"),
+                    "file": _norm_diff_rel_path(str(getattr(item, "file", "") or "")),
+                    "line": int(getattr(item, "line", 0) or 0),
+                    "message": _sanitize_home_paths(str(getattr(item, "message", "") or "")),
+                }
+            )
+    return out
+
+
+def evaluate_pre_review_fail_fast_gate(
+    repo_dir: Path | str | None,
+    *,
+    changed_files: Sequence[Any] = (),
+    lock_info: dict[str, Any] | None = None,
+    verification_results: dict[str, Any] | None = None,
+    verification_gate: dict[str, Any] | None = None,
+    head_branch: str = "",
+    head_sha: str = "",
+    pre_commit_state: dict[str, Any] | None = None,
+    strict_audit: bool = True,
+    project_audit_fn: Callable[[Path, bool], Any] | None = None,
+) -> dict[str, Any]:
+    """Run deterministic 0-LLM pre-review fail-fast checks before spawning `agy-code-pr-reviewer`.
+
+    Checks:
+      1. `project_audit --strict` (Zero-PII, Santa Lockdown, 5-language AST/shell/web/JSON checks).
+      2. Diff test coverage presence (non-doc code changes require test coverage in diff or verified `test-local`).
+      3. SHA parity (`head_sha` / tree state matches `verification_results` when present).
+    """
+    resolved_repo = Path(repo_dir).expanduser().resolve() if repo_dir is not None and str(repo_dir).strip() else None
+    norm_changed = [_norm_diff_rel_path(p) for p in changed_files if _norm_diff_rel_path(p)]
+    changed_set = set(norm_changed)
+    doc_only = bool(norm_changed) and all(_is_doc_only_diff_path(p) for p in norm_changed)
+    test_files = [p for p in norm_changed if _is_test_diff_path(p)]
+    code_files = [p for p in norm_changed if not _is_doc_only_diff_path(p) and not _is_test_diff_path(p)]
+
+    gate_errors: list[dict[str, Any]] = []
+    gate_warnings: list[dict[str, Any]] = []
+
+    # 1. `project_audit --strict` & Zero-PII / Santa compliance
+    audit_summary: dict[str, Any] = {
+        "status": "skipped",
+        "passed": True,
+        "strict": bool(strict_audit),
+        "errors_count": 0,
+        "warnings_count": 0,
+        "errors": [],
+        "warnings": [],
+    }
+    if resolved_repo is not None and resolved_repo.is_dir():
+        audit_callable = project_audit_fn
+        if audit_callable is None:
+            pa_mod = _load_project_audit_module()
+            if pa_mod is not None and callable(getattr(pa_mod, "audit_repository", None)):
+                audit_callable = lambda r_dir, s_flag: pa_mod.audit_repository(r_dir, strict=s_flag)  # noqa: E731
+        if audit_callable is not None:
+            try:
+                rep = audit_callable(resolved_repo, bool(strict_audit))
+            except Exception as exc:
+                audit_summary["status"] = "error"
+                audit_summary["passed"] = False
+                gate_errors.append(
+                    {
+                        "code": "project_audit_exception",
+                        "message": _sanitize_home_paths(f"project_audit failed: {exc.__class__.__name__}: {exc}"),
+                    }
+                )
+            else:
+                rep_errors = _extract_audit_findings_dicts(
+                    rep.get("errors", []) if isinstance(rep, dict) else getattr(rep, "errors", [])
+                )
+                rep_warnings = _extract_audit_findings_dicts(
+                    rep.get("warnings", []) if isinstance(rep, dict) else getattr(rep, "warnings", [])
+                )
+                rep_passed = bool(rep.get("passed")) if isinstance(rep, dict) else bool(getattr(rep, "passed", False))
+                audit_summary.update(
+                    {
+                        "status": "ok" if rep_passed else "failed",
+                        "passed": rep_passed,
+                        "errors_count": len(rep_errors),
+                        "warnings_count": len(rep_warnings),
+                        "errors": rep_errors[:25],
+                        "warnings": rep_warnings[:25],
+                    }
+                )
+                for err in rep_errors:
+                    gate_errors.append(
+                        {
+                            "code": f"project_audit:{err['rule_id']}",
+                            "file": err["file"],
+                            "line": err["line"],
+                            "message": f"{err['rule_id']} @ {err['file']}:{err['line']}: {err['message']}",
+                        }
+                    )
+                for warn in rep_warnings:
+                    in_diff = bool(warn["file"] and (warn["file"] in changed_set or not changed_set))
+                    if strict_audit and in_diff:
+                        gate_errors.append(
+                            {
+                                "code": f"project_audit_strict:{warn['rule_id']}",
+                                "file": warn["file"],
+                                "line": warn["line"],
+                                "message": f"{warn['rule_id']} @ {warn['file']}:{warn['line']}: {warn['message']}",
+                            }
+                        )
+                    else:
+                        gate_warnings.append(
+                            {
+                                "code": f"project_audit_warning:{warn['rule_id']}",
+                                "file": warn["file"],
+                                "line": warn["line"],
+                                "message": f"{warn['rule_id']} @ {warn['file']}:{warn['line']}: {warn['message']}",
+                            }
+                        )
+
+    # 2. SHA parity when `verification_results` is present on lock
+    raw_vr = (
+        lock_info.get("verification_results")
+        if isinstance(lock_info, dict) and isinstance(lock_info.get("verification_results"), dict)
+        else {}
+    )
+    eff_vr = dict(verification_results or {})
+    if not eff_vr and raw_vr and resolved_repo is not None and (resolved_repo / ".git").exists():
+        eff_vr = _resolve_valid_verification_results(
+            lock_info,
+            resolved_repo,
+            branch_name=head_branch,
+            pre_commit_state=pre_commit_state,
+        )
+
+    sha_parity: dict[str, Any] = {
+        "status": "not_present",
+        "passed": True,
+        "head_sha": str(head_sha or (verification_gate or {}).get("head_sha") or ""),
+        "verified_head_sha": str(raw_vr.get("head_sha") or ""),
+    }
+    if raw_vr:
+        vr_overall = bool(raw_vr.get("overall_passed", True))
+        if verification_gate is not None:
+            vg_matches = bool(verification_gate.get("matches_head"))
+            vg_passed = bool(verification_gate.get("passed"))
+            parity_ok = vg_matches and vg_passed
+            sha_parity["head_sha"] = str(verification_gate.get("head_sha") or sha_parity["head_sha"])
+        else:
+            parity_ok = bool(eff_vr) and vr_overall
+            if parity_ok and sha_parity["head_sha"] and eff_vr.get("head_sha"):
+                # Allow pre-amend tree/fingerprint match while detecting mismatched commit SHA when clean.
+                if not eff_vr.get("tree_sha") and str(eff_vr.get("head_sha")) != sha_parity["head_sha"]:
+                    parity_ok = False
+        if not parity_ok:
+            sha_parity["status"] = "failed"
+            sha_parity["passed"] = False
+            if not vr_overall or (verification_gate is not None and not verification_gate.get("passed")):
+                gate_errors.append(
+                    {
+                        "code": "verification_failed",
+                        "message": "Recorded `verification_results` did not pass; fix failures and re-run `pr_remediator.py test-local`.",
+                    }
+                )
+            else:
+                gate_errors.append(
+                    {
+                        "code": "sha_parity_mismatch",
+                        "message": (
+                            "`verification_results` head_sha/tree_sha does not match current branch HEAD; "
+                            "re-run `pr_remediator.py test-local` before `prepare-review`."
+                        ),
+                    }
+                )
+        else:
+            sha_parity["status"] = "ok"
+            sha_parity["passed"] = True
+
+    # 3. Diff test coverage presence (non-doc code changes require test coverage in diff or verified test gate)
+    vr_tests_passed = bool(
+        sha_parity["passed"]
+        and (
+            bool((eff_vr.get("unittest") or {}).get("passed"))
+            or bool(eff_vr.get("overall_passed"))
+            or bool((verification_gate or {}).get("tests_passed") and (verification_gate or {}).get("matches_head"))
+        )
+    )
+    has_tests_dir = bool(resolved_repo is not None and (resolved_repo / "tests").is_dir())
+    if not norm_changed or doc_only or not code_files:
+        cov_mode = "doc_only" if doc_only else "no_code_changes"
+        cov_passed = True
+    elif test_files:
+        cov_mode = "tests_in_diff"
+        cov_passed = True
+    elif vr_tests_passed:
+        cov_mode = "verified_test_gate"
+        cov_passed = True
+    elif has_tests_dir:
+        cov_mode = "missing"
+        cov_passed = False
+        gate_errors.append(
+            {
+                "code": "missing_diff_test_coverage",
+                "message": (
+                    f"Non-doc code change(s) ({', '.join(code_files[:5])}) lack test coverage in diff "
+                    "and lack a current verified `test-local` gate."
+                ),
+            }
+        )
+    else:
+        cov_mode = "missing_no_tests_dir_warning"
+        cov_passed = True
+        gate_warnings.append(
+            {
+                "code": "missing_diff_test_coverage_warning",
+                "message": (
+                    f"Non-doc code change(s) ({', '.join(code_files[:5])}) have no `tests/` directory "
+                    "and no verified `test-local` gate."
+                ),
+            }
+        )
+
+    diff_test_coverage = {
+        "passed": cov_passed,
+        "mode": cov_mode,
+        "doc_only": doc_only,
+        "code_files_count": len(code_files),
+        "test_files_count": len(test_files),
+        "verified_test_gate": vr_tests_passed,
+    }
+    passed = not gate_errors
+    return {
+        "passed": passed,
+        "status": "ok" if passed else "failed",
+        "doc_only": doc_only,
+        "project_audit": audit_summary,
+        "sha_parity": sha_parity,
+        "diff_test_coverage": diff_test_coverage,
+        "errors": gate_errors,
+        "warnings": gate_warnings,
+        "error_messages": [e["message"] for e in gate_errors],
+        "warning_messages": [w["message"] for w in gate_warnings],
+    }
+
+
 def get_branch_diff_with_verification_gate(
     *,
     branch: str = "",
@@ -2507,7 +2859,7 @@ def get_branch_diff_with_verification_gate(
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
 ) -> dict[str, Any]:
-    """Compute native git `branch-diff` and embed SHA-bound `verification_gate` for Lean Reviewer Protocol."""
+    """Compute native git `branch-diff` and embed SHA-bound `verification_gate` + `pre_review_gate`."""
     lock_info = get_dev_pr_lock(
         portfolio_dir=portfolio_dir,
         repo_slug=repo_slug,
@@ -2526,7 +2878,16 @@ def get_branch_diff_with_verification_gate(
     )
     vcs = git_client or GitVcsIntegrationClient()
     res = vcs.get_branch_diff(head_branch=resolved_branch, base_branch=base_branch, repo_dir=repo_dir)
-    res["verification_gate"] = build_branch_diff_verification_gate(lock_info, repo_dir, resolved_branch)
+    vg = build_branch_diff_verification_gate(lock_info, repo_dir, resolved_branch)
+    res["verification_gate"] = vg
+    res["pre_review_gate"] = evaluate_pre_review_fail_fast_gate(
+        repo_dir,
+        changed_files=res.get("files", []) or [],
+        lock_info=lock_info,
+        verification_gate=vg,
+        head_branch=resolved_branch,
+        head_sha=str(res.get("head_sha") or vg.get("head_sha") or ""),
+    )
     return res
 
 
