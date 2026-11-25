@@ -475,6 +475,104 @@ class TestPreReviewFailFastGate(unittest.TestCase):
             self.assertTrue(staged_doc["pre_review_gate"]["doc_only"])
             self.assertTrue(staged_doc["pre_review_gate"]["passed"])
 
+    def test_project_audit_errors_are_diff_scoped_and_warnings_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_dir = Path(tmp)
+
+            # (a) Untouched-file errors do NOT block when changed_files is non-empty
+            res_untouched = review_gate.evaluate_pre_review_fail_fast_gate(
+                repo_dir,
+                changed_files=["src/app.py", "tests/test_app.py"],
+                project_audit_fn=lambda _r, _s: {
+                    "passed": False,
+                    "errors": [
+                        {
+                            "severity": "error",
+                            "rule_id": "pii:home-path",
+                            "file": "tests/legacy_fixture.py",
+                            "line": 12,
+                            "message": "pre-existing fixture",
+                        }
+                    ],
+                    "warnings": [],
+                },
+            )
+            self.assertTrue(res_untouched["passed"])
+            self.assertTrue(res_untouched["project_audit"]["passed"])
+            self.assertFalse(res_untouched["project_audit"]["repo_passed"])
+            self.assertEqual(res_untouched["project_audit"]["errors_count"], 1)
+            self.assertEqual(res_untouched["project_audit"]["diff_errors_count"], 0)
+            self.assertEqual(res_untouched["project_audit"]["untouched_errors_count"], 1)
+            self.assertEqual(res_untouched["warnings_count"], 1)
+            self.assertEqual(res_untouched["warnings"][0]["code"], "project_audit_untouched:pii:home-path")
+
+            # (b) Errors inside changed_files STILL fail fast
+            res_in_diff = review_gate.evaluate_pre_review_fail_fast_gate(
+                repo_dir,
+                changed_files=["src/app.py", "tests/test_app.py"],
+                project_audit_fn=lambda _r, _s: {
+                    "passed": False,
+                    "errors": [
+                        {
+                            "severity": "error",
+                            "rule_id": "pii:home-path",
+                            "file": "src/app.py",
+                            "line": 4,
+                            "message": "hardcoded path in diff",
+                        },
+                        {
+                            "severity": "error",
+                            "rule_id": "santa:curl-pipe",
+                            "file": "tests/legacy_fixture.py",
+                            "line": 22,
+                            "message": "untouched error",
+                        },
+                    ],
+                    "warnings": [],
+                },
+            )
+            self.assertFalse(res_in_diff["passed"])
+            self.assertFalse(res_in_diff["project_audit"]["passed"])
+            self.assertEqual(res_in_diff["project_audit"]["errors_count"], 2)
+            self.assertEqual(res_in_diff["project_audit"]["diff_errors_count"], 1)
+            self.assertEqual(res_in_diff["project_audit"]["untouched_errors_count"], 1)
+            self.assertEqual([e["code"] for e in res_in_diff["errors"]], ["project_audit:pii:home-path"])
+
+            # (c) Returned warnings/warning_messages lists are bounded (<= 50) while preserving warnings_count
+            res_capped = review_gate.evaluate_pre_review_fail_fast_gate(
+                repo_dir,
+                changed_files=["README.md"],
+                project_audit_fn=lambda _r, _s: {
+                    "passed": False,
+                    "errors": [
+                        {
+                            "severity": "error",
+                            "rule_id": "santa:bin",
+                            "file": f"tests/untouched_{idx}.py",
+                            "line": idx + 1,
+                            "message": f"untouched err {idx}",
+                        }
+                        for idx in range(2)
+                    ],
+                    "warnings": [
+                        {
+                            "severity": "warning",
+                            "rule_id": "html:inline-style",
+                            "file": f"assets/exam_{idx}.html",
+                            "line": idx + 1,
+                            "message": f"untouched warn {idx}",
+                        }
+                        for idx in range(120)
+                    ],
+                },
+            )
+            self.assertTrue(res_capped["passed"])
+            self.assertTrue(res_capped["project_audit"]["passed"])
+            self.assertEqual(len(res_capped["warnings"]), 50)
+            self.assertEqual(len(res_capped["warning_messages"]), 50)
+            self.assertEqual(res_capped["warnings_count"], 122)
+            self.assertEqual(res_capped["warnings"][0]["code"], "project_audit_untouched:santa:bin")
+
 
 class TestComplexityAuditAndDocsContracts(unittest.TestCase):
     """(C3 & C4) Pure-stdlib AST complexity auditor, SKILL/agent contracts, and router integrity."""

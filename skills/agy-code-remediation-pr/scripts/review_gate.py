@@ -2653,8 +2653,11 @@ def evaluate_pre_review_fail_fast_gate(
     audit_summary: dict[str, Any] = {
         "status": "skipped",
         "passed": True,
+        "repo_passed": True,
         "strict": bool(strict_audit),
         "errors_count": 0,
+        "diff_errors_count": 0,
+        "untouched_errors_count": 0,
         "warnings_count": 0,
         "errors": [],
         "warnings": [],
@@ -2671,6 +2674,7 @@ def evaluate_pre_review_fail_fast_gate(
             except Exception as exc:
                 audit_summary["status"] = "error"
                 audit_summary["passed"] = False
+                audit_summary["repo_passed"] = False
                 gate_errors.append(
                     {
                         "code": "project_audit_exception",
@@ -2685,28 +2689,35 @@ def evaluate_pre_review_fail_fast_gate(
                     rep.get("warnings", []) if isinstance(rep, dict) else getattr(rep, "warnings", [])
                 )
                 rep_passed = bool(rep.get("passed")) if isinstance(rep, dict) else bool(getattr(rep, "passed", False))
-                audit_summary.update(
-                    {
-                        "status": "ok" if rep_passed else "failed",
-                        "passed": rep_passed,
-                        "errors_count": len(rep_errors),
-                        "warnings_count": len(rep_warnings),
-                        "errors": rep_errors[:25],
-                        "warnings": rep_warnings[:25],
-                    }
-                )
+                diff_errors: list[dict[str, Any]] = []
+                diff_strict_warnings_count = 0
+                untouched_errors_count = 0
                 for err in rep_errors:
-                    gate_errors.append(
-                        {
-                            "code": f"project_audit:{err['rule_id']}",
-                            "file": err["file"],
-                            "line": err["line"],
-                            "message": f"{err['rule_id']} @ {err['file']}:{err['line']}: {err['message']}",
-                        }
-                    )
+                    in_diff = bool(err["file"] and (err["file"] in changed_set or not changed_set))
+                    if in_diff or not err["file"]:
+                        diff_errors.append(err)
+                        gate_errors.append(
+                            {
+                                "code": f"project_audit:{err['rule_id']}",
+                                "file": err["file"],
+                                "line": err["line"],
+                                "message": f"{err['rule_id']} @ {err['file']}:{err['line']}: {err['message']}",
+                            }
+                        )
+                    else:
+                        untouched_errors_count += 1
+                        gate_warnings.append(
+                            {
+                                "code": f"project_audit_untouched:{err['rule_id']}",
+                                "file": err["file"],
+                                "line": err["line"],
+                                "message": f"{err['rule_id']} @ {err['file']}:{err['line']}: {err['message']}",
+                            }
+                        )
                 for warn in rep_warnings:
                     in_diff = bool(warn["file"] and (warn["file"] in changed_set or not changed_set))
                     if strict_audit and in_diff:
+                        diff_strict_warnings_count += 1
                         gate_errors.append(
                             {
                                 "code": f"project_audit_strict:{warn['rule_id']}",
@@ -2724,6 +2735,24 @@ def evaluate_pre_review_fail_fast_gate(
                                 "message": f"{warn['rule_id']} @ {warn['file']}:{warn['line']}: {warn['message']}",
                             }
                         )
+                diff_audit_passed = (
+                    (len(diff_errors) == 0 and diff_strict_warnings_count == 0)
+                    if (rep_errors or rep_warnings)
+                    else rep_passed
+                )
+                audit_summary.update(
+                    {
+                        "status": "ok" if diff_audit_passed else "failed",
+                        "passed": diff_audit_passed,
+                        "repo_passed": rep_passed,
+                        "errors_count": len(rep_errors),
+                        "diff_errors_count": len(diff_errors),
+                        "untouched_errors_count": untouched_errors_count,
+                        "warnings_count": len(rep_warnings),
+                        "errors": diff_errors[:25],
+                        "warnings": rep_warnings[:25],
+                    }
+                )
 
     # 2. SHA parity when `verification_results` is present on lock
     raw_vr = (
@@ -2835,6 +2864,8 @@ def evaluate_pre_review_fail_fast_gate(
         "test_files_count": len(test_files),
         "verified_test_gate": vr_tests_passed,
     }
+    max_warnings = 50
+    capped_warnings = gate_warnings[:max_warnings]
     passed = not gate_errors
     return {
         "passed": passed,
@@ -2844,9 +2875,10 @@ def evaluate_pre_review_fail_fast_gate(
         "sha_parity": sha_parity,
         "diff_test_coverage": diff_test_coverage,
         "errors": gate_errors,
-        "warnings": gate_warnings,
+        "warnings": capped_warnings,
+        "warnings_count": len(gate_warnings),
         "error_messages": [e["message"] for e in gate_errors],
-        "warning_messages": [w["message"] for w in gate_warnings],
+        "warning_messages": [w["message"] for w in capped_warnings],
     }
 
 
