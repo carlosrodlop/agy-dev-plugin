@@ -2775,6 +2775,170 @@ def _inspect_local_branch_merged_readonly(
     return False, "not_merged"
 
 
+def _escape_md_cell(value: Any, *, max_len: int = 120) -> str:
+    """Sanitize a table cell for GitHub-Flavored Markdown rendering."""
+    text = str(value if value is not None else "").replace("\r", " ").replace("\n", " ").strip()
+    text = text.replace("|", "\\|")
+    if max_len > 3 and len(text) > max_len:
+        text = text[: max_len - 1].rstrip() + "…"
+    return text
+
+
+def _summarize_lock_slot(slot_obj: Mapping[str, Any], *, fallback_slot_id: int = 1) -> dict[str, Any]:
+    """Project one lock slot dictionary into a minimal, token-saving summary."""
+    raw_files = slot_obj.get("target_files")
+    target_files = [str(p) for p in raw_files if str(p or "").strip()] if isinstance(raw_files, Sequence) and not isinstance(raw_files, (str, bytes)) else []
+    try:
+        slot_id = int(slot_obj.get("slot_id") or fallback_slot_id)
+    except (TypeError, ValueError):
+        slot_id = fallback_slot_id
+    return {
+        "slot_id": slot_id,
+        "lock_id": str(slot_obj.get("lock_id") or ""),
+        "conversation_id": str(slot_obj.get("conversation_id") or ""),
+        "action_id": str(slot_obj.get("action_id") or ""),
+        "status": str(slot_obj.get("status") or ""),
+        "stage_label": str(slot_obj.get("stage_label") or ""),
+        "branch_name": str(slot_obj.get("branch_name") or ""),
+        "pr_gate_ready": bool(slot_obj.get("pr_gate_ready", False)),
+        "branch_pushed": bool(slot_obj.get("branch_pushed", False)),
+        "manual_pr_url": str(slot_obj.get("manual_pr_url") or ""),
+        "worker_cid": str(slot_obj.get("worker_cid") or ""),
+        "overlap_tier": str(slot_obj.get("overlap_tier") or ""),
+        "needs_base_rebase": bool(slot_obj.get("needs_base_rebase", False)),
+        "target_files_count": len(target_files),
+        "target_files": target_files[:12],
+        "summary": str(slot_obj.get("summary") or "")[:180],
+    }
+
+
+def _summarize_repo_lock_entry(repo_slug: str, lock_obj: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one per-repository lock entry (normalizing `slots` dict/list into a flat list)."""
+    raw_slots = lock_obj.get("slots")
+    slot_summaries: list[dict[str, Any]] = []
+    if isinstance(raw_slots, Mapping):
+        for s_key, s_val in raw_slots.items():
+            if not isinstance(s_val, Mapping):
+                continue
+            try:
+                fb_id = int(s_key)
+            except (TypeError, ValueError):
+                fb_id = len(slot_summaries) + 1
+            slot_summaries.append(_summarize_lock_slot(s_val, fallback_slot_id=fb_id))
+    elif isinstance(raw_slots, Sequence) and not isinstance(raw_slots, (str, bytes)):
+        for idx, s_val in enumerate(raw_slots, start=1):
+            if isinstance(s_val, Mapping):
+                slot_summaries.append(_summarize_lock_slot(s_val, fallback_slot_id=idx))
+    elif bool(lock_obj.get("active", False)):
+        slot_summaries.append(_summarize_lock_slot(lock_obj, fallback_slot_id=1))
+    slot_summaries.sort(key=lambda item: int(item.get("slot_id") or 1))
+
+    try:
+        max_slots = int(lock_obj.get("max_slots") or DEFAULT_MAX_REPO_SLOTS)
+    except (TypeError, ValueError):
+        max_slots = DEFAULT_MAX_REPO_SLOTS
+    active_slots_count = len(slot_summaries) if slot_summaries else int(lock_obj.get("active_slots_count") or 0)
+    occupancy = str(lock_obj.get("slot_occupancy") or f"{active_slots_count}/{max_slots}")
+    is_active = bool(lock_obj.get("active", bool(slot_summaries)))
+    resolved_slug = str(lock_obj.get("repo_slug") or lock_obj.get("repo") or repo_slug)
+    return {
+        "repo_slug": resolved_slug,
+        "active": is_active,
+        "status": str(lock_obj.get("status") or ("INACTIVE" if not is_active else "")),
+        "slot_occupancy": occupancy,
+        "active_slots_count": active_slots_count,
+        "max_slots": max_slots,
+        "conversation_id": str(lock_obj.get("conversation_id") or ""),
+        "branch_name": str(lock_obj.get("branch_name") or ""),
+        "pr_gate_ready": bool(lock_obj.get("pr_gate_ready", False)),
+        "manual_pr_url": str(lock_obj.get("manual_pr_url") or ""),
+        "slots": slot_summaries,
+    }
+
+
+def build_compact_lock_status_payload(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a compact, token-saving JSON projection of a `lock-status` payload."""
+    raw_locks = raw.get("locks")
+    locks_map: dict[str, dict[str, Any]] = {}
+    active_locks: list[dict[str, Any]] = []
+    if isinstance(raw_locks, Mapping):
+        for slug in sorted(raw_locks.keys()):
+            val = raw_locks[slug]
+            if isinstance(val, Mapping):
+                entry = _summarize_repo_lock_entry(str(slug), val)
+                locks_map[str(slug)] = entry
+                if entry["active"]:
+                    active_locks.append(entry)
+
+    compact_payload: dict[str, Any] = {
+        "status": str(raw.get("status") or "ok"),
+        "compact": True,
+        "active_count": len(active_locks),
+        "active": bool(raw.get("active", bool(active_locks))),
+    }
+    if "released" in raw:
+        compact_payload["released"] = bool(raw.get("released", False))
+    if raw.get("repo_slug"):
+        compact_payload["repo_slug"] = str(raw.get("repo_slug"))
+    raw_single = raw.get("lock")
+    if isinstance(raw_single, Mapping) and raw_single:
+        single_slug = str(raw_single.get("repo_slug") or raw.get("repo_slug") or "")
+        compact_payload["lock"] = _summarize_repo_lock_entry(single_slug, raw_single)
+    compact_payload["locks"] = locks_map
+    compact_payload["active_locks"] = active_locks
+
+    q_recon = raw.get("queue_reconciliation")
+    if isinstance(q_recon, Mapping):
+        compact_payload["queue_reconciliation"] = {
+            "status": str(q_recon.get("status") or "ok"),
+            "checked_count": int(q_recon.get("checked_count") or 0),
+            "reconciled_count": int(q_recon.get("reconciled_count") or 0),
+            "reconciled_items": list(q_recon.get("reconciled_items") or [])[:10],
+        }
+    return compact_payload
+
+
+def render_lock_status_markdown(raw: Mapping[str, Any]) -> str:
+    """Render a compact Markdown summary table for `pr_remediator.py lock-status`."""
+    compact = build_compact_lock_status_payload(raw)
+    active_locks = list(compact.get("active_locks") or [])
+    header_parts = [f"`{len(active_locks)}` active repo(s)"]
+    if compact.get("repo_slug"):
+        header_parts.append(f"scope `{compact['repo_slug']}`")
+    if "released" in compact:
+        header_parts.append(f"released=`{compact['released']}`")
+    lines = [f"### Per-Repository Dev PR Locks ({' · '.join(header_parts)})", ""]
+    if not active_locks:
+        lines.append("_No active repository locks._")
+        return "\n".join(lines)
+
+    lines.append("| Repo | Slot | Occupancy | Status | Conversation ID | Branch | PR Gate | Files |")
+    lines.append("| :--- | :---: | :---: | :--- | :--- | :--- | :---: | :---: |")
+    for repo_entry in active_locks:
+        repo_lbl = _escape_md_cell(repo_entry.get("repo_slug") or "", max_len=60)
+        occ = _escape_md_cell(repo_entry.get("slot_occupancy") or "", max_len=12)
+        slots = repo_entry.get("slots") or []
+        if not slots:
+            lines.append(
+                f"| `{repo_lbl}` | - | `{occ}` | `{_escape_md_cell(repo_entry.get('status') or '', max_len=36)}` "
+                f"| `{_escape_md_cell(repo_entry.get('conversation_id') or '-', max_len=36)}` "
+                f"| `{_escape_md_cell(repo_entry.get('branch_name') or '-', max_len=60)}` "
+                f"| `{'yes' if repo_entry.get('pr_gate_ready') else 'no'}` | `0` |"
+            )
+            continue
+        for slot in slots:
+            slot_lbl = f"#{slot.get('slot_id', 1)}"
+            st_lbl = _escape_md_cell(slot.get("status") or repo_entry.get("status") or "", max_len=36)
+            cid_lbl = _escape_md_cell(slot.get("conversation_id") or "-", max_len=36)
+            br_lbl = _escape_md_cell(slot.get("branch_name") or "-", max_len=60)
+            pr_lbl = "ready" if slot.get("pr_gate_ready") else ("pushed" if slot.get("branch_pushed") else "local")
+            f_cnt = int(slot.get("target_files_count") or 0)
+            lines.append(
+                f"| `{repo_lbl}` | `{slot_lbl}` | `{occ}` | `{st_lbl}` | `{cid_lbl}` | `{br_lbl}` | `{pr_lbl}` | `{f_cnt}` |"
+            )
+    return "\n".join(lines)
+
+
 def register_lock_cli(sub: Any) -> None:
     """Register per-repository lock CLI subcommands (`lock-status`, `acquire-lock`, `release-lock`, `lock-heartbeat`)."""
     p_lock = sub.add_parser("lock-status", help="Inspect or sync per-repository cross-conversation branch locks (`dev_pr_locks`).")
@@ -2787,6 +2951,19 @@ def register_lock_cli(sub: Any) -> None:
     p_lock.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug filter.")
     p_lock.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
     p_lock.add_argument("--all", dest="all_repos", action="store_true", help="Include all active repository locks.")
+    p_lock.add_argument(
+        "--summary",
+        dest="summary",
+        action="store_true",
+        help="Emit compact token-saving JSON projection (shorthand for `--format compact`).",
+    )
+    p_lock.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "compact", "md"),
+        default="json",
+        help="Output format: `json` (full default), `compact` (minimal JSON), or `md` (Markdown table).",
+    )
 
     p_acq = sub.add_parser("acquire-lock", help="Acquire a per-repository cross-conversation branch development lock.")
     p_acq.add_argument("--id", "--conversation-id", dest="conversation_id", required=True, help="Conversation ID.")
@@ -2853,7 +3030,15 @@ def dispatch_lock_cli(args: Any) -> int | None:
                 "lock": _facade_attr("get_dev_pr_lock", get_dev_pr_lock)(repo_slug=repo_s, workdir=workdir_s),
                 "locks": all_locks,
             }
-        print(json.dumps(res, indent=2, ensure_ascii=False))
+        output_fmt = str(getattr(args, "output_format", "json") or "json").strip().lower()
+        if output_fmt == "json" and bool(getattr(args, "summary", False)):
+            output_fmt = "compact"
+        if output_fmt == "md":
+            print(render_lock_status_markdown(res))
+        elif output_fmt == "compact":
+            print(json.dumps(build_compact_lock_status_payload(res), indent=2, ensure_ascii=False))
+        else:
+            print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
 
     if args.subcommand == "acquire-lock":

@@ -18,7 +18,7 @@ Instead of jumping straight to code or dumping a monolithic finished proposal wi
 ## 1. Adaptive Activation Gate (When to Grill vs. Skip)
 
 - **Trigger by Default (Interactive Engineering Work)**: Activate Phase 0 Grill-Me automatically whenever the user introduces a new feature, UX/UI change, architectural refactor, workflow design, cross-repo change, or open-ended problem statement — and whenever resolving an existing `hitl_blocked` item in `dev_queue.json`.
-- **RCA / Discrepancy Triage -> Co-Design Transition**: Whenever an interactive diagnostic investigation or discrepancy RCA surfaces `>=2` product, UX, or scope forks (rather than a single obvious deterministic bug), immediately run silent `pr_remediator.py lock-status --all` + `pr_remediator.py queue-list` inspection and transition directly to Phase 0 Co-Design in the **same response** using structured `ask_question` trade-offs with `(Recommended)` defaults — NEVER close an RCA with trailing plain-text `"would you like me to..."` open bullet lists.
+- **RCA / Discrepancy Triage -> Co-Design Transition**: Whenever an interactive diagnostic investigation or discrepancy RCA surfaces `>=2` product, UX, or scope forks (rather than a single obvious deterministic bug), immediately run silent `pr_remediator.py lock-status --all --format md` + `pr_remediator.py queue-list --active-only --format md` inspection (prefer `--format md` or `--summary` over raw JSON/ad-hoc Python parsers) and transition directly to Phase 0 Co-Design in the **same response** using structured `ask_question` trade-offs with `(Recommended)` defaults — NEVER close an RCA with trailing plain-text `"would you like me to..."` open bullet lists.
 - **Skip Cleanly When Unnecessary**:
   1. **Trivial or Unambiguous Fixes**: Typos, mechanical lint/format repairs, or deterministic bugs with a single obvious root cause and fix.
   2. **Explicit User Bypass**: When the user explicitly asks to skip discovery (e.g., *"do it directly"*, *"no questions"*, *"skip grill-me"*).
@@ -28,7 +28,7 @@ Instead of jumping straight to code or dumping a monolithic finished proposal wi
 
 ## 2. Silent Codebase-First Discovery (Zero Redundant Questions)
 
-- Before asking the first question (including when transitioning out of a discrepancy RCA), **silently inspect** the target repositories, impacted modules, existing tests, active per-repository `dev_pr_locks` (`pr_remediator.py lock-status --all`), and queued work (`pr_remediator.py queue-list` / `dev_queue.json`).
+- Before asking the first question (including when transitioning out of a discrepancy RCA), **silently inspect** the target repositories, impacted modules, existing tests, active per-repository `dev_pr_locks` (`pr_remediator.py lock-status --all --format md` or `--summary`), and queued work (`pr_remediator.py queue-list --active-only --format md` or `--summary`).
 - **NEVER** ask the user facts the codebase, git history, or runtime config can already answer (file paths, schemas, existing endpoints, lock collisions, test frameworks).
 - Reserve every question strictly for genuine product, UX, scope, trade-off, or risk-appetite forks where human judgment defines the right design.
 
@@ -70,6 +70,6 @@ Then execute the exit handoff calibrated to current per-repository `dev_pr_locks
 - **Target Repo(s) Unlocked**: Ask whether to **implement immediately** on a timestamped `fix/*` worktree branch (`agy-code-remediation-pr`) OR **enqueue as `pending`** in `dev_queue.json` (`pr_remediator.py queue-add`).
 - **Target Repo(s) Locked (Mandatory Auto-Enqueue — Zero Confirmation Prompt)**:
   - When one or more target repositories currently hold an active `dev_pr_lock`, **DO NOT ask the user for confirmation or priority** (never prompt *"Do you want me to enqueue this?"* or *"What priority should I assign?"*).
-  - Immediately inspect `dev_queue.json` (`pr_remediator.py queue-list`), active `dev_pr_locks` (`pr_remediator.py lock-status --all`), application architecture, dependencies (`depends_on`), and user urgency to **assign a calibrated numeric priority automatically** relative to existing queued tasks.
+  - Immediately inspect `dev_queue.json` (`pr_remediator.py queue-list --active-only --format md`), active `dev_pr_locks` (`pr_remediator.py lock-status --all --format md`), application architecture, dependencies (`depends_on`), and user urgency to **assign a calibrated numeric priority automatically** relative to existing queued tasks.
   - Immediately run `pr_remediator.py queue-add --status pending` with full `rca_summary`, `proposed_fix`, `target_files`, `depends_on`, `repo_slugs` (`--repos`), and `--notes` (all confirmed Design Contract decisions and non-goals) — avoiding `hitl_blocked` buildup so `agy-dev-orchestrator` executes cleanly as soon as the blocking lock clears.
   - Render a **concise visual confirmation** of the newly queued item and active queue state (compact Markdown table showing queue position, calibrated priority, target repo(s), active blocker lock, and next-up sequence).

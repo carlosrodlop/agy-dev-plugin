@@ -37,6 +37,7 @@ from git_client import GitVcsIntegrationClient  # noqa: E402
 from lock_store import (  # noqa: E402
     _branch_found_in_base_git_log,
     _entry_matches_branch,
+    _escape_md_cell,
     _facade_attr,
     _inspect_local_branch_merged_readonly,
     _is_same_conversation_id,
@@ -1813,12 +1814,179 @@ def get_next_dev_queue_item(
     }
 
 
+def _filter_queue_list_items(
+    items: Sequence[Mapping[str, Any]],
+    *,
+    status_filter: str = "",
+    active_only: bool = False,
+    repo_slug: str = "",
+) -> list[dict[str, Any]]:
+    """Filter queue items by status, active-only exclusion, and optional repo slug substring."""
+    st_clean = str(status_filter or "").strip().lower()
+    repo_clean = str(repo_slug or "").strip().lower()
+    done_set = set(DEV_QUEUE_DONE_STATUSES)
+    filtered: list[dict[str, Any]] = []
+    for raw_item in items:
+        if not isinstance(raw_item, Mapping):
+            continue
+        item_status = str(raw_item.get("status") or "").strip().lower()
+        if st_clean and item_status != st_clean:
+            continue
+        if active_only and item_status in done_set:
+            continue
+        if repo_clean:
+            repos = [str(r or "").lower() for r in (raw_item.get("repo_slugs") or [])]
+            if not any(repo_clean in r for r in repos):
+                continue
+        filtered.append(dict(raw_item))
+    return filtered
+
+
+def build_compact_queue_list_payload(
+    raw: Mapping[str, Any],
+    *,
+    status_filter: str = "",
+    active_only: bool = False,
+    repo_slug: str = "",
+    limit: int = 0,
+) -> dict[str, Any]:
+    """Return a compact, token-saving JSON projection of `pr_remediator.py queue-list`."""
+    matched = _filter_queue_list_items(
+        raw.get("items") or [],
+        status_filter=status_filter,
+        active_only=active_only,
+        repo_slug=repo_slug,
+    )
+    total_matched = len(matched)
+    selected = matched[:limit] if limit > 0 else matched
+    compact_items: list[dict[str, Any]] = []
+    for it in selected:
+        raw_prio = it.get("priority", 50)
+        eff_prio = it.get("effective_priority", raw_prio)
+        target_files = it.get("target_files")
+        tf_count = len(target_files) if isinstance(target_files, Sequence) and not isinstance(target_files, (str, bytes)) else 0
+        row: dict[str, Any] = {
+            "priority": int(raw_prio) if isinstance(raw_prio, (int, float)) else 50,
+            "effective_priority": int(eff_prio) if isinstance(eff_prio, (int, float)) else (int(raw_prio) if isinstance(raw_prio, (int, float)) else 50),
+            "status": str(it.get("status") or ""),
+            "conversation_id": str(it.get("conversation_id") or ""),
+            "action_id": str(it.get("action_id") or ""),
+            "repo_slugs": [str(r) for r in (it.get("repo_slugs") or []) if str(r or "").strip()],
+            "title": str(it.get("title") or "")[:140],
+            "target_files_count": tf_count,
+        }
+        if it.get("importance"):
+            row["importance"] = str(it.get("importance"))
+        if it.get("component"):
+            row["component"] = str(it.get("component"))
+        merged_repos = [str(r) for r in (it.get("merged_repos") or []) if str(r or "").strip()]
+        if merged_repos:
+            row["merged_repos"] = merged_repos
+        depends_on = [str(d) for d in (it.get("depends_on") or []) if str(d or "").strip()]
+        if depends_on:
+            row["depends_on"] = depends_on
+        branch_names = [str(b) for b in (it.get("branch_names") or []) if str(b or "").strip()]
+        if branch_names:
+            row["branch_names"] = branch_names
+        pr_urls = [str(u) for u in (it.get("pr_urls") or []) if str(u or "").strip()]
+        if pr_urls:
+            row["pr_urls"] = pr_urls
+        compact_items.append(row)
+
+    return {
+        "status": str(raw.get("status") or "ok"),
+        "compact": True,
+        "active_only": bool(active_only),
+        "total_matched": total_matched,
+        "returned_count": len(compact_items),
+        "summary": dict(raw.get("summary") or {}),
+        "items": compact_items,
+    }
+
+
+def render_queue_list_markdown(
+    raw: Mapping[str, Any],
+    *,
+    status_filter: str = "",
+    active_only: bool = False,
+    repo_slug: str = "",
+    limit: int = 0,
+) -> str:
+    """Render a compact Markdown summary table for `pr_remediator.py queue-list`."""
+    compact = build_compact_queue_list_payload(
+        raw,
+        status_filter=status_filter,
+        active_only=active_only,
+        repo_slug=repo_slug,
+        limit=limit,
+    )
+    summary = compact.get("summary") or {}
+    items = list(compact.get("items") or [])
+    counts_str = ", ".join(
+        f"{k}={summary.get(k, 0)}"
+        for k in ("in_progress", "pr_open", "pending", "hitl_blocked", "standby")
+        if int(summary.get(k, 0) or 0) > 0 or k in ("in_progress", "pr_open", "pending")
+    )
+    scope_bits = [f"{compact['returned_count']}/{compact['total_matched']} shown"]
+    if active_only:
+        scope_bits.append("active-only")
+    if status_filter:
+        scope_bits.append(f"status={status_filter}")
+    if repo_slug:
+        scope_bits.append(f"repo={repo_slug}")
+    lines = [
+        f"### Dev Queue ({' · '.join(scope_bits)} | {counts_str})",
+        "",
+    ]
+    if not items:
+        lines.append("_No matching queue items._")
+        return "\n".join(lines)
+
+    lines.append("| Prio | Status | Conversation ID | Repos | Deps | Title |")
+    lines.append("| :---: | :--- | :--- | :--- | :--- | :--- |")
+    for it in items:
+        raw_p = it["priority"]
+        eff_p = it["effective_priority"]
+        prio_lbl = f"P{raw_p}→{eff_p}" if eff_p != raw_p else f"P{raw_p}"
+        st_lbl = _escape_md_cell(it.get("status") or "", max_len=24)
+        cid_lbl = _escape_md_cell(it.get("conversation_id") or "", max_len=36)
+        repos_short = ", ".join(r.split("/")[-1] for r in (it.get("repo_slugs") or [])) or "-"
+        deps_short = ", ".join(d[:8] for d in (it.get("depends_on") or [])) or "-"
+        title_lbl = _escape_md_cell(it.get("title") or "", max_len=100)
+        lines.append(
+            f"| `{prio_lbl}` | `{st_lbl}` | `{cid_lbl}` | `{_escape_md_cell(repos_short, max_len=48)}` "
+            f"| `{_escape_md_cell(deps_short, max_len=32)}` | {title_lbl} |"
+        )
+    return "\n".join(lines)
+
+
 def register_queue_cli(sub: Any) -> None:
     """Register `dev_queue.json`, optimizer, and doctor CLI subcommands."""
     from dev_queue_doctor import DEFAULT_WAKE_COOLDOWN_SECONDS
 
     p_qlist = sub.add_parser("queue-list", help="Inspect persistent orchestrator development queue (`dev_queue.json`).")
     p_qlist.add_argument("--status", default="", help="Optional status filter.")
+    p_qlist.add_argument(
+        "--active-only",
+        dest="active_only",
+        action="store_true",
+        help="Exclude terminal statuses (`merged`, `cleaned`, `cancelled`, `rejected`).",
+    )
+    p_qlist.add_argument("--repo", dest="repo_slug", default="", help="Optional repository slug/substring filter.")
+    p_qlist.add_argument("--limit", type=int, default=0, help="Optional maximum number of items to return (0 = unlimited).")
+    p_qlist.add_argument(
+        "--summary",
+        dest="summary",
+        action="store_true",
+        help="Emit compact token-saving JSON projection (implies `--active-only` when `--status` is unset).",
+    )
+    p_qlist.add_argument(
+        "--format",
+        dest="output_format",
+        choices=("json", "compact", "md"),
+        default="json",
+        help="Output format: `json` (full default), `compact` (minimal JSON), or `md` (Markdown table).",
+    )
 
     p_qadd = sub.add_parser("queue-add", help="Add or update a task in `dev_queue.json`.")
     p_qadd.add_argument("--id", "--conversation-id", dest="conversation_id", required=True, help="Task Conversation ID.")
@@ -1964,9 +2132,49 @@ def dispatch_queue_cli(args: Any) -> int | None:
     if args.subcommand == "queue-list":
         q_res = _facade_attr("load_dev_queue", load_dev_queue)()
         st_filter = str(getattr(args, "status", "") or "").strip().lower()
-        if st_filter:
-            q_res["items"] = [it for it in q_res.get("items") or [] if str(it.get("status") or "").lower() == st_filter]
-        print(json.dumps({"status": "ok", **q_res}, indent=2, ensure_ascii=False))
+        repo_filter = str(getattr(args, "repo_slug", "") or "").strip()
+        limit_n = max(0, int(getattr(args, "limit", 0) or 0))
+        summary_flag = bool(getattr(args, "summary", False))
+        active_only = bool(getattr(args, "active_only", False)) or (summary_flag and not st_filter)
+        output_fmt = str(getattr(args, "output_format", "json") or "json").strip().lower()
+        if output_fmt == "json" and summary_flag:
+            output_fmt = "compact"
+
+        if output_fmt == "md":
+            print(
+                render_queue_list_markdown(
+                    q_res,
+                    status_filter=st_filter,
+                    active_only=active_only,
+                    repo_slug=repo_filter,
+                    limit=limit_n,
+                )
+            )
+        elif output_fmt == "compact":
+            print(
+                json.dumps(
+                    build_compact_queue_list_payload(
+                        q_res,
+                        status_filter=st_filter,
+                        active_only=active_only,
+                        repo_slug=repo_filter,
+                        limit=limit_n,
+                    ),
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+        else:
+            if st_filter or active_only or repo_filter:
+                q_res["items"] = _filter_queue_list_items(
+                    q_res.get("items") or [],
+                    status_filter=st_filter,
+                    active_only=active_only,
+                    repo_slug=repo_filter,
+                )
+            if limit_n > 0:
+                q_res["items"] = list(q_res.get("items") or [])[:limit_n]
+            print(json.dumps({"status": "ok", **q_res}, indent=2, ensure_ascii=False))
         return 0
 
     if args.subcommand == "queue-add":

@@ -10,9 +10,10 @@ All code, script, skill, rule, agent, hook, and configuration changes MUST flow 
 ## End-to-End Execution Protocol
 1. **Check Per-Repository Lock Status & Sync Local `main`**:
    ```bash
-   python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py lock-status --all --sync-git
-   python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py lock-status --workdir <TARGET_REPO_DIR> --sync-git
+   python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py lock-status --all --sync-git --format md
+   python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py lock-status --workdir <TARGET_REPO_DIR> --sync-git --summary
    ```
+   - Use `--format md` (Markdown table) or `--summary` / `--format compact` (minimal JSON with flat `slots` lists) on `lock-status`, and `--active-only --format md` or `--summary` on `queue-list` to avoid verbose raw JSON truncation and ad-hoc inline Python scraping (`--format json` remains the backward-compatible default).
    - Locks are isolated per repository slug (`owner/repo`) with up to N slots per repo (`max_slots` via `AGY_DEV_MAX_SLOTS_PER_REPO`, clamped 1..4, default 3; strictly max 1 open GitHub PR per repo, Slot #1 only); distinct unlocked repositories progress in parallel.
    - **4-Tier Overlap Analysis (`analyze-overlap`), Follower Slots #2..#N (`--allow-slot2`), Swarm & Stacked Branches**:
      - Run `pr_remediator.py analyze-overlap --repo <owner/repo> --workdir <TARGET_REPO_DIR>` to classify same-repo blast-radius overlap (`NONE`, `TRANSITIVE`, `INTERFACE_SHARED`, `DEEP_SHARED`).
