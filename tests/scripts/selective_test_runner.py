@@ -31,6 +31,7 @@ ALL_TEST_MODULES = [
     "tests.test_pr_remediator_preview_staging",
     "tests.test_pr_remediator_queue_and_cleanup",
     "tests.test_queue_compactor",
+    "tests.test_sdlc_determinism_batch",
     "tests.test_sidecar_ghost_purge",
 ]
 
@@ -107,6 +108,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_pr_remediator_preview_staging.py": "tests.test_pr_remediator_preview_staging",
     "tests/test_pr_remediator_queue_and_cleanup.py": "tests.test_pr_remediator_queue_and_cleanup",
     "tests/test_queue_compactor.py": "tests.test_queue_compactor",
+    "tests/test_sdlc_determinism_batch.py": "tests.test_sdlc_determinism_batch",
     "tests/test_sidecar_ghost_purge.py": "tests.test_sidecar_ghost_purge",
 }
 
@@ -537,6 +539,24 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_deterministic_first_audit" not in selected:
                 selected.append("tests.test_deterministic_first_audit")
+
+        if (
+            norm.endswith(
+                (
+                    "pr_remediator.py",
+                    "review_gate.py",
+                    "dev_queue_doctor.py",
+                    "queue_compactor.py",
+                    "complexity_audit.py",
+                    "test_sdlc_determinism_batch.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith(("sidecars/dev-queue-watchdog/", "skills/agy-code-design-refactor/"))
+            or norm in ("agents/agy-dev-orchestrator.md",)
+        ):
+            if "tests.test_sdlc_determinism_batch" not in selected:
+                selected.append("tests.test_sdlc_determinism_batch")
 
         if norm not in ISOLATED_TEST_FILE_MODULES and "tests.test_agy_dev_plugin" not in selected:
             selected.append("tests.test_agy_dev_plugin")

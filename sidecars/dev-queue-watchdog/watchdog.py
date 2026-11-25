@@ -42,8 +42,10 @@ for _cand_root in (_INSTALLED_PLUGIN_ROOT, _PLUGIN_ROOT):
 
 import dev_common  # noqa: E402
 import dev_queue_doctor  # noqa: E402
+import lock_store  # noqa: E402
 import merge_watcher  # noqa: E402
 import orchestration_control as _orch_ctrl  # noqa: E402
+import review_gate  # noqa: E402
 
 DEFAULT_WATCHDOG_INTERVAL_SECONDS = 300
 MIN_WATCHDOG_INTERVAL_SECONDS = 30
@@ -257,6 +259,133 @@ def _maybe_run_hourly_auto_cleanup(
         }
 
 
+def _run_zero_llm_rebase_reverify_pass(
+    *,
+    state_dir: Path | str | None = None,
+    sync_git: bool = True,
+    dry_run: bool = False,
+    git_client: Any | None = None,
+) -> dict[str, Any]:
+    """Run 0-LLM `rebase-reverify` directly on `NEEDS_REBASE_REVERIFY` / stale follower locks without waking LLM."""
+    resolved_state = dev_common.resolve_state_dir(portfolio_dir=state_dir)
+    all_locks = lock_store.get_all_dev_pr_locks(portfolio_dir=resolved_state)
+    is_offline = os.environ.get("AGY_OFFLINE_ONLY") == "1"
+    actions: list[dict[str, Any]] = []
+    agent_intervention_slots: list[dict[str, Any]] = []
+    auto_promoted_count = 0
+    applied_count = 0
+
+    for slug, lk in sorted(all_locks.items()):
+        if not isinstance(lk, dict) or not bool(lk.get("active")):
+            continue
+        for slot_lk in dev_common.iter_active_lock_slots(lk):
+            st_u = str(slot_lk.get("status") or "").strip().upper()
+            slot_num = int(slot_lk.get("slot_id") or 1)
+            br = str(slot_lk.get("branch_name") or "").strip()
+            wt_raw = str(slot_lk.get("worktree_path") or slot_lk.get("target_repo_dir") or "").strip()
+            wt_expanded = wt_raw.replace("$HOME", str(Path.home())) if wt_raw else ""
+            if st_u in ("NEEDS_AGENT_CONFLICT_RESOLUTION", "NEEDS_AGENT_SEMANTIC_FIX"):
+                agent_intervention_slots.append(
+                    {
+                        "repo_slug": slug,
+                        "slot_id": slot_num,
+                        "branch_name": br,
+                        "status": st_u,
+                    }
+                )
+                continue
+            needs_rb = bool(
+                st_u == "NEEDS_REBASE_REVERIFY"
+                or slot_lk.get("needs_base_rebase")
+                or slot_lk.get("base_stale")
+            )
+            if not needs_rb:
+                continue
+            if dry_run:
+                actions.append(
+                    {
+                        "action": "rebase_and_reverify_stale_follower",
+                        "repo_slug": slug,
+                        "slot_id": slot_num,
+                        "branch_name": br,
+                        "status": "dry_run",
+                        "outcome": "DRY_RUN",
+                        "promoted_to_human_pr": False,
+                        "requires_wake": False,
+                    }
+                )
+                continue
+            try:
+                rb_res = review_gate.run_slot_rebase_reverify(
+                    repo_slug=slug,
+                    workdir=wt_expanded or None,
+                    branch_name=br,
+                    fetch=bool(sync_git and not is_offline),
+                    portfolio_dir=resolved_state,
+                    git_client=git_client,
+                )
+                outcome = str((rb_res or {}).get("outcome") or (rb_res or {}).get("status") or "")
+                promoted = bool((rb_res or {}).get("promoted_to_human_pr"))
+                auto_promoted = outcome == "AUTO_PROMOTED_ZERO_LLM" or promoted
+                needs_wake = outcome in ("NEEDS_AGENT_CONFLICT_RESOLUTION", "NEEDS_AGENT_SEMANTIC_FIX") or (
+                    (rb_res or {}).get("status") != "ok"
+                )
+                if (rb_res or {}).get("status") == "ok":
+                    applied_count += 1
+                if auto_promoted:
+                    auto_promoted_count += 1
+                if needs_wake:
+                    agent_intervention_slots.append(
+                        {
+                            "repo_slug": slug,
+                            "slot_id": slot_num,
+                            "branch_name": br,
+                            "status": outcome or "ERROR",
+                        }
+                    )
+                actions.append(
+                    {
+                        "action": "rebase_and_reverify_stale_follower",
+                        "repo_slug": slug,
+                        "slot_id": slot_num,
+                        "branch_name": br,
+                        "status": "applied" if (rb_res or {}).get("status") == "ok" else "error",
+                        "outcome": outcome,
+                        "promoted_to_human_pr": promoted,
+                        "auto_promoted_zero_llm": auto_promoted,
+                        "requires_wake": needs_wake,
+                    }
+                )
+            except Exception as exc:
+                agent_intervention_slots.append(
+                    {
+                        "repo_slug": slug,
+                        "slot_id": slot_num,
+                        "branch_name": br,
+                        "status": "ERROR",
+                    }
+                )
+                actions.append(
+                    {
+                        "action": "rebase_and_reverify_stale_follower",
+                        "repo_slug": slug,
+                        "slot_id": slot_num,
+                        "branch_name": br,
+                        "status": "error",
+                        "error": _sanitize_path(str(exc)),
+                        "requires_wake": True,
+                    }
+                )
+
+    return {
+        "actions": actions,
+        "applied_count": applied_count,
+        "auto_promoted_count": auto_promoted_count,
+        "agent_intervention_slots": agent_intervention_slots,
+        "requires_wake": bool(agent_intervention_slots),
+    }
+
+
 def run_watchdog_cycle(
     *,
     state_dir: Path | str | None = None,
@@ -366,6 +495,13 @@ def run_watchdog_cycle(
             "wake": wake_info,
         }
 
+    rebase_pass = _run_zero_llm_rebase_reverify_pass(
+        state_dir=state_dir,
+        sync_git=sync_git,
+        dry_run=dry_run,
+        git_client=git_client,
+    )
+
     diag = dev_queue_doctor.diagnose_orchestrator(
         state_dir=state_dir,
         repos_dir=repos_dir,
@@ -393,6 +529,24 @@ def run_watchdog_cycle(
             ps_output=ps_output,
             ps_runner=ps_runner,
         )
+        if rebase_pass["applied_count"] > 0 or rebase_pass["auto_promoted_count"] > 0:
+            return {
+                "status": "healed",
+                "overall_status": str(diag.get("overall_status") or "healthy"),
+                "action_required": False,
+                "needs_fix": False,
+                "needs_wake": False,
+                "healed": True,
+                "woke": False,
+                "auto_promoted_zero_llm": rebase_pass["auto_promoted_count"] > 0,
+                "rebase_actions": rebase_pass["actions"],
+                "remediation_actions": rebase_pass["actions"],
+                "checked_at": str(diag.get("generated_at") or _utc_now_iso()),
+                "health_score": int(diag.get("health_score") or 100),
+                "anomalies": [],
+                "queue_summary": dict(diag.get("queue_summary") or {}),
+                "auto_cleanup": auto_cleanup,
+            }
         return {
             "status": "healthy",
             "overall_status": str(diag.get("overall_status") or "healthy"),
@@ -407,7 +561,7 @@ def run_watchdog_cycle(
         }
 
     needs_fix = bool(diag.get("needs_fix"))
-    needs_wake = bool(diag.get("needs_wake"))
+    needs_wake = bool(diag.get("needs_wake") or rebase_pass.get("requires_wake"))
     doc_res = dev_queue_doctor.run_queue_doctor(
         state_dir=state_dir,
         repos_dir=repos_dir,
@@ -430,8 +584,17 @@ def run_watchdog_cycle(
 
     wake_info = doc_res.get("wake") if isinstance(doc_res.get("wake"), dict) else {}
     woke = bool(wake_info.get("woke"))
-    rem_actions = [r for r in (doc_res.get("remediation_actions") or []) if isinstance(r, dict)]
-    healed = bool(needs_fix and not dry_run and any(r.get("status") == "applied" for r in rem_actions))
+    rem_actions = [
+        *rebase_pass["actions"],
+        *[r for r in (doc_res.get("remediation_actions") or []) if isinstance(r, dict)],
+    ]
+    healed = bool(
+        not dry_run
+        and (
+            rebase_pass["applied_count"] > 0
+            or (needs_fix and any(r.get("status") == "applied" for r in rem_actions))
+        )
+    )
 
     wake_status = str(wake_info.get("status") or "")
     if dry_run:

@@ -11,7 +11,13 @@ Provides a disciplined, low-risk refactoring and design-review procedure across 
 
 ## Phase 1: Structural Smell & Complexity Triage
 
-Before moving code, inspect the target module(s) and classify the actual structural bottleneck (skip refactoring if the code is already clear — apply YAGNI):
+Before moving code, run the pure-stdlib AST Complexity & God-File Auditor (`complexity_audit.py`) to obtain deterministic per-file/per-function LOC, max nesting depth, McCabe cyclomatic complexity, and god-file signals (skip refactoring if the code is already clear — apply YAGNI):
+
+```bash
+# Deterministic 0-LLM complexity & god-file triage (exit 0 with --warn-only; exit 1 on violations without it)
+python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-design-refactor/scripts/complexity_audit.py \
+  --repo <TARGET_REPO_DIR> --warn-only --json
+```
 
 | Structural Smell | Concrete Signal | Target Remedy |
 | :--- | :--- | :--- |
@@ -43,11 +49,15 @@ Always follow this strict 4-step sequence so behavior changes are never conflate
    # 1. Targeted fast test iteration
    python3 -m unittest <target_test_module> -v
 
-   # 2. 5-language static QA, Zero-PII & Santa Lockdown audit
+   # 2. AST complexity & god-file regression check on refactored Python modules
+   python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-design-refactor/scripts/complexity_audit.py \
+     <MODIFIED_PYTHON_FILES> --json
+
+   # 3. 5-language static QA, Zero-PII & Santa Lockdown audit
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-project-standards/scripts/project_audit.py \
      --repo <TARGET_REPO_DIR> --strict
 
-   # 3. Full pre-commit & local gate before staging for agy-code-pr-reviewer
+   # 4. Full pre-commit & local gate before staging for agy-code-pr-reviewer
    pre-commit run --all-files
    ```
 

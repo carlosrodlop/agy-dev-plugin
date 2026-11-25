@@ -33,12 +33,14 @@ if __name__ != "__main__":
 import argparse  # noqa: E402
 from collections.abc import Sequence  # noqa: F401, E402
 import contextlib  # noqa: E402
+import json  # noqa: E402
 import os  # noqa: E402
 from pathlib import Path  # noqa: E402
 import shutil  # noqa: F401, E402
 import signal  # noqa: E402
 import subprocess  # noqa: F401, E402
 import sys  # noqa: E402
+from typing import Any  # noqa: E402
 
 import dev_common  # noqa: F401, E402
 from conversation_service_client import (  # noqa: F401, E402
@@ -95,7 +97,10 @@ from dev_queue_doctor import (  # noqa: F401, E402
     DEFAULT_WAKE_COOLDOWN_SECONDS,
     apply_safe_fixes,
     diagnose_orchestrator,
+    dispatch_orchestrator_tick_cli,
+    register_orchestrator_tick_cli,
     render_doctor_report,
+    run_orchestrator_tick,
     run_queue_doctor,
     trigger_orchestrator_wake,
 )
@@ -377,6 +382,7 @@ from review_gate import (  # noqa: F401, E402
     build_pr_reviewer_subagent_plan,
     dispatch_review_cli,
     evaluate_branch_and_release_lock,
+    evaluate_pre_review_fail_fast_gate,
     get_branch_diff_with_verification_gate,
     push_remediation_branch_and_build_reviewer_plan,
     record_pr_review_evaluation,
@@ -401,6 +407,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     register_watcher_cli(sub)
     register_queue_cli(sub)
     register_control_cli(sub)
+    register_orchestrator_tick_cli(sub)
     return parser.parse_args(argv)
 
 
@@ -442,6 +449,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         dispatch_watcher_cli(args, argv),
         dispatch_queue_cli(args),
         dispatch_control_cli(args),
+        dispatch_orchestrator_tick_cli(args),
     ):
         if rc is not None:
             return int(rc)

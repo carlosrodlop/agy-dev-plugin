@@ -1330,6 +1330,40 @@ def diagnose_orchestrator(
                 )
             )
 
+    agent_rebase_locks: list[dict[str, Any]] = []
+    for slug, slot_num, slot_lk in active_lock_slots:
+        st_u = str(slot_lk.get("status") or "").strip().upper()
+        if st_u in ("NEEDS_AGENT_CONFLICT_RESOLUTION", "NEEDS_AGENT_SEMANTIC_FIX"):
+            agent_rebase_locks.append(
+                {
+                    "repo_slug": slug,
+                    "slot_id": slot_num,
+                    "status": st_u,
+                    "branch_name": str(slot_lk.get("branch_name") or ""),
+                    "conversation_id": str(slot_lk.get("conversation_id") or ""),
+                    "worktree_path": _sanitize_path(
+                        str(slot_lk.get("worktree_path") or slot_lk.get("target_repo_dir") or "")
+                    ),
+                }
+            )
+    if agent_rebase_locks:
+        statuses_lbl = ", ".join(sorted({str(lk["status"]) for lk in agent_rebase_locks}))
+        anomalies.append(
+            _make_anomaly(
+                code="rebase_agent_intervention_required",
+                severity="critical",
+                title=f"{len(agent_rebase_locks)} lock(s) require LLM rebase fix ({statuses_lbl})",
+                cause=(
+                    "0-LLM `rebase-reverify` detected merge conflict(s) or semantic cross-impact test failure(s) "
+                    "requiring `agy-code-developer` intervention."
+                ),
+                evidence={"locks": agent_rebase_locks, "count": len(agent_rebase_locks)},
+                safe_fix_action="agy-doctor --wake",
+                requires_wake=True,
+                auto_fixable=False,
+            )
+        )
+
     # 6. Recent wake process crash signatures (`SIGABRT`, stdin metadata failure, non-zero exit)
     wake_log_audit = inspect_wake_logs(resolved_state)
     if wake_log_audit.get("has_active_crash"):
@@ -2254,6 +2288,244 @@ def run_queue_doctor(
         "check_only": bool(check_only),
         "exit_code": exit_code,
     }
+
+
+def run_orchestrator_tick(
+    *,
+    orchestrator_id: str = "",
+    portfolio_dir: Path | str | None = None,
+    repos_dir: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
+    sync_git: bool = True,
+    auto_heal: bool = True,
+    compact: bool = True,
+    compact_tier: str = "all",
+    respect_pause: bool = True,
+    include_optimize: bool = True,
+    dry_run: bool = False,
+    git_client: Any | None = None,
+    home_dir: Path | None = None,
+    now_ts: float | None = None,
+    stall_threshold_seconds: int | float | None = None,
+) -> dict[str, Any]:
+    """Run one unified 0-LLM orchestrator tick: lock sync, safe auto-heals, queue-compact, queue-optimize, and queue-next."""
+    pr_rem = _load_pr_remediator()
+    resolved_state = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir, home_dir=home_dir)
+    orch_ctrl = _orch_ctrl.load_orchestration_control(state_dir=resolved_state, home_dir=home_dir)
+    is_paused = bool(orch_ctrl.get("paused"))
+    is_offline = os.environ.get("AGY_OFFLINE_ONLY") == "1"
+
+    # 1. `lock-status --all --sync-git`
+    if sync_git and not dry_run and not is_paused and not is_offline:
+        sync_res = pr_rem.sync_dev_pr_lock_with_git(portfolio_dir=resolved_state, git_client=git_client)
+        active_locks = pr_rem.get_all_dev_pr_locks(portfolio_dir=resolved_state)
+        lock_sync_summary: dict[str, Any] = {
+            "status": str(sync_res.get("status") or "ok"),
+            "synced": True,
+            "released": bool(sync_res.get("released")),
+            "active_count": len(active_locks),
+            "active_repos": sorted(active_locks.keys()),
+        }
+    else:
+        active_locks = pr_rem.get_all_dev_pr_locks(portfolio_dir=resolved_state)
+        skip_reason = (
+            "paused"
+            if is_paused
+            else ("dry_run" if dry_run else ("AGY_OFFLINE_ONLY=1" if is_offline else "no_sync_git"))
+        )
+        lock_sync_summary = {
+            "status": "skipped" if sync_git else "ok",
+            "synced": False,
+            "skip_reason": skip_reason if sync_git else "",
+            "released": False,
+            "active_count": len(active_locks),
+            "active_repos": sorted(active_locks.keys()),
+        }
+
+    # 2. Safe deterministic auto-heals (phantom_pr_open reconciliation + stale_follower_needs_rebase)
+    if auto_heal and not dry_run and not is_paused:
+        heal_res = apply_safe_fixes(
+            state_dir=resolved_state,
+            sync_git=False,
+            git_client=git_client,
+            now_ts=now_ts,
+            home_dir=home_dir,
+        )
+        active_locks = pr_rem.get_all_dev_pr_locks(portfolio_dir=resolved_state)
+        lock_sync_summary["active_count"] = len(active_locks)
+        lock_sync_summary["active_repos"] = sorted(active_locks.keys())
+        rem_actions = [dict(a) for a in (heal_res.get("remediation_actions") or []) if isinstance(a, dict)]
+        applied_actions = [
+            a
+            for a in rem_actions
+            if a.get("status") == "applied"
+            and (
+                a.get("action") == "rebase_and_reverify_stale_follower"
+                or (a.get("action") == "reconcile_dev_queue_with_git" and int(a.get("reconciled_count") or 0) > 0)
+                or a.get("action") == "record_model_quota_cooldowns"
+            )
+        ]
+        auto_heals_summary: dict[str, Any] = {
+            "status": str(heal_res.get("status") or "ok"),
+            "ran": True,
+            "reconciled_count": int(heal_res.get("reconciled_count") or 0),
+            "applied_count": len(applied_actions),
+            "actions": rem_actions,
+        }
+    else:
+        auto_heals_summary = {
+            "status": "skipped",
+            "ran": False,
+            "reconciled_count": 0,
+            "applied_count": 0,
+            "actions": [],
+        }
+
+    # 3. `queue-compact --apply --tier all --respect-pause`
+    comp_apply = bool(compact and not dry_run)
+    comp_res = pr_rem.compact_dev_queue(
+        portfolio_dir=resolved_state,
+        apply=comp_apply,
+        tier=compact_tier,
+        repos_dir=repos_dir,
+        orchestrator_id=orchestrator_id,
+        respect_pause=respect_pause,
+    )
+    compaction_summary = {
+        "status": str(comp_res.get("status") or "ok"),
+        "mode": str(comp_res.get("mode") or ("applied" if comp_apply else "dry_run")),
+        "paused": bool(comp_res.get("paused")),
+        "applied_count": int(comp_res.get("applied_count") or 0),
+        "total_prs_saved": int(comp_res.get("total_prs_saved") or 0),
+        "plans_count": len(comp_res.get("plans") or []),
+    }
+
+    # 4. `queue-optimize`
+    if include_optimize:
+        opt_res = dev_flow_optimizer.analyze_dev_flow_optimizations(
+            portfolio_dir=resolved_state,
+            repos_dir=repos_dir,
+            brain_dir=brain_dir,
+            orchestrator_cid=orchestrator_id,
+            stall_threshold_seconds=stall_threshold_seconds,
+            now_ts=now_ts,
+        )
+        raw_findings = [f for f in (opt_res.get("findings") or []) if isinstance(f, dict)]
+        optimization_summary: dict[str, Any] = {
+            "status": str(opt_res.get("status") or "ok"),
+            "health_score": int(opt_res.get("health_score") or 100),
+            "findings_count": len(raw_findings),
+            "findings": [
+                {
+                    "code": str(f.get("code") or ""),
+                    "severity": str(f.get("severity") or "low"),
+                    "title": str(f.get("title") or ""),
+                    "auto_action_hint": str(f.get("auto_action_hint") or ""),
+                }
+                for f in raw_findings
+            ],
+        }
+    else:
+        optimization_summary = {
+            "status": "skipped",
+            "health_score": 100,
+            "findings_count": 0,
+            "findings": [],
+        }
+
+    # 5. `queue-next --unlocked`
+    q_next = pr_rem.get_next_dev_queue_item(
+        portfolio_dir=resolved_state,
+        orchestrator_conversation_id=orchestrator_id,
+        skip_locked_repos=True,
+    )
+    runnable_by_repo = dict(q_next.get("runnable_by_repo") or {})
+    next_unlocked = q_next.get("next_unlocked_item")
+    multi_slots = list(q_next.get("multi_slot_candidates") or q_next.get("slot2_candidates") or [])
+    compact_q_next = {
+        "status": str(q_next.get("status") or "ok"),
+        "paused": bool(q_next.get("paused") or is_paused),
+        "queue_counts": dict(q_next.get("queue_counts") or {}),
+        "runnable_by_repo": runnable_by_repo,
+        "next_unlocked_item": next_unlocked,
+        "multi_slot_candidates": multi_slots,
+        "blocked_by_lock_repos": list(q_next.get("blocked_by_lock_repos") or []),
+        "blocked_by_wip_cap_repos": list(q_next.get("blocked_by_wip_cap_repos") or []),
+    }
+
+    needs_llm_action = bool(
+        not is_paused
+        and (
+            runnable_by_repo
+            or next_unlocked is not None
+            or multi_slots
+            or any(bool(a.get("requires_wake")) for a in auto_heals_summary["actions"])
+        )
+    )
+    cur_epoch = float(now_ts if now_ts is not None else time.time())
+    return {
+        "status": "ok",
+        "mode": "orchestrator_tick",
+        "tick_at": _utc_now_iso(cur_epoch),
+        "dry_run": bool(dry_run),
+        "paused": bool(is_paused),
+        "orchestration_control": _orch_ctrl.summarize_orchestration_phase(orch_ctrl, active_locks),
+        "lock_sync": lock_sync_summary,
+        "auto_heals": auto_heals_summary,
+        "compaction": compaction_summary,
+        "optimization": optimization_summary,
+        "queue_next": compact_q_next,
+        "summary": {
+            "active_locks_count": len(active_locks),
+            "runnable_repos_count": len(runnable_by_repo),
+            "multi_slot_candidates_count": len(multi_slots),
+            "auto_healed_count": int(auto_heals_summary["applied_count"]),
+            "compacted_count": int(compaction_summary["applied_count"]),
+            "findings_count": int(optimization_summary["findings_count"]),
+            "needs_llm_action": needs_llm_action,
+        },
+    }
+
+
+def register_orchestrator_tick_cli(sub: Any) -> None:
+    """Register the unified 0-LLM `orchestrator-tick` subcommand."""
+    p_tick = sub.add_parser(
+        "orchestrator-tick",
+        help="Run unified 0-LLM orchestrator tick (lock-status --sync-git + auto-heals + queue-compact + queue-optimize + queue-next --unlocked).",
+    )
+    p_tick.add_argument("--orchestrator-id", dest="orchestrator_id", default="", help="Active orchestrator conversation ID.")
+    p_tick.add_argument("--state-dir", dest="state_dir", default="", help="Optional state directory override.")
+    p_tick.add_argument("--repos-dir", dest="repos_dir", default="", help="Optional parent directory of managed git repositories.")
+    p_tick.add_argument("--brain-dir", dest="brain_dir", default=None, help="Optional Antigravity brain directory override.")
+    p_tick.add_argument("--no-sync-git", dest="no_sync_git", action="store_true", help="Skip remote git lock sync.")
+    p_tick.add_argument("--no-heal", dest="no_heal", action="store_true", help="Skip deterministic safe auto-heals.")
+    p_tick.add_argument("--no-compact", dest="no_compact", action="store_true", help="Preview compaction only instead of applying.")
+    p_tick.add_argument("--tier", choices=("1", "all"), default="all", help="Compaction tier filter (default: all).")
+    p_tick.add_argument("--no-respect-pause", dest="no_respect_pause", action="store_true", help="Do not skip compaction when orchestration is paused.")
+    p_tick.add_argument("--no-optimize", dest="no_optimize", action="store_true", help="Skip `queue-optimize` findings scan.")
+    p_tick.add_argument("--dry-run", dest="dry_run", action="store_true", help="Preview tick without mutating locks or queue.")
+    p_tick.add_argument("--json", dest="as_json", action="store_true", help="Emit compact JSON tick payload (default).")
+
+
+def dispatch_orchestrator_tick_cli(args: Any) -> int | None:
+    """Handle `orchestrator-tick` CLI subcommand; return exit code or None."""
+    if getattr(args, "subcommand", "") != "orchestrator-tick":
+        return None
+    res = run_orchestrator_tick(
+        orchestrator_id=str(getattr(args, "orchestrator_id", "") or ""),
+        portfolio_dir=str(getattr(args, "state_dir", "") or "") or None,
+        repos_dir=str(getattr(args, "repos_dir", "") or "") or None,
+        brain_dir=getattr(args, "brain_dir", None),
+        sync_git=not bool(getattr(args, "no_sync_git", False)),
+        auto_heal=not bool(getattr(args, "no_heal", False)),
+        compact=not bool(getattr(args, "no_compact", False)),
+        compact_tier=str(getattr(args, "tier", "all") or "all"),
+        respect_pause=not bool(getattr(args, "no_respect_pause", False)),
+        include_optimize=not bool(getattr(args, "no_optimize", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+    return 0 if res.get("status") == "ok" else 1
 
 
 def render_doctor_report(report: dict[str, Any], *, color: bool = True) -> str:

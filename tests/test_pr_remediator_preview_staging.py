@@ -303,7 +303,7 @@ class TestPrRemediatorPreviewStaging(unittest.TestCase):
             (wt2 / "web" / "index.html").write_text("SLOT2_INDEX", encoding="utf-8")
             (wt2 / "web" / "css" / "slot2.css").write_text("SLOT2_CSS", encoding="utf-8")
             (wt2 / "web" / "js" / "slot2.mjs").write_text("SLOT2_JS", encoding="utf-8")
-            (wt2 / "api" / "slot2.py").write_text("SLOT2_API", encoding="utf-8")
+            (wt2 / "api" / "slot2.py").write_text("SLOT2_API = 1\n", encoding="utf-8")
             _commit_worktree_changes(wt2, "feat(web): slot 2 bundle")
 
             with (
