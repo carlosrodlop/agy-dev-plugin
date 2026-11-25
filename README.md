@@ -38,6 +38,7 @@ By decoupling generic SDLC automation from domain-specific plugins (such as [`ag
 ### 4. Rules (`rules/`)
 - `engineering-pillars.md` (`always_on`) — Foundational SDLC pillars, 5 primary languages (`Python 3`, `Shell`, `Vanilla JS/HTML/CSS`), and Santa Lockdown binary rules
 - `co-design-and-discovery.md` (`model_decision`) — Default Phase 0 adaptive Grill-Me protocol, silent codebase-first discovery, demanding partner pushback, hybrid cadence, and Design Contract exit gate
+- `deterministic-first-engineering.md` (`model_decision`) — 4-Tier Determinism Ladder (`0-LLM` default), Deterministic Sandwich pattern, pre-gated scheduled sidecars with zero double-`detect` JSON handoff, skill scriptability, and Layer-1 fail-fast gates
 - `python-and-testing.md` (`glob`: `*.py`, `pyproject.toml`, `.pre-commit-config.yaml`, CI workflows) — Python 3 typing, AST safety, Santa pure-Python constraints, and hermetic offline testing
 - `shell-standards.md` (`glob`: `*.sh`, `*.bash`, `*.zsh`, `*.bats`, `Makefile`) — POSIX/Bash/Zsh portability, sourced-safe strict mode, quoting, Santa binary safety, and BATS
 - `web-frontend-standards.md` (`glob`: `*.js`, `*.mjs`, `*.html`, `*.css`) — Vanilla-First Zero-Build JS/HTML5/CSS3, XSS/CSP defense, WCAG accessibility, design tokens, and Santa Lockdown toolchain rules

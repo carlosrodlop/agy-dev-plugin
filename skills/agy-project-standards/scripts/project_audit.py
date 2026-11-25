@@ -31,6 +31,19 @@ from typing import Any
 MAX_MARKDOWN_INSTRUCTION_BYTES = 24000
 MAX_COPILOT_INSTRUCTIONS_BYTES = 4000
 MAX_CSS_IMPORTANT_PER_FILE = 10
+SKILL_HEAVY_BYTES_THRESHOLD = 12000
+SKILL_HEAVY_BASH_BLOCKS_THRESHOLD = 4
+FENCED_SHELL_BLOCK_RE = re.compile(r"(?m)^```(?:bash|sh|zsh|shell)\b")
+SKILL_SCRIPT_OR_CLIENT_REF_RE = re.compile(
+    r"(?:clients/[a-zA-Z0-9_.-]+\.py|skills/[a-zA-Z0-9_.-]+/scripts/[a-zA-Z0-9_.-]+\.(?:py|sh)|deterministic-wrapper\s*:\s*true)",
+    re.IGNORECASE,
+)
+SIDECAR_PREGATE_SCRIPT_RE = re.compile(
+    r"(?:^|[\s/\"'])(?:[a-zA-Z0-9_.-]*?(?:precheck|pregate|pre_gate|watchdog|gate_runner)[a-zA-Z0-9_.-]*\.(?:py|sh))(?:\b|[\s\"'])",
+    re.IGNORECASE,
+)
+SIDECAR_INLINE_AGENTAPI_RE = re.compile(r"(?:^|[\s;&|\"'(])(?:[^\s;&|\"'(]*/)?agentapi(?:\b|[\s\"'])")
+SHELL_INTERPRETER_BASENAMES = frozenset({"sh", "bash", "zsh", "dash"})
 COPILOT_INSTRUCTIONS_REL_PATH = ".github/copilot-instructions.md"
 REQUIREMENTS_MANIFEST_FILENAME = "requirements.json"
 REQUIREMENTS_SCHEMA_VERSION = "1.0"
@@ -1136,6 +1149,161 @@ def _check_css_file(fpath: Path, rel: str, errors: list[AuditFinding], warnings:
         )
 
 
+def _check_skill_determinism(
+    fpath: Path,
+    rel: str,
+    text: str,
+    size_bytes: int,
+    warnings: list[AuditFinding],
+) -> None:
+    """Advise extracting deterministic scripts when a large SKILL.md orchestrates many shell blocks without code backing."""
+    if size_bytes < SKILL_HEAVY_BYTES_THRESHOLD:
+        return
+    bash_blocks = len(FENCED_SHELL_BLOCK_RE.findall(text))
+    if bash_blocks < SKILL_HEAVY_BASH_BLOCKS_THRESHOLD:
+        return
+    scripts_dir = fpath.parent / "scripts"
+    has_local_script = scripts_dir.is_dir() and any(
+        child.is_file() and child.suffix.lower() in {".py", ".sh", ".bash", ".zsh"}
+        for child in scripts_dir.iterdir()
+    )
+    if has_local_script or SKILL_SCRIPT_OR_CLIENT_REF_RE.search(text):
+        return
+    warnings.append(
+        AuditFinding(
+            "warning",
+            "agy:skill-heavy-no-script",
+            rel,
+            0,
+            (
+                f"Skill is {size_bytes} bytes with {bash_blocks} shell blocks and no scripts/*.py helper or "
+                "client delegation; extract repeatable steps into a deterministic script (deterministic-first-engineering.md)."
+            ),
+        )
+    )
+
+
+def _resolve_sidecar_effective_command(tokens: list[str]) -> tuple[str, list[str]]:
+    """Unwrap leading `env` flags and `KEY=VALUE` assignments to return `(executable, remaining_args)`."""
+    if not tokens:
+        return "", []
+    idx = 0
+    if os.path.basename(tokens[0]) == "env":
+        idx = 1
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if tok == "--":
+                idx += 1
+                break
+            if tok in {"-u", "-C", "--unset", "--chdir"}:
+                idx += 2
+                continue
+            if tok.startswith("-"):
+                idx += 1
+                continue
+            if "=" in tok and not tok.startswith((".", "/", "$")):
+                idx += 1
+                continue
+            break
+    if idx >= len(tokens):
+        return "", []
+    return tokens[idx], tokens[idx + 1 :]
+
+
+def _check_sidecar_determinism(
+    rel: str,
+    parsed_json: Any,
+    errors: list[AuditFinding],
+) -> None:
+    """Enforce valid executables and mandatory 0-LLM pre-gates on scheduled `sidecar.json` definitions."""
+    if not isinstance(parsed_json, dict):
+        return
+    builtin = str(parsed_json.get("builtin") or "").strip().lower()
+    if builtin == "schedule":
+        raw_args = parsed_json.get("args")
+        if not isinstance(raw_args, list) or len(raw_args) < 2:
+            errors.append(
+                AuditFinding(
+                    "error",
+                    "agy:sidecar-invalid-executable",
+                    rel,
+                    0,
+                    "Scheduled sidecar must provide a cron schedule in args[0] and an executable in args[1].",
+                )
+            )
+            return
+        exec_token = str(raw_args[1] or "").strip()
+        if not exec_token or exec_token.startswith("-"):
+            errors.append(
+                AuditFinding(
+                    "error",
+                    "agy:sidecar-invalid-executable",
+                    rel,
+                    0,
+                    f"Scheduled sidecar args[1] must be a valid executable, got {exec_token!r} (never a bare flag).",
+                )
+            )
+            return
+        str_tokens = [str(tok or "").strip() for tok in raw_args[1:]]
+        eff_exec, eff_rest = _resolve_sidecar_effective_command(str_tokens)
+        if not eff_exec or eff_exec.startswith("-"):
+            errors.append(
+                AuditFinding(
+                    "error",
+                    "agy:sidecar-invalid-executable",
+                    rel,
+                    0,
+                    f"Scheduled sidecar resolved an invalid executable {eff_exec!r} after env wrapper.",
+                )
+            )
+            return
+        eff_base = os.path.basename(eff_exec)
+        if eff_base == "agentapi":
+            errors.append(
+                AuditFinding(
+                    "error",
+                    "agy:schedule-missing-pregate",
+                    rel,
+                    0,
+                    (
+                        "Scheduled sidecar invokes 'agentapi' directly without a deterministic 0-LLM pre-gate runner; "
+                        "run 0-LLM Python directly or wrap with action_precheck_runner.py (deterministic-first-engineering.md)."
+                    ),
+                )
+            )
+            return
+        if eff_base in SHELL_INTERPRETER_BASENAMES:
+            for r_idx, r_tok in enumerate(eff_rest):
+                if r_tok.startswith("-") and not r_tok.startswith("--") and "c" in r_tok[1:]:
+                    inline_cmd = eff_rest[r_idx + 1] if r_idx + 1 < len(eff_rest) else ""
+                    if SIDECAR_INLINE_AGENTAPI_RE.search(inline_cmd) and not SIDECAR_PREGATE_SCRIPT_RE.search(inline_cmd):
+                        errors.append(
+                            AuditFinding(
+                                "error",
+                                "agy:schedule-missing-pregate",
+                                rel,
+                                0,
+                                (
+                                    "Scheduled shell sidecar invokes 'agentapi' inline without a deterministic 0-LLM pre-gate "
+                                    "script (deterministic-first-engineering.md)."
+                                ),
+                            )
+                        )
+                    break
+    elif "command" in parsed_json:
+        cmd_token = str(parsed_json.get("command") or "").strip()
+        if not cmd_token or cmd_token.startswith("-"):
+            errors.append(
+                AuditFinding(
+                    "error",
+                    "agy:sidecar-invalid-executable",
+                    rel,
+                    0,
+                    f"Sidecar 'command' must be a valid executable, got {cmd_token!r}.",
+                )
+            )
+
+
 def _check_markdown_limits(fpath: Path, rel: str, errors: list[AuditFinding], warnings: list[AuditFinding]) -> None:
     """Verify Antigravity rules/skills/agents (24 KB + YAML frontmatter) and optional Copilot 4 KB hygiene cap."""
     normalized_rel = rel.replace(os.sep, "/")
@@ -1176,6 +1344,8 @@ def _check_markdown_limits(fpath: Path, rel: str, errors: list[AuditFinding], wa
             )
         )
     text = fpath.read_text(encoding="utf-8", errors="ignore")
+    if is_skill:
+        _check_skill_determinism(fpath, rel, text, size_bytes, warnings)
     if not text.startswith("---\n") or "\n---\n" not in text[4:]:
         warnings.append(
             AuditFinding("warning", "agy:missing-frontmatter", rel, 1, "Missing YAML frontmatter block.")
@@ -1850,9 +2020,12 @@ def audit_repository(repo_dir: Path | str, *, strict: bool = False) -> AuditRepo
             _check_python_ast(fpath, rel, errors, warnings)
         elif suffix == ".json":
             try:
-                json.loads(fpath.read_text(encoding="utf-8"))
+                parsed_json = json.loads(fpath.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 errors.append(AuditFinding("error", "json:invalid", rel, 0, f"Invalid JSON: {exc}"))
+            else:
+                if fpath.name == "sidecar.json":
+                    _check_sidecar_determinism(rel, parsed_json, errors)
         elif suffix in JS_SUFFIXES:
             _check_js_file(fpath, rel, errors, warnings)
         elif suffix in HTML_SUFFIXES:
