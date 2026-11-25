@@ -119,8 +119,12 @@ def _maybe_run_hourly_auto_cleanup(
     env: Mapping[str, str] | None = None,
     git_client: Any | None = None,
     auto_cleanup_interval_seconds: int | float | None = None,
+    ps_output: str | None = None,
+    ps_runner: Callable[[], str] | None = None,
+    conversation_client: Any | None = None,
+    adhoc_days: float | None = None,
 ) -> dict[str, Any]:
-    """Run cooldown-gated 0-LLM conversation/sidecar/orphan cleanup once per `AGY_AUTO_CLEANUP_INTERVAL_SECONDS`."""
+    """Run cooldown-gated 0-LLM conversation/sidecar/orphan cleanup and auto-archive once per `AGY_AUTO_CLEANUP_INTERVAL_SECONDS`."""
     eff_env = os.environ if env is None else env
     interval = resolve_auto_cleanup_interval(auto_cleanup_interval_seconds, env=eff_env)
     if interval <= 0:
@@ -190,7 +194,31 @@ def _maybe_run_hourly_auto_cleanup(
                 git_client=git_client,
                 now_ts=cur_now,
                 env=eff_env,
+                ps_output=ps_output,
+                ps_runner=ps_runner,
+                conversation_client=conversation_client,
             )
+            try:
+                archive_res = merge_watcher.auto_archive_stale_conversations(
+                    adhoc_days=adhoc_days,
+                    dry_run=dry_run,
+                    portfolio_dir=st_dir,
+                    brain_dir=eff_brain_dir,
+                    antigravity_dirs=eff_agy_dirs,
+                    now_ts=cur_now,
+                    env=eff_env,
+                    conversation_client=conversation_client,
+                )
+            except Exception as arch_exc:
+                archive_res = {
+                    "status": "error",
+                    "archived_count": 0,
+                    "archived": [],
+                    "error": _sanitize_path(f"{arch_exc.__class__.__name__}: {arch_exc}"),
+                }
+
+            archived_count = int(archive_res.get("archived_count") or 0)
+            deferred_desktop_count = int(clean_res.get("deferred_desktop_count") or 0)
             if not dry_run and clean_res.get("status") == "ok":
                 dev_common.atomic_write_json(
                     state_path,
@@ -199,6 +227,8 @@ def _maybe_run_hourly_auto_cleanup(
                         "last_cleanup_epoch": cur_now,
                         "last_cleanup_at": _utc_now_iso(),
                         "deleted_count": int(clean_res.get("deleted_count") or 0),
+                        "archived_count": archived_count,
+                        "deferred_desktop_count": deferred_desktop_count,
                         "sidecar_events_pruned_count": int(clean_res.get("sidecar_events_pruned_count") or 0),
                         "orphan_artifacts_pruned_count": int(clean_res.get("orphan_artifacts_pruned_count") or 0),
                         "freed_bytes": int(clean_res.get("freed_bytes") or 0),
@@ -210,10 +240,14 @@ def _maybe_run_hourly_auto_cleanup(
                 "dry_run": bool(dry_run),
                 "interval_seconds": interval,
                 "deleted_count": int(clean_res.get("deleted_count") or 0),
+                "archived_count": archived_count,
+                "deferred_desktop_count": deferred_desktop_count,
+                "native_delete_count": int(clean_res.get("native_delete_count") or 0),
                 "sidecar_events_pruned_count": int(clean_res.get("sidecar_events_pruned_count") or 0),
                 "orphan_artifacts_pruned_count": int(clean_res.get("orphan_artifacts_pruned_count") or 0),
                 "freed_bytes": int(clean_res.get("freed_bytes") or 0),
                 "freed_mb": float(clean_res.get("freed_mb") or 0.0),
+                "auto_archive": archive_res,
             }
     except Exception as exc:
         return {
@@ -356,6 +390,8 @@ def run_watchdog_cycle(
             env=env,
             git_client=git_client,
             auto_cleanup_interval_seconds=auto_cleanup_interval_seconds,
+            ps_output=ps_output,
+            ps_runner=ps_runner,
         )
         return {
             "status": "healthy",
@@ -422,6 +458,8 @@ def run_watchdog_cycle(
         env=env,
         git_client=git_client,
         auto_cleanup_interval_seconds=auto_cleanup_interval_seconds,
+        ps_output=ps_output,
+        ps_runner=ps_runner,
     )
 
     return {

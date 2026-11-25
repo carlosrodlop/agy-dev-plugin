@@ -41,6 +41,11 @@ import subprocess  # noqa: F401, E402
 import sys  # noqa: E402
 
 import dev_common  # noqa: F401, E402
+from conversation_service_client import (  # noqa: F401, E402
+    ConversationServiceClient,
+    ConversationServiceError,
+    resolve_conversation_service_config,
+)
 import git_client as _git_client  # noqa: F401, E402
 from git_client import GitVcsIntegrationClient, stamp_repo_version_manifests  # noqa: F401, E402
 
@@ -265,6 +270,7 @@ from merge_watcher import (  # noqa: F401, E402
     DEFAULT_ACTION_CLEANUP_DELIVERABLE_HOURS,
     DEFAULT_ACTION_CLEANUP_NOOP_HOURS,
     DEFAULT_ACTION_CLEANUP_UNAUDITED_CAP_HOURS,
+    DEFAULT_AUTO_ARCHIVE_ADHOC_DAYS,
     DEFAULT_GHOST_PURGE_ARM_TTL_SECONDS,
     DEFAULT_NOOP_ACTION_RETENTION_DAYS,
     DEFAULT_SIDECAR_EVENT_RETENTION_HOURS,
@@ -315,6 +321,7 @@ from merge_watcher import (  # noqa: F401, E402
     _write_ghost_purge_result,
     ack_ghost_purge_result,
     arm_ghost_purge,
+    auto_archive_stale_conversations,
     cancel_ghost_purge,
     check_ghost_purge_restart_guard,
     cleanup_merged_conversations,
