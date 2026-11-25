@@ -2477,5 +2477,334 @@ class TestDevQueueTuiNSlots(unittest.TestCase):
             self.assertIn("owner/repo-legacy  [2/3]", locks_out)
 
 
+def _pb_varint(val: int) -> bytes:
+    """Encode non-negative integer as protobuf unsigned LEB128 varint."""
+    out = bytearray()
+    n = int(val)
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            break
+    return bytes(out)
+
+
+def _pb_field_bytes(field_num: int, payload: bytes) -> bytes:
+    """Encode a protobuf wire_type=2 (length-delimited) field."""
+    return _pb_varint((field_num << 3) | 2) + _pb_varint(len(payload)) + payload
+
+
+def _pb_field_varint(field_num: int, val: int) -> bytes:
+    """Encode a protobuf wire_type=0 (varint) field."""
+    return _pb_varint((field_num << 3) | 0) + _pb_varint(val)
+
+
+def _build_raw_summary_field8(
+    *,
+    tool_name: str = "",
+    questions_f56: list[str] | None = None,
+    questions_f140: list[str] | None = None,
+    include_f8: bool = True,
+    opaque_f8_only: bool = False,
+) -> bytes:
+    """Synthesize a `conversation_summaries.raw_summary` blob matching Antigravity field `8` layout."""
+    base = _pb_field_bytes(1, b"summary-header") + _pb_field_varint(2, 42)
+    if not include_f8:
+        return base
+    if opaque_f8_only:
+        return base + _pb_field_bytes(8, _pb_field_varint(99, 1))
+
+    f1_parts: list[bytes] = []
+    if tool_name:
+        f4 = _pb_field_bytes(2, tool_name.encode("utf-8"))
+        f5 = _pb_field_bytes(4, f4)
+        f1_parts.append(_pb_field_bytes(5, f5))
+    if questions_f56:
+        q_msgs = b"".join(_pb_field_bytes(1, _pb_field_bytes(1, q.encode("utf-8"))) for q in questions_f56)
+        f22 = _pb_field_bytes(22, q_msgs)
+        f1_parts.append(_pb_field_bytes(56, f22))
+    if questions_f140:
+        q_raw = b"".join(_pb_field_bytes(1, q.encode("utf-8")) for q in questions_f140)
+        f1_parts.append(_pb_field_bytes(140, q_raw))
+
+    f1_payload = b"".join(f1_parts) if f1_parts else _pb_field_varint(9, 1)
+    return base + _pb_field_bytes(8, _pb_field_bytes(1, f1_payload))
+
+
+class TestLiveWaitingUserConversations(unittest.TestCase):
+    """Hermetic tests for stdlib protobuf wire decoding and live waiting input surfacing in TUI & board."""
+
+    def test_protobuf_decoder_parses_ask_question_f56_f140_approval_and_corrupt_blobs(self) -> None:
+        multi_q = _build_raw_summary_field8(
+            tool_name="ask_question",
+            questions_f56=["Deploy to staging now?", "Enable canary rollout?"],
+        )
+        parsed_multi = tui._parse_waiting_step_from_raw_summary(multi_q)
+        self.assertIsNotNone(parsed_multi)
+        assert parsed_multi is not None
+        self.assertEqual(parsed_multi["waiting_kind"], "ask_question")
+        self.assertEqual(parsed_multi["waiting_tool"], "ask_question")
+        self.assertEqual(parsed_multi["question_count"], 2)
+        self.assertEqual(parsed_multi["question_preview"], "Deploy to staging now?")
+        self.assertTrue(parsed_multi["has_readable_text"])
+
+        f140_q = _build_raw_summary_field8(
+            tool_name="ask_question",
+            questions_f140=["Confirm database migration plan?"],
+        )
+        parsed_f140 = tui._parse_waiting_step_from_raw_summary(f140_q)
+        assert parsed_f140 is not None
+        self.assertEqual(parsed_f140["waiting_kind"], "ask_question")
+        self.assertEqual(parsed_f140["question_count"], 1)
+        self.assertEqual(parsed_f140["question_preview"], "Confirm database migration plan?")
+
+        approval = _build_raw_summary_field8(tool_name="run_command")
+        parsed_app = tui._parse_waiting_step_from_raw_summary(approval)
+        assert parsed_app is not None
+        self.assertEqual(parsed_app["waiting_kind"], "approval")
+        self.assertEqual(parsed_app["waiting_tool"], "run_command")
+        self.assertEqual(parsed_app["question_count"], 0)
+        self.assertTrue(parsed_app["has_readable_text"])
+
+        no_f8 = _build_raw_summary_field8(include_f8=False)
+        self.assertIsNone(tui._parse_waiting_step_from_raw_summary(no_f8))
+        self.assertIsNone(tui._parse_waiting_step_from_raw_summary(None))
+        self.assertIsNone(tui._parse_waiting_step_from_raw_summary(b""))
+        self.assertIsNone(tui._parse_waiting_step_from_raw_summary(b"\xff\xff\xff\x00"))
+
+    def test_load_waiting_conversations_filters_and_transcript_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agy_dir = root / "agy"
+            brain_dir = agy_dir / "brain"
+            ann_dir = agy_dir / "annotations"
+            db_path = agy_dir / "conversation_summaries.db"
+            brain_dir.mkdir(parents=True, exist_ok=True)
+            ann_dir.mkdir(parents=True, exist_ok=True)
+
+            cid_ask = "11111111-1111-4111-8111-111111111111"
+            cid_app = "22222222-2222-4222-8222-222222222222"
+            cid_fb = "33333333-3333-4333-8333-333333333333"
+            cid_nof8 = "44444444-4444-4444-8444-444444444444"
+            cid_idle = "55555555-5555-4555-8555-555555555555"
+            cid_killed = "66666666-6666-4666-8666-666666666666"
+            cid_child = "77777777-7777-4777-8777-777777777777"
+            cid_arch = "88888888-8888-4888-8888-888888888888"
+
+            # Archived annotation excludes cid_arch, while non-archived annotation keeps cid_ask
+            (ann_dir / f"{cid_arch}.pbtxt").write_text("archived: true\n", encoding="utf-8")
+            (ann_dir / f"{cid_ask}.pbtxt").write_text("archived: false\npinned: true\n", encoding="utf-8")
+
+            # Transcript fallback for cid_fb (f8 exists without readable text) and cid_nof8 (must NOT be read)
+            fb_tp = brain_dir / cid_fb / ".system_generated" / "logs" / "transcript.jsonl"
+            fb_tp.parent.mkdir(parents=True, exist_ok=True)
+            fb_tp.write_text(
+                json.dumps(
+                    {
+                        "name": "ask_question",
+                        "arguments": {"questions": [{"question": "Fallback question from transcript?"}]},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            nof8_tp = brain_dir / cid_nof8 / ".system_generated" / "logs" / "transcript.jsonl"
+            nof8_tp.parent.mkdir(parents=True, exist_ok=True)
+            nof8_tp.write_text(
+                json.dumps({"name": "ask_question", "arguments": {"questions": [{"question": "Old question?"}]}}) + "\n",
+                encoding="utf-8",
+            )
+
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        status TEXT,
+                        title TEXT,
+                        parent_conversation_id TEXT,
+                        killed INTEGER,
+                        last_modified_time TEXT,
+                        raw_summary BLOB
+                    )
+                    """
+                )
+                rows = [
+                    (
+                        cid_ask,
+                        "CASCADE_RUN_STATUS_RUNNING",
+                        f"Refactor {os.sep}Users{os.sep}realperson{os.sep}secret{os.sep}app",
+                        "",
+                        0,
+                        "2026-11-25T10:03:00Z",
+                        _build_raw_summary_field8(
+                            tool_name="ask_question",
+                            questions_f56=[f"Approve schema in {os.sep}Users{os.sep}realperson{os.sep}repo?", "Also update docs?"],
+                        ),
+                    ),
+                    (
+                        cid_app,
+                        "CASCADE_RUN_STATUS_RUNNING",
+                        "Build Runner",
+                        "",
+                        0,
+                        "2026-11-25T10:02:00Z",
+                        _build_raw_summary_field8(tool_name="run_command"),
+                    ),
+                    (
+                        cid_fb,
+                        "CASCADE_RUN_STATUS_RUNNING",
+                        "Opaque Step Chat",
+                        "",
+                        0,
+                        "2026-11-25T10:01:00Z",
+                        _build_raw_summary_field8(tool_name="ask_question", opaque_f8_only=False),
+                    ),
+                    (
+                        cid_nof8,
+                        "CASCADE_RUN_STATUS_RUNNING",
+                        "Active Coding No Prompt",
+                        "",
+                        0,
+                        "2026-11-25T10:04:00Z",
+                        _build_raw_summary_field8(include_f8=False),
+                    ),
+                    (
+                        cid_idle,
+                        "CASCADE_RUN_STATUS_IDLE",
+                        "Idle Chat",
+                        "",
+                        0,
+                        "2026-11-25T10:05:00Z",
+                        _build_raw_summary_field8(tool_name="ask_question", questions_f56=["Stale?"]),
+                    ),
+                    (
+                        cid_killed,
+                        "CASCADE_RUN_STATUS_RUNNING",
+                        "Killed Chat",
+                        "",
+                        1,
+                        "2026-11-25T10:05:00Z",
+                        _build_raw_summary_field8(tool_name="run_command"),
+                    ),
+                    (
+                        cid_child,
+                        "CASCADE_RUN_STATUS_RUNNING",
+                        "Subagent Chat",
+                        cid_ask,
+                        0,
+                        "2026-11-25T10:05:00Z",
+                        _build_raw_summary_field8(tool_name="run_command"),
+                    ),
+                    (
+                        cid_arch,
+                        "CASCADE_RUN_STATUS_RUNNING",
+                        "Archived Chat",
+                        "",
+                        0,
+                        "2026-11-25T10:05:00Z",
+                        _build_raw_summary_field8(tool_name="run_command"),
+                    ),
+                ]
+                conn.executemany("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+                conn.commit()
+
+            waiting = tui.load_waiting_user_conversations(db_path=db_path, brain_dir=brain_dir)
+            self.assertEqual([w["conversation_id"] for w in waiting], [cid_ask, cid_app, cid_fb])
+            self.assertNotIn("realperson", waiting[0]["sidebar_title"])
+            self.assertNotIn("realperson", waiting[0]["question_preview"])
+            self.assertIn("$HOME/repo", waiting[0]["question_preview"])
+            self.assertEqual(waiting[0]["question_count"], 2)
+            self.assertEqual(waiting[1]["waiting_kind"], "approval")
+            self.assertEqual(waiting[1]["waiting_tool"], "run_command")
+            self.assertEqual(waiting[2]["waiting_kind"], "ask_question")
+            self.assertEqual(waiting[2]["question_preview"], "Fallback question from transcript?")
+
+            # Minimal backwards-compatible DB without status/raw_summary returns [] cleanly
+            min_db = root / "minimal.db"
+            with sqlite3.connect(str(min_db)) as mconn:
+                mconn.execute("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)")
+                mconn.execute("INSERT INTO conversation_summaries VALUES (?, ?)", (cid_ask, "Minimal"))
+                mconn.commit()
+            self.assertEqual(tui.load_waiting_user_conversations(db_path=min_db, brain_dir=brain_dir), [])
+
+    def test_tui_render_board_and_open_hitl_surface_live_waiting_prompts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state_dir = root / "state"
+            brain_dir = root / "agy" / "brain"
+            db_path = root / "agy" / "conversation_summaries.db"
+            board_path = root / "dev_queue_board.md"
+            brain_dir.mkdir(parents=True, exist_ok=True)
+
+            live_cid = "aaaaaaaa-9999-4111-8111-111111111111"
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        status TEXT,
+                        title TEXT,
+                        parent_conversation_id TEXT,
+                        killed INTEGER,
+                        last_modified_time TEXT,
+                        raw_summary BLOB
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        live_cid,
+                        "CASCADE_RUN_STATUS_RUNNING",
+                        "Live Question Chat",
+                        "",
+                        0,
+                        "2026-11-25T10:10:00Z",
+                        _build_raw_summary_field8(
+                            tool_name="ask_question",
+                            questions_f56=["Proceed with deployment?", "Notify Slack?"],
+                        ),
+                    ),
+                )
+                conn.commit()
+
+            # Empty dev_queue.json still surfaces live waiting prompt in TUI, board, and --open-hitl h1
+            _write_state(state_dir, items=[], locks={})
+            out, _, hitl_convs, _, _, _ = tui.render(
+                _make_args(state_dir, write_board=str(board_path), no_color=True, plain_urls=True),
+                conv_db_path=db_path,
+                brain_dir=brain_dir,
+                is_tty_override=True,
+                term_width_override=140,
+            )
+            self.assertIn("hitl:1", out)
+            self.assertIn("HITL — ANTIGRAVITY APP VALIDATION", out)
+            self.assertIn("QUESTION (2): Proceed with deployment? (+1 more)", out)
+            self.assertIn(1, hitl_convs)
+            self.assertEqual(hitl_convs[1][1], live_cid)
+            self.assertEqual(hitl_convs[1][2], "Live Question Chat")
+
+            board_md = board_path.read_text(encoding="utf-8")
+            self.assertIn("`HITL: 1`", board_md)
+            self.assertIn(f"[Live Question Chat](conversation://{live_cid})", board_md)
+            self.assertIn("QUESTION (2): Proceed with deployment? (+1 more)", board_md)
+
+            with (
+                mock.patch.dict(os.environ, {"AGY_CONVERSATION_SUMMARIES_DB": str(db_path), "AGY_NAV_INTENT_ACK_WAIT_SECONDS": "0"}),
+                mock.patch.object(tui, "_focus_antigravity_app", return_value=True),
+                mock.patch.object(tui, "_copy_to_clipboard", return_value=True),
+            ):
+                rc = tui.main(["--state-dir", str(state_dir), "--open-hitl", "h1"])
+            self.assertEqual(rc, 0)
+            nav_data = json.loads((state_dir / tui.NAV_INTENT_FILENAME).read_text(encoding="utf-8"))
+            self.assertEqual(nav_data["conversation_id"], live_cid)
+            self.assertEqual(nav_data["hotkey"], "h1")
+            self.assertEqual(nav_data["sidebar_title"], "Live Question Chat")
+
+
 if __name__ == "__main__":
     unittest.main()

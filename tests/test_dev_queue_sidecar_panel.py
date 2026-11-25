@@ -132,6 +132,18 @@ class TestSidecarManifestAndFrontendContracts(unittest.TestCase):
         self.assertIn("ready for manual GitHub PR review and merge", html)
         self.assertIn("Blocked · Needs Input", html)
         self.assertIn("Open Blocked Chat", js)
+        self.assertIn("Answer Chat", js)
+        self.assertIn("Review Prompt", js)
+        self.assertIn("QUESTION (", js)
+        self.assertIn("APPROVAL", js)
+        self.assertIn("dq-question-preview", js)
+        self.assertIn(".dq-badge-question", css)
+        self.assertIn(".dq-badge-approval", css)
+        self.assertEqual(
+            len(re.findall(r'data-section-filter="[^"]+"', html)),
+            6,
+            "compact 6-pill header must be preserved",
+        )
 
         ids = re.findall(r'\bid="([^"]+)"', html)
         self.assertEqual(len(ids), len(set(ids)), "Duplicate HTML IDs found in index.html")
@@ -756,3 +768,182 @@ class TestNavIntentBridgeInTui(unittest.TestCase):
             data = json.loads(nav_path.read_text(encoding="utf-8"))
             self.assertEqual(data["conversation_id"], cid)
             self.assertEqual(data["hotkey"], "h1")
+
+
+def _panel_pb_varint(val: int) -> bytes:
+    out = bytearray()
+    n = int(val)
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    return bytes(out)
+
+
+def _panel_pb_bytes(field_num: int, payload: bytes) -> bytes:
+    return _panel_pb_varint((field_num << 3) | 2) + _panel_pb_varint(len(payload)) + payload
+
+
+def _panel_raw_summary_field8(*, tool_name: str, questions: list[str] | None = None) -> bytes:
+    f4 = _panel_pb_bytes(2, tool_name.encode("utf-8"))
+    f1_parts = [_panel_pb_bytes(5, _panel_pb_bytes(4, f4))]
+    if questions:
+        q_msgs = b"".join(_panel_pb_bytes(1, _panel_pb_bytes(1, q.encode("utf-8"))) for q in questions)
+        f1_parts.append(_panel_pb_bytes(56, _panel_pb_bytes(22, q_msgs)))
+    return _panel_pb_bytes(1, b"hdr") + _panel_pb_bytes(8, _panel_pb_bytes(1, b"".join(f1_parts)))
+
+
+class TestSidecarLiveWaitingPrompts(unittest.TestCase):
+    """Verify deduplication, live_prompt synthesis, Zero-PII scrubbing, and Planning isolation."""
+
+    def test_build_panel_state_surfaces_deduped_live_prompts_without_inflating_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            st_dir = root / "state"
+            agy_dir = root / "agy"
+            brain_dir = agy_dir / "brain"
+            ann_dir = agy_dir / "annotations"
+            conv_db = agy_dir / "conversation_summaries.db"
+            fake_home = root / "home"
+            brain_dir.mkdir(parents=True, exist_ok=True)
+            ann_dir.mkdir(parents=True, exist_ok=True)
+            fake_home.mkdir(parents=True, exist_ok=True)
+
+            hitl_cid = "aaaaaaaa-1111-4222-8333-444444444444"
+            live_ask_cid = "bbbbbbbb-1111-4222-8333-444444444444"
+            live_app_cid = "cccccccc-1111-4222-8333-444444444444"
+            pending_cid = "dddddddd-1111-4222-8333-444444444444"
+            arch_cid = "eeeeeeee-1111-4222-8333-444444444444"
+
+            (ann_dir / f"{arch_cid}.pbtxt").write_text("archived: true\n", encoding="utf-8")
+
+            with sqlite3.connect(str(conv_db)) as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        status TEXT,
+                        title TEXT,
+                        parent_conversation_id TEXT,
+                        killed INTEGER,
+                        last_modified_time TEXT,
+                        raw_summary BLOB
+                    )
+                    """
+                )
+                conn.executemany(
+                    "INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            hitl_cid,
+                            "CASCADE_RUN_STATUS_RUNNING",
+                            "Existing HITL Queue Task",
+                            "",
+                            0,
+                            "2026-11-25T10:03:00Z",
+                            _panel_raw_summary_field8(
+                                tool_name="ask_question",
+                                questions=["Approve existing HITL design?"],
+                            ),
+                        ),
+                        (
+                            live_ask_cid,
+                            "CASCADE_RUN_STATUS_RUNNING",
+                            "Ad-hoc Question Chat",
+                            "",
+                            0,
+                            "2026-11-25T10:04:00Z",
+                            _panel_raw_summary_field8(
+                                tool_name="ask_question",
+                                questions=[
+                                    f"Proceed in {os.sep}Users{os.sep}realperson{os.sep}work{os.sep}app?",
+                                    "Enable feature flag?",
+                                ],
+                            ),
+                        ),
+                        (
+                            live_app_cid,
+                            "CASCADE_RUN_STATUS_RUNNING",
+                            "Ad-hoc Shell Approval",
+                            "",
+                            0,
+                            "2026-11-25T10:02:00Z",
+                            _panel_raw_summary_field8(tool_name="run_command"),
+                        ),
+                        (
+                            arch_cid,
+                            "CASCADE_RUN_STATUS_RUNNING",
+                            "Archived Prompt",
+                            "",
+                            0,
+                            "2026-11-25T10:05:00Z",
+                            _panel_raw_summary_field8(tool_name="run_command"),
+                        ),
+                    ],
+                )
+                conn.commit()
+
+            _write_mock_state(
+                st_dir,
+                items=[
+                    {
+                        "conversation_id": hitl_cid,
+                        "priority": 10,
+                        "status": "hitl_blocked",
+                        "title": "HITL queue item",
+                        "repo_slugs": ["acme/repo-a"],
+                    },
+                    {
+                        "conversation_id": pending_cid,
+                        "priority": 30,
+                        "status": "pending",
+                        "title": "Pending queue item",
+                        "repo_slugs": ["acme/repo-a"],
+                    },
+                ],
+                locks={},
+            )
+            queue_before = (st_dir / "dev_queue.json").read_text(encoding="utf-8")
+
+            snap = panel_srv.build_panel_state(
+                state_dir=st_dir,
+                conv_db_path=conv_db,
+                brain_dir=brain_dir,
+                home_dir=fake_home,
+                env={},
+            )
+
+            # Read-only guarantee: dev_queue.json never mutated
+            self.assertEqual((st_dir / "dev_queue.json").read_text(encoding="utf-8"), queue_before)
+
+            # Planning counts strictly isolated (only 2 queue items: hitl_cid + pending_cid)
+            self.assertEqual(snap["planning"]["totals"]["open_count"], 2)
+            self.assertEqual(snap["counts"]["hitl_blocked"], 1)
+
+            # sec_hitl deduplicates hitl_cid (enriched) + appends 2 live_prompt cards with unified h1..h3
+            sec_hitl = snap["sections"]["hitl_blocked"]
+            self.assertEqual(len(sec_hitl), 3)
+            self.assertEqual([c["hotkey"] for c in sec_hitl], ["h1", "h2", "h3"])
+            self.assertEqual([c["conversation_id"] for c in sec_hitl], [hitl_cid, live_ask_cid, live_app_cid])
+
+            enriched = sec_hitl[0]
+            self.assertEqual(enriched["input_source"], "hitl_blocked")
+            self.assertTrue(enriched["waiting_input"])
+            self.assertEqual(enriched["waiting_kind"], "ask_question")
+            self.assertEqual(enriched["question_count"], 1)
+
+            synth_ask = sec_hitl[1]
+            self.assertEqual(synth_ask["input_source"], "live_prompt")
+            self.assertEqual(synth_ask["waiting_kind"], "ask_question")
+            self.assertEqual(synth_ask["question_count"], 2)
+            self.assertNotIn("realperson", synth_ask["question_preview"])
+            self.assertIn("$HOME/work/app", synth_ask["question_preview"])
+
+            synth_app = sec_hitl[2]
+            self.assertEqual(synth_app["input_source"], "live_prompt")
+            self.assertEqual(synth_app["waiting_kind"], "approval")
+            self.assertEqual(synth_app["waiting_tool"], "run_command")

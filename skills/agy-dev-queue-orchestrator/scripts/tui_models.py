@@ -391,6 +391,7 @@ class DashboardSnapshot:
     orch_phase: dict[str, Any] = field(default_factory=dict)
     repo_pills: list[RepoPillView] = field(default_factory=list)
     stalled_alerts: list[tuple[str, str, str]] = field(default_factory=list)
+    waiting_convs: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -421,6 +422,7 @@ class RenderResult:
     color_on: bool = False
     use_osc8: bool = False
     bar_w: int = 124
+    waiting_convs: list[dict[str, Any]] = field(default_factory=list)
 
     def to_legacy_tuple(
         self,
@@ -454,6 +456,8 @@ class RenderResult:
             "row_records": self.row_records,
             "row_views": self.row_views,
             "hitl_count": len(self.hitl_convs),
+            "waiting_count": len(self.waiting_convs),
+            "waiting_convs": list(self.waiting_convs),
             "all_pr_links": self.all_pr_links,
             "has_active_work": self.has_active_work,
             "orchestration_paused": self.orchestration_paused,

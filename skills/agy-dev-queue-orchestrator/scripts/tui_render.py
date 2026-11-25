@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import contextlib
 from datetime import datetime, timezone
 import json
@@ -69,6 +69,7 @@ from tui_state import (
     _secondary_slot_progress,
     _slot_label,
     _synthesize_untracked_lock_items,
+    load_waiting_user_conversations,
 )
 
 
@@ -759,6 +760,11 @@ def _build_dashboard_snapshot(
     )
 
     orch_phase = _facade_attr("_load_orchestration_phase", _load_orchestration_phase)(state_dir, locks)
+    waiting_convs = _facade_attr("load_waiting_user_conversations", load_waiting_user_conversations)(
+        db_path=conv_db_path,
+        brain_dir=brain_dir,
+        strict=strict_io,
+    )
 
     return DashboardSnapshot(
         state_dir=state_dir,
@@ -788,7 +794,141 @@ def _build_dashboard_snapshot(
         orch_phase=orch_phase,
         repo_pills=repo_pills,
         stalled_alerts=stalled_alerts,
+        waiting_convs=waiting_convs,
     )
+
+
+def _format_waiting_hitl_detail(w: Mapping[str, Any]) -> str:
+    """Format a compact single-line badge/preview label for a live waiting conversation."""
+    kind = str(w.get("waiting_kind") or "").strip().lower()
+    tool = str(w.get("waiting_tool") or "").strip()
+    q_cnt = int(w.get("question_count") or 0)
+    preview = str(w.get("question_preview") or "").strip()
+    if kind == "ask_question":
+        badge = f"QUESTION ({q_cnt})" if q_cnt > 0 else "QUESTION"
+        more = f" (+{q_cnt - 1} more)" if q_cnt > 1 else ""
+        return f"{badge}: {preview}{more}" if preview else badge
+    return f"APPROVAL ({tool})" if tool else "APPROVAL"
+
+
+def _collect_brain_proposal_links(cid: str, brain_roots: Sequence[Path]) -> str:
+    """Return compact Markdown links for `.md` artifacts under `<brain_root>/<cid>/`."""
+    prop_mds: list[Path] = []
+    seen_names: set[str] = set()
+    for b_root in brain_roots:
+        cid_brain_dir = b_root / cid
+        if cid_brain_dir.is_dir():
+            for md_cand in sorted(cid_brain_dir.glob("*.md")):
+                if md_cand.name not in seen_names:
+                    seen_names.add(md_cand.name)
+                    prop_mds.append(md_cand)
+    return " · ".join(f"[{p.name}](file://{p})" for p in prop_mds[:2]) if prop_mds else "—"
+
+
+def _compute_unified_hitl_total(snap: DashboardSnapshot) -> int:
+    """Count queue `hitl_blocked` items plus deduplicated live waiting conversations."""
+    queue_hitl_cids = [
+        str(it.get("conversation_id") or "").strip()
+        for it in snap.effective_items
+        if _resolve_effective_item_status(it, snap.locks_by_cid).lower() == "hitl_blocked"
+        and str(it.get("conversation_id") or "").strip()
+    ]
+    extra_live = [
+        w
+        for w in snap.waiting_convs
+        if not any(_cids_match(str(w.get("conversation_id") or ""), qcid) for qcid in queue_hitl_cids)
+    ]
+    return snap.counts.get("hitl_blocked", 0) + len(extra_live)
+
+
+def _append_live_waiting_hitl_entries(
+    *,
+    args: argparse.Namespace,
+    snap: DashboardSnapshot,
+    resolved_brain_roots: Sequence[Path],
+    hitl_convs: dict[int, tuple[str, str, str]],
+    hitl_footer: list[tuple[int, str, str]],
+    hitl_board_rows: list[dict[str, str]],
+    hitl_idx: int,
+) -> int:
+    """Append deduplicated live waiting conversations to unified HITL hotkeys, footer, and board rows."""
+    status_filter = (getattr(args, "status", "") or "").strip().lower()
+    repo_filter = (getattr(args, "repo", "") or "").strip().lower()
+    if status_filter and status_filter != "hitl_blocked":
+        return hitl_idx
+
+    existing_cids = [entry[1] for entry in hitl_convs.values() if entry[1]]
+    items_by_cid = {
+        str(it.get("conversation_id") or "").strip(): it
+        for it in snap.effective_items
+        if str(it.get("conversation_id") or "").strip()
+    }
+    for w in snap.waiting_convs:
+        w_cid = str(w.get("conversation_id") or "").strip()
+        if not w_cid or any(_cids_match(w_cid, cur) for cur in existing_cids):
+            continue
+        matched_it = items_by_cid.get(w_cid)
+        if matched_it is None:
+            for icid, it_obj in items_by_cid.items():
+                if _cids_match(w_cid, icid):
+                    matched_it = it_obj
+                    break
+        if repo_filter:
+            it_repos = [str(r) for r in ((matched_it or {}).get("repo_slugs") or []) if r]
+            if not any(repo_filter in r.lower() for r in it_repos):
+                continue
+
+        hitl_idx += 1
+        existing_cids.append(w_cid)
+        w_disp = str(w.get("display_id") or w_cid[:8])
+        w_title = str(w.get("sidebar_title") or w.get("title") or w_disp)
+        detail = _format_waiting_hitl_detail(w)
+        footer_label = f"{w_title} · {detail}" if detail and w_title != w_disp else (f"{w_title} · {detail}" if w_title else detail)
+        hitl_convs[hitl_idx] = (w_disp, w_cid, w_title)
+        hitl_footer.append((hitl_idx, w_disp, footer_label))
+        hitl_board_rows.append(
+            {
+                "idx": str(hitl_idx),
+                "prio": "LIVE",
+                "cid": w_cid,
+                "ag_title": _sanitize_md_table_cell(w_title),
+                "repos": "live",
+                "notes": _trunc(_sanitize_md_table_cell(detail), 180),
+                "artifact_link": _collect_brain_proposal_links(w_cid, resolved_brain_roots),
+            }
+        )
+    return hitl_idx
+
+
+def _render_hitl_footer_lines(
+    hitl_footer: list[tuple[int, str, str]],
+    *,
+    bar_w: int,
+    color_on: bool,
+) -> list[str]:
+    """Render the unified `HITL — ANTIGRAVITY APP VALIDATION` footer section."""
+    if not hitl_footer:
+        return []
+    title_part = "HITL — ANTIGRAVITY APP VALIDATION"
+    full_hint = "(press h + number: jump via Dev Queue Panel or copy title & focus Antigravity · /hitl-review):"
+    short_hint = "(press h+# to jump · /hitl-review):"
+    if len(title_part) + 1 + len(full_hint) <= bar_w:
+        header_line = f"{_color(title_part, '1;35', color_on)} {_color(full_hint, '2', color_on)}"
+    elif len(title_part) + 1 + len(short_hint) <= bar_w:
+        header_line = f"{_color(title_part, '1;35', color_on)} {_color(short_hint, '2', color_on)}"
+    else:
+        header_line = _color(_trunc(f"{title_part} {short_hint}", bar_w), "1;35", color_on)
+    lines: list[str] = [
+        _color("─" * bar_w, "2", color_on),
+        header_line,
+    ]
+    for h_i, cid_disp, ag_t in hitl_footer:
+        lines.append(
+            f"  {_color(f'[h{h_i}]', '1;35', color_on)} "
+            f"{_color(cid_disp, '36', color_on)}  "
+            f"{_trunc(ag_t, max(20, bar_w - 20))}"
+        )
+    return lines
 
 
 def _render_json_payload(
@@ -877,6 +1017,8 @@ def _render_json_payload(
         "orchestrator_conversation_id": snap.queue_data.get("orchestrator_conversation_id", ""),
         "orchestration": snap.orch_phase,
         "counts": snap.counts,
+        "unified_hitl_count": _compute_unified_hitl_total(snap),
+        "waiting_user_conversations": list(snap.waiting_convs),
         "managed_repos": snap.managed_list,
         "locks": active_locks_payload,
         "active_locks": active_locks_payload,
@@ -969,11 +1111,12 @@ def render_dashboard(
         + snap.counts.get("needs_agent_semantic_fix", 0)
         + snap.counts.get("needs_agent_conflict_resolution", 0)
     )
+    unified_hitl_total = _compute_unified_hitl_total(snap)
     summary_bits = [
         _color(f"pr:{snap.counts.get('pr_open', 0)}", "1;33", color_on),
         _color(f"run:{in_flight_run}", "1;36", color_on),
         _color(f"pending:{snap.counts.get('pending', 0)}", "1;37", color_on),
-        _color(f"hitl:{snap.counts.get('hitl_blocked', 0)}", "1;35", color_on),
+        _color(f"hitl:{unified_hitl_total}", "1;35", color_on),
         _color(f"standby:{snap.counts.get('standby', 0)}", "2;37", color_on),
         _color(f"merged:{snap.counts.get('merged', 0)}", "0;32", color_on),
     ]
@@ -1017,8 +1160,23 @@ def render_dashboard(
     board_writer_fn = _facade_attr("_write_live_antigravity_board", _write_live_antigravity_board)
 
     if not snap.filtered:
+        resolved_brain_roots_empty = _resolve_brain_dirs(brain_dir)
+        empty_hitl_convs: dict[int, tuple[str, str, str]] = {}
+        empty_hitl_footer: list[tuple[int, str, str]] = []
+        empty_hitl_board_rows: list[dict[str, str]] = []
+        _append_live_waiting_hitl_entries(
+            args=args,
+            snap=snap,
+            resolved_brain_roots=resolved_brain_roots_empty,
+            hitl_convs=empty_hitl_convs,
+            hitl_footer=empty_hitl_footer,
+            hitl_board_rows=empty_hitl_board_rows,
+            hitl_idx=0,
+        )
         empty_msg = _color("No matching items in dev_queue.json.", "2", color_on)
         sticky_empty: list[str] = [empty_msg]
+        if empty_hitl_footer:
+            sticky_empty.extend(_render_hitl_footer_lines(empty_hitl_footer, bar_w=bar_w, color_on=color_on))
         if snap.stalled_alerts:
             sticky_empty.append(_color("─" * bar_w, "2", color_on))
             summary_st = ", ".join(f"{r} idle {idle}" for r, idle, _ in snap.stalled_alerts)
@@ -1044,13 +1202,13 @@ def render_dashboard(
                 repo_local_dirs=snap.repo_local_dirs,
                 item_urls_by_cid=snap.item_urls_by_cid,
                 board_rows=[],
-                hitl_rows=[],
+                hitl_rows=empty_hitl_board_rows,
                 force_write=force_board_write,
             )
         return RenderResult(
             text="\n".join(lines),
             row_links={},
-            hitl_convs={},
+            hitl_convs=empty_hitl_convs,
             first_pr_link=None,
             state_dir=snap.state_dir,
             repo_local_dirs=snap.repo_local_dirs,
@@ -1065,6 +1223,7 @@ def render_dashboard(
             color_on=color_on,
             use_osc8=use_osc8,
             bar_w=bar_w,
+            waiting_convs=list(snap.waiting_convs),
         )
 
     status_col = max(
@@ -1183,22 +1342,21 @@ def render_dashboard(
         elif st_lower == "hitl_blocked" and cid_full:
             hitl_idx += 1
             ag_t = snap.ag_titles.get(cid_full) or title
+            matched_w = next(
+                (w for w in snap.waiting_convs if _cids_match(cid_full, str(w.get("conversation_id") or ""))),
+                None,
+            )
+            live_detail = _format_waiting_hitl_detail(matched_w) if matched_w is not None else ""
             hitl_convs[hitl_idx] = (cid_disp, cid_full, ag_t)
-            hitl_footer.append((hitl_idx, cid_disp, ag_t))
+            hitl_footer.append((hitl_idx, cid_disp, f"{ag_t} · {live_detail}" if live_detail else ag_t))
             pill_raw = f"[h{hitl_idx}] Agy"
             pill_styled = _color(pill_raw, "1;35", color_on)
             action_cell = _pad_visible(pill_styled, link_col)
             action_md = f"[Open chat](conversation://{cid_full})" if _is_uuid(cid_full) else "—"
-            prop_mds: list[Path] = []
-            seen_prop_names: set[str] = set()
-            for b_root in resolved_brain_roots:
-                cid_brain_dir = b_root / cid_full
-                if cid_brain_dir.is_dir():
-                    for md_cand in sorted(cid_brain_dir.glob("*.md")):
-                        if md_cand.name not in seen_prop_names:
-                            seen_prop_names.add(md_cand.name)
-                            prop_mds.append(md_cand)
-            art_link = " · ".join(f"[{p.name}](file://{p})" for p in prop_mds[:2]) if prop_mds else "—"
+            art_link = _collect_brain_proposal_links(cid_full, resolved_brain_roots)
+            notes_raw = str(it.get("notes") or title)
+            if live_detail and live_detail not in notes_raw:
+                notes_raw = f"{live_detail} · {notes_raw}" if notes_raw else live_detail
             hitl_board_rows.append(
                 {
                     "idx": str(hitl_idx),
@@ -1206,7 +1364,7 @@ def render_dashboard(
                     "cid": cid_full,
                     "ag_title": _sanitize_md_table_cell(ag_t),
                     "repos": repos_md,
-                    "notes": _trunc(_sanitize_md_table_cell(str(it.get("notes") or title)), 180),
+                    "notes": _trunc(_sanitize_md_table_cell(notes_raw), 180),
                     "artifact_link": art_link,
                 }
             )
@@ -1305,6 +1463,16 @@ def render_dashboard(
             }
         )
 
+    hitl_idx = _append_live_waiting_hitl_entries(
+        args=args,
+        snap=snap,
+        resolved_brain_roots=resolved_brain_roots,
+        hitl_convs=hitl_convs,
+        hitl_footer=hitl_footer,
+        hitl_board_rows=hitl_board_rows,
+        hitl_idx=hitl_idx,
+    )
+
     if ready_pr_footer:
         sticky_footer_lines.append(_color("─" * bar_w, "2", color_on))
         sticky_footer_lines.append(
@@ -1332,17 +1500,7 @@ def render_dashboard(
                 sticky_footer_lines.append(clean_u)
 
     if hitl_footer:
-        sticky_footer_lines.append(_color("─" * bar_w, "2", color_on))
-        sticky_footer_lines.append(
-            f"{_color('HITL — ANTIGRAVITY APP VALIDATION', '1;35', color_on)} "
-            f"{_color('(press h + number: jump via Dev Queue Panel or copy title & focus Antigravity · /hitl-review):', '2', color_on)}"
-        )
-        for h_i, cid_disp, ag_t in hitl_footer:
-            sticky_footer_lines.append(
-                f"  {_color(f'[h{h_i}]', '1;35', color_on)} "
-                f"{_color(cid_disp, '36', color_on)}  "
-                f"{_trunc(ag_t, max(20, bar_w - 20))}"
-            )
+        sticky_footer_lines.extend(_render_hitl_footer_lines(hitl_footer, bar_w=bar_w, color_on=color_on))
 
     if snap.stalled_alerts:
         sticky_footer_lines.append(_color("─" * bar_w, "2", color_on))
@@ -1411,6 +1569,7 @@ def render_dashboard(
         color_on=color_on,
         use_osc8=use_osc8,
         bar_w=bar_w,
+        waiting_convs=list(snap.waiting_convs),
     )
 
 

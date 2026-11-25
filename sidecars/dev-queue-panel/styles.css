@@ -697,6 +697,21 @@ button {
   color: var(--dq-hitl);
 }
 
+.dq-badge-question {
+  background: color-mix(in srgb, var(--dq-hitl) 22%, transparent);
+  color: var(--dq-hitl);
+}
+
+.dq-badge-approval {
+  background: var(--dq-warn-tint);
+  color: var(--dq-warning);
+}
+
+.dq-question-preview {
+  color: var(--dq-fg);
+  font-style: normal;
+}
+
 .dq-badge-pr {
   background: color-mix(in srgb, var(--dq-success) 18%, transparent);
   color: var(--dq-success);

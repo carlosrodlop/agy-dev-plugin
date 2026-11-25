@@ -47,14 +47,19 @@ def _resolve_pr_remediator_script() -> Path:
     return _INSTALLED_PLUGIN_ROOT / "skills" / "agy-code-remediation-pr" / "scripts" / "pr_remediator.py"
 
 
-def _resolve_conv_summaries_db(override: Path | str | None = None) -> Path:
+def _resolve_conv_summaries_db(
+    override: Path | str | None = None,
+    *,
+    home_dir: Path | None = None,
+) -> Path:
     """Resolve the Antigravity `conversation_summaries.db` SQLite path."""
     if override is not None and str(override).strip():
         return Path(str(override)).expanduser()
     env_val = str(os.environ.get("AGY_CONVERSATION_SUMMARIES_DB") or "").strip()
     if env_val:
         return Path(env_val).expanduser()
-    return Path.home() / ".gemini" / "antigravity" / "conversation_summaries.db"
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    return base_home / ".gemini" / "antigravity" / "conversation_summaries.db"
 
 
 def _resolve_brain_dirs(
@@ -144,6 +149,7 @@ def _load_conversation_titles(
     cids: list[str],
     *,
     db_path: Path | str | None = None,
+    home_dir: Path | None = None,
     strict: bool = False,
 ) -> dict[str, str]:
     """Read exact Antigravity Desktop sidebar conversation titles from `conversation_summaries.db`."""
@@ -152,7 +158,7 @@ def _load_conversation_titles(
         (db_path is not None and str(db_path).strip())
         or str(os.environ.get("AGY_CONVERSATION_SUMMARIES_DB") or "").strip()
     )
-    resolved_db = _resolve_conv_summaries_db(db_path)
+    resolved_db = _resolve_conv_summaries_db(db_path, home_dir=home_dir)
     if not clean_ids or not resolved_db.is_file():
         return {}
     titles: dict[str, str] = {}
@@ -181,6 +187,541 @@ def _load_conversation_titles(
         except OSError:
             break
     return titles
+
+
+_LOCAL_HOME_PATH_RE = re.compile(r"/(?:Users|home)/(?!testuser\b|test\b|Shared\b)[A-Za-z0-9._-]+")
+_ARCHIVED_PBTXT_RE = re.compile(r"^\s*archived\s*:\s*true\b", re.MULTILINE | re.IGNORECASE)
+_QUESTION_PREVIEW_MAX_CHARS = 140
+_TRANSCRIPT_TAIL_MAX_BYTES = 65536
+
+
+def _scrub_home_paths(text: str, *, home_dir: Path | None = None) -> str:
+    """Replace local filesystem home prefixes with `$HOME` for Zero-PII safety."""
+    if not text:
+        return ""
+    cleaned = str(text)
+    home_variants: list[str] = []
+    for cand_home in ([home_dir] if home_dir is not None else []) + [Path.home()]:
+        if cand_home is None:
+            continue
+        with contextlib.suppress(OSError):
+            expanded = cand_home.expanduser()
+            for variant in (str(expanded.resolve()), str(expanded)):
+                if variant and variant != "/" and variant not in home_variants:
+                    home_variants.append(variant)
+    for variant in sorted(home_variants, key=len, reverse=True):
+        cleaned = cleaned.replace(variant, "$HOME")
+    return _LOCAL_HOME_PATH_RE.sub("$HOME", cleaned)
+
+
+def _truncate_question_preview(text: str, max_chars: int = _QUESTION_PREVIEW_MAX_CHARS) -> str:
+    """Collapse whitespace and truncate a question preview cleanly."""
+    collapsed = " ".join(str(text or "").split()).strip()
+    if not collapsed:
+        return ""
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max(1, max_chars - 1)].rstrip() + "…"
+
+
+def _pb_read_varint(data: bytes, pos: int) -> tuple[int, int] | None:
+    """Decode an unsigned LEB128 protobuf varint starting at `pos`."""
+    result = 0
+    shift = 0
+    size = len(data)
+    for idx in range(10):
+        cur = pos + idx
+        if cur >= size:
+            return None
+        b = data[cur]
+        result |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return (result, cur + 1)
+        shift += 7
+    return None
+
+
+def _pb_skip_group(data: bytes, pos: int, group_field: int, depth: int = 0) -> int | None:
+    """Skip a deprecated protobuf start-group (`wire_type=3`) until matching end-group (`wire_type=4`)."""
+    if depth > 16:
+        return None
+    size = len(data)
+    while pos < size:
+        tag_res = _pb_read_varint(data, pos)
+        if tag_res is None:
+            return None
+        tag, pos = tag_res
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+        if field_num <= 0:
+            return None
+        if wire_type == 0:
+            v_res = _pb_read_varint(data, pos)
+            if v_res is None:
+                return None
+            pos = v_res[1]
+        elif wire_type == 1:
+            if pos + 8 > size:
+                return None
+            pos += 8
+        elif wire_type == 2:
+            l_res = _pb_read_varint(data, pos)
+            if l_res is None:
+                return None
+            length, pos = l_res
+            if pos + length > size:
+                return None
+            pos += length
+        elif wire_type == 3:
+            next_pos = _pb_skip_group(data, pos, field_num, depth + 1)
+            if next_pos is None:
+                return None
+            pos = next_pos
+        elif wire_type == 4:
+            return pos if field_num == group_field else None
+        elif wire_type == 5:
+            if pos + 4 > size:
+                return None
+            pos += 4
+        else:
+            return None
+    return None
+
+
+def _pb_iter_fields(data: bytes) -> list[tuple[int, int, Any]]:
+    """Decode top-level protobuf wire fields `(field_number, wire_type, value)` using stdlib only."""
+    fields: list[tuple[int, int, Any]] = []
+    pos = 0
+    size = len(data)
+    while pos < size:
+        tag_res = _pb_read_varint(data, pos)
+        if tag_res is None:
+            break
+        tag, pos = tag_res
+        field_num = tag >> 3
+        wire_type = tag & 0x07
+        if field_num <= 0:
+            break
+        if wire_type == 0:
+            v_res = _pb_read_varint(data, pos)
+            if v_res is None:
+                break
+            val, pos = v_res
+            fields.append((field_num, wire_type, val))
+        elif wire_type == 1:
+            if pos + 8 > size:
+                break
+            fields.append((field_num, wire_type, data[pos : pos + 8]))
+            pos += 8
+        elif wire_type == 2:
+            l_res = _pb_read_varint(data, pos)
+            if l_res is None:
+                break
+            length, pos = l_res
+            if length < 0 or pos + length > size:
+                break
+            fields.append((field_num, wire_type, data[pos : pos + length]))
+            pos += length
+        elif wire_type == 3:
+            next_pos = _pb_skip_group(data, pos, field_num)
+            if next_pos is None:
+                break
+            pos = next_pos
+        elif wire_type == 4:
+            break
+        elif wire_type == 5:
+            if pos + 4 > size:
+                break
+            fields.append((field_num, wire_type, data[pos : pos + 4]))
+            pos += 4
+        else:
+            break
+    return fields
+
+
+def _pb_find_bytes(data: bytes | None, field_num: int) -> list[bytes]:
+    """Return all length-delimited byte payloads for `field_num` in a protobuf message."""
+    if not data:
+        return []
+    return [val for fnum, wtype, val in _pb_iter_fields(data) if fnum == field_num and wtype == 2]
+
+
+def _pb_first_bytes(data: bytes | None, field_num: int) -> bytes | None:
+    """Return the first length-delimited byte payload for `field_num`, or `None`."""
+    matches = _pb_find_bytes(data, field_num)
+    return matches[0] if matches else None
+
+
+def _pb_decode_utf8(raw: bytes | None) -> str:
+    """Decode a protobuf UTF-8 string field safely and collapse surrounding whitespace."""
+    if not raw:
+        return ""
+    text = raw.decode("utf-8", errors="ignore")
+    return " ".join(text.split()).strip()
+
+
+def _parse_waiting_step_from_raw_summary(
+    raw_summary: bytes | bytearray | memoryview | None,
+) -> dict[str, Any] | None:
+    """Decode Antigravity `conversation_summaries.raw_summary` field `8` using pure-Python protobuf wire parsing.
+
+    Extracts:
+      - Tool name from `f8.f1.f5.f4.f2`
+      - `ask_question` prompts from `f8.f1.f56.f22.f1[].f1` (primary) or `f8.f1.f140.f1` (fallback)
+
+    Returns `None` when protobuf field `8` is absent or empty.
+    """
+    if not raw_summary or not isinstance(raw_summary, (bytes, bytearray, memoryview)):
+        return None
+    buf = bytes(raw_summary)
+    f8 = _pb_first_bytes(buf, 8)
+    if not f8:
+        return None
+
+    f1 = _pb_first_bytes(f8, 1)
+    waiting_tool = ""
+    questions: list[str] = []
+
+    if f1:
+        f5 = _pb_first_bytes(f1, 5)
+        f4 = _pb_first_bytes(f5, 4)
+        waiting_tool = _pb_decode_utf8(_pb_first_bytes(f4, 2))
+
+        f56 = _pb_first_bytes(f1, 56)
+        f22 = _pb_first_bytes(f56, 22)
+        for q_msg in _pb_find_bytes(f22, 1):
+            q_txt = _pb_decode_utf8(_pb_first_bytes(q_msg, 1))
+            if q_txt and q_txt not in questions:
+                questions.append(q_txt)
+
+        if not questions:
+            f140 = _pb_first_bytes(f1, 140)
+            for q_raw in _pb_find_bytes(f140, 1):
+                q_txt = _pb_decode_utf8(q_raw)
+                if q_txt and q_txt not in questions:
+                    questions.append(q_txt)
+
+    tool_lower = waiting_tool.lower()
+    is_ask_question = tool_lower == "ask_question" or (not waiting_tool and bool(questions))
+    if is_ask_question:
+        waiting_kind = "ask_question"
+        waiting_tool = waiting_tool or "ask_question"
+        question_count = len(questions)
+        question_preview = _truncate_question_preview(questions[0]) if questions else ""
+        has_readable_text = bool(question_preview)
+    else:
+        waiting_kind = "approval"
+        question_count = 0
+        question_preview = ""
+        has_readable_text = bool(waiting_tool)
+
+    return {
+        "has_waiting_step": True,
+        "waiting_kind": waiting_kind,
+        "waiting_tool": waiting_tool,
+        "questions": questions,
+        "question_count": question_count,
+        "question_preview": question_preview,
+        "has_readable_text": has_readable_text,
+    }
+
+
+def _is_conversation_archived(cid: str, ann_dirs: Sequence[Path]) -> bool:
+    """Return True when `<annotations>/<cid>.pbtxt` sets `archived: true`."""
+    clean_cid = str(cid or "").strip()
+    if not clean_cid:
+        return False
+    cand_names = (f"{clean_cid}.pbtxt",) if clean_cid == clean_cid.lower() else (f"{clean_cid}.pbtxt", f"{clean_cid.lower()}.pbtxt")
+    for ann_dir in ann_dirs:
+        for fname in cand_names:
+            pbtxt = ann_dir / fname
+            if pbtxt.is_file():
+                with contextlib.suppress(OSError, UnicodeDecodeError):
+                    content = pbtxt.read_text(encoding="utf-8", errors="ignore")
+                    if _ARCHIVED_PBTXT_RE.search(content):
+                        return True
+    return False
+
+
+def _extract_questions_from_json_obj(obj: Any) -> list[str]:
+    """Extract question strings from a `transcript.jsonl` step/tool-call payload."""
+    questions: list[str] = []
+
+    def _add_q(raw_val: Any) -> None:
+        cleaned = " ".join(str(raw_val or "").split()).strip()
+        if cleaned and cleaned not in questions:
+            questions.append(cleaned)
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            raw_qs = node.get("questions")
+            if isinstance(raw_qs, list):
+                for entry in raw_qs:
+                    if isinstance(entry, str):
+                        _add_q(entry)
+                    elif isinstance(entry, dict):
+                        _add_q(entry.get("question") or entry.get("prompt") or entry.get("text") or entry.get("title"))
+            for key in ("question", "prompt", "message"):
+                if isinstance(node.get(key), str) and str(node.get("name") or node.get("tool") or node.get("toolName") or "").strip().lower() in ("", "ask_question"):
+                    _add_q(node.get(key))
+            for sub_key in ("arguments", "args", "spec", "askUserQuestion", "ask_question", "toolCall", "tool_calls", "calls"):
+                if sub_key in node:
+                    _walk(node[sub_key])
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(obj)
+    return questions
+
+
+def _extract_waiting_from_transcript(cid: str, brain_dirs: Sequence[Path]) -> dict[str, Any] | None:
+    """Bounded read-only `transcript.jsonl` fallback ONLY when `raw_summary` field `8` lacked readable text."""
+    clean_cid = str(cid or "").strip()
+    if not clean_cid:
+        return None
+    tpath: Path | None = None
+    if _dev_common is not None and hasattr(_dev_common, "resolve_transcript_path"):
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            tpath = _dev_common.resolve_transcript_path(clean_cid, brain_dirs)
+    if tpath is None:
+        for b_root in brain_dirs:
+            for cand_id in dict.fromkeys((clean_cid, clean_cid.lower())):
+                cand = b_root / cand_id / ".system_generated" / "logs" / "transcript.jsonl"
+                if cand.is_file():
+                    tpath = cand
+                    break
+            if tpath is not None:
+                break
+    if tpath is None or not tpath.is_file():
+        return None
+
+    try:
+        with tpath.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - _TRANSCRIPT_TAIL_MAX_BYTES), os.SEEK_SET)
+            raw_bytes = fh.read()
+        lines = raw_bytes.decode("utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+
+    scanned_json = 0
+    for raw_line in reversed(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        scanned_json += 1
+        tool_name = str(obj.get("name") or obj.get("tool") or obj.get("toolName") or "").strip()
+        step_type = str(obj.get("type") or "").strip().upper()
+        qs = _extract_questions_from_json_obj(obj)
+        if tool_name.lower() == "ask_question" or "ASK_USER" in step_type or "ASK_QUESTION" in step_type or qs:
+            return {
+                "waiting_kind": "ask_question",
+                "waiting_tool": "ask_question",
+                "questions": qs,
+                "question_count": len(qs),
+                "question_preview": _truncate_question_preview(qs[0]) if qs else "",
+            }
+        if tool_name:
+            return {
+                "waiting_kind": "approval",
+                "waiting_tool": tool_name,
+                "questions": [],
+                "question_count": 0,
+                "question_preview": "",
+            }
+        # Also inspect nested tool_calls / calls if top-level had no tool name
+        for nested_key in ("tool_calls", "calls", "toolCall"):
+            nested = obj.get(nested_key)
+            candidates = nested if isinstance(nested, list) else ([nested] if isinstance(nested, dict) else [])
+            for cand in reversed(candidates):
+                if not isinstance(cand, dict):
+                    continue
+                n_tool = str(cand.get("name") or cand.get("tool") or cand.get("toolName") or "").strip()
+                n_qs = _extract_questions_from_json_obj(cand)
+                if n_tool.lower() == "ask_question" or n_qs:
+                    return {
+                        "waiting_kind": "ask_question",
+                        "waiting_tool": "ask_question",
+                        "questions": n_qs,
+                        "question_count": len(n_qs),
+                        "question_preview": _truncate_question_preview(n_qs[0]) if n_qs else "",
+                    }
+                if n_tool:
+                    return {
+                        "waiting_kind": "approval",
+                        "waiting_tool": n_tool,
+                        "questions": [],
+                        "question_count": 0,
+                        "question_preview": "",
+                    }
+        role_l = str(obj.get("role") or "").strip().lower()
+        st_u = str(obj.get("status") or "").strip().upper()
+        if role_l == "user" or step_type in ("USER", "USER_INPUT") or st_u in ("COMPLETED", "DONE") or scanned_json >= 10:
+            break
+    return None
+
+
+def load_waiting_user_conversations(
+    *,
+    db_path: Path | str | None = None,
+    brain_dir: Path | str | Sequence[Path | str] | None = None,
+    home_dir: Path | None = None,
+    strict: bool = False,
+) -> list[dict[str, Any]]:
+    """Read `conversation_summaries.db` read-only for live non-killed top-level conversations awaiting user input."""
+    explicit_db = bool(
+        (db_path is not None and str(db_path).strip())
+        or str(os.environ.get("AGY_CONVERSATION_SUMMARIES_DB") or "").strip()
+    )
+    if not explicit_db and home_dir is None and os.environ.get("PRE_COMMIT_HOOK") == "1":
+        return []
+    resolved_db = _resolve_conv_summaries_db(db_path, home_dir=home_dir)
+    if not resolved_db.is_file():
+        return []
+
+    brain_roots = _resolve_brain_dirs(brain_dir, home_dir=home_dir)
+    ann_dirs: list[Path] = []
+    seen_ann: set[str] = set()
+    for cand_ann in [resolved_db.parent / "annotations", *(b.parent / "annotations" for b in brain_roots)]:
+        key = str(cand_ann)
+        if key not in seen_ann:
+            seen_ann.add(key)
+            ann_dirs.append(cand_ann)
+
+    rows: list[tuple[Any, ...]] = []
+    loaded = False
+    for uri in (f"file:{resolved_db}?mode=ro", f"file:{resolved_db}?mode=ro&immutable=1"):
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+            try:
+                tables = {
+                    str(r[0] or "").strip()
+                    for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                if "conversation_summaries" not in tables:
+                    return []
+                cols = {
+                    str(r[1] or "").strip()
+                    for r in conn.execute("PRAGMA table_info(conversation_summaries)").fetchall()
+                }
+                if not {"conversation_id", "status", "raw_summary"}.issubset(cols):
+                    return []
+
+                sel_title = "COALESCE(title, '')" if "title" in cols else "''"
+                sel_parent = "COALESCE(parent_conversation_id, '')" if "parent_conversation_id" in cols else "''"
+                sel_killed = "COALESCE(killed, 0)" if "killed" in cols else "0"
+                if "last_modified_time" in cols:
+                    sel_mtime = "COALESCE(last_modified_time, '')"
+                elif "updated_at" in cols:
+                    sel_mtime = "COALESCE(updated_at, '')"
+                else:
+                    sel_mtime = "''"
+
+                sql = (
+                    f"SELECT conversation_id, status, {sel_title}, {sel_parent}, {sel_killed}, {sel_mtime}, raw_summary "
+                    "FROM conversation_summaries "
+                    "WHERE raw_summary IS NOT NULL"
+                )
+                rows = conn.execute(sql).fetchall()
+            finally:
+                conn.close()
+            loaded = True
+            break
+        except sqlite3.OperationalError:
+            if uri.endswith("immutable=1") and strict and explicit_db:
+                raise
+            continue
+        except sqlite3.Error:
+            if strict and explicit_db:
+                raise
+            return []
+        except OSError:
+            return []
+
+    if not loaded:
+        return []
+
+    waiting: list[dict[str, Any]] = []
+    for row in rows:
+        cid = str(row[0] or "").strip()
+        if not cid:
+            continue
+        st_u = str(row[1] or "").strip().upper()
+        if st_u != "CASCADE_RUN_STATUS_RUNNING":
+            continue
+        parent_cid = str(row[3] or "").strip()
+        if parent_cid:
+            continue
+        try:
+            killed_val = int(row[4] or 0)
+        except (TypeError, ValueError):
+            killed_val = 1 if bool(row[4]) else 0
+        if killed_val != 0:
+            continue
+
+        parsed = _parse_waiting_step_from_raw_summary(row[6])
+        if parsed is None:
+            continue
+        if _is_conversation_archived(cid, ann_dirs):
+            continue
+
+        waiting_kind = str(parsed["waiting_kind"])
+        waiting_tool = str(parsed["waiting_tool"])
+        questions = list(parsed["questions"])
+        question_count = int(parsed["question_count"])
+        question_preview = str(parsed["question_preview"])
+
+        if not parsed["has_readable_text"]:
+            fb = _extract_waiting_from_transcript(cid, brain_roots)
+            if fb is not None:
+                waiting_kind = str(fb["waiting_kind"])
+                waiting_tool = str(fb["waiting_tool"]) or waiting_tool
+                if fb["questions"]:
+                    questions = list(fb["questions"])
+                    question_count = int(fb["question_count"])
+                    question_preview = str(fb["question_preview"])
+
+        clean_title = _scrub_home_paths(" ".join(str(row[2] or "").split()).strip(), home_dir=home_dir)
+        clean_tool = _scrub_home_paths(waiting_tool, home_dir=home_dir)
+        clean_questions = [
+            _truncate_question_preview(_scrub_home_paths(q, home_dir=home_dir))
+            for q in questions
+            if str(q or "").strip()
+        ]
+        clean_preview = (
+            _truncate_question_preview(_scrub_home_paths(question_preview, home_dir=home_dir))
+            if question_preview
+            else (clean_questions[0] if clean_questions else "")
+        )
+        if waiting_kind == "ask_question" and question_count == 0 and clean_questions:
+            question_count = len(clean_questions)
+
+        waiting.append(
+            {
+                "conversation_id": cid,
+                "display_id": cid[:8],
+                "sidebar_title": clean_title,
+                "title": clean_title or cid[:8],
+                "waiting_kind": waiting_kind,
+                "waiting_tool": clean_tool,
+                "question_count": question_count,
+                "question_preview": clean_preview,
+                "questions": clean_questions,
+                "last_modified_time": str(row[5] or "").strip(),
+                "input_source": "live_prompt",
+            }
+        )
+
+    waiting.sort(key=lambda item: (str(item.get("last_modified_time") or ""), str(item.get("conversation_id") or "")), reverse=True)
+    return waiting
 
 
 def _is_lock_base_stale(lk: dict[str, Any]) -> bool:
