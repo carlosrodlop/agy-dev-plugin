@@ -22,6 +22,7 @@ ALL_TEST_MODULES = [
     "tests.test_dev_queue_sidecar_panel",
     "tests.test_dev_queue_tui",
     "tests.test_model_quota_fallback",
+    "tests.test_native_conversation_cleanup",
     "tests.test_orchestration_pause_resume",
     "tests.test_orchestration_wip_and_wake_fixes",
     "tests.test_parallel_file_leases_and_tui",
@@ -96,6 +97,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_dev_queue_sidecar_panel.py": "tests.test_dev_queue_sidecar_panel",
     "tests/test_dev_queue_tui.py": "tests.test_dev_queue_tui",
     "tests/test_model_quota_fallback.py": "tests.test_model_quota_fallback",
+    "tests/test_native_conversation_cleanup.py": "tests.test_native_conversation_cleanup",
     "tests/test_orchestration_pause_resume.py": "tests.test_orchestration_pause_resume",
     "tests/test_orchestration_wip_and_wake_fixes.py": "tests.test_orchestration_wip_and_wake_fixes",
     "tests/test_parallel_file_leases_and_tui.py": "tests.test_parallel_file_leases_and_tui",
@@ -500,6 +502,24 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_queue_compactor" not in selected:
                 selected.append("tests.test_queue_compactor")
+
+        if (
+            norm.endswith(
+                (
+                    "conversation_service_client.py",
+                    "merge_watcher.py",
+                    "pr_remediator.py",
+                    "dev_common.py",
+                    "queue_store.py",
+                    "lock_store.py",
+                    "test_native_conversation_cleanup.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith("sidecars/dev-queue-watchdog/")
+        ):
+            if "tests.test_native_conversation_cleanup" not in selected:
+                selected.append("tests.test_native_conversation_cleanup")
 
         if norm not in ISOLATED_TEST_FILE_MODULES and "tests.test_agy_dev_plugin" not in selected:
             selected.append("tests.test_agy_dev_plugin")

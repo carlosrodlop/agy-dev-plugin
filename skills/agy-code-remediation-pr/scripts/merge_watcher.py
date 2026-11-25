@@ -43,6 +43,11 @@ if _SCRIPT_DIR_STR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR_STR)
 
 import dev_common  # noqa: E402
+from conversation_service_client import (  # noqa: E402
+    ConversationServiceClient,
+    ConversationServiceError,
+    resolve_conversation_service_config,
+)
 import dev_flow_optimizer as _flow_opt  # noqa: E402
 from dev_flow_optimizer import detect_stalled_lock  # noqa: E402
 import dev_queue_doctor as _queue_doctor  # noqa: E402
@@ -784,6 +789,7 @@ DEFAULT_ACTION_CLEANUP_DELIVERABLE_HOURS = 24.0
 DEFAULT_ACTION_CLEANUP_UNAUDITED_CAP_HOURS = 72.0
 DEFAULT_SIDECAR_EVENT_RETENTION_HOURS = 24.0
 DEFAULT_NOOP_ACTION_RETENTION_DAYS = DEFAULT_ACTION_CLEANUP_NOOP_HOURS / 24.0
+DEFAULT_AUTO_ARCHIVE_ADHOC_DAYS = 3.0
 STALE_STEP_RUNNING_IDLE_SECONDS = 3600.0
 _MERGED_LOCK_RELEASE_REASONS_SET: frozenset[str] = frozenset(
     {
@@ -4650,8 +4656,11 @@ def cleanup_merged_conversations(
     now_ts: float | None = None,
     repos_dir: Path | str | None = None,
     env: Mapping[str, str] | None = None,
+    ps_output: str | None = None,
+    ps_runner: Callable[[], str] | None = None,
+    conversation_client: ConversationServiceClient | None = None,
 ) -> dict[str, Any]:
-    """Safely delete merged conversation directories/SQLite `.db`s/protobufs/annotations/presence, sidecar events, orphans, and scheduled actions across Desktop & CLI."""
+    """Safely delete merged conversation artifacts: Native-First via `ConversationService/DeleteConversation` when Desktop is active, or direct disk cleanup when Desktop is closed/CLI/hermetic."""
     root_cids = _normalize_str_list(conversation_ids)
     subonly_cids = _normalize_str_list(subagents_only_of)
     explicit_seed_cids = _normalize_str_list([*root_cids, *subonly_cids])
@@ -4917,6 +4926,33 @@ def cleanup_merged_conversations(
 
     deleted: list[dict[str, Any]] = []
     freed_bytes = 0
+    eff_env = os.environ if env is None else env
+    has_explicit_root_override = any(
+        x is not None for x in (brain_dir, conversations_dir, cli_dir, antigravity_dirs)
+    ) or bool(
+        str(eff_env.get("AGY_ANTIGRAVITY_DIR") or "").strip()
+        or str(eff_env.get("AGY_ANTIGRAVITY_CLI_DIR") or "").strip()
+    )
+    in_test_harness = "unittest" in sys.modules or "pytest" in sys.modules
+    has_explicit_proc_probe = ps_output is not None or ps_runner is not None
+    hermetic_test_override = bool(
+        in_test_harness
+        and has_explicit_root_override
+        and not has_explicit_proc_probe
+        and conversation_client is None
+    )
+    if hermetic_test_override:
+        desktop_active = False
+    else:
+        active_procs = _detect_active_antigravity_processes(ps_output=ps_output, ps_runner=ps_runner)
+        desktop_active = bool(_filter_desktop_antigravity_procs(active_procs))
+    ls_client = (
+        conversation_client
+        if conversation_client is not None
+        else ConversationServiceClient(env=eff_env)
+    )
+    native_delete_count = 0
+    deferred_desktop_count = 0
 
     for cid in candidates:
         reasons = _find_protection_reasons(cid, protected_map)
@@ -4948,10 +4984,55 @@ def cleanup_merged_conversations(
             skipped.append({"conversation_id": cid, "reasons": ["not_present_on_disk"]})
             continue
 
+        desktop_artifacts = [a for a in artifacts if str(a.get("runtime") or "desktop") == "desktop"]
+        cli_artifacts = [a for a in artifacts if str(a.get("runtime") or "desktop") != "desktop"]
+        delete_method = "disk_rmtree"
+        artifacts_to_delete = artifacts
+
+        if desktop_artifacts and desktop_active:
+            if not ls_client.is_configured():
+                deferred_desktop_count += 1
+                skipped.append(
+                    {
+                        "conversation_id": cid,
+                        "runtime": "desktop",
+                        "reason": "deferred_desktop_active_no_ls",
+                        "reasons": ["deferred_desktop_active_no_ls"],
+                    }
+                )
+                artifacts_to_delete = cli_artifacts
+                if not artifacts_to_delete:
+                    continue
+            else:
+                delete_method = "conversation_service"
+                if not dry_run:
+                    live_desktop_exists = any(
+                        Path(a["path"]).is_symlink() or Path(a["path"]).exists()
+                        for a in desktop_artifacts
+                    )
+                    if live_desktop_exists:
+                        try:
+                            ls_client.delete_conversation(cid)
+                            native_delete_count += 1
+                        except ConversationServiceError as exc:
+                            deferred_desktop_count += 1
+                            skipped.append(
+                                {
+                                    "conversation_id": cid,
+                                    "runtime": "desktop",
+                                    "reason": "conversation_service_delete_failed",
+                                    "reasons": ["conversation_service_delete_failed"],
+                                    "error": f"{exc.code}: {exc.message}",
+                                }
+                            )
+                            artifacts_to_delete = cli_artifacts
+                            if not artifacts_to_delete:
+                                continue
+
         sz = 0
         per_kind_bytes: dict[str, int] = {}
         touched_runtimes: set[str] = set()
-        for art in artifacts:
+        for art in artifacts_to_delete:
             art_path = Path(art["path"])
             art_kind = str(art["kind"])
             art_rt = str(art["runtime"])
@@ -4986,6 +5067,7 @@ def cleanup_merged_conversations(
                 "bytes": sz,
                 "mb": round(sz / (1024 * 1024), 4),
                 "category": cat,
+                "delete_method": "disk_rmtree" if touched_runtimes == {"cli"} else delete_method,
                 "runtimes": sorted(touched_runtimes),
                 "artifacts": per_kind_bytes,
             }
@@ -5078,6 +5160,10 @@ def cleanup_merged_conversations(
         "include_scheduled_actions": bool(include_scheduled_actions),
         "include_sidecar_events": eff_include_sidecar_events,
         "include_orphans": eff_include_orphans,
+        "desktop_active": bool(desktop_active),
+        "hermetic_test_override": bool(hermetic_test_override),
+        "native_delete_count": int(native_delete_count),
+        "deferred_desktop_count": int(deferred_desktop_count),
         "deleted_count": len(deleted),
         "deleted": [d["conversation_id"] for d in deleted],
         "deleted_details": deleted,
@@ -5091,6 +5177,348 @@ def cleanup_merged_conversations(
         "freed_mb": round(freed_bytes / (1024 * 1024), 2),
         "breakdown": breakdown,
         "merge_verification": merge_check,
+    }
+
+
+def _resolve_auto_archive_adhoc_days(
+    adhoc_days: float | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> float:
+    """Resolve ad-hoc idle auto-archive threshold in days (`AGY_AUTO_ARCHIVE_ADHOC_DAYS`, default `3`, `0` disables)."""
+    eff_env = os.environ if env is None else env
+    if adhoc_days is not None:
+        with contextlib.suppress(TypeError, ValueError):
+            val = float(adhoc_days)
+            return 0.0 if val <= 0.0 else val
+    raw = str(eff_env.get("AGY_AUTO_ARCHIVE_ADHOC_DAYS") or "").strip()
+    if raw:
+        with contextlib.suppress(TypeError, ValueError):
+            val = float(raw)
+            return 0.0 if val <= 0.0 else val
+    return float(DEFAULT_AUTO_ARCHIVE_ADHOC_DAYS)
+
+
+def _queue_item_matches_cid(cid: str, q_item: Mapping[str, Any]) -> bool:
+    """Return True if `cid` matches a queue item's `conversation_id` or its synthetic 8-char hex prefix."""
+    q_cid = str(q_item.get("conversation_id") or "").strip().lower()
+    if not q_cid:
+        return False
+    if _matches_cid(cid, q_cid):
+        return True
+    if not _CONVERSATION_UUID_RE.fullmatch(q_cid):
+        pfx8 = _extract_prefix8_from_synthetic_or_uuid(q_cid)
+        if pfx8 and _matches_cid(cid, pfx8):
+            return True
+    return False
+
+
+def _collect_app_storage_pinned_cids(
+    roots: Sequence[Mapping[str, Any]],
+    *,
+    has_explicit_root_override: bool,
+    in_test_harness: bool,
+    env: Mapping[str, str] | None = None,
+) -> set[str]:
+    """Read pinned UUIDs from `app_storage.json` strictly read-only without probing host paths in hermetic tests."""
+    if in_test_harness and not has_explicit_root_override:
+        return set()
+    pinned: set[str] = set()
+    app_paths = _resolve_app_storage_paths(
+        roots,
+        has_explicit_root_override=has_explicit_root_override,
+        env=env,
+    )
+    for app_p in app_paths:
+        with contextlib.suppress(OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raw_obj = json.loads(app_p.read_text(encoding="utf-8"))
+            if isinstance(raw_obj, dict) and _PINNED_ORDER_KEY in raw_obj:
+                pinned_list, _ = _parse_json_list_or_raw(raw_obj[_PINNED_ORDER_KEY])
+                if pinned_list is not None:
+                    for entry in pinned_list:
+                        for uid in _extract_uuids_from_value(entry):
+                            pinned.add(uid.lower())
+    return pinned
+
+
+def _is_orchestrator_conversation_payload(conv: Mapping[str, Any]) -> bool:
+    """Return True when a `ConversationService` payload carries orchestrator title, summary, or tags."""
+    annotations = conv.get("annotations") if isinstance(conv.get("annotations"), Mapping) else {}
+    metadata = conv.get("metadata") if isinstance(conv.get("metadata"), Mapping) else {}
+    state = conv.get("state") if isinstance(conv.get("state"), Mapping) else {}
+    for raw_text in (annotations.get("title"), state.get("summary")):
+        txt = str(raw_text or "").strip().lower()
+        if not txt:
+            continue
+        if (
+            txt.startswith("[agy-doctor] orchestrator recovery")
+            or txt in ("main dev queue orchestrator", "dev queue orchestrator")
+            or "agy-dev-orchestrator" in txt
+            or "dev-queue-orchestrator" in txt
+        ):
+            return True
+    for raw_tags in (annotations.get("tags"), metadata.get("tags")):
+        if isinstance(raw_tags, Sequence) and not isinstance(raw_tags, (str, bytes)):
+            for t in raw_tags:
+                t_low = str(t or "").strip().lower()
+                if t_low in ("orchestrator", "agy-dev-orchestrator", "dev-queue-orchestrator"):
+                    return True
+    return False
+
+
+def auto_archive_stale_conversations(
+    *,
+    adhoc_days: float | None = None,
+    include_cancelled_queue: bool = True,
+    exclude_ids: Sequence[str] | None = None,
+    min_idle_seconds: float = 60.0,
+    include_unaudited_check: bool = True,
+    dry_run: bool = False,
+    portfolio_dir: Path | str | None = None,
+    brain_dir: Path | str | None = None,
+    conversations_dir: Path | str | None = None,
+    cli_dir: Path | str | None = None,
+    antigravity_dirs: Sequence[Path | str] | None = None,
+    summaries_db: Path | str | Sequence[Path | str] | None = None,
+    now_ts: float | None = None,
+    env: Mapping[str, str] | None = None,
+    conversation_client: ConversationServiceClient | None = None,
+) -> dict[str, Any]:
+    """Auto-archive stale ad-hoc chats (`> AGY_AUTO_ARCHIVE_ADHOC_DAYS`) and cancelled/compacted queue items via `UpdateConversation(archived=true)`."""
+    eff_env = os.environ if env is None else env
+    eff_adhoc_days = _resolve_auto_archive_adhoc_days(adhoc_days, env=eff_env)
+    ls_client = (
+        conversation_client
+        if conversation_client is not None
+        else ConversationServiceClient(env=eff_env)
+    )
+    if not ls_client.is_configured():
+        return {
+            "status": "skipped",
+            "reason": "no_ls_env",
+            "dry_run": bool(dry_run),
+            "adhoc_days": eff_adhoc_days,
+            "include_cancelled_queue": bool(include_cancelled_queue),
+            "scanned_count": 0,
+            "archived_count": 0,
+            "archived": [],
+            "archived_details": [],
+            "skipped_count": 0,
+            "skipped": [],
+            "by_category": {"cancelled_compacted_queue": 0, "cancelled_queue": 0, "stale_adhoc_chat": 0},
+        }
+
+    try:
+        conversations = ls_client.list_all_conversations(include_archived=False)
+    except ConversationServiceError as exc:
+        return {
+            "status": "error",
+            "reason": "conversation_service_list_failed",
+            "error": f"{exc.code}: {exc.message}",
+            "dry_run": bool(dry_run),
+            "adhoc_days": eff_adhoc_days,
+            "include_cancelled_queue": bool(include_cancelled_queue),
+            "scanned_count": 0,
+            "archived_count": 0,
+            "archived": [],
+            "archived_details": [],
+            "skipped_count": 0,
+            "skipped": [],
+            "by_category": {"cancelled_compacted_queue": 0, "cancelled_queue": 0, "stale_adhoc_chat": 0},
+        }
+
+    cur_now = float(now_ts if now_ts is not None else time.time())
+    p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
+    has_explicit_root_override = any(
+        x is not None for x in (brain_dir, conversations_dir, cli_dir, antigravity_dirs)
+    )
+    in_test_harness = "unittest" in sys.modules or "pytest" in sys.modules
+    roots = _resolve_antigravity_roots(
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=antigravity_dirs,
+    )
+    disk_index = _build_disk_artifacts_index(roots)
+    summaries_graph = _load_conversation_summaries_graph(roots, summaries_db=summaries_db)
+    q_data = load_dev_queue(portfolio_dir=p_dir)
+    q_items = list(q_data.get("items") or [])
+
+    eff_excludes = list(exclude_ids or [])
+    for env_key in ("ANTIGRAVITY_CONVERSATION_ID", "AGY_CONVERSATION_ID"):
+        env_cid = str(eff_env.get(env_key) or "").strip()
+        if env_cid:
+            eff_excludes.append(env_cid)
+
+    protected_map = collect_protected_conversation_ids(
+        exclude_ids=eff_excludes,
+        portfolio_dir=p_dir,
+        brain_dir=brain_dir,
+        conversations_dir=conversations_dir,
+        cli_dir=cli_dir,
+        antigravity_dirs=antigravity_dirs,
+        summaries_db=summaries_db,
+        summaries_graph=summaries_graph,
+        include_unaudited_check=include_unaudited_check,
+        now_ts=cur_now,
+        env=eff_env,
+    )
+    _, all_orch_cids = _discover_orchestrator_roots_and_subagents(q_data, roots, summaries_graph)
+    orch_cid_set = {str(o).strip().lower() for o in all_orch_cids if str(o).strip()}
+    if q_data.get("orchestrator_conversation_id"):
+        orch_cid_set.add(str(q_data["orchestrator_conversation_id"]).strip().lower())
+
+    app_pinned_cids = _collect_app_storage_pinned_cids(
+        roots,
+        has_explicit_root_override=has_explicit_root_override,
+        in_test_harness=in_test_harness,
+        env=eff_env,
+    )
+    parent_by_cid: Mapping[str, str] = summaries_graph.get("parent_by_cid") or {}
+    last_modified_by_cid: Mapping[str, str] = summaries_graph.get("last_modified_by_cid") or {}
+
+    archived: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    by_category: dict[str, int] = {
+        "cancelled_compacted_queue": 0,
+        "cancelled_queue": 0,
+        "stale_adhoc_chat": 0,
+    }
+
+    for conv in conversations:
+        cid = str(conv.get("id") or "").strip().lower()
+        if not cid:
+            continue
+        annotations = conv.get("annotations") if isinstance(conv.get("annotations"), Mapping) else {}
+        metadata = conv.get("metadata") if isinstance(conv.get("metadata"), Mapping) else {}
+        state = conv.get("state") if isinstance(conv.get("state"), Mapping) else {}
+
+        if bool(annotations.get("archived")):
+            skipped.append({"conversation_id": cid, "reasons": ["already_archived"]})
+            continue
+        if bool(annotations.get("pinned")) or cid in app_pinned_cids:
+            skipped.append({"conversation_id": cid, "reasons": ["pinned"]})
+            continue
+        if bool(annotations.get("starred")):
+            skipped.append({"conversation_id": cid, "reasons": ["starred"]})
+            continue
+
+        run_state = str(state.get("runState") or "").strip().upper()
+        if (
+            run_state in ("RUN_STATE_RUNNING", "RUN_STATE_CANCELLING", "RUNNING", "CANCELLING")
+            or run_state.endswith(("_RUNNING", "_CANCELLING"))
+        ):
+            skipped.append({"conversation_id": cid, "reasons": [f"run_state:{run_state}"]})
+            continue
+
+        if str(metadata.get("parentConversationId") or "").strip() or cid in parent_by_cid:
+            skipped.append({"conversation_id": cid, "reasons": ["subagent_child"]})
+            continue
+
+        if any(_matches_cid(cid, o_cid) for o_cid in orch_cid_set) or _is_orchestrator_conversation_payload(conv):
+            skipped.append({"conversation_id": cid, "reasons": ["orchestrator"]})
+            continue
+
+        prot_reasons = _find_protection_reasons(cid, protected_map)
+        if prot_reasons:
+            skipped.append({"conversation_id": cid, "reasons": prot_reasons})
+            continue
+
+        idle_ok, idle_reason = is_conversation_fully_idle(
+            cid,
+            brain_dir=brain_dir,
+            conversations_dir=conversations_dir,
+            min_idle_seconds=min_idle_seconds,
+            now_ts=cur_now,
+            cli_dir=cli_dir,
+            antigravity_dirs=antigravity_dirs,
+            summaries_db=summaries_db,
+            summaries_graph=summaries_graph,
+            disk_index=disk_index,
+        )
+        if not idle_ok:
+            skipped.append({"conversation_id": cid, "reasons": [idle_reason]})
+            continue
+
+        matching_q = [it for it in q_items if _queue_item_matches_cid(cid, it)]
+        category = ""
+        inactive_days: float | None = None
+
+        if matching_q:
+            cancelled_matches = [
+                it for it in matching_q if str(it.get("status") or "").strip().lower() == "cancelled"
+            ]
+            if not include_cancelled_queue or not cancelled_matches:
+                skipped.append({"conversation_id": cid, "reasons": ["queue_item_non_archivable"]})
+                continue
+            is_compacted = any(
+                bool(str(it.get("superseded_by") or "").strip())
+                or bool(_SUPERSEDED_NOTE_RE.search(str(it.get("notes") or "")))
+                for it in cancelled_matches
+            )
+            category = "cancelled_compacted_queue" if is_compacted else "cancelled_queue"
+        else:
+            if eff_adhoc_days <= 0.0:
+                skipped.append({"conversation_id": cid, "reasons": ["adhoc_archive_disabled"]})
+                continue
+            activity_epochs: list[float] = []
+            for raw_ts in (
+                state.get("updateTime"),
+                metadata.get("createTime"),
+                last_modified_by_cid.get(cid),
+            ):
+                ep = _parse_iso_epoch_seconds(str(raw_ts or ""))
+                if ep is not None:
+                    activity_epochs.append(ep)
+            disk_ep = _max_artifact_epoch(cid, roots)
+            if disk_ep is not None:
+                activity_epochs.append(disk_ep)
+            if not activity_epochs:
+                skipped.append({"conversation_id": cid, "reasons": ["missing_activity_timestamp"]})
+                continue
+            last_ep = max(activity_epochs)
+            inactive_seconds = cur_now - last_ep
+            inactive_days = round(inactive_seconds / 86400.0, 2)
+            if inactive_seconds <= (eff_adhoc_days * 86400.0):
+                skipped.append({"conversation_id": cid, "reasons": ["within_adhoc_retention_window"]})
+                continue
+            category = "stale_adhoc_chat"
+
+        if not dry_run:
+            try:
+                ls_client.update_conversation(cid, archived=True)
+            except ConversationServiceError as exc:
+                skipped.append(
+                    {
+                        "conversation_id": cid,
+                        "reasons": ["conversation_service_update_failed"],
+                        "error": f"{exc.code}: {exc.message}",
+                    }
+                )
+                continue
+
+        by_category[category] = by_category.get(category, 0) + 1
+        detail: dict[str, Any] = {
+            "conversation_id": cid,
+            "category": category,
+            "title": str(annotations.get("title") or state.get("summary") or ""),
+        }
+        if inactive_days is not None:
+            detail["inactive_days"] = inactive_days
+        archived.append(detail)
+
+    return {
+        "status": "ok",
+        "dry_run": bool(dry_run),
+        "adhoc_days": eff_adhoc_days,
+        "include_cancelled_queue": bool(include_cancelled_queue),
+        "scanned_count": len(conversations),
+        "archived_count": len(archived),
+        "archived": [a["conversation_id"] for a in archived],
+        "archived_details": archived,
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+        "by_category": by_category,
     }
 
 
@@ -5133,7 +5561,21 @@ def register_watcher_cli(sub: Any) -> None:
     p_clean.add_argument("--min-idle-seconds", type=float, default=60.0, help="Minimum idle age in seconds before deleting conversation artifacts (default: 60).")
     p_clean.add_argument("--confirm-merged", action="store_true", help="Allow cleanup when merged branch refs were already pruned from origin and local.")
     p_clean.add_argument("--skip-unaudited-check", action="store_true", help="Skip conversation_analyzer check-unaudited lookup (useful in isolated tests).")
+    p_clean.add_argument("--auto-archive", dest="auto_archive", action="store_true", help="Also auto-archive cancelled/compacted queue items and idle ad-hoc chats via ConversationService/UpdateConversation.")
+    p_clean.add_argument("--adhoc-days", dest="adhoc_days", type=float, default=None, help="Override AGY_AUTO_ARCHIVE_ADHOC_DAYS threshold for ad-hoc chat archiving (default: 3, 0 disables).")
     p_clean.add_argument("--dry-run", action="store_true", help="Preview candidates and freed MB breakdown without deleting files.")
+
+    p_archive = sub.add_parser(
+        "auto-archive-conversations",
+        help="Archive cancelled/compacted dev_queue items and idle unpinned/unstarred ad-hoc chats via ConversationService/UpdateConversation.",
+    )
+    p_archive.add_argument("--adhoc-days", dest="adhoc_days", type=float, default=None, help="Override AGY_AUTO_ARCHIVE_ADHOC_DAYS threshold in days (default: 3, 0 disables).")
+    p_archive.add_argument("--no-cancelled-queue", dest="include_cancelled_queue", action="store_false", default=True, help="Skip archiving cancelled/compacted dev_queue items.")
+    p_archive.add_argument("--exclude-id", "--exclude-ids", dest="exclude_ids", nargs="*", default=[], help="Additional conversation IDs to protect from archiving.")
+    p_archive.add_argument("--min-idle-seconds", type=float, default=60.0, help="Minimum idle age in seconds before archiving (default: 60).")
+    p_archive.add_argument("--skip-unaudited-check", action="store_true", help="Skip conversation_analyzer check-unaudited lookup.")
+    p_archive.add_argument("--portfolio-dir", dest="portfolio_dir", default=None, help="Optional state/portfolio directory override.")
+    p_archive.add_argument("--dry-run", action="store_true", help="Preview archive candidates without mutating conversations.")
 
     p_ghost = sub.add_parser(
         "prune-ghost-summaries",
@@ -5247,8 +5689,22 @@ def dispatch_watcher_cli(args: Any, argv: list[str] | None = None) -> int | None
         print(json.dumps(g_res, indent=2, ensure_ascii=False))
         return 0 if g_res.get("status") in ("ok", "skipped") else 1
 
+    if args.subcommand == "auto-archive-conversations":
+        arch_res = _facade_attr("auto_archive_stale_conversations", auto_archive_stale_conversations)(
+            adhoc_days=getattr(args, "adhoc_days", None),
+            include_cancelled_queue=bool(getattr(args, "include_cancelled_queue", True)),
+            exclude_ids=list(getattr(args, "exclude_ids", []) or []),
+            min_idle_seconds=float(getattr(args, "min_idle_seconds", 60.0)),
+            include_unaudited_check=not bool(getattr(args, "skip_unaudited_check", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            portfolio_dir=getattr(args, "portfolio_dir", None),
+        )
+        print(json.dumps(arch_res, indent=2, ensure_ascii=False))
+        return 0 if arch_res.get("status") in ("ok", "skipped") else 1
+
     if args.subcommand == "cleanup-merged-conversations":
         prune_ghosts = bool(getattr(args, "prune_ghost_summaries", False))
+        do_auto_archive = bool(getattr(args, "auto_archive", False))
         has_clean_scope = any(
             (
                 args.conversation_ids,
@@ -5258,6 +5714,17 @@ def dispatch_watcher_cli(args: Any, argv: list[str] | None = None) -> int | None
                 getattr(args, "include_scheduled_actions", False),
             )
         )
+        if do_auto_archive and not has_clean_scope and not prune_ghosts:
+            arch_res = _facade_attr("auto_archive_stale_conversations", auto_archive_stale_conversations)(
+                adhoc_days=getattr(args, "adhoc_days", None),
+                exclude_ids=list(getattr(args, "exclude_ids", []) or []),
+                min_idle_seconds=float(getattr(args, "min_idle_seconds", 60.0)),
+                include_unaudited_check=not bool(getattr(args, "skip_unaudited_check", False)),
+                dry_run=bool(getattr(args, "dry_run", False)),
+            )
+            print(json.dumps(arch_res, indent=2, ensure_ascii=False))
+            return 0 if arch_res.get("status") in ("ok", "skipped") else 1
+
         if prune_ghosts and not has_clean_scope:
             g_res = _facade_attr("prune_ghost_conversation_summaries", prune_ghost_conversation_summaries)(
                 dry_run=bool(args.dry_run),
@@ -5288,6 +5755,17 @@ def dispatch_watcher_cli(args: Any, argv: list[str] | None = None) -> int | None
                 c_res["status"] = g_res.get("status", "blocked")
                 print(json.dumps(c_res, indent=2, ensure_ascii=False))
                 return 1
+        if do_auto_archive and c_res.get("status") == "ok":
+            c_res["auto_archive"] = _facade_attr(
+                "auto_archive_stale_conversations",
+                auto_archive_stale_conversations,
+            )(
+                adhoc_days=getattr(args, "adhoc_days", None),
+                exclude_ids=list(getattr(args, "exclude_ids", []) or []),
+                min_idle_seconds=float(getattr(args, "min_idle_seconds", 60.0)),
+                include_unaudited_check=not bool(getattr(args, "skip_unaudited_check", False)),
+                dry_run=bool(getattr(args, "dry_run", False)),
+            )
         print(json.dumps(c_res, indent=2, ensure_ascii=False))
         return 0 if c_res.get("status") == "ok" else 1
 

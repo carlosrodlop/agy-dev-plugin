@@ -27,6 +27,24 @@
       "target_service": "VCS-Interoperable Native Git & SSH (/usr/bin/git + /usr/bin/ssh)"
     },
     {
+      "auth_and_profiles": "Loopback Connect HTTP+JSON via documented ANTIGRAVITY_LS_ADDRESS and ANTIGRAVITY_CSRF_TOKEN env vars",
+      "client_script": "clients/conversation_service_client.py",
+      "description": "Pure-stdlib loopback Connect HTTP+JSON client for Antigravity product.v1.ConversationService (ListConversations, GetConversation, UpdateConversation, DeleteConversation) enabling zero-ghost native conversation deletion and idle conversation auto-archiving.",
+      "env_vars": [],
+      "id": "conversation_service_client",
+      "mechanism": "python_client",
+      "name": "Antigravity Loopback ConversationService Client",
+      "provider_plugin_id": "agy-dev-plugin",
+      "required_by_plugins": [
+        "agy-dev-plugin"
+      ],
+      "required_by_skills": [
+        "agy-code-remediation-pr",
+        "agy-dev-queue-orchestrator"
+      ],
+      "target_service": "Antigravity Language Server ConversationService (Loopback HTTP+JSON)"
+    },
+    {
       "binary": "git",
       "description": "Native OS-signed Git CLI (/usr/bin/git) powering timestamped branch worktrees, unified diffs, protected branch pushes, and atomic git ls-files $HOME plugin deployment.",
       "env_vars": [],
