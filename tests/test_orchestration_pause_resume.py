@@ -649,5 +649,419 @@ class TestSidecarPanelAndTuiPauseControls(unittest.TestCase):
             self.assertEqual(parsed_r["wake"]["status"], "skipped_no_wake")
 
 
+class TestOrchestrationHardStopControls(unittest.TestCase):
+    """Verify non-destructive Hard Stop (Hard Freeze) across control state, PreToolUse, review_gate, panel, and TUI."""
+
+    def test_hard_stop_state_process_scoping_and_resume_reset(self) -> None:
+        fake_ps = "\n".join(
+            [
+                "459 /opt/python3 -m api.server serve",
+                "1018 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=9222",
+                "1345 /Applications/Antigravity.app/Contents/Resources/bin/language_server --standalone",
+                "29872 python3 dev_queue_tui.py -w",
+                "50864 python3 /path/sidecars/dev-queue-panel/server.py",
+                "50865 python3 watchdog.py",
+                "55334 python3 pr_remediator.py watch-pr-merge --interval 15",
+                "64602 python3 pr_remediator.py wait-for-unlock --orchestrator-id 1234",
+                "77101 pytest /tmp/state/tmp/pr-worktree-demo-repo-fix-20261126-demo/tests/test_demo.py",
+                "77102 python3 -m uvicorn --app-dir /tmp/state/tmp/dev_ui_preview api.app:app --port 8788",
+                "77103 node /app/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js",
+            ]
+        )
+        killed: list[tuple[int, int]] = []
+        with tempfile.TemporaryDirectory() as td:
+            st_dir = Path(td)
+            # First pause in Graceful Drain, then escalate to Hard Stop
+            p_res = orch_ctrl.pause_orchestration(
+                state_dir=st_dir,
+                reason="Live demo prep",
+                source="sidecar_panel",
+                stop_chrome_devtools=False,
+                now_ts=1763974800.0,
+            )
+            self.assertFalse(orch_ctrl.is_hard_stop_active(state_dir=st_dir))
+
+            hs_res = orch_ctrl.hard_stop_orchestration(
+                state_dir=st_dir,
+                reason="Live demo /Users/alice/notes.md",
+                source="sidecar_panel",
+                active_locks={
+                    "acme/demo-repo": {
+                        "active": True,
+                        "status": "DEVELOPING",
+                        "worktree_path": "/tmp/state/tmp/pr-worktree-demo-repo-fix-20261126-demo",
+                    }
+                },
+                ps_output=fake_ps,
+                kill_fn=lambda pid, sig: killed.append((pid, sig)),
+                now_ts=1763974860.0,
+            )
+            self.assertTrue(hs_res["paused"])
+            self.assertTrue(hs_res["hard_stopped"])
+            self.assertTrue(hs_res["changed"])
+            self.assertEqual(hs_res["mode"], orch_ctrl.PAUSE_MODE_HARD_STOP)
+            self.assertEqual(hs_res["control"]["paused_at"], p_res["control"]["paused_at"])
+            self.assertTrue(hs_res["control"]["hard_stopped_at"])
+            self.assertNotIn("/Users/alice", hs_res["control"]["reason"])
+            self.assertTrue(orch_ctrl.is_hard_stop_active(state_dir=st_dir))
+
+            # Only worktree/preview/chrome-devtools-mcp processes killed; prod api.server serve (459) and sidecars untouched
+            self.assertEqual(hs_res["chrome_devtools"]["stopped_pids"], [77103])
+            self.assertEqual(hs_res["worktree_processes"]["stopped_pids"], [77101, 77102])
+            self.assertNotIn(459, [pid for pid, _ in killed])
+            self.assertNotIn(50864, [pid for pid, _ in killed])
+            self.assertNotIn(50865, [pid for pid, _ in killed])
+            self.assertNotIn(55334, [pid for pid, _ in killed])
+            self.assertNotIn(64602, [pid for pid, _ in killed])
+
+            # Idempotent second hard-stop call sets changed=False
+            hs_res2 = orch_ctrl.hard_stop_orchestration(
+                state_dir=st_dir,
+                source="cli",
+                stop_chrome_devtools=False,
+                stop_worktree_processes=False,
+                now_ts=1763974900.0,
+            )
+            self.assertFalse(hs_res2["changed"])
+            self.assertTrue(hs_res2["was_hard_stopped"])
+
+            # Phase summary reports hard_stopped preserving ongoing count
+            summary = orch_ctrl.summarize_orchestration_phase(
+                hs_res["control"],
+                {"acme/demo-repo": {"active": True, "status": "DEVELOPING", "pr_gate_ready": False}},
+            )
+            self.assertEqual(summary["phase"], "hard_stopped")
+            self.assertTrue(summary["hard_stopped"])
+            self.assertEqual(summary["ongoing_count"], 1)
+            self.assertIn("HARD STOPPED", summary["banner_text"])
+            self.assertIn("preserved", summary["banner_text"])
+
+            # Resume resets mode back to graceful_drain & clears hard_stopped_at
+            r_res = orch_ctrl.resume_orchestration(state_dir=st_dir, source="sidecar_panel", request_wake=False)
+            self.assertFalse(r_res["paused"])
+            self.assertFalse(orch_ctrl.is_hard_stop_active(state_dir=st_dir))
+            self.assertEqual(r_res["control"]["mode"], orch_ctrl.PAUSE_MODE_GRACEFUL_DRAIN)
+            self.assertEqual(r_res["control"]["hard_stopped_at"], "")
+
+    def test_pretool_hard_stop_freezes_active_workers_and_worktrees_only(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            st_dir = root / "state"
+            st_dir.mkdir()
+            wt_dir = st_dir / "tmp" / "pr-worktree-demo-repo-fix-20261126-demo"
+            wt_dir.mkdir(parents=True)
+
+            worker_cid = "aaaaaaaa-1111-4111-8111-111111111111"
+            reviewer_cid = "bbbbbbbb-2222-4222-8222-222222222222"
+            unrelated_cid = "cccccccc-3333-4333-8333-333333333333"
+
+            pr_rem.acquire_dev_pr_lock(
+                conversation_id="dddddddd-4444-4444-8444-444444444444",
+                action_id="demo-hard-stop",
+                branch_name="fix/20261126-100000-demo-dddddddd",
+                branch_timestamp="20261126-100000",
+                worktree_path=str(wt_dir),
+                worker_cid=worker_cid,
+                summary="Test worker",
+                proposed_fix="Test fix",
+                repo_slug="acme/demo-repo",
+                portfolio_dir=st_dir,
+            )
+            pr_rem.update_dev_pr_lock(
+                repo_slug="acme/demo-repo",
+                updates={"reviewer_subagent_id": reviewer_cid},
+                portfolio_dir=st_dir,
+            )
+
+            evaluator = dev_common.DevLifecycleGuardrailEvaluator(state_dir=st_dir)
+
+            # In Graceful Drain mode, active worker commands remain allowed
+            orch_ctrl.pause_orchestration(state_dir=st_dir, stop_chrome_devtools=False)
+            allow_drain = evaluator.evaluate_pre_tool_use(
+                {
+                    "conversationId": worker_cid,
+                    "tool_name": "run_command",
+                    "tool_input": {"CommandLine": "python3 -m unittest"},
+                }
+            )
+            self.assertEqual(allow_drain["decision"], "allow")
+
+            # Escalate to Hard Stop -> worker & reviewer & worktree writes/cmds are immediately denied
+            orch_ctrl.hard_stop_orchestration(
+                state_dir=st_dir,
+                stop_chrome_devtools=False,
+                stop_worktree_processes=False,
+            )
+
+            deny_worker = evaluator.evaluate_pre_tool_use(
+                {
+                    "conversationId": worker_cid,
+                    "tool_name": "run_command",
+                    "tool_input": {"CommandLine": "python3 -m unittest"},
+                }
+            )
+            self.assertEqual(deny_worker["decision"], "deny")
+            self.assertEqual(deny_worker.get("check_id"), "pretool:hard-stop-active-workers")
+
+            deny_reviewer = evaluator.evaluate_pre_tool_use(
+                {
+                    "conversationId": reviewer_cid,
+                    "tool_name": "run_command",
+                    "tool_input": {"CommandLine": "git diff"},
+                }
+            )
+            self.assertEqual(deny_reviewer["decision"], "deny")
+
+            deny_wt_write = evaluator.evaluate_pre_tool_use(
+                {
+                    "conversationId": unrelated_cid,
+                    "tool_name": "edit_file",
+                    "tool_input": {"Path": str(wt_dir / "README.md")},
+                }
+            )
+            self.assertEqual(deny_wt_write["decision"], "deny")
+
+            deny_wt_cmd = evaluator.evaluate_pre_tool_use(
+                {
+                    "conversationId": unrelated_cid,
+                    "tool_name": "run_command",
+                    "tool_input": {"CommandLine": f"git -C {wt_dir} status"},
+                }
+            )
+            self.assertEqual(deny_wt_cmd["decision"], "deny")
+
+            # Unrelated user conversation doing normal work MUST remain 100% allowed
+            allow_unrelated = evaluator.evaluate_pre_tool_use(
+                {
+                    "conversationId": unrelated_cid,
+                    "tool_name": "run_command",
+                    "tool_input": {"CommandLine": "python3 -c 'print(42)'"},
+                }
+            )
+            self.assertEqual(allow_unrelated["decision"], "allow")
+
+            # Resume control commands are NEVER blocked (zero self-lockout)
+            allow_resume_cmd = evaluator.evaluate_pre_tool_use(
+                {
+                    "conversationId": worker_cid,
+                    "tool_name": "run_command",
+                    "tool_input": {"CommandLine": "agy-queue resume"},
+                }
+            )
+            self.assertEqual(allow_resume_cmd["decision"], "allow")
+
+            # After resume, worker commands are allowed again
+            orch_ctrl.resume_orchestration(state_dir=st_dir, request_wake=False)
+            allow_post = evaluator.evaluate_pre_tool_use(
+                {
+                    "conversationId": worker_cid,
+                    "tool_name": "run_command",
+                    "tool_input": {"CommandLine": "python3 -m unittest"},
+                }
+            )
+            self.assertEqual(allow_post["decision"], "allow")
+
+    def test_hard_stop_blocks_reuse_active_review_and_pause_shields_pro_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            st_dir = root / "state"
+            st_dir.mkdir()
+            repo_dir = _init_temp_git_repo(root, "acme/demo-repo")
+            cid_ongoing = "77777777-7777-4777-8777-777777777777"
+
+            res_init = pr_rem.start_remediation_branch_and_lock(
+                conversation_id=cid_ongoing,
+                action_id="ongoing-hard-stop",
+                rca_summary="Ongoing work",
+                proposed_fix="Fix",
+                create_worktree=True,
+                workdir=repo_dir,
+                portfolio_dir=st_dir,
+            )
+            self.assertEqual(res_init["status"], "ok")
+
+            # Hard stop blocks --reuse-active, prepare-review, and record-review while preserving lock
+            orch_ctrl.hard_stop_orchestration(
+                state_dir=st_dir,
+                stop_chrome_devtools=False,
+                stop_worktree_processes=False,
+            )
+            res_reuse = pr_rem.start_remediation_branch_and_lock(
+                conversation_id=cid_ongoing,
+                action_id="ongoing-hard-stop",
+                rca_summary="Retry",
+                proposed_fix="Retry",
+                create_worktree=True,
+                reuse_active_branch=True,
+                workdir=repo_dir,
+                portfolio_dir=st_dir,
+            )
+            self.assertEqual(res_reuse["status"], "hard_stopped")
+            self.assertEqual(res_reuse["error"], "orchestration_hard_stopped")
+
+            res_stage = pr_rem.push_remediation_branch_and_build_reviewer_plan(
+                title="fix(demo): test",
+                workdir=res_init["worktree_path"],
+                portfolio_dir=st_dir,
+            )
+            self.assertEqual(res_stage["status"], "hard_stopped")
+
+            res_rev = pr_rem.record_pr_review_evaluation(
+                verdict="PASS",
+                score=95,
+                summary="Looks good",
+                workdir=res_init["worktree_path"],
+                portfolio_dir=st_dir,
+            )
+            self.assertEqual(res_rev["status"], "hard_stopped")
+
+            # Lock & worktree are strictly preserved
+            lk_after = pr_rem.get_dev_pr_lock(portfolio_dir=st_dir, repo_slug="acme/demo-repo")
+            self.assertTrue(lk_after.get("active"))
+            self.assertTrue(Path(res_init["worktree_path"]).is_dir())
+
+            # Releasing lock while paused MUST NOT call restart_pro_api_server
+            restart_calls: list[int] = []
+            orig_restart = pr_rem.restart_pro_api_server
+            orig_stop_dev = pr_rem.stop_dev_api_server
+            try:
+                pr_rem.restart_pro_api_server = lambda **kw: (restart_calls.append(1) or {"status": "ok"})  # type: ignore[assignment]
+                pr_rem.stop_dev_api_server = lambda **kw: {"status": "ok", "stopped": False}  # type: ignore[assignment]
+                pr_rem.release_dev_pr_lock(
+                    reason="DEMO_CLEANUP",
+                    repo_slug="acme/demo-repo",
+                    portfolio_dir=st_dir,
+                )
+            finally:
+                pr_rem.restart_pro_api_server = orig_restart
+                pr_rem.stop_dev_api_server = orig_stop_dev
+            self.assertEqual(restart_calls, [])
+
+    def test_sidecar_panel_hard_stop_endpoint_and_cli_stop_subcommand(self) -> None:
+        panel_mod = _load_module(PANEL_DIR / "server.py", "dev_queue_panel_hard_stop_test")
+        html_txt = (PANEL_DIR / "index.html").read_text(encoding="utf-8")
+        js_txt = (PANEL_DIR / "app.js").read_text(encoding="utf-8")
+        css_txt = (PANEL_DIR / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="dq-banner-hard-stop-btn"', html_txt)
+        self.assertIn('id="dq-hard-stop-confirm-row"', html_txt)
+        self.assertIn('data-action="hard-stop-prompt"', html_txt)
+        self.assertIn('data-action="hard-stop-confirm"', html_txt)
+        self.assertIn("/api/orchestration/hard-stop", js_txt)
+        self.assertNotIn("onclick=", html_txt.lower())
+        self.assertNotIn("innerHTML", js_txt)
+        self.assertEqual(css_txt.count("{"), css_txt.count("}"))
+
+        with tempfile.TemporaryDirectory() as td:
+            st_dir = Path(td)
+            pr_rem.acquire_dev_pr_lock(
+                conversation_id="88888888-8888-4888-8888-888888888888",
+                action_id="ongoing-hard-stop-panel",
+                branch_name="fix/20261126-100000-panel-88888888",
+                branch_timestamp="20261126-100000",
+                summary="Ongoing panel task",
+                proposed_fix="Fix",
+                repo_slug="acme/repo-a",
+                portfolio_dir=st_dir,
+            )
+            mock_token = "mock-panel-hard-stop-token-456"
+            httpd = panel_mod.create_panel_server(
+                host="127.0.0.1",
+                port=0,
+                ui_token=mock_token,
+                state_dir=st_dir,
+            )
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            t.start()
+            base = f"http://127.0.0.1:{port}"
+            try:
+                # 401 without token
+                st_401, _ = _http_json(f"{base}/api/orchestration/hard-stop", method="POST", body={})
+                self.assertEqual(st_401, 401)
+
+                # Pause -> Draining
+                st_p, body_p = _http_json(
+                    f"{base}/api/orchestration/pause",
+                    method="POST",
+                    headers={"X-Sidecar-Token": mock_token},
+                    body={"reason": "Demo"},
+                )
+                self.assertEqual(st_p, 200)
+                self.assertEqual(body_p["orchestration"]["phase"], "draining")
+
+                # Hard Stop -> Hard Stopped
+                st_hs, body_hs = _http_json(
+                    f"{base}/api/orchestration/hard-stop",
+                    method="POST",
+                    headers={"X-Sidecar-Token": mock_token},
+                    body={"reason": "Live demo"},
+                )
+                self.assertEqual(st_hs, 200)
+                self.assertTrue(body_hs["hard_stopped"])
+                self.assertEqual(body_hs["orchestration"]["phase"], "hard_stopped")
+                self.assertIn("HARD STOPPED", body_hs["orchestration"]["banner_text"])
+
+                # /api/state reflects hard_stopped
+                st_get, snap = _http_json(f"{base}/api/state", headers={"X-Sidecar-Token": mock_token})
+                self.assertEqual(st_get, 200)
+                self.assertEqual(snap["orchestration"]["phase"], "hard_stopped")
+                self.assertTrue(snap["orchestration"]["hard_stopped"])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                t.join(timeout=2.0)
+
+            # TUI banner & footer for hard_stopped + CLI `agy-queue stop`
+            ns_txt = dq_tui._build_parser().parse_args(["--state-dir", str(st_dir), "--no-color"])
+            out_txt, *_ = dq_tui.render(ns_txt)
+            self.assertIn("HARD STOPPED", out_txt)
+            self.assertIn("⏹", out_txt)
+
+            footer_hs = dq_tui._build_watch_footer(
+                interval=3.0,
+                hitl_count=0,
+                compact_pending=False,
+                show_all=False,
+                live_filter="",
+                filter_input_active=False,
+                overlay_mode="",
+                awaiting_hitl_digit=False,
+                sync_in_flight=False,
+                status_msg="",
+                orchestration_paused=True,
+                orchestration_phase="hard_stopped",
+            )
+            self.assertIn("[HARD STOP]", footer_hs)
+
+            footer_dr = dq_tui._build_watch_footer(
+                interval=3.0,
+                hitl_count=0,
+                compact_pending=False,
+                show_all=False,
+                live_filter="",
+                filter_input_active=False,
+                overlay_mode="",
+                awaiting_hitl_digit=False,
+                sync_in_flight=False,
+                status_msg="",
+                orchestration_paused=True,
+                orchestration_phase="draining",
+            )
+            self.assertIn("[S] hard-stop", footer_dr)
+
+            buf_stop = io.StringIO()
+            orig_stdout = sys.stdout
+            try:
+                sys.stdout = buf_stop
+                rc_stop = dq_tui.main(["stop", "--state-dir", str(st_dir), "--reason", "Demo", "--json"])
+            finally:
+                sys.stdout = orig_stdout
+            self.assertEqual(rc_stop, 0)
+            parsed_stop = json.loads(buf_stop.getvalue())
+            self.assertTrue(parsed_stop["hard_stopped"])
+            self.assertEqual(parsed_stop["orchestration"]["phase"], "hard_stopped")
+
+
 if __name__ == "__main__":
     unittest.main()

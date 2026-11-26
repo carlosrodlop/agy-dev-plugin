@@ -75,6 +75,7 @@ from merge_watcher import (  # noqa: E402
     cleanup_merged_conversations,
     spawn_pr_merge_watcher_daemon,
 )
+import orchestration_control as _orch_ctrl  # noqa: E402
 from parallel_scope import (  # noqa: E402
     TaskAnchorSpec,
     analyze_candidates_overlap,
@@ -815,6 +816,17 @@ def push_remediation_branch_and_build_reviewer_plan(
     git_client: GitVcsIntegrationClient | None = None,
 ) -> dict[str, Any]:
     """Local-First Review staging (`push-branch` / `prepare-review`): commit changes locally on the timestamped branch (never `main`), stamp canonical `## 📋 Executive Summary` + deterministic `## 🧪 Automated Verification Checks` into the local HEAD commit WITHOUT pushing to `origin`, invalidate prior review state, and return the `agy-code-pr-reviewer` invocation plan."""
+    if _orch_ctrl.is_hard_stop_active(portfolio_dir=portfolio_dir):
+        return {
+            "status": "hard_stopped",
+            "paused": True,
+            "hard_stopped": True,
+            "error": "orchestration_hard_stopped",
+            "message": (
+                "Orchestration is HARD STOPPED (Hard Freeze): refusing `prepare-review` / `push-branch` staging. "
+                "Existing locks and worktrees are preserved until orchestration is resumed."
+            ),
+        }
     vcs = git_client or GitVcsIntegrationClient()
     scoped_slug, scoped_dir = _resolve_repo_slug_and_dir(
         repo_slug=repo_slug,
@@ -1131,7 +1143,8 @@ def push_remediation_branch_and_build_reviewer_plan(
     )
     has_preview_bundle = bool((web_src_dir / "index.html").is_file() or api_src_dir.is_dir())
     has_staged_plugin = False
-    if slot_num == 1:
+    is_orch_paused = _orch_ctrl.is_orchestration_paused(portfolio_dir=portfolio_dir)
+    if slot_num == 1 and not is_orch_paused:
         if has_preview_bundle:
             dev_server_res = _facade_attr("stop_dev_api_server", stop_dev_api_server)(portfolio_dir=portfolio_dir)
             preview_dir.mkdir(parents=True, exist_ok=True)
@@ -1173,7 +1186,7 @@ def push_remediation_branch_and_build_reviewer_plan(
                 check=False,
             )
 
-    if slot_num == 1 and (has_preview_bundle or has_staged_plugin):
+    if slot_num == 1 and not is_orch_paused and (has_preview_bundle or has_staged_plugin):
         for asset_name in _PREVIEW_TOP_LEVEL_ASSETS:
             staged_asset = preview_dir / asset_name
             if staged_asset.is_file():
@@ -1445,6 +1458,17 @@ def record_pr_review_evaluation(
       `status='OK'` PR Ready for Validation emails (`notification_email_sent=False`; `--send-email` is retained
       strictly for Round-3 `[🟥]` KO circuit-breaker escalations).
     """
+    if _orch_ctrl.is_hard_stop_active(portfolio_dir=portfolio_dir):
+        return {
+            "status": "hard_stopped",
+            "paused": True,
+            "hard_stopped": True,
+            "error": "orchestration_hard_stopped",
+            "message": (
+                "Orchestration is HARD STOPPED (Hard Freeze): refusing `record-review` publish/mutation. "
+                "Existing locks and worktrees are preserved until orchestration is resumed."
+            ),
+        }
     vcs = git_client or GitVcsIntegrationClient()
     score_int = int(score)
     norm_verdict = verdict.strip().upper()
@@ -3086,6 +3110,17 @@ def run_slot_rebase_reverify(
     - `NEEDS_AGENT_SEMANTIC_FIX`: records `NEEDS_AGENT_SEMANTIC_FIX` + `merged_a_diff` + `developer_remediation_plan`.
     - `NEEDS_AGENT_CONFLICT_RESOLUTION`: clean `git rebase --abort`, records `NEEDS_AGENT_CONFLICT_RESOLUTION` + conflicted files.
     """
+    if _orch_ctrl.is_hard_stop_active(portfolio_dir=portfolio_dir):
+        return {
+            "status": "hard_stopped",
+            "paused": True,
+            "hard_stopped": True,
+            "error": "orchestration_hard_stopped",
+            "message": (
+                "Orchestration is HARD STOPPED (Hard Freeze): refusing `rebase-reverify` mutation. "
+                "Existing locks and worktrees are preserved until orchestration is resumed."
+            ),
+        }
     vcs = git_client or GitVcsIntegrationClient()
     lock_info = get_dev_pr_lock(
         portfolio_dir=portfolio_dir,

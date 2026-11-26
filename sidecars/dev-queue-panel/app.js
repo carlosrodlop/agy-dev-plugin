@@ -469,6 +469,7 @@
     query: "",
     inFlight: false,
     pauseBusy: false,
+    hardStopConfirm: false,
     cleanupOpen: false,
     cleanupBusy: false,
     cleanupLoading: false,
@@ -977,11 +978,12 @@
       return "Graceful Drain · ongoing tasks finish cleanly";
     }
     const parts = [];
-    const pausedAt = String(orch.paused_at || "").trim();
-    if (pausedAt.length >= 19) {
-      parts.push(`Paused ${pausedAt.slice(11, 16)}Z`);
+    const hardStopped = Boolean(orch.hard_stopped || orch.phase === "hard_stopped" || orch.mode === "hard_stop");
+    const stamp = String((hardStopped ? orch.hard_stopped_at : "") || orch.paused_at || "").trim();
+    if (stamp.length >= 19) {
+      parts.push(`${hardStopped ? "Hard Stopped" : "Paused"} ${stamp.slice(11, 16)}Z`);
     }
-    parts.push("Graceful Drain");
+    parts.push(hardStopped ? "Hard Freeze · locks & worktrees preserved" : "Graceful Drain");
     const reason = String(orch.reason || "").trim();
     if (reason) {
       parts.push(reason);
@@ -993,7 +995,11 @@
     const ctrl = orch && typeof orch === "object" ? orch : {};
     const paused = Boolean(ctrl.paused);
     const phase = String(ctrl.phase || (paused ? "paused" : "active"));
+    const hardStopped = Boolean(ctrl.hard_stopped || phase === "hard_stopped" || (paused && ctrl.mode === "hard_stop"));
     const ongoingCount = Number(ctrl.ongoing_count || 0);
+    if (!paused || hardStopped) {
+      uiState.hardStopConfirm = false;
+    }
 
     const pauseBtn = document.getElementById("dq-pause-btn");
     if (pauseBtn) {
@@ -1012,15 +1018,36 @@
     const bannerEl = document.getElementById("dq-pause-banner");
     const titleEl = document.getElementById("dq-pause-banner-title");
     const metaEl = document.getElementById("dq-pause-banner-meta");
+    const hardStopBtn = document.getElementById("dq-banner-hard-stop-btn");
+    const confirmRow = document.getElementById("dq-hard-stop-confirm-row");
+    const confirmBtn = document.getElementById("dq-hard-stop-confirm-btn");
+    const cancelBtn = document.getElementById("dq-hard-stop-cancel-btn");
     const bannerBtn = document.getElementById("dq-banner-resume-btn");
     if (bannerEl) {
       bannerEl.classList.toggle("dq-hidden", !paused);
+      bannerEl.classList.toggle("is-hard-stopped", hardStopped);
     }
     if (titleEl && paused) {
-      titleEl.textContent = `⏸ ${ctrl.banner_text || "PAUSED — 0 new dispatches · Watchdog silent"}`;
+      const icon = hardStopped ? "⏹" : "⏸";
+      titleEl.textContent = `${icon} ${ctrl.banner_text || "PAUSED — 0 new dispatches · Watchdog silent"}`;
     }
     if (metaEl && paused) {
       metaEl.textContent = formatPauseMeta(ctrl);
+    }
+    const showHardStopBtn = paused && !hardStopped && phase === "draining" && ongoingCount > 0;
+    if (hardStopBtn) {
+      hardStopBtn.classList.toggle("dq-hidden", !showHardStopBtn);
+      hardStopBtn.disabled = Boolean(uiState.pauseBusy);
+    }
+    if (confirmRow) {
+      confirmRow.classList.toggle("dq-hidden", !(showHardStopBtn && uiState.hardStopConfirm));
+    }
+    if (confirmBtn) {
+      confirmBtn.disabled = Boolean(uiState.pauseBusy);
+      confirmBtn.textContent = uiState.pauseBusy ? "Stopping…" : "Confirm Hard Stop";
+    }
+    if (cancelBtn) {
+      cancelBtn.disabled = Boolean(uiState.pauseBusy);
     }
     if (bannerBtn) {
       bannerBtn.disabled = Boolean(uiState.pauseBusy);
@@ -1030,10 +1057,13 @@
     const pillEl = document.getElementById("dq-live-pill");
     const liveTxt = document.getElementById("dq-live-text");
     if (pillEl && !pillEl.classList.contains("is-error")) {
-      pillEl.classList.toggle("is-paused", paused);
+      pillEl.classList.toggle("is-paused", paused && !hardStopped);
+      pillEl.classList.toggle("is-hard-stopped", hardStopped);
       if (liveTxt) {
         if (!paused) {
           liveTxt.textContent = "Live";
+        } else if (hardStopped) {
+          liveTxt.textContent = ongoingCount > 0 ? `Hard Stopped (${ongoingCount})` : "Hard Stopped";
         } else if (phase === "draining" && ongoingCount > 0) {
           liveTxt.textContent = `Draining (${ongoingCount})`;
         } else {
@@ -1048,6 +1078,7 @@
       return;
     }
     uiState.pauseBusy = true;
+    uiState.hardStopConfirm = false;
     renderOrchestrationControl(uiState.snapshot && uiState.snapshot.orchestration);
     try {
       const endpoint = targetPaused ? "/api/orchestration/pause" : "/api/orchestration/resume";
@@ -1069,6 +1100,37 @@
       await pollState(true);
     } catch (err) {
       showToast(`Unable to ${targetPaused ? "pause" : "resume"} orchestration: ${err.message || "error"}`);
+    } finally {
+      uiState.pauseBusy = false;
+      renderOrchestrationControl(uiState.snapshot && uiState.snapshot.orchestration);
+    }
+  }
+
+  async function triggerHardStopOrchestration() {
+    if (uiState.pauseBusy) {
+      return;
+    }
+    uiState.pauseBusy = true;
+    uiState.hardStopConfirm = false;
+    renderOrchestrationControl(uiState.snapshot && uiState.snapshot.orchestration);
+    try {
+      const res = await apiFetch("/api/orchestration/hard-stop", {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      if (uiState.snapshot && res.orchestration) {
+        uiState.snapshot.orchestration = res.orchestration;
+      }
+      renderOrchestrationControl(res.orchestration);
+      const stoppedCount = Array.isArray(res.worktree_processes && res.worktree_processes.stopped_pids)
+        ? res.worktree_processes.stopped_pids.length
+        : 0;
+      const banner = (res.orchestration && res.orchestration.banner_text) || "HARD STOPPED — Workers frozen";
+      showToast(stoppedCount > 0 ? `⏹ ${banner} (${stoppedCount} proc stopped)` : `⏹ ${banner}`);
+      uiState.etag = "";
+      await pollState(true);
+    } catch (err) {
+      showToast(`Unable to hard-stop orchestration: ${err.message || "error"}`);
     } finally {
       uiState.pauseBusy = false;
       renderOrchestrationControl(uiState.snapshot && uiState.snapshot.orchestration);
@@ -1752,6 +1814,14 @@
         setOrchestrationPaused(!curPaused);
       } else if (action === "resume-dev") {
         setOrchestrationPaused(false);
+      } else if (action === "hard-stop-prompt") {
+        uiState.hardStopConfirm = true;
+        renderOrchestrationControl(uiState.snapshot && uiState.snapshot.orchestration);
+      } else if (action === "hard-stop-cancel") {
+        uiState.hardStopConfirm = false;
+        renderOrchestrationControl(uiState.snapshot && uiState.snapshot.orchestration);
+      } else if (action === "hard-stop-confirm") {
+        triggerHardStopOrchestration();
       } else if (action === "cleanup-preview") {
         toggleCleanupDrawer();
       } else if (action === "cleanup-execute") {

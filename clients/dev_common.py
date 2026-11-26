@@ -140,10 +140,22 @@ DETERMINISTIC_DEV_PRETOOL_CHECKS: tuple[dict[str, str], ...] = (
         "decision": "deny",
         "description": "Turns off Chrome DevTools MCP tool calls and chrome-devtools-mcp CLI launches whenever Dev Queue orchestration is paused (dev_orchestration_control.json).",
     },
+    {
+        "check_id": "pretool:hard-stop-active-workers",
+        "event": "PreToolUse",
+        "title": "Hard-Stopped Dev Worker & Worktree Freeze Blocker",
+        "target": "run_command | write_file | edit_file | call_mcp_tool (active dev worker/reviewer or pr-worktree-*)",
+        "decision": "deny",
+        "description": "Immediately denies tool calls from active dev workers/reviewers or targeting pr-worktree-* paths while Dev Queue Hard Stop (mode=hard_stop) is active without affecting unrelated user chats.",
+    },
 )
 
 _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE = re.compile(r"chrome[-_]?devtools", re.IGNORECASE)
 _CHROME_DEVTOOLS_CMD_RE = re.compile(r"(?:chrome[-_]devtools[-_]mcp|CHROME_DEVTOOLS_MCP_JS)", re.IGNORECASE)
+_HARD_STOP_CONTROL_CMD_RE = re.compile(
+    r"\b(?:orchestration-(?:resume|status|stop|pause)|agy-queue\s+(?:resume|status|stop|pause))\b",
+    re.IGNORECASE,
+)
 
 PARALLEL_MONOLITH_MIN_LINES = 250
 PARALLEL_KNOWN_MONOLITH_BASENAMES: frozenset[str] = frozenset(
@@ -1171,6 +1183,10 @@ class DevLifecycleGuardrailEvaluator:
             raw_input = payload.get("tool_input") or payload.get("args") or payload.get("arguments") or {}
             args = raw_input if isinstance(raw_input, dict) else {}
 
+        hard_stop_deny = self._check_hard_stop_active_workers(tool_name, payload, args)
+        if hard_stop_deny is not None:
+            return hard_stop_deny
+
         paused_devtools_deny = self._check_paused_chrome_devtools(tool_name, args)
         if paused_devtools_deny is not None:
             return paused_devtools_deny
@@ -1243,13 +1259,135 @@ class DevLifecycleGuardrailEvaluator:
 
         return {"decision": "allow"}
 
-    def _is_orchestration_paused(self) -> bool:
-        """Read `<state_dir>/dev_orchestration_control.json` in <0.1ms to check Pause state."""
+    def _read_orchestration_control(self) -> dict[str, Any]:
+        """Read `<state_dir>/dev_orchestration_control.json` in <0.1ms."""
         ctrl_path = self.state_dir / "dev_orchestration_control.json"
         if not ctrl_path.is_file():
-            return False
+            return {}
         raw = atomic_read_json(ctrl_path, default={})
-        return isinstance(raw, dict) and bool(raw.get("paused"))
+        return raw if isinstance(raw, dict) else {}
+
+    def _is_orchestration_paused(self) -> bool:
+        """Read `<state_dir>/dev_orchestration_control.json` in <0.1ms to check Pause state."""
+        return bool(self._read_orchestration_control().get("paused"))
+
+    def _is_hard_stop_active(self) -> bool:
+        """Return True iff Dev Queue orchestration is paused in `hard_stop` (Hard Freeze) mode."""
+        ctrl = self._read_orchestration_control()
+        return bool(ctrl.get("paused")) and str(ctrl.get("mode") or "").strip().lower() == "hard_stop"
+
+    @staticmethod
+    def _cid_matches_worker_or_reviewer(cid: str, slot_data: dict[str, Any]) -> bool:
+        """Return True when `cid` matches an active slot's `worker_cid` or `reviewer_subagent_id`."""
+        clean = str(cid or "").strip().lower()
+        if not clean:
+            return False
+        for key in ("worker_cid", "reviewer_subagent_id"):
+            cand = str(slot_data.get(key) or "").strip().lower()
+            if not cand:
+                continue
+            if clean == cand:
+                return True
+            if len(clean) >= 8 and len(cand) >= 8 and clean[:8] == cand[:8] and (
+                clean.startswith(cand) or cand.startswith(clean)
+            ):
+                return True
+        return False
+
+    def _check_hard_stop_active_workers(
+        self,
+        tool_name: str,
+        payload: dict[str, Any],
+        args: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Freeze active dev workers/reviewers and `pr-worktree-*` actions during Hard Stop without blocking unrelated chats."""
+        if not self._is_hard_stop_active():
+            return None
+
+        cmd_line = str(args.get("CommandLine") or args.get("command") or "").strip() if tool_name == "run_command" else ""
+        if cmd_line and _HARD_STOP_CONTROL_CMD_RE.search(cmd_line):
+            return None
+
+        active_map = self._read_active_locks_map()
+        active_worktrees: set[Path] = set()
+        active_wt_names: set[str] = set()
+        ongoing_slots: list[dict[str, Any]] = []
+        non_ongoing = {
+            "PENDING_HUMAN_PR_VALIDATION",
+            "READY_AWAITING_BASE_MERGE",
+            "ESCALATED_MAX_REVIEW_ITERATIONS",
+            "RELEASED",
+            "INACTIVE",
+        }
+        for ldata in active_map.values():
+            main_td = self._resolve_expanded_path(str(ldata.get("target_repo_dir") or ""))
+            for slot in self._extract_active_slots_from_lock(ldata):
+                st_u = str(slot.get("status") or "").strip().upper()
+                is_ongoing = not bool(slot.get("pr_gate_ready")) and st_u not in non_ongoing
+                if is_ongoing:
+                    ongoing_slots.append(slot)
+                wt_p = self._resolve_expanded_path(str(slot.get("worktree_path") or ""))
+                if wt_p is not None and (main_td is None or wt_p != main_td):
+                    active_worktrees.add(wt_p)
+                    if wt_p.name:
+                        active_wt_names.add(wt_p.name)
+
+        caller_cid = str(
+            payload.get("conversationId")
+            or payload.get("conversation_id")
+            or payload.get("worker_cid")
+            or args.get("conversation_id")
+            or ""
+        ).strip()
+
+        matched_reason = ""
+        if caller_cid:
+            for slot in ongoing_slots:
+                if self._cid_matches_worker_or_reviewer(caller_cid, slot):
+                    matched_reason = f"active dev worker/reviewer conversation '{caller_cid[:8]}'"
+                    break
+
+        if not matched_reason and tool_name in (
+            "write_file",
+            "edit_file",
+            "replace_file_content",
+            "multi_replace_file_content",
+        ):
+            raw_target = str(args.get("Path") or args.get("TargetFile") or args.get("path") or "").strip()
+            if raw_target:
+                target_p = self._resolve_expanded_path(raw_target)
+                if self._is_parallel_worktree_dir(target_p, active_worktrees):
+                    matched_reason = f"worktree file '{target_p.name if target_p else raw_target}'"
+
+        if not matched_reason and tool_name == "run_command":
+            raw_cwd = str(args.get("Cwd") or args.get("cwd") or payload.get("cwd") or "").strip()
+            cwd_p = self._resolve_expanded_path(raw_cwd) if raw_cwd else None
+            if self._is_parallel_worktree_dir(cwd_p, active_worktrees):
+                matched_reason = f"worktree working directory '{cwd_p.name if cwd_p else raw_cwd}'"
+            elif "pr-worktree-" in cmd_line or any(wt_name in cmd_line for wt_name in active_wt_names):
+                matched_reason = "command targeting an active pr-worktree-* directory"
+            else:
+                ws_paths = payload.get("workspacePaths")
+                if isinstance(ws_paths, list):
+                    for ws_raw in ws_paths:
+                        ws_p = self._resolve_expanded_path(str(ws_raw or ""))
+                        if self._is_parallel_worktree_dir(ws_p, active_worktrees):
+                            matched_reason = f"worktree workspace '{ws_p.name if ws_p else ws_raw}'"
+                            break
+
+        if not matched_reason:
+            return None
+
+        return {
+            "decision": "deny",
+            "check_id": "pretool:hard-stop-active-workers",
+            "reason": (
+                f"Guardrail (Dev Queue HARD STOP — pretool:hard-stop-active-workers): Hard Freeze is active "
+                f"({matched_reason}). STOP IMMEDIATELY — do not retry tools, commands, file edits, or MCP calls. "
+                "Existing locks and worktrees are preserved; end your turn now. Click 'Continue Dev' in the Dev Queue "
+                "panel or run 'agy-queue resume' to unfreeze."
+            ),
+        }
 
     def _check_paused_chrome_devtools(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
         """Deny Chrome DevTools MCP calls and `chrome-devtools-mcp` commands while Dev Queue is paused."""
@@ -2228,11 +2366,17 @@ AGY_QUEUE_SUBCOMMANDS: tuple[str, ...] = (
     "watch",
     "doctor",
     "optimize",
+    "compact",
+    "plan",
     "sync",
     "list",
     "show",
     "locks",
     "set-status",
+    "pause",
+    "stop",
+    "resume",
+    "status",
 )
 
 

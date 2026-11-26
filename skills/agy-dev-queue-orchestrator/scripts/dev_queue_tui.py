@@ -217,6 +217,7 @@ from tui_watch import (  # noqa: F401, E402
     _run_subcommand_set_status,
     _run_subcommand_show,
     _run_subcommand_status,
+    _run_subcommand_stop,
     _run_subcommand_sync,
     _run_watch_json_ndjson_loop,
     _silence_broken_pipe_stdout,
@@ -268,9 +269,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "  agy-queue show <ID> [FLAGS]   Inspect single item + live worker/reviewer telemetry\n"
         "  agy-queue locks [FLAGS]       Inspect per-repo dev_pr_locks & stall semaphore\n"
         "  agy-queue set-status <ID> <S> Transition queue item status cleanly\n"
-        "  agy-queue pause [FLAGS]       Pause new dispatches (Graceful Drain: finish ongoing)\n"
+        "  agy-queue pause [FLAGS]       Pause new dispatches (Graceful Drain; --hard for Hard Freeze)\n"
+        "  agy-queue stop [FLAGS]        Hard Stop (Hard Freeze: freeze active workers, preserve locks/worktrees)\n"
         "  agy-queue resume [FLAGS]      Continue orchestration & auto-wake orchestrator\n"
-        "  agy-queue status [FLAGS]      Show Pause / Draining / Active orchestration status\n"
+        "  agy-queue status [FLAGS]      Show Pause / Draining / Hard Stopped / Active orchestration status\n"
     )
     parser = argparse.ArgumentParser(
         prog="agy-queue",
@@ -370,6 +372,8 @@ def _dispatch_subcommand(subcmd: str, rest: list[str], raw_cli_argv: list[str]) 
         return _run_subcommand_set_status(rest)
     if subcmd == "pause":
         return _run_subcommand_pause(rest)
+    if subcmd == "stop":
+        return _run_subcommand_stop(rest)
     if subcmd == "resume":
         return _run_subcommand_resume(rest)
     if subcmd == "status":

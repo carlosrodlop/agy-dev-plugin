@@ -214,6 +214,7 @@ AGY_QUEUE_SUBCOMMANDS: tuple[str, ...] = (
     "locks",
     "set-status",
     "pause",
+    "stop",
     "resume",
     "status",
 )

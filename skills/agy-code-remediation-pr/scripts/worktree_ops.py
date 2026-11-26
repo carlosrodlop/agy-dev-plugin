@@ -470,27 +470,44 @@ def start_remediation_branch_and_lock(
             locked_out["overlap_analysis"] = slot2_overlap_dict
         return locked_out
 
-    # Graceful Drain Pause Guard: allow already-active locks owned by the same conversation to finish
-    # (e.g. review iteration with --reuse-active), while blocking all NEW lock / Slot #2 acquisitions.
+    # Graceful Drain & Hard Stop Pause Guard:
+    # - In `hard_stop` mode, block ALL remediation starts including `--reuse-active` so ongoing workers freeze cleanly.
+    # - In `graceful_drain` mode, allow already-active locks owned by the same conversation to finish while blocking new locks.
     is_reusing_existing_active = bool(
         existing_lock.get("active")
         and ((same_conv and not allocating_slot2) or (allocating_slot2 and same_conv_slot2))
     )
     orch_ctrl = _orch_ctrl.load_orchestration_control(portfolio_dir=portfolio_dir)
-    if bool(orch_ctrl.get("paused")) and not is_reusing_existing_active:
-        return {
-            "status": "paused",
-            "acquired": False,
-            "paused": True,
-            "repo_slug": repo_slug,
-            "orchestration_control": orch_ctrl,
-            "error": "orchestration_paused",
-            "message": (
-                f"Orchestration is paused (Graceful Drain): cannot acquire a new lock on `{repo_slug}` for "
-                f"`{cid_clean}`. Ongoing active-lock tasks may finish, but zero new tasks will be dispatched "
-                "until orchestration is resumed."
-            ),
-        }
+    if bool(orch_ctrl.get("paused")):
+        is_hard_stop = str(orch_ctrl.get("mode") or "").strip().lower() == _orch_ctrl.PAUSE_MODE_HARD_STOP
+        if is_hard_stop:
+            return {
+                "status": "hard_stopped",
+                "acquired": False,
+                "paused": True,
+                "hard_stopped": True,
+                "repo_slug": repo_slug,
+                "orchestration_control": orch_ctrl,
+                "error": "orchestration_hard_stopped",
+                "message": (
+                    f"Orchestration is HARD STOPPED (Hard Freeze): cannot start or resume remediation on `{repo_slug}` "
+                    f"for `{cid_clean}`. Existing locks and worktrees are preserved until orchestration is resumed."
+                ),
+            }
+        if not is_reusing_existing_active:
+            return {
+                "status": "paused",
+                "acquired": False,
+                "paused": True,
+                "repo_slug": repo_slug,
+                "orchestration_control": orch_ctrl,
+                "error": "orchestration_paused",
+                "message": (
+                    f"Orchestration is paused (Graceful Drain): cannot acquire a new lock on `{repo_slug}` for "
+                    f"`{cid_clean}`. Ongoing active-lock tasks may finish, but zero new tasks will be dispatched "
+                    "until orchestration is resumed."
+                ),
+            }
 
     evidence = ""
     lock_for_reuse = slot2_existing if (allocating_slot2 and same_conv_slot2) else existing_lock

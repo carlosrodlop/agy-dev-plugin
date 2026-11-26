@@ -1144,13 +1144,20 @@ def render_dashboard(
 
     orch_phase = snap.orch_phase or {}
     if bool(orch_phase.get("paused")):
+        is_hard_stopped = bool(orch_phase.get("hard_stopped") or orch_phase.get("phase") == "hard_stopped")
         pause_banner = str(orch_phase.get("banner_text") or "PAUSED — 0 new dispatches · Watchdog silent")
         pause_reason = str(orch_phase.get("reason") or "").strip()
         if pause_reason:
             pause_banner = f"{pause_banner} ({pause_reason})"
-        header_lines.append(
-            _color(_trunc(f"⏸ [[P] Continue] {pause_banner}", bar_w), "1;33", color_on)
-        )
+        if is_hard_stopped:
+            header_lines.append(
+                _color(_trunc(f"⏹ [[P] Continue] {pause_banner}", bar_w), "1;31", color_on)
+            )
+        else:
+            stop_hint = " | [S] Hard Stop" if str(orch_phase.get("phase") or "") == "draining" else ""
+            header_lines.append(
+                _color(_trunc(f"⏸ [[P] Continue{stop_hint}] {pause_banner}", bar_w), "1;33", color_on)
+            )
 
     if snap.repo_pills:
         rendered_pills = [_format_repo_pill(p, color_on=color_on, use_osc8=use_osc8) for p in snap.repo_pills]
@@ -2098,6 +2105,7 @@ def _render_help_overlay_lines(term_w: int, color_on: bool) -> list[str]:
         "    h + 1-9           Jump via Dev Queue Sidecar Panel (nav_intent) + clipboard/focus fallback",
         "    d                 Run interactive agy-doctor check ([w] wake · [f] safe fix)",
         "    P                 Toggle Pause / Continue orchestration (Graceful Drain: finish ongoing, 0 new)",
+        "    S                 Hard Stop (Hard Freeze: cut off active workers & worktree procs, preserve locks)",
         "    p / a             Toggle [compact] pending rows (<=3) / [all] inactive items",
         "    s / b             Trigger async background Git fetch+reconcile / force-sync board.md",
         "    r / R / q         Refresh snapshot / safe syntax-checked reload / quit",
@@ -2123,6 +2131,7 @@ def _build_watch_footer(
     sync_in_flight: bool,
     status_msg: str,
     orchestration_paused: bool = False,
+    orchestration_phase: str = "",
 ) -> str:
     """Compose compact 1-line watch footer with conditional `[h+#]` and persistent toggle badges."""
     if filter_input_active:
@@ -2133,7 +2142,9 @@ def _build_watch_footer(
         return f"[{overlay_mode.upper()}]  [j/k/PgUp/PgDn/g/G] scroll · [Esc/Enter] back to queue · [q] close"
 
     toggles: list[str] = []
-    if orchestration_paused:
+    if orchestration_phase == "hard_stopped":
+        toggles.append("[HARD STOP]")
+    elif orchestration_paused:
         toggles.append("[PAUSED]")
     if compact_pending:
         toggles.append("[compact]")
@@ -2144,7 +2155,12 @@ def _build_watch_footer(
     toggle_prefix = (" ".join(toggles) + "  ") if toggles else ""
 
     hitl_seg = " · [h+#] Agy" if hitl_count > 0 else ""
-    pause_hint = "[P] resume" if orchestration_paused else "[P] pause"
+    if orchestration_phase == "draining":
+        pause_hint = "[P] resume · [S] hard-stop"
+    elif orchestration_paused:
+        pause_hint = "[P] resume"
+    else:
+        pause_hint = "[P] pause · [S] hard-stop"
     core_keys = (
         f"[Enter] inspect · [o/O] PR · [1-9] open{hitl_seg} · [/] filter · {pause_hint} · [d] doctor · "
         f"[x] opt · [j/k] scroll · [p] compact · [a] all · [s] sync · [?] help · [R] reload · [q] quit"
