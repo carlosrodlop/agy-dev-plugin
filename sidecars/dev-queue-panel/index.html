@@ -29,6 +29,14 @@
             title="Pause new dispatches (Graceful Drain: ongoing active-lock tasks finish cleanly)"
           >⏸ Pause Dev</button>
           <button
+            id="dq-sync-prod-btn"
+            type="button"
+            class="dq-chip-btn"
+            data-action="dual-env-toggle"
+            aria-expanded="false"
+            title="Org-Prod (:8787) vs Fork-DEV (:8786) controls: Cross-Fork PRs, manual Sync Prod + 1-command Rollback &amp; APFS DEV state refresh"
+          >🚀 Sync Prod</button>
+          <button
             id="dq-clean-btn"
             type="button"
             class="dq-chip-btn dq-clean-btn"
@@ -244,6 +252,86 @@
               data-action="ghost-restart-cancel"
             >Cancel</button>
           </div>
+        </div>
+      </div>
+    </div>
+    <div id="dq-dual-env-panel" class="dq-cleanup-panel dq-hidden" role="region" aria-label="Org-Prod and Fork-DEV environment controls">
+      <div class="dq-cleanup-head">
+        <div class="dq-cleanup-head-copy">
+          <strong id="dq-dual-env-title" class="dq-cleanup-title">Org-Prod (:8787) ↔ Fork-DEV (:8786)</strong>
+          <span id="dq-dual-env-summary" class="dq-cleanup-summary"></span>
+        </div>
+        <div class="dq-cleanup-actions">
+          <button
+            id="dq-dual-env-promote-btn"
+            type="button"
+            class="dq-btn"
+            data-action="dual-env-promote"
+            title="Sync upstream/main on Personal-Fork DEV clones and emit Cross-Fork PR compare links (org:main...user:repo:main)"
+          >↗ Fork → Org PRs</button>
+          <button
+            id="dq-dual-env-sync-btn"
+            type="button"
+            class="dq-btn dq-btn-primary"
+            data-action="dual-env-sync-prompt"
+            title="Pull Org clones (--ff-only), run 0-LLM cross-repo smoke-check, deploy $HOME, and restart :8787 once"
+          >🚀 Sync Prod</button>
+          <button
+            id="dq-dual-env-rollback-btn"
+            type="button"
+            class="dq-btn dq-btn-warn"
+            data-action="dual-env-rollback-prompt"
+            title="1-Command Rollback: restore AGY_PROD_REPOS_DIR to recorded previous_shas, smoke-check, redeploy $HOME &amp; restart :8787"
+          >↩ Rollback Prod</button>
+          <button
+            id="dq-dual-env-refresh-dev-btn"
+            type="button"
+            class="dq-btn"
+            data-action="dual-env-refresh-dev"
+            title="Refresh ~/.local/share/wiz-customer-portfolio-dev via macOS APFS CoW clone (cp -cR)"
+          >↻ Clone DEV State</button>
+          <button
+            id="dq-dual-env-close-btn"
+            type="button"
+            class="dq-btn"
+            data-action="dual-env-close"
+          >Close</button>
+        </div>
+      </div>
+      <div id="dq-dual-env-chips" class="dq-cleanup-breakdown"></div>
+      <div id="dq-dual-env-promote-list" class="dq-actions"></div>
+      <div id="dq-dual-env-sync-confirm-row" class="dq-ghost-confirm-row dq-hidden" role="region" aria-label="Confirm Sync Prod">
+        <span class="dq-ghost-confirm-text">Pull Org clones (--ff-only), run cross-repo smoke-check, deploy $HOME &amp; restart :8787?</span>
+        <div class="dq-ghost-confirm-actions">
+          <button
+            id="dq-dual-env-sync-confirm-btn"
+            type="button"
+            class="dq-btn dq-btn-primary"
+            data-action="dual-env-sync-confirm"
+          >Confirm Sync Prod</button>
+          <button
+            id="dq-dual-env-sync-cancel-btn"
+            type="button"
+            class="dq-btn"
+            data-action="dual-env-sync-cancel"
+          >Cancel</button>
+        </div>
+      </div>
+      <div id="dq-dual-env-rollback-confirm-row" class="dq-ghost-confirm-row dq-hidden" role="region" aria-label="Confirm Rollback Prod">
+        <span class="dq-ghost-confirm-text">Restore Org-Prod clones to previous_shas, redeploy $HOME &amp; restart :8787?</span>
+        <div class="dq-ghost-confirm-actions">
+          <button
+            id="dq-dual-env-rollback-confirm-btn"
+            type="button"
+            class="dq-btn dq-btn-danger"
+            data-action="dual-env-rollback-confirm"
+          >Confirm Rollback</button>
+          <button
+            id="dq-dual-env-rollback-cancel-btn"
+            type="button"
+            class="dq-btn"
+            data-action="dual-env-rollback-cancel"
+          >Cancel</button>
         </div>
       </div>
     </div>

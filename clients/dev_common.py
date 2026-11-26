@@ -20,13 +20,16 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 import contextlib
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 import fcntl
 import importlib.util
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -37,6 +40,24 @@ import urllib.parse
 PLUGIN_NAME = "agy-dev-plugin"
 DEFAULT_DEV_STATE_DIRNAME = "agy-dev-plugin"
 COMPAT_PORTFOLIO_STATE_DIRNAME = "wiz-customer-portfolio"
+DEFAULT_DEV_PORTFOLIO_DIRNAME = "wiz-customer-portfolio-dev"
+DEV_CLONE_META_FILENAME = ".agy_dev_clone_meta.json"
+SYNC_PROD_STATE_FILENAME = "sync_prod_state.json"
+
+# Dual-Environment Org-Prod (:8787) vs Personal-Fork DEV (:8786) topology constants.
+DEFAULT_PRO_PORT = 8787
+DEFAULT_DEV_PORT = 8786
+PRO_PORT_ENV = "AGY_PRO_PORT"
+DEV_PORT_ENV = "AGY_DEV_PORT"
+PROD_REPOS_DIR_ENV = "AGY_PROD_REPOS_DIR"
+DEV_REPOS_DIR_ENV = "AGY_DEV_REPOS_DIR"
+RUNTIME_ENV_VAR = "AGY_RUNTIME_ENV"
+DEV_PORTFOLIO_DIR_ENV = "AGY_DEV_PORTFOLIO_DIR"
+MANAGED_ECOSYSTEM_REPOS: tuple[str, ...] = (
+    "agy-dev-plugin",
+    "agy-tam-plugin",
+    "g-control-tower",
+)
 
 # Multi-slot per-repository development engine bounds (`AGY_DEV_MAX_SLOTS_PER_REPO`, clamped to `[1..4]`).
 DEFAULT_MAX_REPO_SLOTS = 3
@@ -423,13 +444,536 @@ def _resolve_companion_clients_dir(home_dir: Path | None = None) -> Path | None:
     return None
 
 
-def _resolve_companion_control_tower_dir(home_dir: Path | None = None) -> Path | None:
-    """Locate sibling `g-control-tower` repository directory if installed alongside plugins."""
+def _expand_configured_dir(
+    raw_value: Path | str | None,
+    *,
+    base_home: Path,
+) -> Path | None:
+    """Expand a configured directory path (`~`, `$HOME`), returning None on empty or `<placeholder>` values."""
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text or text.startswith("<"):
+        return None
+    if text == "~":
+        return base_home
+    if text.startswith("~/"):
+        return (base_home / text[2:]).resolve()
+    expanded = text.replace("$HOME", str(base_home))
+    return Path(expanded).expanduser().resolve()
+
+
+def _resolve_env_value(
+    key: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> str:
+    """Resolve `key` across explicit `env` (or `os.environ` when unisolated) and `.env`."""
     base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
-    candidates = [
-        resolve_plugin_root().parent / "g-control-tower",
-        base_home / "Code" / "Github" / "carlosrodlop" / "g-control-tower",
-    ]
+    if env is not None:
+        val = str(env.get(key) or "").strip()
+        if val:
+            return val
+    elif home_dir is None:
+        val = str(os.environ.get(key) or "").strip()
+        if val:
+            return val
+    else:
+        val_os = str(os.environ.get(key) or "").strip()
+        dotenv_vars_iso = load_dotenv_dict(env_file=env_file, home_dir=base_home)
+        val_file = str(dotenv_vars_iso.get(key) or "").strip()
+        if val_file:
+            return val_file
+        return val_os
+    dotenv_vars = load_dotenv_dict(env_file=env_file, home_dir=base_home)
+    return str(dotenv_vars.get(key) or "").strip()
+
+
+def resolve_runtime_env(
+    env: Mapping[str, str] | None = None,
+    *,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> str:
+    """Resolve `AGY_RUNTIME_ENV` (`'dev'` vs `'prod'`, defaulting to `'prod'`)."""
+    raw = _resolve_env_value(RUNTIME_ENV_VAR, env=env, env_file=env_file, home_dir=home_dir).lower()
+    return "dev" if raw in ("dev", "development", "fork") else "prod"
+
+
+def resolve_pro_port(
+    explicit_port: int | str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> int:
+    """Resolve Org-Prod Control Tower port (`AGY_PRO_PORT`, default `8787`)."""
+    for raw in (explicit_port, _resolve_env_value(PRO_PORT_ENV, env=env, env_file=env_file, home_dir=home_dir)):
+        if raw is None or raw == "" or isinstance(raw, bool):
+            continue
+        with contextlib.suppress(TypeError, ValueError):
+            port = int(str(raw).strip())
+            if 1 <= port <= 65535:
+                return port
+    return DEFAULT_PRO_PORT
+
+
+def resolve_dev_port(
+    explicit_port: int | str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> int:
+    """Resolve Personal-Fork DEV Control Tower port (`AGY_DEV_PORT`, default `8786`)."""
+    for raw in (explicit_port, _resolve_env_value(DEV_PORT_ENV, env=env, env_file=env_file, home_dir=home_dir)):
+        if raw is None or raw == "" or isinstance(raw, bool):
+            continue
+        with contextlib.suppress(TypeError, ValueError):
+            port = int(str(raw).strip())
+            if 1 <= port <= 65535:
+                return port
+    return DEFAULT_DEV_PORT
+
+
+def resolve_prod_repos_dir(
+    explicit_dir: Path | str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> Path | None:
+    """Resolve `AGY_PROD_REPOS_DIR` (Org Production clones root backing `:8787` and `$HOME` plugins)."""
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    if explicit_dir is not None and str(explicit_dir).strip():
+        return _expand_configured_dir(explicit_dir, base_home=base_home)
+    raw = _resolve_env_value(PROD_REPOS_DIR_ENV, env=env, env_file=env_file, home_dir=home_dir)
+    return _expand_configured_dir(raw, base_home=base_home)
+
+
+def resolve_dev_repos_dir(
+    explicit_dir: Path | str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> Path | None:
+    """Resolve `AGY_DEV_REPOS_DIR` (Personal Fork clones root backing `:8786` DEV)."""
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    if explicit_dir is not None and str(explicit_dir).strip():
+        return _expand_configured_dir(explicit_dir, base_home=base_home)
+    raw = _resolve_env_value(DEV_REPOS_DIR_ENV, env=env, env_file=env_file, home_dir=home_dir)
+    return _expand_configured_dir(raw, base_home=base_home)
+
+
+def resolve_prod_portfolio_dir(
+    portfolio_dir: Path | str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> Path:
+    """Resolve the canonical Org-Prod portfolio state directory (`~/.local/share/wiz-customer-portfolio`)."""
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    if portfolio_dir is not None and str(portfolio_dir).strip():
+        resolved = _expand_configured_dir(portfolio_dir, base_home=base_home)
+        if resolved is not None:
+            return resolved
+    if resolve_runtime_env(env=env, env_file=env_file, home_dir=home_dir) != "dev":
+        raw = _resolve_env_value("WIZ_CUSTOMER_PORTFOLIO_DIR", env=env, env_file=env_file, home_dir=home_dir)
+        configured = _expand_configured_dir(raw, base_home=base_home)
+        if configured is not None and configured.name != DEFAULT_DEV_PORTFOLIO_DIRNAME:
+            return configured
+    return (base_home / ".local" / "share" / COMPAT_PORTFOLIO_STATE_DIRNAME).resolve()
+
+
+def resolve_dev_portfolio_dir(
+    dev_portfolio_dir: Path | str | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> Path:
+    """Resolve the isolated Personal-Fork DEV portfolio state directory (`~/.local/share/wiz-customer-portfolio-dev`)."""
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    if dev_portfolio_dir is not None and str(dev_portfolio_dir).strip():
+        resolved = _expand_configured_dir(dev_portfolio_dir, base_home=base_home)
+        if resolved is not None:
+            return resolved
+    raw = _resolve_env_value(DEV_PORTFOLIO_DIR_ENV, env=env, env_file=env_file, home_dir=home_dir)
+    configured = _expand_configured_dir(raw, base_home=base_home)
+    if configured is not None:
+        return configured
+    return (base_home / ".local" / "share" / DEFAULT_DEV_PORTFOLIO_DIRNAME).resolve()
+
+
+def _extract_remote_owner_repo(remote_url: str) -> str:
+    """Extract lowercase `owner/repo` from SSH/HTTPS remote URL or `<parent>/<name>.git` local path."""
+    cleaned = str(remote_url or "").strip().replace("\\", "/").rstrip("/")
+    if not cleaned:
+        return ""
+    if cleaned.lower().startswith("file://"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith(("/", "~", "./", "../")):
+        p = Path(cleaned)
+        repo_name = p.name.removesuffix(".git").strip().lower()
+        owner_name = p.parent.name.strip().lower()
+        if owner_name and repo_name:
+            return f"{owner_name}/{repo_name}"
+        return ""
+    return normalize_repo_slug(cleaned)
+
+
+def _has_fork_upstream_remote(repo_root: Path) -> bool:
+    """Return True when `.git/config` declares both `origin` and `upstream` with distinct `owner/repo` slugs."""
+    cfg = _resolve_git_config_from_root(repo_root)
+    if cfg is None or not cfg.is_file():
+        return False
+    try:
+        cfg_text = cfg.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    urls: dict[str, str] = {}
+    for rem_name in ("origin", "upstream"):
+        m_sec = re.search(
+            rf'\[remote "{re.escape(rem_name)}"\]\s*\n((?:[ \t]+[^\n]*\n?)*)',
+            cfg_text,
+        )
+        if m_sec:
+            m_url = re.search(r"^\s*url\s*=\s*(.+)$", m_sec.group(1), re.MULTILINE)
+            if m_url and m_url.group(1).strip():
+                urls[rem_name] = m_url.group(1).strip()
+    if "origin" not in urls or "upstream" not in urls:
+        return False
+    origin_slug = _extract_remote_owner_repo(urls["origin"])
+    upstream_slug = _extract_remote_owner_repo(urls["upstream"])
+    return bool(origin_slug and upstream_slug and origin_slug != upstream_slug)
+
+
+def classify_repo_checkout_plane(
+    repo_dir: Path | str | None,
+    *,
+    prod_repos_dir: Path | str | None = None,
+    dev_repos_dir: Path | str | None = None,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> str:
+    """Classify `repo_dir` into `'prod'`, `'dev_fork'`, or `'unclassified'`."""
+    if repo_dir is None or not str(repo_dir).strip():
+        return "unclassified"
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    cand = _expand_configured_dir(repo_dir, base_home=base_home)
+    if cand is None:
+        return "unclassified"
+    if any(part.startswith("pr-worktree-") for part in cand.parts):
+        return "dev_fork"
+
+    eff_prod = resolve_prod_repos_dir(prod_repos_dir, env=env, env_file=env_file, home_dir=home_dir)
+    eff_dev = resolve_dev_repos_dir(dev_repos_dir, env=env, env_file=env_file, home_dir=home_dir)
+
+    if eff_prod is not None and (cand == eff_prod or eff_prod in cand.parents):
+        return "prod"
+    if eff_dev is not None and (cand == eff_dev or eff_dev in cand.parents):
+        return "dev_fork"
+
+    for cur in (cand, *cand.parents):
+        if (cur / ".git").exists():
+            if _has_fork_upstream_remote(cur):
+                return "dev_fork"
+            break
+    return "unclassified"
+
+
+def build_pythonpath_for_repos_dir(
+    repos_dir: Path | str | None,
+    *,
+    extra_paths: Sequence[Path | str] = (),
+) -> str:
+    """Build deterministic isolated `PYTHONPATH` pointing exclusively to `repos_dir` checkouts."""
+    entries: list[str] = []
+    if repos_dir is not None and str(repos_dir).strip():
+        root = Path(str(repos_dir)).expanduser().resolve()
+        ordered_candidates = (
+            root / "g-control-tower",
+            root / "agy-tam-plugin" / "clients",
+            root / "agy-tam-plugin",
+            root / "agy-dev-plugin" / "clients",
+            root / "agy-dev-plugin",
+        )
+        for cand in ordered_candidates:
+            cand_str = str(cand)
+            if cand_str not in entries:
+                entries.append(cand_str)
+    for extra in extra_paths:
+        ex_str = str(extra or "").strip()
+        if ex_str and ex_str not in entries:
+            entries.append(ex_str)
+    return os.pathsep.join(entries)
+
+
+def build_dev_server_env(
+    dev_repos_dir: Path | str | None = None,
+    *,
+    dev_port: int | None = None,
+    dev_portfolio_dir: Path | str | None = None,
+    base_env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> dict[str, str]:
+    """Construct isolated child process environment for Fork-DEV (`:8786`, `AGY_RUNTIME_ENV=dev`)."""
+    source_env = dict(os.environ if base_env is None else base_env)
+    eff_dev_repos = resolve_dev_repos_dir(dev_repos_dir, env=source_env, env_file=env_file, home_dir=home_dir)
+    eff_port = resolve_dev_port(dev_port, env=source_env, env_file=env_file, home_dir=home_dir)
+    eff_dev_pdir = resolve_dev_portfolio_dir(
+        dev_portfolio_dir,
+        env=source_env,
+        env_file=env_file,
+        home_dir=home_dir,
+    )
+    out = dict(source_env)
+    out[RUNTIME_ENV_VAR] = "dev"
+    out[DEV_PORT_ENV] = str(eff_port)
+    out["PORT"] = str(eff_port)
+    out[DEV_PORTFOLIO_DIR_ENV] = str(eff_dev_pdir)
+    out["WIZ_CUSTOMER_PORTFOLIO_DIR"] = str(eff_dev_pdir)
+    if eff_dev_repos is not None:
+        out[DEV_REPOS_DIR_ENV] = str(eff_dev_repos)
+        out["PYTHONPATH"] = build_pythonpath_for_repos_dir(eff_dev_repos)
+    return out
+
+
+def build_prod_server_env(
+    prod_repos_dir: Path | str | None = None,
+    *,
+    pro_port: int | None = None,
+    prod_portfolio_dir: Path | str | None = None,
+    base_env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> dict[str, str]:
+    """Construct isolated child process environment for Org-Prod (`:8787`, `AGY_RUNTIME_ENV=prod`)."""
+    source_env = dict(os.environ if base_env is None else base_env)
+    eff_prod_repos = resolve_prod_repos_dir(prod_repos_dir, env=source_env, env_file=env_file, home_dir=home_dir)
+    eff_port = resolve_pro_port(pro_port, env=source_env, env_file=env_file, home_dir=home_dir)
+    eff_prod_pdir = resolve_prod_portfolio_dir(
+        prod_portfolio_dir,
+        env=source_env,
+        env_file=env_file,
+        home_dir=home_dir,
+    )
+    out = dict(source_env)
+    out[RUNTIME_ENV_VAR] = "prod"
+    out[PRO_PORT_ENV] = str(eff_port)
+    out["WIZ_CUSTOMER_PORTFOLIO_DIR"] = str(eff_prod_pdir)
+    if eff_prod_repos is not None:
+        out[PROD_REPOS_DIR_ENV] = str(eff_prod_repos)
+        out["PYTHONPATH"] = build_pythonpath_for_repos_dir(eff_prod_repos)
+    return out
+
+
+def _sanitize_zero_pii_path_str(raw_path: Path | str, *, base_home: Path | None = None) -> str:
+    """Replace expanded home directory prefixes with `$HOME` for Zero-PII metadata persistence."""
+    text = str(raw_path or "")
+    for cand_h in ([base_home] if base_home is not None else []) + [Path.home()]:
+        if cand_h is None:
+            continue
+        with contextlib.suppress(OSError):
+            h_res = str(cand_h.expanduser().resolve())
+            if h_res and h_res != "/":
+                text = text.replace(h_res, "$HOME")
+    return re.sub(r"/(?:Users|home)/(?!testuser\b|test\b|Shared\b)[A-Za-z0-9._-]+", "$HOME", text)
+
+
+def _prune_transient_cloned_dev_artifacts(cloned_dir: Path) -> None:
+    """Remove transient worktrees, lock files, and sockets from a cloned DEV state directory."""
+    tmp_sub = cloned_dir / "tmp"
+    if tmp_sub.is_dir():
+        for child in list(tmp_sub.iterdir()):
+            if child.name.startswith("pr-worktree-") or child.suffix in (".lock", ".sock"):
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    with contextlib.suppress(OSError):
+                        child.unlink()
+    for lfile in cloned_dir.glob("*.lock"):
+        with contextlib.suppress(OSError):
+            lfile.unlink()
+
+
+def clone_dev_state_apfs(
+    src_dir: Path | str | None = None,
+    dst_dir: Path | str | None = None,
+    *,
+    force_refresh: bool = False,
+    env: Mapping[str, str] | None = None,
+    env_file: Path | str | None = None,
+    home_dir: Path | None = None,
+    system_name: str | None = None,
+    run_cmd: Any = None,
+) -> dict[str, Any]:
+    """Populate `~/.local/share/wiz-customer-portfolio-dev` via macOS APFS CoW (`cp -cR`) with portable `shutil.copytree` fallback."""
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    src = resolve_prod_portfolio_dir(src_dir, env=env, env_file=env_file, home_dir=home_dir)
+    dst = resolve_dev_portfolio_dir(dst_dir, env=env, env_file=env_file, home_dir=home_dir)
+    if src.resolve() == dst.resolve():
+        return {
+            "status": "error",
+            "cloned": False,
+            "error": "refusing_identical_prod_and_dev_portfolio_dir",
+            "src_dir": _sanitize_zero_pii_path_str(src, base_home=base_home),
+            "dst_dir": _sanitize_zero_pii_path_str(dst, base_home=base_home),
+        }
+
+    meta_file = dst / DEV_CLONE_META_FILENAME
+    if not force_refresh and dst.is_dir() and (meta_file.is_file() or any(dst.iterdir())):
+        return {
+            "status": "ok",
+            "cloned": False,
+            "already_initialized": True,
+            "refreshed": False,
+            "method": "existing",
+            "src_dir": _sanitize_zero_pii_path_str(src, base_home=base_home),
+            "dst_dir": _sanitize_zero_pii_path_str(dst, base_home=base_home),
+        }
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if not src.is_dir():
+        dst.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(dst, 0o700)
+        atomic_write_json(
+            dst / DEV_CLONE_META_FILENAME,
+            {
+                "cloned_at": now_iso,
+                "method": "empty_init",
+                "runtime_env": "dev",
+                "src_dir": _sanitize_zero_pii_path_str(src, base_home=base_home),
+                "dst_dir": _sanitize_zero_pii_path_str(dst, base_home=base_home),
+            },
+            mode=0o600,
+        )
+        return {
+            "status": "ok",
+            "cloned": True,
+            "already_initialized": False,
+            "refreshed": bool(force_refresh),
+            "method": "empty_init",
+            "src_dir": _sanitize_zero_pii_path_str(src, base_home=base_home),
+            "dst_dir": _sanitize_zero_pii_path_str(dst, base_home=base_home),
+        }
+
+    staging = dst.with_name(f".{dst.name}.staging.{os.getpid()}")
+    if staging.exists():
+        shutil.rmtree(staging, ignore_errors=True)
+
+    eff_system = system_name if system_name is not None else platform.system()
+    runner = subprocess.run if run_cmd is None else run_cmd
+    method_used = "copytree_fallback"
+    cloned_ok = False
+
+    if eff_system == "Darwin":
+        cp_bin = "/bin/cp" if Path("/bin/cp").is_file() else (shutil.which("cp") or "cp")
+        try:
+            proc = runner(
+                [cp_bin, "-cR", str(src), str(staging)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if getattr(proc, "returncode", 1) == 0 and staging.is_dir():
+                method_used = "apfs_cow_cp_cR"
+                cloned_ok = True
+            elif staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+        except (OSError, subprocess.SubprocessError):
+            if staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+
+    if not cloned_ok:
+        shutil.copytree(
+            src,
+            staging,
+            symlinks=False,
+            ignore=shutil.ignore_patterns("pr-worktree-*", "*.lock", "*.sock", "__pycache__", "*.pyc"),
+        )
+        method_used = "copytree_fallback"
+
+    _prune_transient_cloned_dev_artifacts(staging)
+    with contextlib.suppress(OSError):
+        os.chmod(staging, 0o700)
+    atomic_write_json(
+        staging / DEV_CLONE_META_FILENAME,
+        {
+            "cloned_at": now_iso,
+            "method": method_used,
+            "runtime_env": "dev",
+            "src_dir": _sanitize_zero_pii_path_str(src, base_home=base_home),
+            "dst_dir": _sanitize_zero_pii_path_str(dst, base_home=base_home),
+        },
+        mode=0o600,
+    )
+
+    backup_old = dst.with_name(f".{dst.name}.old.{os.getpid()}")
+    if backup_old.exists():
+        shutil.rmtree(backup_old, ignore_errors=True)
+    had_existing = dst.exists()
+    if had_existing:
+        os.replace(dst, backup_old)
+    try:
+        os.replace(staging, dst)
+    except OSError:
+        if had_existing and backup_old.exists() and not dst.exists():
+            with contextlib.suppress(OSError):
+                os.replace(backup_old, dst)
+        raise
+    finally:
+        if backup_old.exists():
+            shutil.rmtree(backup_old, ignore_errors=True)
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+    return {
+        "status": "ok",
+        "cloned": True,
+        "already_initialized": False,
+        "refreshed": bool(force_refresh),
+        "method": method_used,
+        "src_dir": _sanitize_zero_pii_path_str(src, base_home=base_home),
+        "dst_dir": _sanitize_zero_pii_path_str(dst, base_home=base_home),
+    }
+
+
+def _resolve_companion_control_tower_dir(
+    home_dir: Path | None = None,
+    *,
+    for_env: str = "prod",
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    """Locate `g-control-tower` repository directory scoped to `'prod'` (`AGY_PROD_REPOS_DIR`) or `'dev'` (`AGY_DEV_REPOS_DIR`)."""
+    base_home = Path(home_dir).expanduser().resolve() if home_dir is not None else Path.home()
+    candidates: list[Path] = []
+    if for_env == "dev":
+        dev_root = resolve_dev_repos_dir(env=env, home_dir=home_dir)
+        if dev_root is not None:
+            candidates.append(dev_root / "g-control-tower")
+            return candidates[0] if (candidates[0] / "api" / "server.py").is_file() else None
+    else:
+        prod_root = resolve_prod_repos_dir(env=env, home_dir=home_dir)
+        if prod_root is not None:
+            candidates.append(prod_root / "g-control-tower")
+            if (candidates[0] / "api" / "server.py").is_file():
+                return candidates[0]
+
+    candidates.append(resolve_plugin_root().parent / "g-control-tower")
+    gh_root = base_home / "Code" / "Github"
+    if gh_root.is_dir():
+        for srv_py in sorted(gh_root.glob("*/g-control-tower/api/server.py")):
+            candidates.append(srv_py.parents[1])
     for cand in candidates:
         if (cand / "api" / "server.py").is_file():
             return cand
@@ -439,9 +983,36 @@ def _resolve_companion_control_tower_dir(home_dir: Path | None = None) -> Path |
 def try_restart_control_tower_api(
     *,
     portfolio_dir: Path | str | None = None,
+    prod_repos_dir: Path | str | None = None,
     home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> bool:
-    """Optionally restart companion `g-control-tower` API server after `$HOME` deployment if present."""
+    """Explicitly restart Org-Prod (`:8787`) `g-control-tower` API server (used ONLY by manual `Sync Prod` / rollback)."""
+    eff_prod_repos = resolve_prod_repos_dir(prod_repos_dir, env=env, home_dir=home_dir)
+    if eff_prod_repos is not None:
+        prod_ct = eff_prod_repos / "g-control-tower"
+        if (prod_ct / "api" / "server.py").is_file():
+            child_env = build_prod_server_env(
+                eff_prod_repos,
+                prod_portfolio_dir=portfolio_dir,
+                base_env=env,
+                home_dir=home_dir,
+            )
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-m", "api.server", "restart"],
+                    cwd=str(prod_ct),
+                    env=child_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                if proc.returncode == 0:
+                    return True
+            except (OSError, subprocess.SubprocessError):
+                pass
+
     comp_clients = _resolve_companion_clients_dir(home_dir=home_dir)
     if comp_clients is not None:
         wc_mod = _load_optional_module(comp_clients / "wiz_common.py", "_agy_dev_optional_wiz_common")
@@ -450,13 +1021,20 @@ def try_restart_control_tower_api(
                 return bool(wc_mod.restart_pro_api_server(portfolio_dir=portfolio_dir))
             except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                 pass
-    ct_dir = _resolve_companion_control_tower_dir(home_dir=home_dir)
+    ct_dir = _resolve_companion_control_tower_dir(home_dir=home_dir, for_env="prod", env=env)
     if ct_dir is None:
         return False
+    child_env = build_prod_server_env(
+        eff_prod_repos,
+        prod_portfolio_dir=portfolio_dir,
+        base_env=env,
+        home_dir=home_dir,
+    )
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "api.server", "restart"],
             cwd=str(ct_dir),
+            env=child_env,
             capture_output=True,
             text=True,
             timeout=15,
@@ -465,6 +1043,105 @@ def try_restart_control_tower_api(
         return proc.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def try_reload_dev_api_server(
+    *,
+    portfolio_dir: Path | str | None = None,
+    dev_repos_dir: Path | str | None = None,
+    dev_port: int | None = None,
+    refresh_state: bool = False,
+    home_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    _allow_in_tests: bool = False,
+    run_cmd: Any = None,
+) -> dict[str, Any]:
+    """Reload Personal-Fork DEV (`:8786`) with `AGY_RUNTIME_ENV=dev`, fork `PYTHONPATH`, and APFS CoW state clone — NEVER touching `:8787` or `$HOME`."""
+    eff_env = os.environ if env is None else env
+    if (
+        run_cmd is None
+        and not _allow_in_tests
+        and (
+            "unittest" in sys.modules
+            or "pytest" in sys.modules
+            or eff_env.get("AGY_OFFLINE_ONLY") == "1"
+            or eff_env.get("AGY_DISABLE_API_AUTOSTART") == "1"
+            or eff_env.get("PRE_COMMIT_HOOK") == "1"
+        )
+    ):
+        return {"status": "skipped", "reloaded": False, "reason": "hermetic_or_offline_guard"}
+
+    eff_dev_repos = resolve_dev_repos_dir(dev_repos_dir, env=env, home_dir=home_dir)
+    eff_port = resolve_dev_port(dev_port, env=env, home_dir=home_dir)
+    if eff_port == resolve_pro_port(env=env, home_dir=home_dir):
+        return {"status": "error", "reloaded": False, "error": "dev_port_conflicts_with_pro_port"}
+
+    clone_res = clone_dev_state_apfs(
+        src_dir=portfolio_dir,
+        force_refresh=refresh_state,
+        env=env,
+        home_dir=home_dir,
+    )
+    if clone_res.get("status") != "ok":
+        return {"status": "error", "reloaded": False, "clone": clone_res, "error": str(clone_res.get("error") or "clone_failed")}
+
+    dev_ct_dir = _resolve_companion_control_tower_dir(home_dir=home_dir, for_env="dev", env=env)
+    if dev_ct_dir is None and eff_dev_repos is not None and (eff_dev_repos / "g-control-tower" / "api" / "server.py").is_file():
+        dev_ct_dir = eff_dev_repos / "g-control-tower"
+    if dev_ct_dir is None:
+        return {
+            "status": "skipped",
+            "reloaded": False,
+            "reason": "dev_control_tower_not_found",
+            "port": eff_port,
+            "clone": clone_res,
+        }
+
+    child_env = build_dev_server_env(
+        eff_dev_repos,
+        dev_port=eff_port,
+        base_env=env,
+        home_dir=home_dir,
+    )
+    runner = subprocess.run if run_cmd is None else run_cmd
+    try:
+        proc = runner(
+            [sys.executable, "-m", "api.server", "restart", "--port", str(eff_port)],
+            cwd=str(dev_ct_dir),
+            env=child_env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if getattr(proc, "returncode", 1) != 0 and "unrecognized arguments" in str(getattr(proc, "stderr", "") or ""):
+            proc = runner(
+                [sys.executable, "-m", "api.server", "restart"],
+                cwd=str(dev_ct_dir),
+                env=child_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        reloaded = getattr(proc, "returncode", 1) == 0
+        return {
+            "status": "ok" if reloaded else "error",
+            "reloaded": reloaded,
+            "port": eff_port,
+            "runtime_env": "dev",
+            "pythonpath": child_env.get("PYTHONPATH", ""),
+            "dev_portfolio_dir": child_env.get("WIZ_CUSTOMER_PORTFOLIO_DIR", ""),
+            "clone": clone_res,
+        }
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "status": "error",
+            "reloaded": False,
+            "port": eff_port,
+            "clone": clone_res,
+            "error": str(exc),
+        }
 
 
 def try_stop_dev_api_server(
@@ -484,6 +1161,21 @@ def try_stop_dev_api_server(
             except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                 pass
     return {"status": "skipped", "stopped": False}
+
+
+def try_build_dev_control_tower_ui_url(
+    page: str = "health",
+    *,
+    dev_port: int | None = None,
+    env: Mapping[str, str] | None = None,
+    home_dir: Path | None = None,
+) -> str:
+    """Return Personal-Fork DEV Control Tower URL (`:8786` by default via `DEFAULT_DEV_PORT`)."""
+    eff_env = os.environ if env is None else env
+    host = str(eff_env.get("AGY_DEV_HOST") or eff_env.get("AGY_PRO_HOST") or "agy.localhost").strip()
+    port = resolve_dev_port(dev_port, env=env, home_dir=home_dir)
+    clean_page = page.strip().lstrip("#")
+    return f"http://{host}:{port}/ui#{clean_page}" if clean_page else f"http://{host}:{port}/ui"
 
 
 def try_build_control_tower_ui_url(
@@ -509,7 +1201,7 @@ def try_build_control_tower_ui_url(
             except (OSError, RuntimeError, ValueError, TypeError):
                 pass
     host = str(os.environ.get("AGY_PRO_HOST") or "agy.localhost").strip()
-    port = str(os.environ.get("AGY_PRO_PORT") or "8787").strip()
+    port = str(resolve_pro_port(home_dir=home_dir))
     clean_page = page.strip().lstrip("#")
     return f"http://{host}:{port}/ui#{clean_page}" if clean_page else f"http://{host}:{port}/ui"
 
@@ -1665,7 +2357,18 @@ class DevLifecycleGuardrailEvaluator:
                             f"Guardrail violation (Parallel Worktree Deploy Protection — pretool:parallel-worker-deploy-home): "
                             f"running './install.sh' or 'deploy-home' from parallel worktree '{cand_dir.name}' is blocked "
                             f"so concurrent workers never race live $HOME plugin deployment. Deploy to $HOME exclusively "
-                            f"from the primary main checkout after PR merge."
+                            f"via manual 'Sync Prod' from AGY_PROD_REPOS_DIR."
+                        ),
+                    }
+                if classify_repo_checkout_plane(cand_dir, home_dir=self.home_dir) == "dev_fork":
+                    return {
+                        "decision": "deny",
+                        "check_id": "pretool:parallel-worker-deploy-home",
+                        "reason": (
+                            f"Guardrail violation (Org-Prod vs Fork-DEV Isolation — pretool:parallel-worker-deploy-home): "
+                            f"running './install.sh' or 'deploy-home' from personal fork checkout '{cand_dir.name}' is blocked "
+                            f"so fork development/merges never overwrite live $HOME plugins or restart Org-Prod (:8787). "
+                            f"Promote fork main to Org main and run manual 'Sync Prod' from AGY_PROD_REPOS_DIR instead."
                         ),
                     }
         return None

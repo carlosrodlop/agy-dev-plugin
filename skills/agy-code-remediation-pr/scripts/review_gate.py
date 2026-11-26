@@ -60,6 +60,7 @@ from lock_store import (  # noqa: E402
     _secondary_slot_keys,
     _slot_repo_branch_key,
     _utc_now_iso,
+    build_dev_dashboard_ui_url,
     build_pro_dashboard_ui_url,
     cleanup_worktree,
     format_remediation_commit_title,
@@ -67,6 +68,7 @@ from lock_store import (  # noqa: E402
     get_dev_pr_lock,
     is_frontend_change_detected,
     release_dev_pr_lock,
+    reload_dev_api_server,
     restart_pro_api_server,
     stop_dev_api_server,
     update_dev_pr_lock,
@@ -1127,7 +1129,11 @@ def push_remediation_branch_and_build_reviewer_plan(
         valid_vr = {**valid_vr, "head_sha": staged_head_sha, "dirty": False}
 
     frontend_changed = is_frontend_change_detected(diff_res.get("files", []))
-    dev_preview_url = ""
+    dev_preview_url = (
+        _facade_attr("build_dev_dashboard_ui_url", build_dev_dashboard_ui_url)("health")
+        if frontend_changed
+        else ""
+    )
     pro_url = _facade_attr("build_pro_dashboard_ui_url", build_pro_dashboard_ui_url)("health", portfolio_dir=portfolio_dir, ensure_server=False)
     web_src_dir = (
         (target_repo_dir / "web")
@@ -1199,7 +1205,7 @@ def push_remediation_branch_and_build_reviewer_plan(
                     if staged_file.is_file():
                         with contextlib.suppress(OSError):
                             os.utime(staged_file, None)
-        _facade_attr("restart_pro_api_server", restart_pro_api_server)(portfolio_dir=portfolio_dir)
+        # Org-Prod (:8787) Isolation: NEVER restart :8787 on `prepare-review` staging!
 
     updated_rb = {
         str(k): dict(v)
@@ -3617,6 +3623,56 @@ def register_review_cli(sub: Any) -> None:
     p_quota.add_argument("--resets-at", dest="resets_at", default="", help="Optional ISO-8601 UTC reset timestamp for --record-cooldown-model.")
     p_quota.add_argument("--resets-in-seconds", dest="resets_in_seconds", type=int, default=None, help="Optional reset duration in seconds for --record-cooldown-model.")
 
+    p_prom = sub.add_parser(
+        "promote-org-pr",
+        help="Sync upstream/main across Personal-Fork DEV clones and emit Cross-Fork PR compare URLs (org:main...user:repo:main).",
+    )
+    p_prom.add_argument("--repo-dir", "--workdir", dest="repo_dir", default="", help="Optional single fork repository directory.")
+    p_prom.add_argument("--dev-repos-dir", dest="dev_repos_dir", default="", help="Optional AGY_DEV_REPOS_DIR override.")
+    p_prom.add_argument("--repos", nargs="*", default=[], help="Optional subset of repository names.")
+    p_prom.add_argument("--upstream", default="upstream", help="Upstream Org remote name (default: upstream).")
+    p_prom.add_argument("--fork-remote", dest="fork_remote", default="origin", help="Fork remote name (default: origin).")
+    p_prom.add_argument("--base", default="main", help="Org target branch (default: main).")
+    p_prom.add_argument("--head", default="main", help="Fork source branch (default: main).")
+    p_prom.add_argument("--no-fetch", dest="no_fetch", action="store_true", help="Skip git fetch before comparing.")
+
+    p_sprod = sub.add_parser(
+        "sync-prod",
+        help="Manual Sync Prod: pull Org clones (--ff-only), run 0-LLM cross-repo smoke-check, deploy $HOME, restart :8787 once, and store 0600 rollback SHAs.",
+    )
+    p_sprod.add_argument("--prod-repos-dir", dest="prod_repos_dir", default="", help="Optional AGY_PROD_REPOS_DIR override.")
+    p_sprod.add_argument("--state-dir", dest="state_dir", default="", help="Optional state directory override.")
+    p_sprod.add_argument("--home-dir", dest="home_dir", default="", help="Optional target $HOME override.")
+    p_sprod.add_argument("--remote", default="origin", help="Git remote on Org clones (default: origin).")
+    p_sprod.add_argument("--base", default="main", help="Base branch on Org clones (default: main).")
+    p_sprod.add_argument("--repos", nargs="*", default=[], help="Optional subset of repository names.")
+    p_sprod.add_argument("--no-fetch", dest="no_fetch", action="store_true", help="Use local remote-tracking ref without network git pull.")
+
+    p_rbprod = sub.add_parser(
+        "rollback-prod",
+        help="1-Command Rollback Prod: restore AGY_PROD_REPOS_DIR to recorded previous_shas, smoke-check, redeploy $HOME, and restart :8787 once.",
+    )
+    p_rbprod.add_argument("--prod-repos-dir", dest="prod_repos_dir", default="", help="Optional AGY_PROD_REPOS_DIR override.")
+    p_rbprod.add_argument("--state-dir", dest="state_dir", default="", help="Optional state directory override.")
+    p_rbprod.add_argument("--home-dir", dest="home_dir", default="", help="Optional target $HOME override.")
+    p_rbprod.add_argument("--base", default="main", help="Base branch on Org clones (default: main).")
+
+    p_cdev = sub.add_parser(
+        "clone-dev-state",
+        help="Populate or refresh ~/.local/share/wiz-customer-portfolio-dev via macOS APFS CoW (cp -cR) with portable Unix fallback.",
+    )
+    p_cdev.add_argument("--src-dir", dest="src_dir", default="", help="Optional source Prod portfolio directory override.")
+    p_cdev.add_argument("--dst-dir", dest="dst_dir", default="", help="Optional destination DEV portfolio directory override.")
+    p_cdev.add_argument("--refresh", action="store_true", help="Force refresh even if DEV state already exists.")
+
+    p_rdev = sub.add_parser(
+        "reload-dev-server",
+        help="Reload Personal-Fork DEV (:8786) with AGY_RUNTIME_ENV=dev, fork PYTHONPATH, and APFS state clone without touching :8787.",
+    )
+    p_rdev.add_argument("--dev-repos-dir", dest="dev_repos_dir", default="", help="Optional AGY_DEV_REPOS_DIR override.")
+    p_rdev.add_argument("--port", type=int, default=None, help="Optional DEV port override (default: AGY_DEV_PORT / 8786).")
+    p_rdev.add_argument("--refresh-state", dest="refresh_state", action="store_true", help="Force refresh APFS DEV state clone before reload.")
+
 
 def _compact_review_cli_output(subcommand: str, res: dict[str, Any]) -> dict[str, Any]:
     """Strip bulky redundant prompts & nested lock blobs from CLI stdout to minimize LLM context tokens."""
@@ -3842,5 +3898,70 @@ def dispatch_review_cli(args: Any) -> int | None:
             out["cooldown_recorded"] = cooldown_res
         print(json.dumps(out, indent=2, ensure_ascii=False))
         return 0
+
+    if args.subcommand == "promote-org-pr":
+        prom_res = _facade_attr("promote_fork_to_org_pr", _git_client.promote_fork_to_org_pr)(
+            repo_dir=getattr(args, "repo_dir", "") or None,
+            dev_repos_dir=getattr(args, "dev_repos_dir", "") or None,
+            repo_names=list(getattr(args, "repos", []) or []) or None,
+            upstream_remote=str(getattr(args, "upstream", "upstream") or "upstream"),
+            fork_remote=str(getattr(args, "fork_remote", "origin") or "origin"),
+            base_branch=str(getattr(args, "base", "main") or "main"),
+            head_branch=str(getattr(args, "head", "main") or "main"),
+            fetch=not bool(getattr(args, "no_fetch", False)),
+        )
+        print(json.dumps(prom_res, indent=2, ensure_ascii=False))
+        return 0 if prom_res.get("status") == "ok" else 1
+
+    if args.subcommand == "sync-prod":
+        home_ov = (
+            Path(args.home_dir).expanduser().resolve()
+            if str(getattr(args, "home_dir", "") or "").strip()
+            else None
+        )
+        sp_res = _facade_attr("sync_prod_environment", _git_client.sync_prod_environment)(
+            prod_repos_dir=getattr(args, "prod_repos_dir", "") or None,
+            state_dir=getattr(args, "state_dir", "") or None,
+            home_dir=home_ov,
+            remote=str(getattr(args, "remote", "origin") or "origin"),
+            base_branch=str(getattr(args, "base", "main") or "main"),
+            fetch=not bool(getattr(args, "no_fetch", False)),
+            repo_names=list(getattr(args, "repos", []) or []) or None,
+        )
+        print(json.dumps(sp_res, indent=2, ensure_ascii=False))
+        return 0 if sp_res.get("status") == "ok" else 1
+
+    if args.subcommand == "rollback-prod":
+        home_ov = (
+            Path(args.home_dir).expanduser().resolve()
+            if str(getattr(args, "home_dir", "") or "").strip()
+            else None
+        )
+        rb_res = _facade_attr("rollback_prod_environment", _git_client.rollback_prod_environment)(
+            prod_repos_dir=getattr(args, "prod_repos_dir", "") or None,
+            state_dir=getattr(args, "state_dir", "") or None,
+            home_dir=home_ov,
+            base_branch=str(getattr(args, "base", "main") or "main"),
+        )
+        print(json.dumps(rb_res, indent=2, ensure_ascii=False))
+        return 0 if rb_res.get("status") == "ok" else 1
+
+    if args.subcommand == "clone-dev-state":
+        cdev_res = dev_common.clone_dev_state_apfs(
+            src_dir=getattr(args, "src_dir", "") or None,
+            dst_dir=getattr(args, "dst_dir", "") or None,
+            force_refresh=bool(getattr(args, "refresh", False)),
+        )
+        print(json.dumps(cdev_res, indent=2, ensure_ascii=False))
+        return 0 if cdev_res.get("status") == "ok" else 1
+
+    if args.subcommand == "reload-dev-server":
+        rdev_res = _facade_attr("reload_dev_api_server", reload_dev_api_server)(
+            dev_repos_dir=getattr(args, "dev_repos_dir", "") or None,
+            dev_port=getattr(args, "port", None),
+            refresh_state=bool(getattr(args, "refresh_state", False)),
+        )
+        print(json.dumps(rdev_res, indent=2, ensure_ascii=False))
+        return 0 if rdev_res.get("status") in ("ok", "skipped") else 1
 
     return None
