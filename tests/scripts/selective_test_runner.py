@@ -22,6 +22,7 @@ ALL_TEST_MODULES = [
     "tests.test_dev_queue_planning",
     "tests.test_dev_queue_sidecar_panel",
     "tests.test_dev_queue_tui",
+    "tests.test_dual_env_fork_sync_prod",
     "tests.test_model_quota_fallback",
     "tests.test_native_conversation_cleanup",
     "tests.test_orchestration_pause_resume",
@@ -100,6 +101,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_dev_queue_planning.py": "tests.test_dev_queue_planning",
     "tests/test_dev_queue_sidecar_panel.py": "tests.test_dev_queue_sidecar_panel",
     "tests/test_dev_queue_tui.py": "tests.test_dev_queue_tui",
+    "tests/test_dual_env_fork_sync_prod.py": "tests.test_dual_env_fork_sync_prod",
     "tests/test_model_quota_fallback.py": "tests.test_model_quota_fallback",
     "tests/test_native_conversation_cleanup.py": "tests.test_native_conversation_cleanup",
     "tests/test_orchestration_pause_resume.py": "tests.test_orchestration_pause_resume",
@@ -398,6 +400,25 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_dev_queue_sidecar_panel" not in selected:
                 selected.append("tests.test_dev_queue_sidecar_panel")
+        if (
+            norm.endswith(
+                (
+                    "dev_common.py",
+                    "git_client.py",
+                    "pr_remediator.py",
+                    "lock_store.py",
+                    "review_gate.py",
+                    "merge_watcher.py",
+                    ".env.example",
+                    "test_dual_env_fork_sync_prod.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith("sidecars/dev-queue-panel/")
+        ):
+            if "tests.test_dual_env_fork_sync_prod" not in selected:
+                selected.append("tests.test_dual_env_fork_sync_prod")
+
         if (
             norm.endswith(
                 (

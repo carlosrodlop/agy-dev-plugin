@@ -48,7 +48,9 @@ from parallel_scope import (  # noqa: E402
 import rebase_gate as _rebase_gate  # noqa: E402
 
 build_pro_dashboard_ui_url = dev_common.try_build_control_tower_ui_url
+build_dev_dashboard_ui_url = dev_common.try_build_dev_control_tower_ui_url
 restart_pro_api_server = dev_common.try_restart_control_tower_api
+reload_dev_api_server = dev_common.try_reload_dev_api_server
 stop_dev_api_server = dev_common.try_stop_dev_api_server
 
 _REPO_CLIENTS_DIR = Path(__file__).resolve().parents[3] / "clients"
@@ -2231,8 +2233,18 @@ def release_dev_pr_lock(
         import orchestration_control as _orch_ctrl_mod
 
         is_orch_paused = bool(_orch_ctrl_mod.is_orchestration_paused(portfolio_dir=portfolio_dir))
-    if not is_orch_paused:
-        _facade_attr("restart_pro_api_server", restart_pro_api_server)(portfolio_dir=portfolio_dir)
+
+    # Org-Prod (:8787) Isolation: NEVER restart :8787 on lock release/merge.
+    # Only reload Personal-Fork DEV (:8786) when a branch merges into fork main.
+    dev_server_reload: dict[str, Any] = {"status": "skipped", "reloaded": False}
+    if not is_orch_paused and reason in (
+        "BRANCH_MERGED_INTO_MAIN",
+        "HUMAN_VALIDATED_MANUAL_PR",
+        "SLOT1_MERGED_SLOT2_PROMOTED",
+    ):
+        dev_server_reload = _facade_attr("reload_dev_api_server", reload_dev_api_server)(
+            portfolio_dir=portfolio_dir
+        )
 
     primary_prev = released_entries[0][1] if released_entries else {}
     out_res: dict[str, Any] = {
@@ -2243,6 +2255,8 @@ def release_dev_pr_lock(
         "reason": reason,
         "resolution": resolution,
         "previous_lock": primary_prev,
+        "prod_restarted": False,
+        "dev_server_reload": dev_server_reload,
     }
     if promoted_slots:
         out_res["promoted_slots"] = promoted_slots
@@ -2466,9 +2480,12 @@ def _resolve_repo_dir_for_slug(
     base_dir = base_vcs.resolve_repo_dir()
     main_base_dir = _resolve_main_git_repo_root(base_dir) if (base_dir / ".git").exists() else base_dir
     candidates: list[Path] = []
+    repo_name = clean_slug.rsplit("/", 1)[-1]
+    dev_root = dev_common.resolve_dev_repos_dir()
+    if dev_root is not None and repo_name:
+        candidates.append(dev_root / repo_name)
     if (main_base_dir / ".git").exists():
         candidates.append(main_base_dir)
-    repo_name = clean_slug.rsplit("/", 1)[-1]
     if repo_name:
         candidates.append(main_base_dir.parent / repo_name)
         candidates.append(base_dir.parent / repo_name)

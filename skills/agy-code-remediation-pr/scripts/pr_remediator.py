@@ -49,7 +49,17 @@ from conversation_service_client import (  # noqa: F401, E402
     resolve_conversation_service_config,
 )
 import git_client as _git_client  # noqa: F401, E402
-from git_client import GitVcsIntegrationClient, stamp_repo_version_manifests  # noqa: F401, E402
+from git_client import (  # noqa: F401, E402
+    GitVcsIntegrationClient,
+    build_vcs_cross_fork_pr_url,
+    extract_vcs_remote_endpoint,
+    load_sync_prod_state,
+    promote_fork_to_org_pr,
+    rollback_prod_environment,
+    run_cross_repo_import_smoke_check,
+    stamp_repo_version_manifests,
+    sync_prod_environment,
+)
 
 _SCRIPT_DIR_STR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR_STR not in sys.path:
@@ -180,6 +190,7 @@ from lock_store import (  # noqa: F401, E402
     _utc_now_iso,
     _write_locks_state,
     acquire_dev_pr_lock,
+    build_dev_dashboard_ui_url,
     build_pro_dashboard_ui_url,
     cleanup_worktree,
     dispatch_lock_cli,
@@ -193,6 +204,7 @@ from lock_store import (  # noqa: F401, E402
     record_dev_pr_lock_heartbeat,
     register_lock_cli,
     release_dev_pr_lock,
+    reload_dev_api_server,
     restart_pro_api_server,
     stop_dev_api_server,
     sync_dev_pr_lock_with_git,

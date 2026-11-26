@@ -50,8 +50,10 @@ for _cand_root in (_INSTALLED_PLUGIN_ROOT, _PLUGIN_ROOT):
                 sys.path.remove(_cand_str)
             sys.path.insert(0, _cand_str)
 
+import dev_common as _dev_common  # noqa: E402
 import dev_queue_planner as _queue_planner  # noqa: E402
 import dev_queue_tui as _tui  # noqa: E402
+import git_client as _git_client  # noqa: E402
 import merge_watcher as _merge_watcher  # noqa: E402
 import orchestration_control as _orch_ctrl  # noqa: E402
 
@@ -865,6 +867,14 @@ def build_panel_state(
         cache_lock=cache_lock,
         now_ts=now_ts,
     )
+    dual_env_state = _get_cached_dual_env_panel_summary(
+        st_dir=st_dir,
+        env=env,
+        home_dir=home_dir,
+        repo_cache=repo_cache,
+        cache_lock=cache_lock,
+        now_ts=now_ts,
+    )
 
     planning_snapshot = _queue_planner.build_component_planning_snapshot(
         effective_items,
@@ -892,6 +902,7 @@ def build_panel_state(
             "board": board_info,
             "opt_hint": opt_hint,
             "ghost_purge": ghost_purge_state,
+            "dual_env": dual_env_state,
         },
         home_dir=home_dir,
     )
@@ -1086,6 +1097,82 @@ def _get_cached_ghost_purge_status(
                 "signature": sig,
                 "cached_at": cur_ts,
                 "armed_expires_at_ts": arm_doc.get("expires_at_ts") if isinstance(arm_doc, Mapping) else None,
+                "value": fresh,
+            }
+        return fresh
+
+
+def _build_dual_env_panel_summary(
+    *,
+    st_dir: Path,
+    env: Mapping[str, str] | None = None,
+    home_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Build lightweight (<1 ms, 0 subprocess) Org-Prod vs Fork-DEV state summary for `/api/state`."""
+    prod_port = _dev_common.resolve_pro_port(env=env, home_dir=home_dir)
+    dev_port = _dev_common.resolve_dev_port(env=env, home_dir=home_dir)
+    prod_repos = _dev_common.resolve_prod_repos_dir(env=env, home_dir=home_dir)
+    dev_repos = _dev_common.resolve_dev_repos_dir(env=env, home_dir=home_dir)
+    dev_pdir = _dev_common.resolve_dev_portfolio_dir(env=env, home_dir=home_dir)
+    clone_meta_file = dev_pdir / _dev_common.DEV_CLONE_META_FILENAME
+    clone_meta = _dev_common.atomic_read_json(clone_meta_file, default={})
+    if not isinstance(clone_meta, dict):
+        clone_meta = {}
+    sync_state = _git_client.load_sync_prod_state(st_dir, home_dir=home_dir)
+    prev_shas = sync_state.get("previous_shas") if isinstance(sync_state.get("previous_shas"), dict) else {}
+    cur_shas = sync_state.get("current_shas") if isinstance(sync_state.get("current_shas"), dict) else {}
+    return {
+        "prod_port": prod_port,
+        "dev_port": dev_port,
+        "prod_repos_configured": bool(prod_repos is not None and prod_repos.is_dir()),
+        "dev_repos_configured": bool(dev_repos is not None and dev_repos.is_dir()),
+        "dev_state_cloned": bool(clone_meta_file.is_file()),
+        "dev_clone_method": str(clone_meta.get("method") or ""),
+        "dev_cloned_at": str(clone_meta.get("cloned_at") or ""),
+        "can_rollback_prod": bool(prev_shas),
+        "last_synced_at": str(sync_state.get("last_synced_at") or ""),
+        "last_rolled_back_at": str(sync_state.get("last_rolled_back_at") or ""),
+        "current_prod_shas": dict(cur_shas),
+        "previous_prod_shas": dict(prev_shas),
+    }
+
+
+def _get_cached_dual_env_panel_summary(
+    *,
+    st_dir: Path,
+    env: Mapping[str, str] | None = None,
+    home_dir: Path | None = None,
+    repo_cache: dict[str, Any] | None = None,
+    cache_lock: threading.Lock | None = None,
+    now_ts: float | None = None,
+    ttl_seconds: float = 30.0,
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """Return mtime + TTL cached `_build_dual_env_panel_summary()` for `/api/state`."""
+    dev_pdir = _dev_common.resolve_dev_portfolio_dir(env=env, home_dir=home_dir)
+    sig = (
+        str(st_dir),
+        str(home_dir or ""),
+        str((env or os.environ).get(_dev_common.PROD_REPOS_DIR_ENV) or ""),
+        str((env or os.environ).get(_dev_common.DEV_REPOS_DIR_ENV) or ""),
+        str((env or os.environ).get(_dev_common.DEV_PORT_ENV) or ""),
+        _stat_path_signature(st_dir / _dev_common.SYNC_PROD_STATE_FILENAME),
+        _stat_path_signature(dev_pdir / _dev_common.DEV_CLONE_META_FILENAME),
+    )
+    cur_ts = float(now_ts if now_ts is not None else time.time())
+    lock_ctx = cache_lock if cache_lock is not None else contextlib.nullcontext()
+    with lock_ctx:
+        if repo_cache is not None and not force_refresh:
+            cached = repo_cache.get("_dual_env_cache")
+            if isinstance(cached, Mapping) and cached.get("signature") == sig:
+                age = cur_ts - float(cached.get("cached_at") or 0.0)
+                if 0.0 <= age < float(ttl_seconds):
+                    return dict(cached["value"])
+        fresh = _build_dual_env_panel_summary(st_dir=st_dir, env=env, home_dir=home_dir)
+        if repo_cache is not None:
+            repo_cache["_dual_env_cache"] = {
+                "signature": sig,
+                "cached_at": cur_ts,
                 "value": fresh,
             }
         return fresh
@@ -1550,6 +1637,76 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
                     )
                 payload = sanitize_zero_pii_payload(
                     {"ok": ok, **action_res, **err_fields, "ghost_purge": ghost_state},
+                    home_dir=cfg.home_dir,
+                )
+                self._send_json(status_code, payload)
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": sanitize_zero_pii_text(f"{exc.__class__.__name__}: {exc}", home_dir=cfg.home_dir),
+                    },
+                )
+            return
+
+        if route in (
+            "/api/dual-env/promote-org-pr",
+            "/api/dual-env/sync-prod",
+            "/api/dual-env/rollback-prod",
+            "/api/dual-env/refresh-dev-state",
+        ):
+            try:
+                st_dir = _tui._resolve_state_dir(str(cfg.state_dir) if cfg.state_dir is not None else "")
+                if route == "/api/dual-env/promote-org-pr":
+                    raw_repos = body.get("repos")
+                    repo_names = [str(r) for r in raw_repos if str(r).strip()] if isinstance(raw_repos, list) else None
+                    dual_res = _git_client.promote_fork_to_org_pr(
+                        repo_dir=str(body.get("repo_dir") or "").strip() or None,
+                        dev_repos_dir=str(body.get("dev_repos_dir") or "").strip() or None,
+                        repo_names=repo_names,
+                        fetch=bool(body.get("fetch", True)),
+                        env=cfg.env,
+                        home_dir=cfg.home_dir,
+                    )
+                elif route == "/api/dual-env/sync-prod":
+                    raw_repos = body.get("repos")
+                    repo_names = [str(r) for r in raw_repos if str(r).strip()] if isinstance(raw_repos, list) else None
+                    dual_res = _git_client.sync_prod_environment(
+                        prod_repos_dir=str(body.get("prod_repos_dir") or "").strip() or None,
+                        state_dir=st_dir,
+                        home_dir=cfg.home_dir,
+                        fetch=bool(body.get("fetch", True)),
+                        repo_names=repo_names,
+                        env=cfg.env,
+                    )
+                elif route == "/api/dual-env/rollback-prod":
+                    dual_res = _git_client.rollback_prod_environment(
+                        prod_repos_dir=str(body.get("prod_repos_dir") or "").strip() or None,
+                        state_dir=st_dir,
+                        home_dir=cfg.home_dir,
+                        env=cfg.env,
+                    )
+                else:
+                    dual_res = _dev_common.clone_dev_state_apfs(
+                        src_dir=st_dir,
+                        force_refresh=bool(body.get("force_refresh", True)),
+                        env=cfg.env,
+                        home_dir=cfg.home_dir,
+                    )
+
+                ok = str(dual_res.get("status") or "") == "ok"
+                status_code = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
+                dual_summary = _get_cached_dual_env_panel_summary(
+                    st_dir=st_dir,
+                    env=cfg.env,
+                    home_dir=cfg.home_dir,
+                    repo_cache=cfg.repo_cache,
+                    cache_lock=cfg.cache_lock,
+                    force_refresh=True,
+                )
+                payload = sanitize_zero_pii_payload(
+                    {"ok": ok, **dual_res, "dual_env": dual_summary},
                     home_dir=cfg.home_dir,
                 )
                 self._send_json(status_code, payload)
