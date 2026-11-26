@@ -478,12 +478,6 @@
     cleanupPreview: null,
     ghostBusy: false,
     ghostConfirmRestart: false,
-    dualEnvOpen: false,
-    dualEnvBusy: false,
-    dualEnvConfirmSync: false,
-    dualEnvConfirmRollback: false,
-    dualEnvPromoteResult: null,
-    dualEnvStatusMsg: "",
     toastTimer: null,
     consumedIntentIds: new Set(),
   };
@@ -976,269 +970,6 @@
       uiState.cleanupBusy = false;
       uiState.cleanupLoading = false;
       renderCleanupPreview();
-    }
-  }
-
-  function closeDualEnvDrawer() {
-    if (uiState.dualEnvBusy) {
-      return;
-    }
-    uiState.dualEnvOpen = false;
-    uiState.dualEnvConfirmSync = false;
-    uiState.dualEnvConfirmRollback = false;
-    uiState.dualEnvStatusMsg = "";
-    renderDualEnvDrawer();
-  }
-
-  function toggleDualEnvDrawer() {
-    if (uiState.dualEnvOpen && !uiState.dualEnvBusy) {
-      closeDualEnvDrawer();
-      return;
-    }
-    uiState.dualEnvOpen = true;
-    uiState.dualEnvConfirmSync = false;
-    uiState.dualEnvConfirmRollback = false;
-    renderDualEnvDrawer();
-  }
-
-  function renderDualEnvDrawer() {
-    const panel = document.getElementById("dq-dual-env-panel");
-    const toggleBtn = document.getElementById("dq-sync-prod-btn");
-    const titleEl = document.getElementById("dq-dual-env-title");
-    const summaryEl = document.getElementById("dq-dual-env-summary");
-    const chipsEl = document.getElementById("dq-dual-env-chips");
-    const promoteListEl = document.getElementById("dq-dual-env-promote-list");
-    const promoteBtn = document.getElementById("dq-dual-env-promote-btn");
-    const syncBtn = document.getElementById("dq-dual-env-sync-btn");
-    const rollbackBtn = document.getElementById("dq-dual-env-rollback-btn");
-    const refreshDevBtn = document.getElementById("dq-dual-env-refresh-dev-btn");
-    const closeBtn = document.getElementById("dq-dual-env-close-btn");
-    const syncConfirmRow = document.getElementById("dq-dual-env-sync-confirm-row");
-    const rollbackConfirmRow = document.getElementById("dq-dual-env-rollback-confirm-row");
-
-    const de =
-      uiState.snapshot && uiState.snapshot.dual_env && typeof uiState.snapshot.dual_env === "object"
-        ? uiState.snapshot.dual_env
-        : {};
-    const prodPort = Number(de.prod_port || 8787);
-    const devPort = Number(de.dev_port || 8786);
-    const prodConfigured = Boolean(de.prod_repos_configured);
-    const devConfigured = Boolean(de.dev_repos_configured);
-    const canRollback = Boolean(de.can_rollback_prod);
-
-    if (toggleBtn) {
-      toggleBtn.disabled = Boolean(uiState.dualEnvBusy);
-      toggleBtn.setAttribute("aria-expanded", uiState.dualEnvOpen ? "true" : "false");
-      toggleBtn.textContent = uiState.dualEnvBusy ? "Syncing…" : "🚀 Sync Prod";
-    }
-    if (!panel || !summaryEl || !chipsEl) {
-      return;
-    }
-    if (!uiState.dualEnvOpen) {
-      panel.classList.add("dq-hidden");
-      return;
-    }
-    panel.classList.remove("dq-hidden");
-    if (titleEl) {
-      titleEl.textContent = `Org-Prod (:${prodPort}) ↔ Fork-DEV (:${devPort})`;
-    }
-
-    const metaParts = [];
-    if (uiState.dualEnvStatusMsg) {
-      metaParts.push(uiState.dualEnvStatusMsg);
-    } else {
-      metaParts.push(prodConfigured ? "Prod clones ready" : "AGY_PROD_REPOS_DIR unset");
-      metaParts.push(devConfigured ? "Fork clones ready" : "AGY_DEV_REPOS_DIR unset");
-      if (de.last_synced_at) {
-        metaParts.push(`Last Sync: ${String(de.last_synced_at)}`);
-      }
-      if (de.last_rolled_back_at) {
-        metaParts.push(`Last Rollback: ${String(de.last_rolled_back_at)}`);
-      }
-    }
-    summaryEl.textContent = metaParts.join(" · ");
-
-    const chipFrag = document.createDocumentFragment();
-    const chipRows = [
-      ["PRO Port", `:${prodPort}`],
-      ["DEV Port", `:${devPort}`],
-      ["DEV State", de.dev_state_cloned ? (de.dev_clone_method || "cloned") : "uninitialized"],
-      ["Rollback Snapshot", canRollback ? "ready" : "none"],
-    ];
-    for (const [lbl, val] of chipRows) {
-      const chip = el("span", "dq-cleanup-chip");
-      chip.appendChild(el("span", "dq-cleanup-chip-label", lbl));
-      chip.appendChild(el("span", "dq-cleanup-chip-val", String(val)));
-      chipFrag.appendChild(chip);
-    }
-    chipsEl.replaceChildren(chipFrag);
-
-    if (promoteListEl) {
-      const promFrag = document.createDocumentFragment();
-      const promRepos =
-        uiState.dualEnvPromoteResult && Array.isArray(uiState.dualEnvPromoteResult.repos)
-          ? uiState.dualEnvPromoteResult.repos
-          : [];
-      for (const r of promRepos) {
-        if (r && r.has_unpromoted_commits && r.cross_fork_pr_url) {
-          const anchor = buildExternalLink(
-            `↗ ${r.repo_name} (+${r.ahead_count})`,
-            r.cross_fork_pr_url,
-            true,
-          );
-          if (anchor) {
-            promFrag.appendChild(anchor);
-          }
-        }
-      }
-      promoteListEl.replaceChildren(promFrag);
-    }
-
-    const busy = Boolean(uiState.dualEnvBusy);
-    if (promoteBtn) {
-      promoteBtn.disabled = busy || !devConfigured;
-    }
-    if (syncBtn) {
-      syncBtn.disabled = busy || !prodConfigured;
-    }
-    if (rollbackBtn) {
-      rollbackBtn.disabled = busy || !prodConfigured || !canRollback;
-    }
-    if (refreshDevBtn) {
-      refreshDevBtn.disabled = busy;
-    }
-    if (closeBtn) {
-      closeBtn.disabled = busy;
-    }
-    if (syncConfirmRow) {
-      syncConfirmRow.classList.toggle("dq-hidden", !(uiState.dualEnvConfirmSync && prodConfigured && !busy));
-    }
-    if (rollbackConfirmRow) {
-      rollbackConfirmRow.classList.toggle(
-        "dq-hidden",
-        !(uiState.dualEnvConfirmRollback && prodConfigured && canRollback && !busy),
-      );
-    }
-  }
-
-  async function runPromoteOrgPr() {
-    if (uiState.dualEnvBusy) {
-      return;
-    }
-    uiState.dualEnvBusy = true;
-    uiState.dualEnvConfirmSync = false;
-    uiState.dualEnvConfirmRollback = false;
-    uiState.dualEnvStatusMsg = "Syncing upstream/main & computing Cross-Fork PRs…";
-    renderDualEnvDrawer();
-    try {
-      const res = await apiFetch("/api/dual-env/promote-org-pr", {
-        method: "POST",
-        body: JSON.stringify({}),
-        timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
-      });
-      uiState.dualEnvPromoteResult = res;
-      const cnt = Number(res.actionable_count || 0);
-      uiState.dualEnvStatusMsg =
-        cnt > 0
-          ? `${cnt} fork repo${cnt === 1 ? "" : "s"} ahead of upstream/main — open Cross-Fork PRs below`
-          : "All fork main branches are in sync with upstream/main";
-      showToast(uiState.dualEnvStatusMsg);
-    } catch (err) {
-      uiState.dualEnvStatusMsg = `Promote check failed: ${err.message || "error"}`;
-      showToast(uiState.dualEnvStatusMsg);
-    } finally {
-      uiState.dualEnvBusy = false;
-      renderDualEnvDrawer();
-    }
-  }
-
-  async function runSyncProd() {
-    if (uiState.dualEnvBusy) {
-      return;
-    }
-    uiState.dualEnvBusy = true;
-    uiState.dualEnvConfirmSync = false;
-    uiState.dualEnvStatusMsg = "Pulling Org clones, running smoke-check & syncing Prod (:8787)…";
-    renderDualEnvDrawer();
-    try {
-      const res = await apiFetch("/api/dual-env/sync-prod", {
-        method: "POST",
-        body: JSON.stringify({}),
-        timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
-      });
-      if (res.dual_env && uiState.snapshot) {
-        uiState.snapshot.dual_env = res.dual_env;
-      }
-      const changed = Array.isArray(res.changed_repos) ? res.changed_repos.length : 0;
-      uiState.dualEnvStatusMsg = `Sync Prod succeeded (${changed} repo${changed === 1 ? "" : "s"} updated · smoke-check PASS)`;
-      showToast(`🚀 ${uiState.dualEnvStatusMsg}`);
-      uiState.etag = "";
-      await pollState(true);
-    } catch (err) {
-      uiState.dualEnvStatusMsg = `Sync Prod aborted: ${err.message || "smoke-check failed"}`;
-      showToast(`⚠️ ${uiState.dualEnvStatusMsg}`);
-    } finally {
-      uiState.dualEnvBusy = false;
-      renderDualEnvDrawer();
-    }
-  }
-
-  async function runRollbackProd() {
-    if (uiState.dualEnvBusy) {
-      return;
-    }
-    uiState.dualEnvBusy = true;
-    uiState.dualEnvConfirmRollback = false;
-    uiState.dualEnvStatusMsg = "Restoring previous_shas, smoke-checking & redeploying $HOME…";
-    renderDualEnvDrawer();
-    try {
-      const res = await apiFetch("/api/dual-env/rollback-prod", {
-        method: "POST",
-        body: JSON.stringify({}),
-        timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
-      });
-      if (res.dual_env && uiState.snapshot) {
-        uiState.snapshot.dual_env = res.dual_env;
-      }
-      uiState.dualEnvStatusMsg = "Rollback Prod completed — restored previous_shas & restarted :8787";
-      showToast(`↩ ${uiState.dualEnvStatusMsg}`);
-      uiState.etag = "";
-      await pollState(true);
-    } catch (err) {
-      uiState.dualEnvStatusMsg = `Rollback failed: ${err.message || "error"}`;
-      showToast(`⚠️ ${uiState.dualEnvStatusMsg}`);
-    } finally {
-      uiState.dualEnvBusy = false;
-      renderDualEnvDrawer();
-    }
-  }
-
-  async function runRefreshDevState() {
-    if (uiState.dualEnvBusy) {
-      return;
-    }
-    uiState.dualEnvBusy = true;
-    uiState.dualEnvStatusMsg = "Refreshing DEV state clone (:8786)…";
-    renderDualEnvDrawer();
-    try {
-      const res = await apiFetch("/api/dual-env/refresh-dev-state", {
-        method: "POST",
-        body: JSON.stringify({}),
-        timeoutMs: CLEANUP_FETCH_TIMEOUT_MS,
-      });
-      if (res.dual_env && uiState.snapshot) {
-        uiState.snapshot.dual_env = res.dual_env;
-      }
-      uiState.dualEnvStatusMsg = `DEV state refreshed (${res.method || "ok"})`;
-      showToast(`↻ ${uiState.dualEnvStatusMsg}`);
-      uiState.etag = "";
-      await pollState(true);
-    } catch (err) {
-      uiState.dualEnvStatusMsg = `DEV state refresh failed: ${err.message || "error"}`;
-      showToast(`⚠️ ${uiState.dualEnvStatusMsg}`);
-    } finally {
-      uiState.dualEnvBusy = false;
-      renderDualEnvDrawer();
     }
   }
 
@@ -1870,7 +1601,6 @@
     renderOrchestrationControl(snap.orchestration);
     renderGhostResultBanner();
     renderGhostPurgeControls();
-    renderDualEnvDrawer();
 
     const sections = snap.sections || {};
     const rawHitl = Array.isArray(sections.hitl_blocked) ? sections.hitl_blocked : [];
@@ -2112,32 +1842,6 @@
         renderGhostPurgeControls();
       } else if (action === "ghost-ack-result") {
         ackGhostPurgeResult();
-      } else if (action === "dual-env-toggle") {
-        toggleDualEnvDrawer();
-      } else if (action === "dual-env-close") {
-        closeDualEnvDrawer();
-      } else if (action === "dual-env-promote") {
-        runPromoteOrgPr();
-      } else if (action === "dual-env-sync-prompt") {
-        uiState.dualEnvConfirmSync = true;
-        uiState.dualEnvConfirmRollback = false;
-        renderDualEnvDrawer();
-      } else if (action === "dual-env-sync-cancel") {
-        uiState.dualEnvConfirmSync = false;
-        renderDualEnvDrawer();
-      } else if (action === "dual-env-sync-confirm") {
-        runSyncProd();
-      } else if (action === "dual-env-rollback-prompt") {
-        uiState.dualEnvConfirmRollback = true;
-        uiState.dualEnvConfirmSync = false;
-        renderDualEnvDrawer();
-      } else if (action === "dual-env-rollback-cancel") {
-        uiState.dualEnvConfirmRollback = false;
-        renderDualEnvDrawer();
-      } else if (action === "dual-env-rollback-confirm") {
-        runRollbackProd();
-      } else if (action === "dual-env-refresh-dev") {
-        runRefreshDevState();
       } else if (action === "open-conv") {
         triggerConversationToggle(actionBtn.dataset.convId, actionBtn.dataset.label);
       } else if (action === "open-board") {
@@ -2219,13 +1923,6 @@
       armGhostPurge,
       cancelGhostPurge,
       ackGhostPurgeResult,
-      toggleDualEnvDrawer,
-      closeDualEnvDrawer,
-      renderDualEnvDrawer,
-      runPromoteOrgPr,
-      runSyncProd,
-      runRollbackProd,
-      runRefreshDevState,
       pollState,
     };
   }

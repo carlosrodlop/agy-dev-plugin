@@ -379,8 +379,6 @@ def run_pr_merge_watcher_loop(
                     "terminated": True,
                     "reason": str(last_sync.get("reason") or "lock_inactive"),
                     "released": bool(last_sync.get("released")),
-                    "prod_isolated": True,
-                    "prod_restarted": False,
                     "iterations": iterations,
                     "last_sync": last_sync,
                 }

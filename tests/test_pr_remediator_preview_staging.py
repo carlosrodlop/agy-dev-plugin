@@ -142,7 +142,7 @@ class TestPrRemediatorPreviewStaging(unittest.TestCase):
 
             self.assertEqual(staged["status"], "ok")
             mock_stop.assert_called_once()
-            mock_restart.assert_not_called()
+            mock_restart.assert_called_once()
 
             preview_dir = dev_common.resolve_state_dir(portfolio_dir=pdir) / "tmp" / "dev_ui_preview"
             self.assertTrue((preview_dir / "index.html").is_file())
