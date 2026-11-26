@@ -119,17 +119,45 @@
     </header>
 
     <div id="dq-pause-banner" class="dq-pause-banner dq-hidden" role="status" aria-live="polite">
-      <div class="dq-pause-banner-copy">
-        <strong id="dq-pause-banner-title" class="dq-pause-banner-title"></strong>
-        <span id="dq-pause-banner-meta" class="dq-pause-banner-meta"></span>
+      <div class="dq-pause-banner-row">
+        <div class="dq-pause-banner-copy">
+          <strong id="dq-pause-banner-title" class="dq-pause-banner-title"></strong>
+          <span id="dq-pause-banner-meta" class="dq-pause-banner-meta"></span>
+        </div>
+        <div class="dq-pause-banner-actions">
+          <button
+            id="dq-banner-hard-stop-btn"
+            type="button"
+            class="dq-btn dq-btn-danger dq-hidden"
+            data-action="hard-stop-prompt"
+            title="Hard Freeze: cut off active workers, kill worktree subprocesses &amp; block Control Tower restarts (preserves locks &amp; worktrees)"
+          >⏹ Hard Stop</button>
+          <button
+            id="dq-banner-resume-btn"
+            type="button"
+            class="dq-btn dq-btn-resume"
+            data-action="resume-dev"
+            title="Continue orchestration and auto-wake orchestrator"
+          >▶ Continue Dev</button>
+        </div>
       </div>
-      <button
-        id="dq-banner-resume-btn"
-        type="button"
-        class="dq-btn dq-btn-resume"
-        data-action="resume-dev"
-        title="Continue orchestration and auto-wake orchestrator"
-      >▶ Continue Dev</button>
+      <div id="dq-hard-stop-confirm-row" class="dq-hard-stop-confirm-row dq-hidden" role="region" aria-label="Confirm Hard Stop">
+        <span class="dq-hard-stop-confirm-text">Freeze active workers, stop worktree subprocesses &amp; block restarts? Locks and worktrees stay preserved.</span>
+        <div class="dq-pause-banner-actions">
+          <button
+            id="dq-hard-stop-confirm-btn"
+            type="button"
+            class="dq-btn dq-btn-danger"
+            data-action="hard-stop-confirm"
+          >Confirm Hard Stop</button>
+          <button
+            id="dq-hard-stop-cancel-btn"
+            type="button"
+            class="dq-btn"
+            data-action="hard-stop-cancel"
+          >Cancel</button>
+        </div>
+      </div>
     </div>
     <div id="dq-ghost-result-banner" class="dq-ghost-result-banner dq-hidden" role="status" aria-live="polite">
       <div class="dq-ghost-result-copy">

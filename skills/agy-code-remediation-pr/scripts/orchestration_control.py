@@ -44,6 +44,8 @@ ORCHESTRATION_CONTROL_SCHEMA_VERSION = 1
 ORCHESTRATION_CONTROL_FILENAME = "dev_orchestration_control.json"
 ORCHESTRATION_CONTROL_LOCK_FILENAME = "dev_orchestration_control.lock"
 PAUSE_MODE_GRACEFUL_DRAIN = "graceful_drain"
+PAUSE_MODE_HARD_STOP = "hard_stop"
+VALID_PAUSE_MODES: frozenset[str] = frozenset({PAUSE_MODE_GRACEFUL_DRAIN, PAUSE_MODE_HARD_STOP})
 DEFAULT_PAUSED_POLL_INTERVAL_SECONDS = 3.0
 MAX_CONTROL_REASON_LENGTH = 160
 ALLOWED_CONTROL_SOURCES: frozenset[str] = frozenset(
@@ -65,6 +67,12 @@ _CHROME_DEVTOOLS_EXCLUDED_RE = re.compile(
     r"Google Chrome\.app|Antigravity\.app/Contents/MacOS/Antigravity\b|language_server\b|watchdog\.py\b|dev_queue_tui\.py\b",
     re.IGNORECASE,
 )
+_WORKTREE_SUBPROC_RE = re.compile(r"(?:pr-worktree-[A-Za-z0-9._-]+|dev_ui_preview)", re.IGNORECASE)
+_WORKTREE_EXCLUDED_PROC_RE = re.compile(
+    r"Google Chrome\.app|Antigravity\.app|language_server\b|watchdog\.py\b|dev_queue_tui\.py\b|"
+    r"dev-queue-panel/server\.py\b|\bwait-for-unlock\b|\bwatch-pr-merge\b|\bapi\.server\s+serve\b",
+    re.IGNORECASE,
+)
 
 
 def stop_chrome_devtools_mcp_processes(
@@ -75,6 +83,16 @@ def stop_chrome_devtools_mcp_processes(
     self_pid: int | None = None,
 ) -> dict[str, Any]:
     """Terminate running `chrome-devtools-mcp` helper processes on pause without touching Chrome browser tabs."""
+    if ps_output is None and ps_runner is None and kill_fn is None and (
+        "unittest" in sys.modules or "pytest" in sys.modules
+    ):
+        return {
+            "status": "skipped_hermetic_test",
+            "stopped_pids": [],
+            "hook_gate_active": True,
+            "errors": [],
+        }
+
     raw_ps = ""
     if ps_output is not None:
         raw_ps = str(ps_output)
@@ -125,6 +143,104 @@ def stop_chrome_devtools_mcp_processes(
         "status": "stopped" if stopped_pids else "none_running",
         "stopped_pids": stopped_pids,
         "hook_gate_active": True,
+        "errors": errors,
+    }
+
+
+def stop_active_worktree_processes(
+    *,
+    state_dir: Path | str | None = None,
+    portfolio_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+    active_worktrees: list[str] | tuple[str, ...] | None = None,
+    stop_dev_server: bool = True,
+    ps_output: str | None = None,
+    ps_runner: Callable[[], str] | None = None,
+    kill_fn: Callable[[int, int], None] | None = None,
+    self_pid: int | None = None,
+) -> dict[str, Any]:
+    """Terminate child processes running inside `pr-worktree-*` or preview dev servers without touching Control Tower prod (`8787`) or Antigravity."""
+    if ps_output is None and ps_runner is None and kill_fn is None and (
+        "unittest" in sys.modules or "pytest" in sys.modules
+    ):
+        return {
+            "status": "skipped_hermetic_test",
+            "stopped_pids": [],
+            "dev_server": {"status": "skipped", "stopped": False},
+            "errors": [],
+        }
+
+    raw_ps = ""
+    if ps_output is not None:
+        raw_ps = str(ps_output)
+    elif ps_runner is not None:
+        with contextlib.suppress(Exception):
+            raw_ps = str(ps_runner() or "")
+    else:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            proc = subprocess.run(
+                ["ps", "-eo", "pid=,args="],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            if proc.returncode == 0:
+                raw_ps = proc.stdout or ""
+
+    base_home = str((home_dir or Path.home()).expanduser())
+    wt_tokens: list[str] = []
+    for raw_wt in active_worktrees or ():
+        clean_wt = str(raw_wt or "").strip()
+        if not clean_wt:
+            continue
+        expanded = clean_wt.replace("$HOME", base_home)
+        if expanded not in wt_tokens:
+            wt_tokens.append(expanded)
+        wt_name = Path(expanded).name
+        if wt_name and wt_name not in wt_tokens:
+            wt_tokens.append(wt_name)
+
+    cur_pid = int(self_pid if self_pid is not None else os.getpid())
+    parent_pid = int(os.getppid()) if self_pid is None else -1
+    killer = kill_fn if kill_fn is not None else os.kill
+    stopped_pids: list[int] = []
+    errors: list[str] = []
+
+    for line in raw_ps.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        pid = int(parts[0])
+        cmd = parts[1].strip()
+        if pid <= 1 or pid == cur_pid or (parent_pid > 1 and pid == parent_pid):
+            continue
+        if _WORKTREE_EXCLUDED_PROC_RE.search(cmd):
+            continue
+        matched = bool(_WORKTREE_SUBPROC_RE.search(cmd)) or any(tok in cmd for tok in wt_tokens)
+        if not matched:
+            continue
+        try:
+            killer(pid, signal.SIGTERM)
+            stopped_pids.append(pid)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            errors.append(f"pid={pid}:{exc.__class__.__name__}")
+
+    dev_server_res: dict[str, Any] = {"status": "skipped", "stopped": False}
+    if stop_dev_server and ps_output is None and ps_runner is None and kill_fn is None:
+        resolved_dir = resolve_control_state_dir(state_dir, portfolio_dir=portfolio_dir, home_dir=home_dir)
+        with contextlib.suppress(Exception):
+            dev_server_res = dev_common.try_stop_dev_api_server(portfolio_dir=resolved_dir)
+
+    return {
+        "status": "stopped" if (stopped_pids or dev_server_res.get("stopped")) else "none_running",
+        "stopped_pids": stopped_pids,
+        "dev_server": dev_server_res,
         "errors": errors,
     }
 
@@ -216,6 +332,7 @@ def default_orchestration_control() -> dict[str, Any]:
         "reason": "",
         "source": "",
         "paused_at": "",
+        "hard_stopped_at": "",
         "resumed_at": "",
         "resume_nonce": "",
         "resume_handled_nonce": "",
@@ -233,11 +350,11 @@ def _normalize_control_dict(raw: Any, *, home_dir: Path | None = None) -> dict[s
     base["paused"] = bool(raw.get("paused"))
     base["chrome_devtools_disabled"] = bool(raw.get("chrome_devtools_disabled", base["paused"]))
     mode_val = str(raw.get("mode") or PAUSE_MODE_GRACEFUL_DRAIN).strip().lower()
-    base["mode"] = mode_val or PAUSE_MODE_GRACEFUL_DRAIN
+    base["mode"] = mode_val if mode_val in VALID_PAUSE_MODES else PAUSE_MODE_GRACEFUL_DRAIN
     base["reason"] = sanitize_control_reason(str(raw.get("reason") or ""), home_dir=home_dir)
     raw_source = str(raw.get("source") or "").strip().lower()
     base["source"] = raw_source if raw_source in ALLOWED_CONTROL_SOURCES else ""
-    for ts_key in ("paused_at", "resumed_at", "resume_handled_at", "updated_at"):
+    for ts_key in ("paused_at", "hard_stopped_at", "resumed_at", "resume_handled_at", "updated_at"):
         base[ts_key] = str(raw.get(ts_key) or "").strip()
     for nonce_key in ("resume_nonce", "resume_handled_nonce", "resume_handled_by"):
         base[nonce_key] = str(raw.get(nonce_key) or "").strip()
@@ -262,8 +379,19 @@ def is_orchestration_paused(
     portfolio_dir: Path | str | None = None,
     home_dir: Path | None = None,
 ) -> bool:
-    """Return True when orchestration is currently paused (`Graceful Drain`)."""
+    """Return True when orchestration is currently paused (`Graceful Drain` or `Hard Stop`)."""
     return bool(load_orchestration_control(state_dir, portfolio_dir=portfolio_dir, home_dir=home_dir).get("paused"))
+
+
+def is_hard_stop_active(
+    state_dir: Path | str | None = None,
+    *,
+    portfolio_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+) -> bool:
+    """Return True iff orchestration is paused in non-destructive `hard_stop` (Hard Freeze) mode."""
+    ctrl = load_orchestration_control(state_dir, portfolio_dir=portfolio_dir, home_dir=home_dir)
+    return bool(ctrl.get("paused")) and str(ctrl.get("mode") or "").strip().lower() == PAUSE_MODE_HARD_STOP
 
 
 def has_unhandled_resume_request(control: Mapping[str, Any] | None) -> bool:
@@ -305,13 +433,25 @@ def summarize_orchestration_phase(
     control: Mapping[str, Any] | None,
     active_locks: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compute a unified Zero-PII status view (`active` | `draining` | `paused`) across UI, TUI, and CLI."""
+    """Compute a unified Zero-PII status view (`active` | `draining` | `paused` | `hard_stopped`) across UI, TUI, and CLI."""
     norm = _normalize_control_dict(control)
     paused = bool(norm.get("paused"))
+    mode = str(norm.get("mode") or PAUSE_MODE_GRACEFUL_DRAIN).strip().lower()
+    hard_stopped = paused and mode == PAUSE_MODE_HARD_STOP
     ongoing = count_ongoing_lock_slots(active_locks)
     if not paused:
         phase = "active"
         banner_text = ""
+    elif hard_stopped:
+        phase = "hard_stopped"
+        if ongoing > 0:
+            task_word = "task" if ongoing == 1 else "tasks"
+            banner_text = (
+                f"HARD STOPPED — {ongoing} frozen {task_word} (locks & worktrees preserved) · "
+                "Workers & restarts blocked · Chrome DevTools OFF"
+            )
+        else:
+            banner_text = "HARD STOPPED — 0 active tasks · Workers & restarts blocked · Chrome DevTools OFF"
     elif ongoing > 0:
         phase = "draining"
         task_word = "task" if ongoing == 1 else "tasks"
@@ -322,10 +462,117 @@ def summarize_orchestration_phase(
     return {
         **norm,
         "phase": phase,
+        "hard_stopped": hard_stopped,
         "ongoing_count": ongoing,
         "new_dispatches_blocked": paused,
         "chrome_devtools_disabled": paused,
         "banner_text": banner_text,
+    }
+
+
+def _collect_active_worktree_paths(active_locks: Mapping[str, Any] | None) -> list[str]:
+    """Extract unique active worktree paths from `dev_pr_locks` mapping."""
+    if not isinstance(active_locks, Mapping):
+        return []
+    paths: list[str] = []
+    for lk in active_locks.values():
+        if not isinstance(lk, Mapping) or not bool(lk.get("active")):
+            continue
+        slots_map = lk.get("slots")
+        entries: list[Mapping[str, Any]] = []
+        if isinstance(slots_map, Mapping) and slots_map:
+            entries.extend(v for v in slots_map.values() if isinstance(v, Mapping) and bool(v.get("active", True)))
+        else:
+            entries.append(lk)
+        for entry in entries:
+            wt = str(entry.get("worktree_path") or "").strip()
+            if wt and wt not in paths:
+                paths.append(wt)
+    return paths
+
+
+def hard_stop_orchestration(
+    state_dir: Path | str | None = None,
+    *,
+    portfolio_dir: Path | str | None = None,
+    home_dir: Path | None = None,
+    reason: str = "",
+    source: str = "cli",
+    stop_chrome_devtools: bool = True,
+    stop_worktree_processes: bool = True,
+    active_locks: Mapping[str, Any] | None = None,
+    ps_output: str | None = None,
+    ps_runner: Callable[[], str] | None = None,
+    kill_fn: Callable[[int, int], None] | None = None,
+    now_ts: float | None = None,
+) -> dict[str, Any]:
+    """Atomically activate non-destructive Hard Stop (`Hard Freeze`) preserving locks & worktrees while stopping active worker execution."""
+    resolved_dir = resolve_control_state_dir(state_dir, portfolio_dir=portfolio_dir, home_dir=home_dir)
+    ctrl_path = resolved_dir / ORCHESTRATION_CONTROL_FILENAME
+    lock_path = resolved_dir / ORCHESTRATION_CONTROL_LOCK_FILENAME
+    now_iso = _utc_now_iso(now_ts)
+    clean_reason = sanitize_control_reason(reason, home_dir=home_dir)
+    clean_source = normalize_control_source(source)
+
+    with dev_common.file_lock(lock_path):
+        prev = _normalize_control_dict(dev_common.atomic_read_json(ctrl_path, default=None), home_dir=home_dir)
+        was_paused = bool(prev.get("paused"))
+        was_hard_stopped = was_paused and str(prev.get("mode") or "") == PAUSE_MODE_HARD_STOP
+        updated = dict(prev)
+        updated["schema_version"] = ORCHESTRATION_CONTROL_SCHEMA_VERSION
+        updated["paused"] = True
+        updated["mode"] = PAUSE_MODE_HARD_STOP
+        updated["chrome_devtools_disabled"] = True
+        updated["source"] = clean_source
+        if clean_reason or not was_paused:
+            updated["reason"] = clean_reason
+        if not was_paused or not updated.get("paused_at"):
+            updated["paused_at"] = now_iso
+        if not was_hard_stopped or not updated.get("hard_stopped_at"):
+            updated["hard_stopped_at"] = now_iso
+        updated["updated_at"] = now_iso
+        dev_common.atomic_write_json(ctrl_path, updated, mode=0o600)
+
+    if stop_chrome_devtools:
+        chrome_devtools_res = stop_chrome_devtools_mcp_processes(
+            ps_output=ps_output,
+            ps_runner=ps_runner,
+            kill_fn=kill_fn,
+        )
+    else:
+        chrome_devtools_res = {"status": "skipped", "stopped_pids": [], "hook_gate_active": True, "errors": []}
+
+    eff_locks = active_locks
+    if eff_locks is None and stop_worktree_processes:
+        with contextlib.suppress(Exception):
+            import lock_store as _ls
+
+            eff_locks = _ls.get_all_dev_pr_locks(portfolio_dir=resolved_dir)
+
+    if stop_worktree_processes:
+        worktree_procs_res = stop_active_worktree_processes(
+            state_dir=resolved_dir,
+            home_dir=home_dir,
+            active_worktrees=_collect_active_worktree_paths(eff_locks),
+            ps_output=ps_output,
+            ps_runner=ps_runner,
+            kill_fn=kill_fn,
+        )
+    else:
+        worktree_procs_res = {"status": "skipped", "stopped_pids": [], "dev_server": {"status": "skipped", "stopped": False}, "errors": []}
+
+    return {
+        "status": "ok",
+        "paused": True,
+        "hard_stopped": True,
+        "mode": PAUSE_MODE_HARD_STOP,
+        "changed": not was_hard_stopped,
+        "was_paused": was_paused,
+        "was_hard_stopped": was_hard_stopped,
+        "chrome_devtools": chrome_devtools_res,
+        "worktree_processes": worktree_procs_res,
+        "control": updated,
+        "control_path": sanitize_control_text(str(ctrl_path), home_dir=home_dir),
     }
 
 
@@ -413,6 +660,7 @@ def resume_orchestration(
         updated["mode"] = PAUSE_MODE_GRACEFUL_DRAIN
         updated["chrome_devtools_disabled"] = False
         updated["reason"] = ""
+        updated["hard_stopped_at"] = ""
         updated["source"] = clean_source
         updated["resumed_at"] = now_iso
         updated["resume_nonce"] = nonce
@@ -479,20 +727,34 @@ def mark_resume_handled(
 
 
 def register_control_cli(sub: Any) -> None:
-    """Register `orchestration-status`, `orchestration-pause`, and `orchestration-resume` CLI subcommands."""
+    """Register `orchestration-status`, `orchestration-pause`, `orchestration-stop`, and `orchestration-resume` CLI subcommands."""
     p_status = sub.add_parser(
         "orchestration-status",
-        help="Show current orchestration Pause / Continue (Graceful Drain) control state.",
+        help="Show current orchestration Pause / Hard Stop / Continue control state.",
     )
     p_status.add_argument("--portfolio-dir", default="", help="Optional state directory override.")
 
     p_pause = sub.add_parser(
         "orchestration-pause",
-        help="Pause orchestration (Graceful Drain: finish ongoing active-lock tasks, dispatch zero new tasks).",
+        help="Pause orchestration (Graceful Drain by default, or Hard Freeze with --hard).",
     )
     p_pause.add_argument("--reason", default="", help="Optional short Zero-PII reason (e.g. 'Customer focus').")
+    p_pause.add_argument(
+        "--hard",
+        dest="hard",
+        action="store_true",
+        help="Activate Hard Stop (Hard Freeze: cut off active workers & kill worktree subprocesses while preserving locks).",
+    )
     p_pause.add_argument("--source", default="cli", help="Mutation origin tag (cli, tui, sidecar_panel).")
     p_pause.add_argument("--portfolio-dir", default="", help="Optional state directory override.")
+
+    p_stop = sub.add_parser(
+        "orchestration-stop",
+        help="Activate non-destructive Hard Stop (Hard Freeze: freeze active workers & kill worktree processes, preserving locks/worktrees).",
+    )
+    p_stop.add_argument("--reason", default="", help="Optional short Zero-PII reason (e.g. 'Live demo').")
+    p_stop.add_argument("--source", default="cli", help="Mutation origin tag (cli, tui, sidecar_panel).")
+    p_stop.add_argument("--portfolio-dir", default="", help="Optional state directory override.")
 
     p_resume = sub.add_parser(
         "orchestration-resume",
@@ -510,9 +772,9 @@ def register_control_cli(sub: Any) -> None:
 
 
 def dispatch_control_cli(args: Any) -> int | None:
-    """Dispatch `orchestration-status`, `orchestration-pause`, and `orchestration-resume` commands."""
+    """Dispatch `orchestration-status`, `orchestration-pause`, `orchestration-stop`, and `orchestration-resume` commands."""
     subcmd = getattr(args, "subcommand", "")
-    if subcmd not in ("orchestration-status", "orchestration-pause", "orchestration-resume"):
+    if subcmd not in ("orchestration-status", "orchestration-pause", "orchestration-stop", "orchestration-resume"):
         return None
 
     state_override: Path | str | None = str(getattr(args, "portfolio_dir", "") or "").strip() or None
@@ -531,6 +793,8 @@ def dispatch_control_cli(args: Any) -> int | None:
                 {
                     "status": "ok",
                     "paused": bool(summary.get("paused")),
+                    "hard_stopped": bool(summary.get("hard_stopped")),
+                    "mode": summary.get("mode"),
                     "phase": summary.get("phase"),
                     "ongoing_count": summary.get("ongoing_count"),
                     "new_dispatches_blocked": summary.get("new_dispatches_blocked"),
@@ -542,6 +806,15 @@ def dispatch_control_cli(args: Any) -> int | None:
                 ensure_ascii=False,
             )
         )
+        return 0
+
+    if subcmd == "orchestration-stop" or (subcmd == "orchestration-pause" and bool(getattr(args, "hard", False))):
+        res = hard_stop_orchestration(
+            state_dir=state_override,
+            reason=str(getattr(args, "reason", "") or ""),
+            source=str(getattr(args, "source", "cli") or "cli"),
+        )
+        print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0
 
     if subcmd == "orchestration-pause":

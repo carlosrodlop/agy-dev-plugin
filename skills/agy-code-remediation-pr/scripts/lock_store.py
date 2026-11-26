@@ -2226,7 +2226,13 @@ def release_dev_pr_lock(
             cleanup_worktree(wt_path, repo_dir=_resolve_lock_target_repo_dir(released_lock))
 
     _facade_attr("stop_dev_api_server", stop_dev_api_server)(portfolio_dir=portfolio_dir)
-    _facade_attr("restart_pro_api_server", restart_pro_api_server)(portfolio_dir=portfolio_dir)
+    is_orch_paused = False
+    with contextlib.suppress(Exception):
+        import orchestration_control as _orch_ctrl_mod
+
+        is_orch_paused = bool(_orch_ctrl_mod.is_orchestration_paused(portfolio_dir=portfolio_dir))
+    if not is_orch_paused:
+        _facade_attr("restart_pro_api_server", restart_pro_api_server)(portfolio_dir=portfolio_dir)
 
     primary_prev = released_entries[0][1] if released_entries else {}
     out_res: dict[str, Any] = {

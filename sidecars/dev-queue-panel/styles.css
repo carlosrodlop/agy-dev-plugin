@@ -188,6 +188,16 @@ button {
   background: var(--dq-warning);
 }
 
+.dq-live-pill.is-hard-stopped {
+  background: var(--dq-danger-tint, color-mix(in srgb, var(--dq-danger) 14%, var(--dq-card)));
+  color: var(--dq-danger);
+  font-weight: 650;
+}
+
+.dq-live-pill.is-hard-stopped .dq-live-dot {
+  background: var(--dq-danger);
+}
+
 .dq-pause-btn {
   border: 1px solid color-mix(in srgb, var(--dq-warning) 44%, var(--dq-border));
   background: var(--dq-warn-tint);
@@ -427,13 +437,31 @@ button {
 
 .dq-pause-banner {
   display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--dq-warn-tint);
+  border-bottom: 1px solid color-mix(in srgb, var(--dq-warning) 38%, var(--dq-border));
+}
+
+.dq-pause-banner.is-hard-stopped {
+  background: var(--dq-danger-tint, color-mix(in srgb, var(--dq-danger) 12%, var(--dq-card)));
+  border-bottom-color: color-mix(in srgb, var(--dq-danger) 42%, var(--dq-border));
+}
+
+.dq-pause-banner-row {
+  display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   flex-wrap: wrap;
-  padding: 8px 12px;
-  background: var(--dq-warn-tint);
-  border-bottom: 1px solid color-mix(in srgb, var(--dq-warning) 38%, var(--dq-border));
+}
+
+.dq-pause-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .dq-pause-banner-copy {
@@ -451,10 +479,30 @@ button {
   font-variant-numeric: tabular-nums;
 }
 
+.dq-pause-banner.is-hard-stopped .dq-pause-banner-title {
+  color: var(--dq-danger);
+}
+
 .dq-pause-banner-meta {
   font-size: 11px;
   color: var(--dq-fg-muted);
   font-variant-numeric: tabular-nums;
+}
+
+.dq-hard-stop-confirm-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 6px;
+  border-top: 1px solid color-mix(in srgb, var(--dq-danger) 28%, var(--dq-border));
+}
+
+.dq-hard-stop-confirm-text {
+  font-size: 11px;
+  color: var(--dq-fg);
+  flex: 1 1 180px;
 }
 
 .dq-btn-resume {

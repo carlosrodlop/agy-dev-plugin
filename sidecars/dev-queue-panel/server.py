@@ -1371,6 +1371,35 @@ class DevQueuePanelRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if route == "/api/orchestration/hard-stop":
+            st_dir = _tui._resolve_state_dir(str(cfg.state_dir) if cfg.state_dir is not None else "")
+            reason = str(body.get("reason") or "")
+            locks, _ = _tui._load_locks(st_dir)
+            res = _orch_ctrl.hard_stop_orchestration(
+                state_dir=st_dir,
+                home_dir=cfg.home_dir,
+                reason=reason,
+                source="sidecar_panel",
+                active_locks=locks,
+            )
+            orch_state = _orch_ctrl.summarize_orchestration_phase(res.get("control"), locks)
+            self._send_json(
+                HTTPStatus.OK,
+                sanitize_zero_pii_payload(
+                    {
+                        "ok": True,
+                        "paused": True,
+                        "hard_stopped": True,
+                        "changed": bool(res.get("changed")),
+                        "chrome_devtools": res.get("chrome_devtools") or {},
+                        "worktree_processes": res.get("worktree_processes") or {},
+                        "orchestration": orch_state,
+                    },
+                    home_dir=cfg.home_dir,
+                ),
+            )
+            return
+
         if route == "/api/orchestration/resume":
             st_dir = _tui._resolve_state_dir(str(cfg.state_dir) if cfg.state_dir is not None else "")
             res = _orch_ctrl.resume_orchestration(

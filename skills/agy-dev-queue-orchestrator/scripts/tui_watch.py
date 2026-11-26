@@ -721,6 +721,7 @@ def run_watch_loop(
                 sync_in_flight=sync_ctrl.is_in_flight(),
                 status_msg=ws.status_msg,
                 orchestration_paused=bool(ws.layout_data.get("orchestration_paused", False)),
+                orchestration_phase=str(ws.layout_data.get("orchestration_phase") or ""),
             )
 
             color_on = bool(ws.layout_data.get("color_on", False))
@@ -1052,6 +1053,22 @@ def run_watch_loop(
                     ws.scroll_offset = 0
                     ws.status_msg = f"Pending view: {'COMPACT' if ws.compact_pending else 'FULL'}"
                     ws.status_until = time.monotonic() + 2.5
+                    break
+                if key == "S":
+                    oc_mod = _facade_attr("_get_orch_control", _get_orch_control)()
+                    if oc_mod is None:
+                        ws.status_msg = "⚠ orchestration_control module unavailable"
+                    else:
+                        cur_locks, _ = _load_locks(ws.state_dir)
+                        res_s = oc_mod.hard_stop_orchestration(
+                            state_dir=ws.state_dir,
+                            source="tui",
+                            active_locks=cur_locks,
+                        )
+                        phase_info = oc_mod.summarize_orchestration_phase(res_s.get("control"), cur_locks)
+                        ws.status_msg = f"⏹ {phase_info.get('banner_text') or 'HARD STOPPED — Workers frozen'}"
+                    ws.status_until = time.monotonic() + 5.0
+                    ws.data_dirty = True
                     break
                 if key == "P":
                     oc_mod = _facade_attr("_get_orch_control", _get_orch_control)()
@@ -1589,12 +1606,18 @@ def _run_subcommand_set_status(argv: list[str]) -> int:
 
 
 def _run_subcommand_pause(argv: list[str]) -> int:
-    """Handle `agy-queue pause [--reason ...] [--state-dir DIR] [--json]`."""
+    """Handle `agy-queue pause [--hard] [--reason ...] [--state-dir DIR] [--json]`."""
     parser = argparse.ArgumentParser(
         prog="agy-queue pause",
-        description="Pause orchestration (Graceful Drain: finish ongoing active-lock tasks, dispatch zero new tasks).",
+        description="Pause orchestration (Graceful Drain by default, or non-destructive Hard Freeze with --hard).",
     )
     parser.add_argument("--reason", default="", help="Optional short Zero-PII reason (e.g. 'Customer focus').")
+    parser.add_argument(
+        "--hard",
+        dest="hard",
+        action="store_true",
+        help="Activate Hard Stop (Hard Freeze: cut off active workers & kill worktree processes while preserving locks).",
+    )
     parser.add_argument("--state-dir", default="", help="Optional state directory override.")
     parser.add_argument("--json", action="store_true", help="Output JSON payload.")
     ns = parser.parse_args(argv)
@@ -1603,19 +1626,70 @@ def _run_subcommand_pause(argv: list[str]) -> int:
     if oc_mod is None:
         print("Error: orchestration_control module not found.", file=sys.stderr)
         return 1
-    res = oc_mod.pause_orchestration(state_dir=st_dir, reason=ns.reason, source="cli")
     locks, _ = _load_locks(st_dir)
+    if ns.hard:
+        res = oc_mod.hard_stop_orchestration(
+            state_dir=st_dir,
+            reason=ns.reason,
+            source="cli",
+            active_locks=locks,
+        )
+    else:
+        res = oc_mod.pause_orchestration(state_dir=st_dir, reason=ns.reason, source="cli")
+    summary = oc_mod.summarize_orchestration_phase(res.get("control"), locks)
+    out_payload: dict[str, Any] = {
+        "status": "ok",
+        "paused": True,
+        "hard_stopped": bool(summary.get("hard_stopped")),
+        "changed": bool(res.get("changed")),
+        "orchestration": summary,
+    }
+    if ns.hard:
+        out_payload["worktree_processes"] = res.get("worktree_processes") or {}
+    if ns.json:
+        print(json.dumps(out_payload, indent=2, ensure_ascii=False))
+    else:
+        icon = "⏹" if summary.get("hard_stopped") else "⏸"
+        print(f"{icon} {summary.get('banner_text') or 'PAUSED — 0 new dispatches · Watchdog silent'}")
+    return 0
+
+
+def _run_subcommand_stop(argv: list[str]) -> int:
+    """Handle `agy-queue stop [--reason ...] [--state-dir DIR] [--json]` (non-destructive Hard Freeze)."""
+    parser = argparse.ArgumentParser(
+        prog="agy-queue stop",
+        description="Hard Stop orchestration (Hard Freeze: freeze active workers, kill worktree subprocesses, preserve locks & worktrees).",
+    )
+    parser.add_argument("--reason", default="", help="Optional short Zero-PII reason (e.g. 'Live demo').")
+    parser.add_argument("--state-dir", default="", help="Optional state directory override.")
+    parser.add_argument("--json", action="store_true", help="Output JSON payload.")
+    ns = parser.parse_args(argv)
+    st_dir = _resolve_state_dir(ns.state_dir)
+    oc_mod = _facade_attr("_get_orch_control", _get_orch_control)()
+    if oc_mod is None:
+        print("Error: orchestration_control module not found.", file=sys.stderr)
+        return 1
+    locks, _ = _load_locks(st_dir)
+    res = oc_mod.hard_stop_orchestration(
+        state_dir=st_dir,
+        reason=ns.reason,
+        source="cli",
+        active_locks=locks,
+    )
     summary = oc_mod.summarize_orchestration_phase(res.get("control"), locks)
     out_payload = {
         "status": "ok",
         "paused": True,
+        "hard_stopped": True,
         "changed": bool(res.get("changed")),
+        "chrome_devtools": res.get("chrome_devtools") or {},
+        "worktree_processes": res.get("worktree_processes") or {},
         "orchestration": summary,
     }
     if ns.json:
         print(json.dumps(out_payload, indent=2, ensure_ascii=False))
     else:
-        print(f"⏸ {summary.get('banner_text') or 'PAUSED — 0 new dispatches · Watchdog silent'}")
+        print(f"⏹ {summary.get('banner_text') or 'HARD STOPPED — Workers frozen'}")
     return 0
 
 
@@ -1670,7 +1744,9 @@ def _run_subcommand_status(argv: list[str]) -> int:
     if ns.json:
         print(json.dumps({"status": "ok", "orchestration": summary}, indent=2, ensure_ascii=False))
     else:
-        if summary.get("paused"):
+        if summary.get("hard_stopped"):
+            print(f"⏹ {summary.get('banner_text') or 'HARD STOPPED — Workers frozen'}")
+        elif summary.get("paused"):
             print(f"⏸ {summary.get('banner_text') or 'PAUSED — 0 new dispatches · Watchdog silent'}")
         else:
             ongoing = int(summary.get("ongoing_count") or 0)
