@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -29,6 +30,9 @@ import shutil
 import subprocess
 import sys
 from typing import Any
+
+DEFAULT_REBASE_VERIFY_TIMEOUT_SECONDS: float = 480.0
+ENV_REBASE_VERIFY_TIMEOUT: str = "AGY_DEV_REBASE_VERIFY_TIMEOUT"
 
 OUTCOME_AUTO_PROMOTED = "AUTO_PROMOTED_ZERO_LLM"
 OUTCOME_NEEDS_SEMANTIC_FIX = "NEEDS_AGENT_SEMANTIC_FIX"
@@ -530,29 +534,51 @@ def _snapshot_clean_fingerprint(worktree_dir: Path, head_sha: str) -> dict[str, 
     }
 
 
-def _load_repo_selective_runner(worktree_dir: Path) -> Any | None:
-    """Dynamically load `tests/scripts/selective_test_runner.py` from `worktree_dir` if present."""
-    runner_path = worktree_dir / "tests" / "scripts" / "selective_test_runner.py"
-    if not runner_path.is_file():
-        return None
-    try:
-        spec = importlib.util.spec_from_file_location("_rebase_selective_runner", str(runner_path))
-        if spec is None or spec.loader is None:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    except Exception:
-        return None
+def _resolve_rebase_verify_timeout(timeout: float | None = None) -> float:
+    """Resolve rebase verification subprocess timeout (explicit > `AGY_DEV_REBASE_VERIFY_TIMEOUT` > 480.0s)."""
+    if timeout is not None:
+        try:
+            explicit_val = float(timeout)
+            if explicit_val > 0:
+                return explicit_val
+        except (TypeError, ValueError):
+            pass
+    raw_env = str(os.environ.get(ENV_REBASE_VERIFY_TIMEOUT) or "").strip()
+    if raw_env:
+        try:
+            env_val = float(raw_env)
+            if env_val > 0:
+                return env_val
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_REBASE_VERIFY_TIMEOUT_SECONDS
 
 
-def _run_default_union_verification(
-    worktree_dir: Path,
-    union_files: Sequence[str],
-    *,
-    timeout: float = 180.0,
-) -> dict[str, Any]:
-    """Execute `qa_static_audit.py --incremental` + selective tests covering `files(B) ∪ files(merged_A)`."""
+def _coerce_subprocess_output(raw: Any) -> str:
+    """Safely convert subprocess stdout/stderr (str, bytes, or None) to str."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
+
+
+def _format_timeout_output(step_label: str, timeout_seconds: float, exc: subprocess.TimeoutExpired) -> str:
+    """Build diagnostic timeout text preserving any partial stdout/stderr from `TimeoutExpired`."""
+    partial = "\n".join(
+        part
+        for part in (
+            _coerce_subprocess_output(getattr(exc, "stdout", None)).strip(),
+            _coerce_subprocess_output(getattr(exc, "stderr", None)).strip(),
+        )
+        if part
+    ).strip()
+    header = f"TIMEOUT after {timeout_seconds:.1f}s in {step_label}"
+    return f"{header}\n{partial}".strip() if partial else header
+
+
+def _build_verification_env(worktree_dir: Path) -> dict[str, str]:
+    """Build sanitized verification environment with repo `PYTHONPATH` entries."""
     clean_env = _clean_git_env(
         {
             "AGY_OFFLINE_ONLY": "1",
@@ -560,78 +586,349 @@ def _run_default_union_verification(
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
+    pp_parts: list[str] = []
+    for cand in (worktree_dir, worktree_dir / "clients", worktree_dir / "tests" / "scripts"):
+        if cand.exists():
+            resolved = str(cand)
+            if resolved not in pp_parts:
+                pp_parts.append(resolved)
+    existing_pp = clean_env.get("PYTHONPATH", "")
+    if existing_pp:
+        for part in existing_pp.split(os.pathsep):
+            if part and part not in pp_parts:
+                pp_parts.append(part)
+    if pp_parts:
+        clean_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
+    return clean_env
+
+
+def _load_repo_selective_runner(worktree_dir: Path) -> Any | None:
+    """Dynamically load `tests/scripts/selective_test_runner.py` from `worktree_dir` if present."""
+    runner_path = worktree_dir / "tests" / "scripts" / "selective_test_runner.py"
+    if not runner_path.is_file():
+        return None
+    prev_no_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec = importlib.util.spec_from_file_location("_rebase_selective_runner", str(runner_path))
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except (Exception, SystemExit):
+        return None
+    finally:
+        sys.dont_write_bytecode = prev_no_bytecode
+
+
+def _extract_cli_plan_targets(plan_payload: dict[str, Any]) -> tuple[list[str], bool, bool, bool]:
+    """Extract `(targets, run_all, skip_unit_tests, should_run_bats)` from selective plan JSON."""
+    run_all = bool(plan_payload.get("run_all", False))
+    skip_unit_tests = bool(plan_payload.get("skip_unit_tests", False))
+    should_run_bats = bool(plan_payload.get("should_run_bats", False))
+    unittest_targets = [
+        str(item).strip() for item in (plan_payload.get("unittest_targets") or []) if str(item).strip()
+    ]
+    resolved_methods = [
+        str(item).strip() for item in (plan_payload.get("resolved_test_methods") or []) if str(item).strip()
+    ]
+    targets = list(dict.fromkeys(unittest_targets))
+    for method_target in resolved_methods:
+        if method_target not in targets and not any(
+            method_target == existing or method_target.startswith(f"{existing}.") for existing in targets
+        ):
+            targets.append(method_target)
+    return targets, run_all, skip_unit_tests, should_run_bats
+
+
+def _build_discover_command(worktree_dir: Path) -> list[str]:
+    """Build `unittest discover` command when `tests/test_*.py` exist."""
+    tests_dir = worktree_dir / "tests"
+    if not (tests_dir.is_dir() and any(tests_dir.glob("test_*.py"))):
+        return []
+    cmd = [sys.executable, "-m", "unittest", "discover", "-s", "tests"]
+    if (tests_dir / "__init__.py").is_file():
+        cmd.extend(["-t", "."])
+    cmd.extend(["-p", "test_*.py"])
+    return cmd
+
+
+def _resolve_selective_execution_plan(
+    worktree_dir: Path,
+    union_files: Sequence[str],
+    clean_env: dict[str, str],
+    *,
+    timeout: float,
+) -> dict[str, Any]:
+    """Resolve test targets across legacy `select_test_modules` and CLI/plan `selective_test_runner.py`."""
+    discover_cmd = _build_discover_command(worktree_dir)
+    runner_path = worktree_dir / "tests" / "scripts" / "selective_test_runner.py"
+    runner_mod = _load_repo_selective_runner(worktree_dir)
+    files_list = list(union_files)
+
+    if runner_mod is not None and hasattr(runner_mod, "select_test_modules"):
+        selected_modules = list(runner_mod.select_test_modules(files_list, run_all=not bool(files_list)))
+        run_bats = (
+            bool(runner_mod.should_run_bats(files_list, run_all=not bool(files_list)))
+            if hasattr(runner_mod, "should_run_bats")
+            else False
+        )
+        cmd = [sys.executable, "-m", "unittest", *selected_modules, "-v"] if selected_modules else discover_cmd
+        return {
+            "mode": "legacy_module",
+            "selected_modules": selected_modules,
+            "cmd": cmd,
+            "discover_cmd": discover_cmd,
+            "unittest_ran": bool(cmd),
+            "run_bats": run_bats,
+            "plan_timed_out": False,
+            "plan_timeout_output": "",
+        }
+
+    if runner_path.is_file():
+        probe_candidates: list[list[str]] = [
+            [
+                sys.executable,
+                str(runner_path),
+                *(["--changed-files", *files_list] if files_list else ["--all"]),
+                "--dry-run",
+                "--json",
+            ],
+            [
+                sys.executable,
+                str(runner_path),
+                *(files_list if files_list else ["--all"]),
+                "--plan-only",
+                "--format",
+                "json",
+            ],
+        ]
+        for probe_cmd in probe_candidates:
+            try:
+                proc_plan = subprocess.run(
+                    probe_cmd,
+                    cwd=str(worktree_dir),
+                    env=clean_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                return {
+                    "mode": "cli_plan",
+                    "selected_modules": [],
+                    "cmd": [],
+                    "discover_cmd": discover_cmd,
+                    "unittest_ran": True,
+                    "run_bats": False,
+                    "plan_timed_out": True,
+                    "plan_timeout_output": _format_timeout_output("selective_test_runner (--dry-run)", timeout, exc),
+                }
+            if proc_plan.returncode == 0:
+                try:
+                    plan_payload = json.loads(proc_plan.stdout or "")
+                except (ValueError, TypeError):
+                    plan_payload = None
+                if isinstance(plan_payload, dict):
+                    targets, run_all, skip_unit_tests, plan_bats = _extract_cli_plan_targets(plan_payload)
+                    bats_needed = (
+                        plan_bats
+                        if "should_run_bats" in plan_payload
+                        else (run_all or any(str(rel).endswith((".sh", ".bats")) for rel in files_list))
+                    )
+                    if skip_unit_tests and not run_all and not targets:
+                        return {
+                            "mode": "cli_plan",
+                            "selected_modules": [],
+                            "cmd": [],
+                            "discover_cmd": discover_cmd,
+                            "unittest_ran": False,
+                            "run_bats": bats_needed,
+                            "plan_timed_out": False,
+                            "plan_timeout_output": "",
+                        }
+                    if not run_all and targets:
+                        return {
+                            "mode": "cli_plan",
+                            "selected_modules": targets,
+                            "cmd": [sys.executable, "-m", "unittest", *targets, "-v"],
+                            "discover_cmd": discover_cmd,
+                            "unittest_ran": True,
+                            "run_bats": bats_needed,
+                            "plan_timed_out": False,
+                            "plan_timeout_output": "",
+                        }
+                    return {
+                        "mode": "cli_plan",
+                        "selected_modules": [],
+                        "cmd": discover_cmd,
+                        "discover_cmd": discover_cmd,
+                        "unittest_ran": bool(discover_cmd),
+                        "run_bats": bats_needed,
+                        "plan_timed_out": False,
+                        "plan_timeout_output": "",
+                    }
+
+        cli_cmd = [
+            sys.executable,
+            str(runner_path),
+            *(["--changed-files", *files_list] if files_list else ["--all"]),
+        ]
+        return {
+            "mode": "cli_direct",
+            "selected_modules": [],
+            "cmd": cli_cmd,
+            "discover_cmd": discover_cmd,
+            "unittest_ran": True,
+            "run_bats": any(str(rel).endswith((".sh", ".bats")) for rel in files_list),
+            "plan_timed_out": False,
+            "plan_timeout_output": "",
+        }
+
+    return {
+        "mode": "discover" if discover_cmd else "none",
+        "selected_modules": [],
+        "cmd": discover_cmd,
+        "discover_cmd": discover_cmd,
+        "unittest_ran": bool(discover_cmd),
+        "run_bats": False,
+        "plan_timed_out": False,
+        "plan_timeout_output": "",
+    }
+
+
+def _did_direct_cli_runner_execute_tests(output: str) -> bool:
+    """Return True when direct `selective_test_runner.py` CLI output shows actual test execution."""
+    return bool(
+        re.search(r"Ran\s+\d+\s+tests?\s+in\b", output)
+        or "FAILED (" in output
+        or "[Selective Test Runner] FAILED" in output
+        or "[Selective Test Runner] PASSED" in output
+    )
+
+
+def _run_default_union_verification(
+    worktree_dir: Path,
+    union_files: Sequence[str],
+    *,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Execute `qa_static_audit.py --incremental` + selective tests covering `files(B) ∪ files(merged_A)`."""
+    effective_timeout = _resolve_rebase_verify_timeout(timeout)
+    clean_env = _build_verification_env(worktree_dir)
 
     qa_script = worktree_dir / "tests" / "scripts" / "qa_static_audit.py"
     qa_ran = qa_script.is_file()
     qa_passed = True
+    qa_timed_out = False
     qa_output = ""
     if qa_ran:
-        proc_qa = subprocess.run(
-            [sys.executable, str(qa_script), "--incremental"],
-            cwd=str(worktree_dir),
-            env=clean_env,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-        qa_passed = proc_qa.returncode == 0
-        qa_output = f"{proc_qa.stdout or ''}\n{proc_qa.stderr or ''}".strip()
-
-    runner_mod = _load_repo_selective_runner(worktree_dir)
-    tests_dir = worktree_dir / "tests"
-    selected_modules: list[str] = []
-    run_bats = False
-
-    if runner_mod is not None and hasattr(runner_mod, "select_test_modules"):
-        selected_modules = list(runner_mod.select_test_modules(list(union_files), run_all=not bool(union_files)))
-        if hasattr(runner_mod, "should_run_bats"):
-            run_bats = bool(runner_mod.should_run_bats(list(union_files), run_all=not bool(union_files)))
-
-    unittest_ran = True
-    tests_passed = True
-    test_output = ""
-    if selected_modules:
-        cmd = [sys.executable, "-m", "unittest", *selected_modules, "-v"]
-    elif tests_dir.is_dir() and any(tests_dir.glob("test_*.py")):
-        cmd = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"]
-    else:
-        cmd = []
-        unittest_ran = False
-
-    if cmd:
-        proc_ut = subprocess.run(
-            cmd,
-            cwd=str(worktree_dir),
-            env=clean_env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        tests_passed = proc_ut.returncode == 0
-        test_output = f"{proc_ut.stdout or ''}\n{proc_ut.stderr or ''}".strip()
-
-    bats_ran = False
-    bats_passed = True
-    bats_output = ""
-    bats_dir = worktree_dir / "tests" / "bats"
-    if run_bats and bats_dir.is_dir():
-        bats_files = sorted(bats_dir.glob("*.bats"))
-        bats_bin = shutil.which("bats")
-        if bats_files and bats_bin:
-            bats_ran = True
-            proc_b = subprocess.run(
-                [bats_bin, *(str(p) for p in bats_files)],
+        try:
+            proc_qa = subprocess.run(
+                [sys.executable, str(qa_script), "--incremental"],
                 cwd=str(worktree_dir),
                 env=clean_env,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=effective_timeout,
                 check=False,
             )
-            bats_passed = proc_b.returncode == 0
-            bats_output = f"{proc_b.stdout or ''}\n{proc_b.stderr or ''}".strip()
+            qa_passed = proc_qa.returncode == 0
+            qa_output = f"{proc_qa.stdout or ''}\n{proc_qa.stderr or ''}".strip()
+        except subprocess.TimeoutExpired as exc:
+            qa_passed = False
+            qa_timed_out = True
+            qa_output = _format_timeout_output("qa_static_audit", effective_timeout, exc)
+
+    selected_modules: list[str] = []
+    unittest_ran = False
+    tests_passed = True
+    tests_timed_out = False
+    test_output = ""
+    run_bats = False
+
+    if not qa_timed_out:
+        plan_info = _resolve_selective_execution_plan(
+            worktree_dir,
+            union_files,
+            clean_env,
+            timeout=effective_timeout,
+        )
+        selected_modules = list(plan_info["selected_modules"])
+        unittest_ran = bool(plan_info["unittest_ran"])
+        run_bats = bool(plan_info["run_bats"])
+
+        if plan_info["plan_timed_out"]:
+            tests_passed = False
+            tests_timed_out = True
+            test_output = str(plan_info["plan_timeout_output"])
+        elif plan_info["cmd"]:
+            try:
+                proc_ut = subprocess.run(
+                    list(plan_info["cmd"]),
+                    cwd=str(worktree_dir),
+                    env=clean_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=effective_timeout,
+                    check=False,
+                )
+                tests_passed = proc_ut.returncode == 0
+                test_output = f"{proc_ut.stdout or ''}\n{proc_ut.stderr or ''}".strip()
+                if (
+                    not tests_passed
+                    and plan_info["mode"] == "cli_direct"
+                    and plan_info["discover_cmd"]
+                    and not _did_direct_cli_runner_execute_tests(test_output)
+                ):
+                    proc_fb = subprocess.run(
+                        list(plan_info["discover_cmd"]),
+                        cwd=str(worktree_dir),
+                        env=clean_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=effective_timeout,
+                        check=False,
+                    )
+                    tests_passed = proc_fb.returncode == 0
+                    test_output = f"{proc_fb.stdout or ''}\n{proc_fb.stderr or ''}".strip()
+            except subprocess.TimeoutExpired as exc:
+                tests_passed = False
+                tests_timed_out = True
+                test_output = _format_timeout_output(
+                    f"unittest ({', '.join(selected_modules) or plan_info['mode']})",
+                    effective_timeout,
+                    exc,
+                )
+
+    bats_ran = False
+    bats_passed = True
+    bats_timed_out = False
+    bats_output = ""
+    bats_dir = worktree_dir / "tests" / "bats"
+    if run_bats and not (qa_timed_out or tests_timed_out) and bats_dir.is_dir():
+        bats_files = sorted(bats_dir.glob("*.bats"))
+        bats_bin = shutil.which("bats")
+        if bats_files and bats_bin:
+            bats_ran = True
+            try:
+                proc_b = subprocess.run(
+                    [bats_bin, *(str(p) for p in bats_files)],
+                    cwd=str(worktree_dir),
+                    env=clean_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=effective_timeout,
+                    check=False,
+                )
+                bats_passed = proc_b.returncode == 0
+                bats_output = f"{proc_b.stdout or ''}\n{proc_b.stderr or ''}".strip()
+            except subprocess.TimeoutExpired as exc:
+                bats_passed = False
+                bats_timed_out = True
+                bats_output = _format_timeout_output("bats", effective_timeout, exc)
 
     head_proc = _run_git(worktree_dir, ["rev-parse", "HEAD"], timeout=5.0)
     head_sha = (head_proc.stdout or "").strip() if head_proc.returncode == 0 else ""
@@ -645,7 +942,8 @@ def _run_default_union_verification(
         fail_ut = max(1, total_ut or 1)
     passed_ut = max(0, total_ut - fail_ut) if total_ut else 0
 
-    overall_passed = bool(qa_passed and tests_passed and bats_passed)
+    any_timed_out = bool(qa_timed_out or tests_timed_out or bats_timed_out)
+    overall_passed = bool(qa_passed and tests_passed and bats_passed and not any_timed_out)
     failure_chunks: list[str] = []
     if not qa_passed and qa_output:
         failure_chunks.append(f"[qa_static_audit]\n{qa_output[-2000:]}")
@@ -654,6 +952,37 @@ def _run_default_union_verification(
     if not bats_passed and bats_output:
         failure_chunks.append(f"[bats]\n{bats_output[-1500:]}")
 
+    qa_entry: dict[str, Any] = {
+        "status": "timeout" if qa_timed_out else (("pass" if qa_passed else "fail") if qa_ran else "skipped"),
+        "passed": bool(qa_passed),
+        "errors": 0 if qa_passed else 1,
+        "warnings": 0,
+        "timed_out": bool(qa_timed_out),
+    }
+    if qa_timed_out:
+        qa_entry["timeout_seconds"] = effective_timeout
+
+    ut_entry: dict[str, Any] = {
+        "status": "timeout" if tests_timed_out else (("pass" if tests_passed else "fail") if unittest_ran else "skipped"),
+        "passed": bool(tests_passed),
+        "passed_count": passed_ut,
+        "total_count": total_ut,
+        "failed_count": fail_ut,
+        "timed_out": bool(tests_timed_out),
+    }
+    if tests_timed_out:
+        ut_entry["timeout_seconds"] = effective_timeout
+
+    bats_entry: dict[str, Any] = {
+        "status": "timeout" if bats_timed_out else (("pass" if bats_passed else "fail") if bats_ran else "skipped"),
+        "passed": bool(bats_passed),
+        "passed_count": 0,
+        "total_count": 0,
+        "timed_out": bool(bats_timed_out),
+    }
+    if bats_timed_out:
+        bats_entry["timeout_seconds"] = effective_timeout
+
     verification_results: dict[str, Any] = {
         "head_sha": snap["head_sha"],
         "tree_sha": snap["tree_sha"],
@@ -661,28 +990,14 @@ def _run_default_union_verification(
         "content_fingerprint": snap["content_fingerprint"],
         "verified_at_utc": _utc_now_iso(),
         "overall_passed": overall_passed,
+        "timed_out": any_timed_out,
+        "timeout_seconds": effective_timeout,
         "pre_commit_status": "SKIPPED",
         "cross_impact_union_files": list(union_files),
         "selected_test_modules": selected_modules,
-        "qa_static_audit": {
-            "status": ("pass" if qa_passed else "fail") if qa_ran else "skipped",
-            "passed": bool(qa_passed),
-            "errors": 0 if qa_passed else 1,
-            "warnings": 0,
-        },
-        "unittest": {
-            "status": ("pass" if tests_passed else "fail") if unittest_ran else "skipped",
-            "passed": bool(tests_passed),
-            "passed_count": passed_ut,
-            "total_count": total_ut,
-            "failed_count": fail_ut,
-        },
-        "bats": {
-            "status": ("pass" if bats_passed else "fail") if bats_ran else "skipped",
-            "passed": bool(bats_passed),
-            "passed_count": 0,
-            "total_count": 0,
-        },
+        "qa_static_audit": qa_entry,
+        "unittest": ut_entry,
+        "bats": bats_entry,
         "pre_commit": {"status": "skipped", "passed": None},
     }
     return {
@@ -718,7 +1033,7 @@ def rebase_and_reverify(
     base_branch: str = "main",
     remote: str = "origin",
     fetch: bool = False,
-    timeout: float = 180.0,
+    timeout: float | None = None,
     verify_fn: Callable[[Path, list[str]], dict[str, Any]] | None = None,
     restamp_fn: Callable[[Path, list[str]], None] | None = None,
 ) -> RebaseReverifyResult:
@@ -913,7 +1228,8 @@ def rebase_and_reverify(
     if verify_fn is not None:
         ver_out = verify_fn(effective_dir, union_files)
     else:
-        ver_out = _run_default_union_verification(effective_dir, union_files, timeout=timeout)
+        effective_timeout = _resolve_rebase_verify_timeout(timeout)
+        ver_out = _run_default_union_verification(effective_dir, union_files, timeout=effective_timeout)
 
     ver_passed = bool(ver_out.get("passed"))
     ver_results = dict(ver_out.get("verification_results") or {})

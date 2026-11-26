@@ -851,6 +851,267 @@ class TestRebaseGate(unittest.TestCase):
             self.assertIn("calc.py", res_conf.conflicted_files)
             self.assertIn("factor: int = 42", res_conf.merged_a_diff)
 
+    def test_default_timeout_480_and_env_override(self) -> None:
+        self.assertEqual(rgate.DEFAULT_REBASE_VERIFY_TIMEOUT_SECONDS, 480.0)
+        self.assertEqual(rgate.ENV_REBASE_VERIFY_TIMEOUT, "AGY_DEV_REBASE_VERIFY_TIMEOUT")
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AGY_DEV_REBASE_VERIFY_TIMEOUT", None)
+            self.assertEqual(rgate._resolve_rebase_verify_timeout(), 480.0)
+
+            os.environ["AGY_DEV_REBASE_VERIFY_TIMEOUT"] = "not-a-number"
+            self.assertEqual(rgate._resolve_rebase_verify_timeout(), 480.0)
+
+            os.environ["AGY_DEV_REBASE_VERIFY_TIMEOUT"] = "-10"
+            self.assertEqual(rgate._resolve_rebase_verify_timeout(), 480.0)
+
+            os.environ["AGY_DEV_REBASE_VERIFY_TIMEOUT"] = "615.5"
+            self.assertEqual(rgate._resolve_rebase_verify_timeout(), 615.5)
+            self.assertEqual(rgate._resolve_rebase_verify_timeout(300.0), 300.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, clone = _init_org_bare_and_clone(root)
+            (clone / "tests").mkdir(parents=True, exist_ok=True)
+            (clone / "tests" / "__init__.py").write_text("", encoding="utf-8")
+            (clone / "tests" / "test_ok.py").write_text(
+                "import unittest\n\n"
+                "class TestOk(unittest.TestCase):\n"
+                "    def test_pass(self) -> None:\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            _git(clone, "add", "tests/__init__.py", "tests/test_ok.py")
+            _git(clone, "commit", "-m", "test: seed ok")
+
+            observed_timeouts: list[float] = []
+            real_run = rgate.subprocess.run
+
+            def _spy_run(cmd: object, *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if isinstance(cmd, list) and "unittest" in cmd:
+                    observed_timeouts.append(float(kwargs.get("timeout", -1)))  # type: ignore[arg-type]
+                return real_run(cmd, *args, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGY_DEV_REBASE_VERIFY_TIMEOUT", None)
+                with mock.patch.object(rgate.subprocess, "run", side_effect=_spy_run):
+                    res_default = rgate._run_default_union_verification(clone, ["tests/test_ok.py"])
+                self.assertTrue(res_default["passed"])
+                self.assertEqual(res_default["verification_results"]["timeout_seconds"], 480.0)
+                self.assertEqual(observed_timeouts, [480.0])
+
+                observed_timeouts.clear()
+                os.environ["AGY_DEV_REBASE_VERIFY_TIMEOUT"] = "720"
+                with mock.patch.object(rgate.subprocess, "run", side_effect=_spy_run):
+                    res_env = rgate._run_default_union_verification(clone, ["tests/test_ok.py"])
+                self.assertTrue(res_env["passed"])
+                self.assertEqual(res_env["verification_results"]["timeout_seconds"], 720.0)
+                self.assertEqual(observed_timeouts, [720.0])
+
+    def test_cli_selective_test_runner_interop_targets_methods_run_all_and_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            _, clone = _init_org_bare_and_clone(root)
+            (clone / "tests" / "scripts").mkdir(parents=True, exist_ok=True)
+            (clone / "tests" / "__init__.py").write_text("", encoding="utf-8")
+            (clone / "tests" / "test_alpha.py").write_text(
+                "import unittest\n\n"
+                "class TestAlpha(unittest.TestCase):\n"
+                "    def test_one(self) -> None:\n"
+                "        self.assertEqual(1 + 1, 2)\n"
+                "    def test_two(self) -> None:\n"
+                "        self.assertEqual(2 + 2, 4)\n",
+                encoding="utf-8",
+            )
+            (clone / "tests" / "test_beta.py").write_text(
+                "import unittest\n\n"
+                "class TestBeta(unittest.TestCase):\n"
+                "    def test_only(self) -> None:\n"
+                "        self.assertTrue(True)\n"
+                "    def test_skipped_when_method_targeted(self) -> None:\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            runner_file = clone / "tests" / "scripts" / "selective_test_runner.py"
+
+            # Subcase A: g-control-tower style CLI `--changed-files ... --dry-run --json`
+            # resolving both `unittest_targets` and `resolved_test_methods` (without `select_test_modules`).
+            runner_file.write_text(
+                "import argparse, json\n"
+                "def main() -> None:\n"
+                "    p = argparse.ArgumentParser()\n"
+                "    p.add_argument('--changed-files', nargs='*', default=[])\n"
+                "    p.add_argument('--all', action='store_true')\n"
+                "    p.add_argument('--dry-run', action='store_true')\n"
+                "    p.add_argument('--json', action='store_true')\n"
+                "    args = p.parse_args()\n"
+                "    print(json.dumps({\n"
+                "        'mode': 'selective',\n"
+                "        'run_all': False,\n"
+                "        'skip_unit_tests': False,\n"
+                "        'changed_files': args.changed_files,\n"
+                "        'unittest_targets': ['tests.test_alpha'],\n"
+                "        'resolved_test_methods': ['tests.test_beta.TestBeta.test_only'],\n"
+                "    }))\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n",
+                encoding="utf-8",
+            )
+            _git(clone, "add", ".")
+            _git(clone, "commit", "-m", "feat: add cli selective runner and two test modules")
+
+            res_targeted = rgate._run_default_union_verification(clone, ["api/alpha.py"])
+            self.assertTrue(res_targeted["passed"])
+            vr_targeted = res_targeted["verification_results"]
+            self.assertEqual(
+                vr_targeted["selected_test_modules"],
+                ["tests.test_alpha", "tests.test_beta.TestBeta.test_only"],
+            )
+            self.assertEqual(vr_targeted["unittest"]["total_count"], 3)
+
+            # Subcase B: `run_all: True` escalates to full `unittest discover` (all 4 tests).
+            runner_file.write_text(
+                "import json\n"
+                "if __name__ == '__main__':\n"
+                "    print(json.dumps({'mode': 'full', 'run_all': True, 'skip_unit_tests': False, 'unittest_targets': []}))\n",
+                encoding="utf-8",
+            )
+            res_run_all = rgate._run_default_union_verification(clone, ["api/core.py"])
+            self.assertTrue(res_run_all["passed"])
+            vr_all = res_run_all["verification_results"]
+            self.assertEqual(vr_all["selected_test_modules"], [])
+            self.assertEqual(vr_all["unittest"]["total_count"], 4)
+
+            # Subcase C1: Direct CLI fallback when `--dry-run --json` is unsupported.
+            runner_file.write_text(
+                "import argparse, sys\n"
+                "def main() -> None:\n"
+                "    p = argparse.ArgumentParser()\n"
+                "    p.add_argument('--changed-files', nargs='*', default=[])\n"
+                "    p.add_argument('--all', action='store_true')\n"
+                "    p.parse_args()\n"
+                "    sys.stderr.write('Ran 1 test in 0.001s\\n\\nOK\\n')\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n",
+                encoding="utf-8",
+            )
+            res_cli_direct = rgate._run_default_union_verification(clone, ["api/alpha.py"])
+            self.assertTrue(res_cli_direct["passed"])
+            self.assertEqual(res_cli_direct["verification_results"]["unittest"]["total_count"], 1)
+
+            # Subcase C2: Broken selective runner (including top-level SystemExit) safely falls back to `unittest discover`.
+            runner_file.write_text(
+                "raise SystemExit(2)\n",
+                encoding="utf-8",
+            )
+            res_fallback = rgate._run_default_union_verification(clone, ["api/alpha.py"])
+            self.assertTrue(res_fallback["passed"])
+            self.assertEqual(res_fallback["verification_results"]["unittest"]["total_count"], 4)
+
+    def test_rebase_and_reverify_handles_timeout_expired_gracefully(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            bare, clone = _init_org_bare_and_clone(root)
+            (clone / "tests").mkdir(parents=True, exist_ok=True)
+            (clone / "tests" / "__init__.py").write_text("", encoding="utf-8")
+            (clone / "tests" / "test_slow.py").write_text(
+                "import time, unittest\n\n"
+                "class TestSlow(unittest.TestCase):\n"
+                "    def test_sleep(self) -> None:\n"
+                "        time.sleep(1.5)\n",
+                encoding="utf-8",
+            )
+            _git(clone, "add", "tests/__init__.py", "tests/test_slow.py")
+            _git(clone, "commit", "-m", "feat: seed slow test")
+            _git(clone, "push", "origin", "main")
+            base_v1 = _git(clone, "rev-parse", "main").stdout.strip()
+
+            br_slot2 = "fix/20261126-090000-timeout-slot2-dddd4444"
+            _git(clone, "checkout", "-b", br_slot2, "main")
+            (clone / "slot2_mod.py").write_text("SLOT2 = True\n", encoding="utf-8")
+            _git(clone, "add", "slot2_mod.py")
+            _git(clone, "commit", "-m", "feat: add slot2_mod")
+            pre_head_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
+
+            base_v2 = _push_upstream_files(bare, root, {"slot1_mod.py": "SLOT1 = True\n"})
+
+            # End-to-end real OS TimeoutExpired via AGY_DEV_REBASE_VERIFY_TIMEOUT
+            with mock.patch.dict(os.environ, {"AGY_DEV_REBASE_VERIFY_TIMEOUT": "0.08"}, clear=False):
+                res_ut_to = rgate.rebase_and_reverify(
+                    clone,
+                    branch_name=br_slot2,
+                    recorded_base_sha=base_v1,
+                    fetch=True,
+                )
+            self.assertEqual(res_ut_to.status, "ok")
+            self.assertEqual(res_ut_to.outcome, rgate.OUTCOME_NEEDS_SEMANTIC_FIX)
+            self.assertTrue(res_ut_to.rebased)
+            self.assertFalse(res_ut_to.verification_passed)
+            self.assertTrue(res_ut_to.worktree_pristine)
+            self.assertNotEqual(res_ut_to.new_head_sha, pre_head_sha)
+            self.assertEqual(res_ut_to.new_base_sha, base_v2)
+            self.assertTrue(res_ut_to.verification_results["timed_out"])
+            self.assertEqual(res_ut_to.verification_results["unittest"]["status"], "timeout")
+            self.assertTrue(res_ut_to.verification_results["unittest"]["timed_out"])
+            self.assertIn("TIMEOUT", res_ut_to.failure_details)
+
+            # Direct TimeoutExpired coverage for `qa_static_audit.py` and `bats` subprocesses
+            (clone / "tests" / "scripts").mkdir(parents=True, exist_ok=True)
+            (clone / "tests" / "scripts" / "qa_static_audit.py").write_text(
+                "import sys; sys.exit(0)\n",
+                encoding="utf-8",
+            )
+            (clone / "tests" / "scripts" / "selective_test_runner.py").write_text(
+                "def select_test_modules(files, *, run_all=False):\n"
+                "    return ['tests.test_fast']\n"
+                "def should_run_bats(files, *, run_all=False):\n"
+                "    return True\n",
+                encoding="utf-8",
+            )
+            (clone / "tests" / "test_fast.py").write_text(
+                "import unittest\n\n"
+                "class TestFast(unittest.TestCase):\n"
+                "    def test_fast(self) -> None:\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            (clone / "tests" / "bats").mkdir(parents=True, exist_ok=True)
+            (clone / "tests" / "bats" / "sample.bats").write_text("@test 'ok' { true; }\n", encoding="utf-8")
+
+            real_run = rgate.subprocess.run
+
+            def _qa_timeout_run(cmd: object, *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if isinstance(cmd, list) and any("qa_static_audit.py" in str(part) for part in cmd):
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=1.0, output=b"qa partial")
+                return real_run(cmd, *args, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.object(rgate.subprocess, "run", side_effect=_qa_timeout_run):
+                res_qa_to = rgate._run_default_union_verification(clone, ["slot2_mod.py"], timeout=1.0)
+            self.assertFalse(res_qa_to["passed"])
+            self.assertTrue(res_qa_to["verification_results"]["timed_out"])
+            self.assertEqual(res_qa_to["verification_results"]["qa_static_audit"]["status"], "timeout")
+            self.assertIn("qa partial", res_qa_to["failure_details"])
+
+            def _bats_timeout_run(cmd: object, *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if isinstance(cmd, list) and cmd and str(cmd[0]).endswith("bats"):
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=1.0, stderr=b"bats stalled")
+                return real_run(cmd, *args, **kwargs)  # type: ignore[arg-type]
+
+            real_which = rgate.shutil.which
+
+            def _which_bats_only(name: str, *args: object, **kwargs: object) -> str | None:
+                if name == "bats":
+                    return "/usr/local/bin/bats"
+                return real_which(name, *args, **kwargs)  # type: ignore[arg-type]
+
+            with mock.patch.object(rgate.shutil, "which", side_effect=_which_bats_only):
+                with mock.patch.object(rgate.subprocess, "run", side_effect=_bats_timeout_run):
+                    res_bats_to = rgate._run_default_union_verification(clone, ["slot2_mod.py"], timeout=1.0)
+            self.assertFalse(res_bats_to["passed"])
+            self.assertTrue(res_bats_to["verification_results"]["timed_out"])
+            self.assertEqual(res_bats_to["verification_results"]["bats"]["status"], "timeout")
+            self.assertIn("bats stalled", res_bats_to["failure_details"])
+
 
 class TestTwoSlotLocksQueueLookaheadAndPromotion(unittest.TestCase):
     """Test `pr_remediator.py` 2-slot locks, max-1-PR invariant, `queue-next`, `analyze-overlap`, and `rebase-reverify`."""
