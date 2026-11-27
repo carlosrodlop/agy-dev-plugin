@@ -688,6 +688,231 @@ class TestGitClientAndRemediation(unittest.TestCase):
             self.assertEqual(installed_data["schema_version"], "1.0")
             self.assertEqual(installed_data["plugin_id"], "agy-dev-plugin")
 
+    def test_deploy_control_tower_syncs_api_site_packages_sidecars_scheduler_and_prunes_orphans(self) -> None:
+        """Verify `g-control-tower` deployment atomically syncs `api/` -> `site-packages/api`, deploys `sidecars/` + `scheduler/`, prunes orphans cleanly, and restarts Control Tower after deploy."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            troot = pathlib.Path(tmp)
+            bare, ct_repo = _create_bare_and_clone(troot, name="g-control-tower")
+            fake_home = troot / "fake-home"
+            fake_home.mkdir(parents=True)
+            fake_sp = troot / "fake-site-packages"
+            fake_sp.mkdir(parents=True)
+
+            # Build synthetic Zero-PII g-control-tower layout
+            (ct_repo / "pyproject.toml").write_text('[project]\nname = "g-control-tower"\nversion = "20261127+g0000001"\n', encoding="utf-8")
+            (ct_repo / "api" / "routers").mkdir(parents=True)
+            (ct_repo / "api" / "__init__.py").write_text('__version__ = "0000001-20261127"\n', encoding="utf-8")
+            (ct_repo / "api" / "app.py").write_text('APP_NAME = "acme-control-tower"\n', encoding="utf-8")
+            (ct_repo / "api" / "routers" / "health.py").write_text("STATUS = 'ok'\n", encoding="utf-8")
+
+            ct_sc_dir = ct_repo / "sidecars" / "g-control-tower"
+            ct_sc_dir.mkdir(parents=True)
+            (ct_sc_dir / "sidecar.json").write_text(
+                '{"command": "python3", "args": ["-m", "api.server", "serve"], "env": {"HOME_DIR": "$HOME/.local/state"}}\n',
+                encoding="utf-8",
+            )
+            sched_sc_dir = ct_repo / "scheduler" / "sidecars" / "acme-check"
+            sched_sc_dir.mkdir(parents=True)
+            (sched_sc_dir / "sidecar.json").write_text(
+                '{"args": ["0 9 * * 1-5", "python3", "$HOME/.gemini/config/actions/_shared/action_precheck_runner.py"]}\n',
+                encoding="utf-8",
+            )
+            sched_act_dir = ct_repo / "scheduler" / "actions" / "acme-check"
+            sched_act_dir.mkdir(parents=True)
+            (sched_act_dir / "ACTION.md").write_text("---\nname: acme-check\n---\n# Acme Check\n", encoding="utf-8")
+            sched_scripts_dir = ct_repo / "scheduler" / "scripts"
+            sched_scripts_dir.mkdir(parents=True)
+            (sched_scripts_dir / "action_precheck_runner.py").write_text("#!/usr/bin/env python3\nprint('ok')\n", encoding="utf-8")
+
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(ct_repo),
+                    "add",
+                    "pyproject.toml",
+                    "api",
+                    "sidecars",
+                    "scheduler",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(["git", "-C", str(ct_repo), "commit", "-m", "feat: initial control tower layout"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ct_repo), "push", "origin", "main"], check=True, capture_output=True)
+
+            # Seed sibling package + stale orphans inside site-packages/api and $HOME/.gemini/config/
+            sibling_pkg = fake_sp / "acme_sibling_pkg"
+            sibling_pkg.mkdir(parents=True)
+            (sibling_pkg / "keep.py").write_text("KEEP = True\n", encoding="utf-8")
+            (sibling_pkg / "__pycache__").mkdir()
+            (sibling_pkg / "__pycache__" / "keep.cpython-311.pyc").write_bytes(b"sibling-pyc")
+
+            stale_api_pkg = fake_sp / "api"
+            (stale_api_pkg / "stale_sub" / "__pycache__").mkdir(parents=True)
+            (stale_api_pkg / "__pycache__").mkdir(parents=True)
+            (stale_api_pkg / "stale_mod.py").write_text("STALE = True\n", encoding="utf-8")
+            (stale_api_pkg / "__pycache__" / "stale_mod.cpython-311.pyc").write_bytes(b"stale-pyc")
+            (stale_api_pkg / "__pycache__" / "app.cpython-311.pyc").write_bytes(b"old-app-pyc")
+            (stale_api_pkg / "stale_sub" / "dead.py").write_text("DEAD = True\n", encoding="utf-8")
+            (stale_api_pkg / "stale_sub" / "__pycache__" / "dead.cpython-311.pyc").write_bytes(b"dead-pyc")
+
+            stale_sidecar = fake_home / ".gemini" / "config" / "sidecars" / "old-sidecar" / "sidecar.json"
+            stale_sidecar.parent.mkdir(parents=True)
+            stale_sidecar.write_text("{}\n", encoding="utf-8")
+
+            # Valid symlink inside .gemini/config/actions must NOT be pruned
+            target_script = fake_home / ".gemini" / "config" / "plugins" / "wiz-tam-plugin" / "meeting_notes_action.py"
+            target_script.parent.mkdir(parents=True)
+            target_script.write_text("# target\n", encoding="utf-8")
+            valid_action_link = fake_home / ".gemini" / "config" / "actions" / "meeting-notes-followup" / "scripts" / "meeting_notes_action.py"
+            valid_action_link.parent.mkdir(parents=True)
+            valid_action_link.symlink_to(target_script)
+
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(ct_repo)})
+            seen_order: list[bool] = []
+
+            def _verify_restart_after_sync(deployed_files: list[str], target_home: pathlib.Path | None = None, **_kw: object) -> bool:
+                seen_order.append(
+                    (fake_sp / "api" / "app.py").is_file()
+                    and (fake_home / ".gemini" / "config" / "sidecars" / "g-control-tower" / "sidecar.json").is_file()
+                    and (fake_home / ".gemini" / "config" / "actions" / "_shared" / "action_precheck_runner.py").is_file()
+                )
+                return bool(deployed_files and target_home == fake_home.resolve())
+
+            # 1) Fresh deploy discovering fake_sp via site.getsitepackages() without network calls
+            with (
+                mock.patch("site.getsitepackages", return_value=[str(fake_sp)]),
+                mock.patch.object(git_client, "_maybe_restart_control_tower_after_deploy", side_effect=_verify_restart_after_sync),
+            ):
+                res = vcs.deploy_repo_to_home(repo_dir=ct_repo, home_dir=fake_home)
+
+            self.assertEqual(res["status"], "ok")
+            self.assertTrue(res["deployed"])
+            self.assertTrue(res.get("control_tower_layout"))
+            self.assertEqual(pathlib.Path(res["site_packages_dir"]), fake_sp.resolve())
+            self.assertEqual(seen_order, [True])
+            self.assertTrue(res["control_tower_restarted"])
+
+            # Verify api/ synced & stale .py/.pyc orphans inside api/ pruned, while sibling package untouched
+            self.assertEqual((fake_sp / "api" / "app.py").read_text(encoding="utf-8"), 'APP_NAME = "acme-control-tower"\n')
+            self.assertTrue((fake_sp / "api" / "routers" / "health.py").is_file())
+            self.assertEqual(stat.S_IMODE((fake_sp / "api" / "app.py").stat().st_mode), 0o644)
+            self.assertFalse((stale_api_pkg / "stale_mod.py").exists())
+            self.assertFalse((stale_api_pkg / "__pycache__" / "stale_mod.cpython-311.pyc").exists())
+            self.assertFalse((stale_api_pkg / "__pycache__" / "app.cpython-311.pyc").exists())
+            self.assertFalse((stale_api_pkg / "stale_sub").exists())
+            self.assertTrue((sibling_pkg / "keep.py").is_file())
+            self.assertTrue((sibling_pkg / "__pycache__" / "keep.cpython-311.pyc").is_file())
+
+            # Verify sidecars/ and scheduler/ deployed with $HOME expansion and permissions, and symlink preserved
+            deployed_ct_sc = fake_home / ".gemini" / "config" / "sidecars" / "g-control-tower" / "sidecar.json"
+            deployed_sched_sc = fake_home / ".gemini" / "config" / "sidecars" / "acme-check" / "sidecar.json"
+            deployed_act_md = fake_home / ".gemini" / "config" / "actions" / "acme-check" / "ACTION.md"
+            deployed_runner = fake_home / ".gemini" / "config" / "actions" / "_shared" / "action_precheck_runner.py"
+            self.assertIn(str(fake_home), deployed_ct_sc.read_text(encoding="utf-8"))
+            self.assertIn(str(fake_home), deployed_sched_sc.read_text(encoding="utf-8"))
+            self.assertTrue(deployed_act_md.is_file())
+            self.assertEqual(stat.S_IMODE(deployed_act_md.stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE(deployed_runner.stat().st_mode), 0o755)
+            self.assertFalse(stale_sidecar.exists())
+            self.assertTrue(valid_action_link.is_symlink())
+
+            # Seed active .pyc for unchanged app.py and confirm idempotent re-run preserves it
+            active_pyc = stale_api_pkg / "__pycache__" / "app.cpython-311.pyc"
+            active_pyc.parent.mkdir(parents=True, exist_ok=True)
+            active_pyc.write_bytes(b"fresh-pyc")
+            with mock.patch("site.getsitepackages", return_value=[str(fake_sp)]):
+                res_idem = vcs.deploy_repo_to_home(repo_dir=ct_repo, home_dir=fake_home)
+            self.assertEqual(res_idem["deployed_count"], 0)
+            self.assertTrue(active_pyc.is_file())
+
+            # 2) sync_and_clean_local_repo auto-detects g-control-tower when deploy_to_home=None
+            peer = troot / "peer"
+            subprocess.run(["git", "clone", str(bare), str(peer)], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "config", "user.name", "Acme Bot"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "config", "user.email", "acme-bot@example.com"], check=True, capture_output=True)
+            (peer / "api" / "app.py").write_text('APP_NAME = "acme-control-tower-v2"\n', encoding="utf-8")
+            subprocess.run(["git", "-C", str(peer), "add", "api/app.py"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "commit", "-m", "feat: bump app"], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(peer), "push", "origin", "main"], check=True, capture_output=True)
+
+            state_dir = troot / "state"
+            state_dir.mkdir(parents=True)
+            sync_res = vcs.sync_and_clean_local_repo(
+                repo_dir=ct_repo,
+                home_dir=fake_home,
+                state_dir=state_dir,
+                deploy_to_home=None,
+                site_packages_dir=fake_sp,
+            )
+            self.assertEqual(sync_res["status"], "ok")
+            self.assertTrue(sync_res["home_deploy"]["deployed"])
+            self.assertEqual((fake_sp / "api" / "app.py").read_text(encoding="utf-8"), 'APP_NAME = "acme-control-tower-v2"\n')
+            self.assertFalse(active_pyc.exists())
+
+    def test_deploy_control_tower_guards_non_main_branch_and_unisolated_site_packages(self) -> None:
+        """Verify `g-control-tower` deployment rejects `fix/*` branches and blocks unisolated real `$HOME` / real `site-packages` writes in tests."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            troot = pathlib.Path(tmp)
+            _, ct_repo = _create_bare_and_clone(troot, name="g-control-tower-guard")
+            fake_home = troot / "fake-home"
+            fake_home.mkdir(parents=True)
+            fake_sp = troot / "fake-sp"
+            fake_sp.mkdir(parents=True)
+
+            (ct_repo / "pyproject.toml").write_text('[project]\nname = "g-control-tower"\nversion = "20261127+g0000001"\n', encoding="utf-8")
+            (ct_repo / "api").mkdir()
+            (ct_repo / "api" / "__init__.py").write_text('__version__ = "0000001-20261127"\n', encoding="utf-8")
+            (ct_repo / "sidecars" / "g-control-tower").mkdir(parents=True)
+            (ct_repo / "sidecars" / "g-control-tower" / "sidecar.json").write_text('{"command": "python3"}\n', encoding="utf-8")
+            (ct_repo / "scheduler" / "actions" / "acme-check").mkdir(parents=True)
+            (ct_repo / "scheduler" / "actions" / "acme-check" / "ACTION.md").write_text("# Acme\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(ct_repo), "add", "."], check=True, capture_output=True)
+            subprocess.run(["git", "-C", str(ct_repo), "commit", "-m", "feat: init"], check=True, capture_output=True)
+
+            vcs = git_client.GitVcsIntegrationClient(env_overrides={"AGY_CONF_REPO_DIR": str(ct_repo)})
+            real_os_home = git_client._resolve_real_os_home()
+
+            # 1) Unisolated real $HOME is blocked
+            with mock.patch.dict(os.environ, {"HOME": str(real_os_home)}, clear=False):
+                os.environ.pop("AGY_ALLOW_TEST_REAL_HOME_DEPLOY", None)
+                blocked_home = vcs.deploy_repo_to_home(repo_dir=ct_repo, home_dir=None, site_packages_dir=fake_sp)
+            self.assertEqual(blocked_home["status"], "skipped")
+            self.assertEqual(blocked_home["reason"], "blocked_unisolated_test_real_home")
+
+            # 2) Fake $HOME without isolated site-packages MUST block mutating real ~/.local or system site-packages
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGY_ALLOW_TEST_REAL_HOME_DEPLOY", None)
+                os.environ.pop("AGY_CONTROL_TOWER_SITE_PACKAGES", None)
+                blocked_sp = vcs.deploy_repo_to_home(repo_dir=ct_repo, home_dir=fake_home)
+            self.assertEqual(blocked_sp["status"], "skipped")
+            self.assertFalse(blocked_sp["deployed"])
+            self.assertEqual(blocked_sp["reason"], "blocked_unisolated_test_real_site_packages")
+            self.assertFalse((fake_home / ".gemini" / "config" / "sidecars" / "g-control-tower" / "sidecar.json").exists())
+
+            # 3) Explicit real site-packages in test runner is also blocked
+            real_sys_sp = pathlib.Path(sys.prefix) / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+            blocked_explicit_sp = vcs.deploy_repo_to_home(
+                repo_dir=ct_repo,
+                home_dir=fake_home,
+                site_packages_dir=real_sys_sp,
+            )
+            self.assertEqual(blocked_explicit_sp["reason"], "blocked_unisolated_test_real_site_packages")
+
+            # 4) Non-main branch guard rejects deployment before touching fake_sp or fake_home
+            subprocess.run(["git", "-C", str(ct_repo), "checkout", "-b", "fix/20261127-120000-unmerged"], check=True, capture_output=True)
+            branch_skip = vcs.deploy_repo_to_home(
+                repo_dir=ct_repo,
+                home_dir=fake_home,
+                require_base_branch="main",
+                site_packages_dir=fake_sp,
+            )
+            self.assertEqual(branch_skip["status"], "skipped")
+            self.assertEqual(branch_skip["reason"], "not_on_base_branch")
+            self.assertFalse((fake_sp / "api").exists())
+            self.assertFalse((fake_home / ".gemini" / "config" / "sidecars").exists())
+
     def test_manual_pr_url_formatting_for_major_vcs_hosts(self) -> None:
         self.assertEqual(
             git_client.build_vcs_manual_pr_url(
