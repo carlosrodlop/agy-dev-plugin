@@ -103,9 +103,10 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
 
     def test_deterministic_checks_catalog_and_pre_tool_use_blocks(self) -> None:
         all_checks = dev_common.get_deterministic_dev_checks()
-        self.assertEqual(len(all_checks), 10)
+        self.assertEqual(len(all_checks), 11)
         pre_checks = dev_common.get_deterministic_dev_checks("PreToolUse")
-        self.assertEqual(len(pre_checks), 9)
+        self.assertEqual(len(pre_checks), 10)
+        self.assertEqual(len(dev_common.PRETOOLUSE_RULES), 10)
         self.assertEqual(
             {c["check_id"] for c in pre_checks},
             {
@@ -117,6 +118,7 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
                 "pretool:parallel-file-lease",
                 "pretool:parallel-worker-deploy-home",
                 "pretool:paused-chrome-devtools",
+                "pretool:dev-scoped-chrome-devtools",
                 "pretool:hard-stop-active-workers",
             },
         )
@@ -365,6 +367,184 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
             )
             self.assertEqual(res_stale["decision"], "deny")
             self.assertEqual(res_stale.get("check_id"), "pretool:unvalidated-branch-push")
+
+    def test_pretool_dev_scoped_chrome_devtools_matrix(self) -> None:
+        """Verify Chrome DevTools PreToolUse scoping across scheduled, TAM, non-dev, dev/worktree, and paused states."""
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            fake_home = troot / "home"
+            fake_home.mkdir(parents=True)
+            state_dir = fake_home / ".local" / "share" / "agy-dev-plugin"
+            state_dir.mkdir(parents=True)
+
+            # Seed TAM runtime & portfolio directories + isolated pr-worktree inside wiz-customer-portfolio/tmp
+            tam_portfolio_dir = fake_home / ".local" / "share" / "wiz-customer-portfolio"
+            (tam_portfolio_dir / "cache").mkdir(parents=True)
+            nested_worktree = tam_portfolio_dir / "tmp" / "pr-worktree-acme-ui-fix-20261127-090000-11111111"
+            nested_worktree.mkdir(parents=True)
+            tam_plugin_runtime = fake_home / ".gemini" / "config" / "plugins" / "wiz-tam-plugin" / "skills"
+            tam_plugin_runtime.mkdir(parents=True)
+            custom_tam_folder = troot / "acme-tam-notes"
+            custom_tam_folder.mkdir(parents=True)
+            (custom_tam_folder / "customer_portfolio.json").write_text("{}\n", encoding="utf-8")
+
+            # Seed managed dev git repo (queued in dev_queue.json) + unmanaged git repo + opted-in repo
+            managed_repo = troot / "managed-web-repo"
+            managed_repo.mkdir(parents=True)
+            subprocess.run(["git", "init", "-b", "main", str(managed_repo)], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(managed_repo), "remote", "add", "origin", "git@github.com:acme-org/managed-web.git"],
+                check=True,
+                capture_output=True,
+            )
+            dev_common.atomic_write_json(
+                state_dir / "dev_queue.json",
+                {"items": [{"conversation_id": "11111111", "repo_slugs": ["acme-org/managed-web"]}]},
+            )
+
+            unmanaged_repo = troot / "unmanaged-repo"
+            unmanaged_repo.mkdir(parents=True)
+            subprocess.run(["git", "init", "-b", "main", str(unmanaged_repo)], check=True, capture_output=True)
+            subprocess.run(
+                ["git", "-C", str(unmanaged_repo), "remote", "add", "origin", "git@github.com:acme-org/unmanaged.git"],
+                check=True,
+                capture_output=True,
+            )
+
+            opt_in_repo = troot / "opt-in-frontend"
+            (opt_in_repo / ".agents").mkdir(parents=True)
+            (opt_in_repo / ".agents" / "plugins.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "path": "$HOME/.gemini/config/plugins/chrome-devtools-plugin",
+                            "scope": "workspace",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            opt_out_repo = troot / "opt-out-repo"
+            (opt_out_repo / ".agents").mkdir(parents=True)
+            (opt_out_repo / ".agents" / "plugins.json").write_text(
+                json.dumps({"entries": [{"name": "chrome-devtools-plugin", "enabled": False}]}),
+                encoding="utf-8",
+            )
+
+            scratch_dir = fake_home / ".gemini" / "antigravity" / "scratch"
+            scratch_dir.mkdir(parents=True)
+
+            devtools_invocations = (
+                {"tool_name": "call_mcp_tool", "tool_input": {"ServerName": "chrome_devtools", "ToolName": "list_pages"}},
+                {"tool_name": "call_mcp_tool", "tool_input": {"ServerName": "chrome-devtools-plugin", "ToolName": "take_snapshot"}},
+                {"tool_name": "mcp_chrome_devtools_take_snapshot", "tool_input": {}},
+                {"tool_name": "chrome-devtools-plugin", "tool_input": {}},
+                {"tool_name": "run_command", "tool_input": {"CommandLine": "npx chrome-devtools-mcp@latest --help"}},
+                {"tool_name": "run_command", "tool_input": {"CommandLine": "node $CHROME_DEVTOOLS_MCP_JS"}},
+            )
+
+            # 1. AGY_SCHEDULED_ACTION=1 -> automatic deny even inside an active dev worktree or opted-in repo
+            sched_eval = dev_common.DevLifecycleGuardrailEvaluator(
+                home_dir=fake_home,
+                state_dir=state_dir,
+                env={"AGY_SCHEDULED_ACTION": "1"},
+            )
+            for inv in devtools_invocations:
+                payload_sched = {**inv, "cwd": str(nested_worktree)}
+                res_sched = sched_eval.evaluate_pre_tool_use(payload_sched)
+                self.assertEqual(res_sched["decision"], "deny", msg=f"Expected scheduled deny for {inv}")
+                self.assertEqual(res_sched.get("check_id"), "pretool:dev-scoped-chrome-devtools")
+
+            # Functional alias evaluate_pretooluse_guardrail also honors env
+            alias_sched = dev_common.evaluate_pretooluse_guardrail(
+                {"tool_name": "mcp_chrome_devtools_take_snapshot", "cwd": str(opt_in_repo)},
+                home_dir=fake_home,
+                state_dir=state_dir,
+                env={"AGY_SCHEDULED_ACTION": "true"},
+            )
+            self.assertEqual(alias_sched["decision"], "deny")
+
+            # 2. Customer TAM / disabled workspaces -> automatic deny
+            evaluator = dev_common.DevLifecycleGuardrailEvaluator(
+                home_dir=fake_home,
+                state_dir=state_dir,
+                env={},
+            )
+            for tam_dir in (tam_portfolio_dir / "cache", tam_plugin_runtime, custom_tam_folder, opt_out_repo):
+                for inv in devtools_invocations:
+                    res_tam = evaluator.evaluate_pre_tool_use({**inv, "cwd": str(tam_dir)})
+                    self.assertEqual(res_tam["decision"], "deny", msg=f"Expected TAM deny in {tam_dir} for {inv}")
+                    self.assertEqual(res_tam.get("check_id"), "pretool:dev-scoped-chrome-devtools")
+
+            # cd into TAM dir inside run_command is also denied
+            res_cd_tam = evaluator.evaluate_pre_tool_use(
+                {
+                    "tool_name": "run_command",
+                    "cwd": str(scratch_dir),
+                    "tool_input": {"CommandLine": f"cd {tam_portfolio_dir} && npx chrome-devtools-mcp"},
+                }
+            )
+            self.assertEqual(res_cd_tam["decision"], "deny")
+
+            # 3. Outside managed dev repos / empty workspace -> force_ask
+            for non_dev_payload_ctx in (
+                {"cwd": str(scratch_dir)},
+                {"cwd": str(fake_home)},
+                {"cwd": str(unmanaged_repo)},
+                {"workspacePaths": []},
+            ):
+                res_ask = evaluator.evaluate_pre_tool_use(
+                    {
+                        "tool_name": "call_mcp_tool",
+                        "tool_input": {"ServerName": "chrome_devtools", "ToolName": "list_pages"},
+                        **non_dev_payload_ctx,
+                    }
+                )
+                self.assertEqual(res_ask["decision"], "force_ask", msg=f"Expected force_ask for {non_dev_payload_ctx}")
+                self.assertEqual(res_ask.get("check_id"), "pretool:dev-scoped-chrome-devtools")
+
+            # Hard deny checks (e.g. Santa Lockdown / main push) still beat force_ask in non-dev dirs
+            res_hard_deny = evaluator.evaluate_pre_tool_use(
+                {
+                    "tool_name": "run_command",
+                    "cwd": str(scratch_dir),
+                    "tool_input": {"CommandLine": "git push origin main && npx chrome-devtools-mcp"},
+                }
+            )
+            self.assertEqual(res_hard_deny["decision"], "deny")
+
+            # VCS metadata commands mentioning chrome-devtools-mcp in commit/review text do not trigger force_ask/deny
+            res_commit_meta = evaluator.evaluate_pre_tool_use(
+                {
+                    "tool_name": "run_command",
+                    "cwd": str(scratch_dir),
+                    "tool_input": {"CommandLine": "git commit -m 'feat: scope chrome-devtools-mcp guardrail'"},
+                }
+            )
+            self.assertEqual(res_commit_meta["decision"], "allow")
+
+            # 4. Active dev repo, isolated pr-worktree-* (even under wiz-customer-portfolio/tmp), and .agents/plugins.json opt-in -> allow
+            for dev_dir in (nested_worktree, managed_repo, opt_in_repo):
+                for inv in devtools_invocations:
+                    res_allow = evaluator.evaluate_pre_tool_use({**inv, "cwd": str(dev_dir)})
+                    self.assertEqual(res_allow["decision"], "allow", msg=f"Expected allow in {dev_dir} for {inv}")
+
+            # 5. Paused orchestration -> deny (pretool:paused-chrome-devtools) takes precedence even in active dev worktree
+            dev_common.atomic_write_json(
+                state_dir / "dev_orchestration_control.json",
+                {"paused": True, "mode": "graceful_drain"},
+            )
+            res_paused = evaluator.evaluate_pre_tool_use(
+                {
+                    "tool_name": "call_mcp_tool",
+                    "cwd": str(nested_worktree),
+                    "tool_input": {"ServerName": "chrome_devtools", "ToolName": "list_pages"},
+                }
+            )
+            self.assertEqual(res_paused["decision"], "deny")
+            self.assertEqual(res_paused.get("check_id"), "pretool:paused-chrome-devtools")
+            self.assertIn("Paused", res_paused["reason"])
 
 
 class TestGitClientAndRemediation(unittest.TestCase):
@@ -1780,6 +1960,10 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
                     "web-frontend-standards.md",
                     "discrepancy RCA",
                     "trailing plain-text open bullet questions",
+                    ".agents/plugins.json",
+                    "AGY_SCHEDULED_ACTION=1",
+                    "force_ask",
+                    "pretool:dev-scoped-chrome-devtools",
                 ),
             ),
             "co-design-and-discovery.md": (
@@ -1806,6 +1990,7 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
                     "escapeHtml",
                     "noopener noreferrer",
                     "chrome-devtools-plugin",
+                    ".agents/plugins.json",
                     "Data-Table Badges",
                     ".data-table tbody td:not(:first-child)",
                     "border-color: transparent",
@@ -1827,7 +2012,7 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
                 self.assertIn(term, text, msg=f"Rule {fname} missing expected contract term: {term}")
 
         expected_skills = {
-            "agy-web-ui-architecture": ("Vanilla-First", "Santa Lockdown", "project_audit.py", "chrome-devtools-plugin"),
+            "agy-web-ui-architecture": ("Vanilla-First", "Santa Lockdown", "project_audit.py", "chrome-devtools-plugin", ".agents/plugins.json"),
             "agy-code-design-refactor": ("Characterization", "Reinvented Wheel", "allowed non-binary library", "Python 3", "Shell", "Vanilla JS", "project_audit.py"),
             "agy-project-standards": ("5-Language", "sec:santa-binary-download", "html:duplicate-id", "css:unbalanced-braces"),
         }
@@ -2369,7 +2554,7 @@ class TestGitClientDevCommonAndRunnerCoverage(unittest.TestCase):
             out_json = io.StringIO()
             with contextlib.redirect_stdout(out_json):
                 self.assertEqual(dev_common.main(["checks", "--format", "json"]), 0)
-            self.assertEqual(json.loads(out_json.getvalue())["count"], 10)
+            self.assertEqual(json.loads(out_json.getvalue())["count"], 11)
 
             out_txt = io.StringIO()
             with contextlib.redirect_stdout(out_txt):

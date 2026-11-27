@@ -10,7 +10,8 @@ Provides zero-dependency stdlib primitives for `agy-dev-plugin` scripts:
   - Deterministic SDLC lifecycle guardrails (`DevLifecycleGuardrailEvaluator`) for
     `PreToolUse` (`direct-main-push`, `proprietary-vcs-cli`, `santa-lockdown-binary`,
     `dotenv-write-protection`, `unvalidated-branch-push`, `parallel-file-lease`,
-    `parallel-worker-deploy-home`) and multi-slot `SessionStart` (`dev-pr-lock-context`)
+    `parallel-worker-deploy-home`, `paused-chrome-devtools`, `dev-scoped-chrome-devtools`,
+    `hard-stop-active-workers`) and multi-slot `SessionStart` (`dev-pr-lock-context`)
 """
 
 from __future__ import annotations
@@ -136,9 +137,22 @@ DETERMINISTIC_DEV_PRETOOL_CHECKS: tuple[dict[str, str], ...] = (
         "check_id": "pretool:paused-chrome-devtools",
         "event": "PreToolUse",
         "title": "Paused Dev Queue Chrome DevTools Blocker",
-        "target": "call_mcp_tool | mcp_*chrome*devtools* | run_command (chrome-devtools-mcp)",
+        "target": "call_mcp_tool | mcp_*chrome*devtools* | chrome-devtools* | run_command (chrome-devtools-mcp)",
         "decision": "deny",
         "description": "Turns off Chrome DevTools MCP tool calls and chrome-devtools-mcp CLI launches whenever Dev Queue orchestration is paused (dev_orchestration_control.json).",
+    },
+    {
+        "check_id": "pretool:dev-scoped-chrome-devtools",
+        "event": "PreToolUse",
+        "title": "Dev-Context Scoped Chrome DevTools Guardrail",
+        "target": "call_mcp_tool | mcp_*chrome*devtools* | chrome-devtools* | run_command (chrome-devtools-mcp)",
+        "decision": "deny|force_ask",
+        "description": (
+            "Automatically denies Chrome DevTools MCP and chrome-devtools-mcp launches in scheduled/unattended "
+            "actions (AGY_SCHEDULED_ACTION=1) and customer TAM operational workspaces, allows managed dev "
+            "repositories, pr-worktree-* branches, and workspace .agents/plugins.json opt-ins, and requires "
+            "explicit user confirmation (force_ask) outside managed dev workspaces."
+        ),
     },
     {
         "check_id": "pretool:hard-stop-active-workers",
@@ -149,9 +163,15 @@ DETERMINISTIC_DEV_PRETOOL_CHECKS: tuple[dict[str, str], ...] = (
         "description": "Immediately denies tool calls from active dev workers/reviewers or targeting pr-worktree-* paths while Dev Queue Hard Stop (mode=hard_stop) is active without affecting unrelated user chats.",
     },
 )
+PRETOOLUSE_RULES = DETERMINISTIC_DEV_PRETOOL_CHECKS
 
 _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE = re.compile(r"chrome[-_]?devtools", re.IGNORECASE)
 _CHROME_DEVTOOLS_CMD_RE = re.compile(r"(?:chrome[-_]devtools[-_]mcp|CHROME_DEVTOOLS_MCP_JS)", re.IGNORECASE)
+_CHROME_DEVTOOLS_VCS_METADATA_CMD_RE = re.compile(
+    r"^(?:git\s+commit\b|(?:python3?(?:\.\d+)?\s+\S*)?pr_remediator\.py\b)"
+)
+_TRUTHY_ENV_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
+_TAM_PORTFOLIO_MARKER_FILES: tuple[str, ...] = ("customer_portfolio.json", "canonical_accounts.json")
 _HARD_STOP_CONTROL_CMD_RE = re.compile(
     r"\b(?:orchestration-(?:resume|status|stop|pause)|agy-queue\s+(?:resume|status|stop|pause))\b",
     re.IGNORECASE,
@@ -1158,13 +1178,19 @@ class DevLifecycleGuardrailEvaluator:
         state_dir: Path | None = None,
         *,
         portfolio_dir: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> None:
         self.home_dir = (home_dir or Path.home()).expanduser().resolve()
         explicit_state = state_dir if state_dir is not None else portfolio_dir
         self.state_dir = resolve_state_dir(explicit_state, home_dir=self.home_dir)
+        self._env = env
+
+    def _get_env_map(self) -> Mapping[str, str]:
+        """Return explicit environment mapping when injected, else `os.environ`."""
+        return self._env if self._env is not None else os.environ
 
     def evaluate_pre_tool_use(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Evaluate a `PreToolUse` hook payload and return `{\"decision\": \"allow\"|\"deny\", ...}`."""
+        """Evaluate a `PreToolUse` hook payload and return `{\"decision\": \"allow\"|\"deny\"|\"force_ask\", ...}`."""
         tool_call = payload.get("toolCall")
         if isinstance(tool_call, dict):
             tool_name = str(tool_call.get("name") or tool_call.get("toolName") or "").strip()
@@ -1190,6 +1216,15 @@ class DevLifecycleGuardrailEvaluator:
         paused_devtools_deny = self._check_paused_chrome_devtools(tool_name, args)
         if paused_devtools_deny is not None:
             return paused_devtools_deny
+
+        scoped_devtools_gate = self._check_dev_scoped_chrome_devtools(tool_name, payload, args)
+        if scoped_devtools_gate is not None and scoped_devtools_gate.get("decision") == "deny":
+            return scoped_devtools_gate
+        pending_force_ask = (
+            scoped_devtools_gate
+            if scoped_devtools_gate is not None and scoped_devtools_gate.get("decision") == "force_ask"
+            else None
+        )
 
         if tool_name == "run_command":
             cmd_line = str(args.get("CommandLine") or args.get("command") or "").strip()
@@ -1257,7 +1292,7 @@ class DevLifecycleGuardrailEvaluator:
                 if lease_deny is not None:
                     return lease_deny
 
-        return {"decision": "allow"}
+        return pending_force_ask if pending_force_ask is not None else {"decision": "allow"}
 
     def _read_orchestration_control(self) -> dict[str, Any]:
         """Read `<state_dir>/dev_orchestration_control.json` in <0.1ms."""
@@ -1389,29 +1424,381 @@ class DevLifecycleGuardrailEvaluator:
             ),
         }
 
+    @staticmethod
+    def _is_chrome_devtools_command(cmd_line: str, *, ignore_vcs_metadata: bool = False) -> bool:
+        """Return True when any shell segment launches or invokes `chrome-devtools-mcp` / `CHROME_DEVTOOLS_MCP_JS`."""
+        if not cmd_line or not _CHROME_DEVTOOLS_CMD_RE.search(cmd_line):
+            return False
+        if not ignore_vcs_metadata:
+            return True
+        for seg in re.split(r"(?:&&|\|\||[;|\n])", cmd_line):
+            seg_clean = seg.strip()
+            if not seg_clean or not _CHROME_DEVTOOLS_CMD_RE.search(seg_clean):
+                continue
+            if _CHROME_DEVTOOLS_VCS_METADATA_CMD_RE.match(seg_clean):
+                continue
+            return True
+        return False
+
+    @classmethod
+    def _is_chrome_devtools_invocation(
+        cls,
+        tool_name: str,
+        args: dict[str, Any],
+        *,
+        ignore_vcs_metadata: bool = False,
+    ) -> bool:
+        """Return True when `tool_name` / `args` invokes Chrome DevTools MCP or `chrome-devtools-mcp`."""
+        if _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(tool_name):
+            return True
+        if tool_name == "call_mcp_tool":
+            server_name = str(args.get("ServerName") or args.get("server_name") or args.get("serverName") or "")
+            if _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(server_name):
+                return True
+        if tool_name == "run_command":
+            cmd_line = str(args.get("CommandLine") or args.get("command") or "")
+            if cls._is_chrome_devtools_command(cmd_line, ignore_vcs_metadata=ignore_vcs_metadata):
+                return True
+        return False
+
     def _check_paused_chrome_devtools(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
         """Deny Chrome DevTools MCP calls and `chrome-devtools-mcp` commands while Dev Queue is paused."""
         if not self._is_orchestration_paused():
             return None
-        deny_payload = {
+        if not self._is_chrome_devtools_invocation(tool_name, args, ignore_vcs_metadata=False):
+            return None
+        return {
             "decision": "deny",
+            "check_id": "pretool:paused-chrome-devtools",
             "reason": (
                 "Guardrail (Dev Queue Paused): Chrome DevTools automation is turned off while Dev Queue "
                 "orchestration is paused. Click 'Continue Dev' in the Dev Queue sidebar/panel or run "
                 "'agy-queue resume' to re-enable Chrome DevTools."
             ),
         }
-        if _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(tool_name):
-            return deny_payload
-        if tool_name == "call_mcp_tool":
-            server_name = str(args.get("ServerName") or args.get("server_name") or args.get("serverName") or "")
-            if _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(server_name):
-                return deny_payload
-        if tool_name == "run_command":
-            cmd_line = str(args.get("CommandLine") or args.get("command") or "")
-            if _CHROME_DEVTOOLS_CMD_RE.search(cmd_line):
-                return deny_payload
+
+    @staticmethod
+    def _parse_devtools_plugin_entry(entry: Any) -> bool | None:
+        """Inspect a single `.agents/plugins.json` entry for `chrome-devtools` opt-in (`True`) or disable (`False`)."""
+        if isinstance(entry, str):
+            return True if _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(entry) else None
+        if isinstance(entry, Mapping):
+            matched = any(
+                _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(str(entry.get(k) or ""))
+                for k in ("name", "id", "plugin", "path", "server")
+            )
+            if not matched:
+                return None
+            if entry.get("enabled") is False or entry.get("disabled") is True:
+                return False
+            return True
         return None
+
+    def _inspect_workspace_devtools_plugin_opt_in(self, cand_dir: Path) -> bool | None:
+        """Check `.agents/plugins.json` along `cand_dir` up to its repo/workspace root for `chrome-devtools-plugin`."""
+        for anc in (cand_dir, *cand_dir.parents):
+            if anc == anc.parent or anc == self.home_dir:
+                break
+            manifest_path = anc / ".agents" / "plugins.json"
+            if manifest_path.is_file():
+                raw = atomic_read_json(manifest_path, default=None)
+                if isinstance(raw, list):
+                    for item in raw:
+                        verdict = self._parse_devtools_plugin_entry(item)
+                        if verdict is not None:
+                            return verdict
+                elif isinstance(raw, Mapping):
+                    for list_key in ("disabled", "disabled_plugins"):
+                        dis_seq = raw.get(list_key)
+                        if isinstance(dis_seq, list) and any(
+                            _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(str(x or "")) for x in dis_seq
+                        ):
+                            return False
+                    for list_key in ("entries", "plugins", "enabled", "enabled_plugins"):
+                        seq = raw.get(list_key)
+                        if isinstance(seq, list):
+                            for item in seq:
+                                verdict = self._parse_devtools_plugin_entry(item)
+                                if verdict is not None:
+                                    return verdict
+                        elif isinstance(seq, Mapping):
+                            for k, v in seq.items():
+                                if _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(str(k)):
+                                    if v is False or (isinstance(v, Mapping) and v.get("enabled") is False):
+                                        return False
+                                    return True
+                    for k, v in raw.items():
+                        if k in ("entries", "plugins", "enabled", "enabled_plugins", "disabled", "disabled_plugins"):
+                            continue
+                        if _CHROME_DEVTOOLS_TOOL_OR_SERVER_RE.search(str(k)):
+                            if v is False or (isinstance(v, Mapping) and v.get("enabled") is False):
+                                return False
+                            return True
+            if (anc / ".git").exists():
+                break
+        return None
+
+    def _collect_managed_dev_context(self) -> tuple[set[Path], set[Path], set[str]]:
+        """Return `(active_worktrees, managed_dev_dirs, managed_repo_slugs)` from local dev state in `<1ms`."""
+        active_worktrees: set[Path] = set()
+        managed_dev_dirs: set[Path] = set()
+        managed_repo_slugs: set[str] = set()
+
+        search_dirs = [self.state_dir]
+        compat_dir = self.home_dir / ".local" / "share" / COMPAT_PORTFOLIO_STATE_DIRNAME
+        with contextlib.suppress(OSError):
+            if compat_dir.is_dir() and compat_dir.resolve() != self.state_dir.resolve():
+                search_dirs.append(compat_dir.resolve())
+
+        for s_dir in search_dirs:
+            active_locks, all_locks = load_dev_locks_from_dir(s_dir)
+            for ldata in active_locks.values():
+                main_td = self._resolve_expanded_path(str(ldata.get("target_repo_dir") or ""))
+                for slot in self._extract_active_slots_from_lock(ldata):
+                    wt_p = self._resolve_expanded_path(str(slot.get("worktree_path") or ""))
+                    if wt_p is not None and (main_td is None or wt_p != main_td):
+                        active_worktrees.add(wt_p)
+
+            for raw_slug, ldata in all_locks.items():
+                if not isinstance(ldata, Mapping):
+                    continue
+                for cand_slug in (raw_slug, str(ldata.get("repo_slug") or ""), str(ldata.get("repo") or "")):
+                    norm_s = normalize_repo_slug(cand_slug)
+                    if norm_s and norm_s != "default":
+                        managed_repo_slugs.add(norm_s)
+                td_p = self._resolve_expanded_path(str(ldata.get("target_repo_dir") or ""))
+                if td_p is not None and (td_p / ".git").exists():
+                    managed_dev_dirs.add(td_p)
+                for rb_key in ("repo_branches", "last_repo_branches"):
+                    rb_map = ldata.get(rb_key)
+                    if isinstance(rb_map, Mapping):
+                        for rb_slug, rb_info in rb_map.items():
+                            norm_rb = normalize_repo_slug(str(rb_slug))
+                            if norm_rb and norm_rb != "default":
+                                managed_repo_slugs.add(norm_rb)
+                            if isinstance(rb_info, Mapping):
+                                rtd_p = self._resolve_expanded_path(str(rb_info.get("target_repo_dir") or ""))
+                                if rtd_p is not None and (rtd_p / ".git").exists():
+                                    managed_dev_dirs.add(rtd_p)
+
+            q_raw = atomic_read_json(s_dir / "dev_queue.json", default={})
+            q_items = q_raw.get("items") if isinstance(q_raw, Mapping) else (q_raw if isinstance(q_raw, list) else [])
+            if isinstance(q_items, list):
+                for q_item in q_items:
+                    if not isinstance(q_item, Mapping):
+                        continue
+                    for rs in (
+                        str(q_item.get("repo_slug") or ""),
+                        *(str(x or "") for x in (q_item.get("repo_slugs") or []) if x),
+                    ):
+                        norm_q = normalize_repo_slug(rs)
+                        if norm_q and norm_q != "default":
+                            managed_repo_slugs.add(norm_q)
+                    qtd_p = self._resolve_expanded_path(str(q_item.get("target_repo_dir") or ""))
+                    if qtd_p is not None and (qtd_p / ".git").exists():
+                        managed_dev_dirs.add(qtd_p)
+
+        plugin_root = resolve_plugin_root()
+        if (plugin_root / ".git").exists():
+            with contextlib.suppress(OSError):
+                managed_dev_dirs.add(plugin_root.resolve())
+        ct_dir = _resolve_companion_control_tower_dir(home_dir=self.home_dir)
+        if ct_dir is not None and (ct_dir / ".git").exists():
+            with contextlib.suppress(OSError):
+                managed_dev_dirs.add(ct_dir.resolve())
+
+        return active_worktrees, managed_dev_dirs, managed_repo_slugs
+
+    def _classify_devtools_context_dir(
+        self,
+        cand_dir: Path,
+        *,
+        active_worktrees: set[Path],
+        managed_dev_dirs: set[Path],
+        managed_repo_slugs: set[str],
+        tam_roots: set[Path],
+    ) -> str:
+        """Classify `cand_dir` into `'dev'`, `'tam'`, or `'non_dev'` for Chrome DevTools scoping."""
+        if self._is_parallel_worktree_dir(cand_dir, active_worktrees) or any(
+            part.startswith("dev_ui_preview") for part in cand_dir.parts
+        ):
+            return "dev"
+
+        opt_in = self._inspect_workspace_devtools_plugin_opt_in(cand_dir)
+        if opt_in is False:
+            return "tam"
+        if opt_in is True:
+            return "dev"
+
+        if (
+            any(self._path_is_within(cand_dir, tr) for tr in tam_roots)
+            or COMPAT_PORTFOLIO_STATE_DIRNAME in cand_dir.parts
+            or ".gemini/config/plugins/wiz-tam-plugin" in cand_dir.as_posix()
+        ):
+            return "tam"
+
+        for anc in (cand_dir, *cand_dir.parents):
+            if anc == anc.parent or anc == self.home_dir:
+                break
+            if any((anc / marker).is_file() for marker in _TAM_PORTFOLIO_MARKER_FILES):
+                return "tam"
+            if (anc / ".git").exists():
+                break
+
+        if any(self._path_is_within(cand_dir, d_root) for d_root in managed_dev_dirs):
+            return "dev"
+
+        for anc in (cand_dir, *cand_dir.parents):
+            if (anc / ".git").exists():
+                slug = resolve_repo_slug_from_path(anc)
+                if slug and slug in managed_repo_slugs:
+                    return "dev"
+                break
+
+        return "non_dev"
+
+    def _check_dev_scoped_chrome_devtools(
+        self,
+        tool_name: str,
+        payload: dict[str, Any],
+        args: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Scope Chrome DevTools strictly to dev contexts (`deny` in scheduled/TAM, `force_ask` outside dev repos)."""
+        if not self._is_chrome_devtools_invocation(tool_name, args, ignore_vcs_metadata=True):
+            return None
+
+        env_map = self._get_env_map()
+        for env_key in ("AGY_SCHEDULED_ACTION", "AGY_UNATTENDED", "WIZ_SCHEDULED_ACTION"):
+            if str(env_map.get(env_key) or "").strip().lower() in _TRUTHY_ENV_VALUES:
+                return {
+                    "decision": "deny",
+                    "check_id": "pretool:dev-scoped-chrome-devtools",
+                    "reason": (
+                        f"Guardrail violation (Scheduled/Unattended Context — pretool:dev-scoped-chrome-devtools): "
+                        f"Chrome DevTools MCP and chrome-devtools-mcp are strictly forbidden in scheduled or "
+                        f"unattended actions ({env_key}=1). Use direct HTTP/REST/OAuth2/MCP APIs with zero CDP."
+                    ),
+                }
+
+        if bool(payload.get("scheduledAction") or payload.get("scheduled_action")):
+            return {
+                "decision": "deny",
+                "check_id": "pretool:dev-scoped-chrome-devtools",
+                "reason": (
+                    "Guardrail violation (Scheduled/Unattended Context — pretool:dev-scoped-chrome-devtools): "
+                    "Chrome DevTools MCP and chrome-devtools-mcp are strictly forbidden in scheduled actions."
+                ),
+            }
+
+        ctx_mode = str(env_map.get("AGY_CONTEXT_MODE") or env_map.get("AGY_WORKSPACE_KIND") or "").strip().lower()
+        if ctx_mode == "tam":
+            return {
+                "decision": "deny",
+                "check_id": "pretool:dev-scoped-chrome-devtools",
+                "reason": (
+                    "Guardrail violation (TAM Operational Context — pretool:dev-scoped-chrome-devtools): "
+                    "Chrome DevTools MCP is automatically denied in customer TAM operational contexts."
+                ),
+            }
+
+        candidate_dirs: list[Path] = []
+        has_explicit_context = False
+
+        raw_cwd = str(args.get("Cwd") or args.get("cwd") or payload.get("cwd") or "").strip()
+        if raw_cwd:
+            has_explicit_context = True
+            cwd_p = self._resolve_expanded_path(raw_cwd, base_dir=Path.cwd())
+            if cwd_p is not None:
+                candidate_dirs.append(cwd_p)
+
+        has_ws_key = "workspacePaths" in payload or "workspace_paths" in payload
+        if has_ws_key:
+            raw_ws = payload.get("workspacePaths") if "workspacePaths" in payload else payload.get("workspace_paths")
+            if isinstance(raw_ws, Sequence) and not isinstance(raw_ws, (str, bytes)):
+                has_explicit_context = True
+                for item in raw_ws:
+                    s_item = str(item or "").strip()
+                    if s_item:
+                        ws_p = self._resolve_expanded_path(s_item, base_dir=Path.cwd())
+                        if ws_p is not None and ws_p not in candidate_dirs:
+                            candidate_dirs.append(ws_p)
+
+        if tool_name == "run_command":
+            cmd_line = str(args.get("CommandLine") or args.get("command") or "").strip()
+            base_cd = candidate_dirs[0] if candidate_dirs else Path.cwd()
+            for seg in re.split(r"(?:&&|\|\||[;|\n])", cmd_line):
+                seg_clean = seg.strip()
+                if seg_clean.startswith("cd "):
+                    with contextlib.suppress(ValueError):
+                        toks = shlex.split(seg_clean)
+                        if len(toks) >= 2:
+                            nxt = self._resolve_expanded_path(toks[1], base_dir=base_cd)
+                            if nxt is not None:
+                                has_explicit_context = True
+                                base_cd = nxt
+                                if nxt not in candidate_dirs:
+                                    candidate_dirs.insert(0, nxt)
+
+        if not has_explicit_context:
+            with contextlib.suppress(OSError):
+                candidate_dirs.append(Path.cwd().resolve())
+
+        active_worktrees, managed_dev_dirs, managed_repo_slugs = self._collect_managed_dev_context()
+
+        tam_roots: set[Path] = {
+            (self.home_dir / ".local" / "share" / COMPAT_PORTFOLIO_STATE_DIRNAME).resolve(),
+            (self.home_dir / ".gemini" / "config" / "plugins" / "wiz-tam-plugin").resolve(),
+        }
+        dotenv_vars = load_dotenv_dict(home_dir=self.home_dir)
+        raw_pdir = str(env_map.get("WIZ_CUSTOMER_PORTFOLIO_DIR") or dotenv_vars.get("WIZ_CUSTOMER_PORTFOLIO_DIR") or "").strip()
+        if raw_pdir and not raw_pdir.startswith("<"):
+            pdir_resolved = self._resolve_expanded_path(raw_pdir)
+            if pdir_resolved is not None:
+                tam_roots.add(pdir_resolved)
+
+        if candidate_dirs:
+            classifications = [
+                self._classify_devtools_context_dir(
+                    c_dir,
+                    active_worktrees=active_worktrees,
+                    managed_dev_dirs=managed_dev_dirs,
+                    managed_repo_slugs=managed_repo_slugs,
+                    tam_roots=tam_roots,
+                )
+                for c_dir in candidate_dirs
+            ]
+            explicit_cwd_is_worktree = bool(
+                raw_cwd
+                and candidate_dirs
+                and (
+                    self._is_parallel_worktree_dir(candidate_dirs[0], active_worktrees)
+                    or any(part.startswith("dev_ui_preview") for part in candidate_dirs[0].parts)
+                )
+            )
+            if "tam" in classifications and not explicit_cwd_is_worktree:
+                return {
+                    "decision": "deny",
+                    "check_id": "pretool:dev-scoped-chrome-devtools",
+                    "reason": (
+                        "Guardrail violation (TAM/Disabled Workspace — pretool:dev-scoped-chrome-devtools): "
+                        "Chrome DevTools MCP and chrome-devtools-mcp are automatically denied in customer TAM "
+                        "workspaces and directories where chrome-devtools-plugin is disabled. Never use CDP for "
+                        "connector data extraction; use HTTP/REST/OAuth2/MCP APIs instead."
+                    ),
+                }
+            if "dev" in classifications:
+                return None
+
+        return {
+            "decision": "force_ask",
+            "check_id": "pretool:dev-scoped-chrome-devtools",
+            "reason": (
+                "Guardrail (Outside Managed Dev Workspace — pretool:dev-scoped-chrome-devtools): "
+                "Chrome DevTools MCP is scoped to managed development repositories, isolated pr-worktree-* "
+                "branches, and workspaces opting in via .agents/plugins.json. Confirm explicitly only for "
+                "interactive one-off troubleshooting or endpoint mapping (never for connector data scraping)."
+            ),
+        }
 
     @staticmethod
     def _read_git_head_branch_and_sha(target_dir: Path | None, branch_name: str = "") -> tuple[str, str]:
@@ -2284,12 +2671,17 @@ def evaluate_pre_tool_use(
     *,
     home_dir: Path | None = None,
     state_dir: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Pure functional evaluator for an SDLC `PreToolUse` hook payload."""
     return DevLifecycleGuardrailEvaluator(
         home_dir=home_dir,
         state_dir=state_dir,
+        env=env,
     ).evaluate_pre_tool_use(payload)
+
+
+evaluate_pretooluse_guardrail = evaluate_pre_tool_use
 
 
 def evaluate_session_start(
