@@ -59,6 +59,7 @@ from lock_store import (  # noqa: E402
     _sanitize_home_paths,
     _secondary_slot_keys,
     _slot_repo_branch_key,
+    _strip_legacy_lock_keys_in_memory,
     _utc_now_iso,
     build_pro_dashboard_ui_url,
     cleanup_worktree,
@@ -2285,46 +2286,53 @@ def record_pr_review_evaluation(
     if cid_clean:
         p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
         state_path = p_dir / "actions_state.json"
-        lock_file = state_path.with_suffix(".json.lock")
-        with dev_common.file_lock(lock_file):
-            state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
-            if isinstance(state_obj, dict):
-                audit_state = state_obj.get("actions_log_audit_state")
-                if not isinstance(audit_state, dict):
-                    audit_state = {}
-                legacy_audited = audit_state.get("audited_runs") if isinstance(audit_state.get("audited_runs"), dict) else {}
-                audited_runs = dev_common.try_sync_actions_ledger_verdicts(
-                    state_dir=p_dir,
-                    legacy_audited=legacy_audited,
-                )
-                existing_run = audited_runs.get(cid_clean) if isinstance(audited_runs.get(cid_clean), dict) else {}
-                updated_verdict = {
-                    **existing_run,
-                    "conversation_id": cid_clean,
-                    "tier": str(existing_run.get("tier") or "TIER_2"),
-                    "resolution": str(existing_run.get("resolution") or "STAGE_PROPOSED"),
-                    "branch_action": "NEW_BRANCH_CREATED",
-                    "branch_name": resolved_branch,
-                    "branch_timestamp": resolved_ts,
-                    "manual_pr_url": manual_pr_url,
-                    "created_by": created_by_label,
-                    "reviewer_verdict": norm_verdict,
-                    "reviewer_score": score_int,
-                    "review_iteration": current_iteration,
-                    "summary": (
-                        f"New branch validated & published by {PR_DEVELOPER_SUBAGENT_NAME} / {PR_REVIEWER_SUBAGENT_NAME}: "
-                        f"{resolved_branch} [{resolved_ts}] ({norm_verdict} {score_int}/100, round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS}) — ready for manual PR."
-                    ),
-                    "updated_at": now_iso,
-                }
-                dev_common.try_sync_actions_ledger_verdicts({cid_clean: updated_verdict}, state_dir=p_dir)
-                audit_state.pop("audited_runs", None)
-                state_obj["actions_log_audit_state"] = audit_state
-                tmp_path = state_path.with_suffix(".tmp")
-                tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                with contextlib.suppress(OSError):
-                    os.chmod(tmp_path, 0o600)
-                os.replace(tmp_path, state_path)
+        legacy_audited: dict[str, Any] = {}
+        if state_path.is_file():
+            st_preview = dev_common.atomic_read_json(state_path, default={})
+            if isinstance(st_preview, dict) and isinstance(st_preview.get("actions_log_audit_state"), dict):
+                aud_prev = st_preview["actions_log_audit_state"]
+                if isinstance(aud_prev.get("audited_runs"), dict):
+                    legacy_audited = dict(aud_prev["audited_runs"])
+        audited_runs = dev_common.try_sync_actions_ledger_verdicts(
+            state_dir=p_dir,
+            legacy_audited=legacy_audited,
+        )
+        existing_run = audited_runs.get(cid_clean) if isinstance(audited_runs.get(cid_clean), dict) else {}
+        updated_verdict = {
+            **existing_run,
+            "conversation_id": cid_clean,
+            "tier": str(existing_run.get("tier") or "TIER_2"),
+            "resolution": str(existing_run.get("resolution") or "STAGE_PROPOSED"),
+            "branch_action": "NEW_BRANCH_CREATED",
+            "branch_name": resolved_branch,
+            "branch_timestamp": resolved_ts,
+            "manual_pr_url": manual_pr_url,
+            "created_by": created_by_label,
+            "reviewer_verdict": norm_verdict,
+            "reviewer_score": score_int,
+            "review_iteration": current_iteration,
+            "summary": (
+                f"New branch validated & published by {PR_DEVELOPER_SUBAGENT_NAME} / {PR_REVIEWER_SUBAGENT_NAME}: "
+                f"{resolved_branch} [{resolved_ts}] ({norm_verdict} {score_int}/100, round {current_iteration}/{MAX_PR_REVIEW_ITERATIONS}) — ready for manual PR."
+            ),
+            "updated_at": now_iso,
+        }
+        dev_common.try_sync_actions_ledger_verdicts({cid_clean: updated_verdict}, state_dir=p_dir)
+        if state_path.is_file():
+            lock_file = state_path.with_suffix(".json.lock")
+            with dev_common.file_lock(lock_file):
+                state_obj = dev_common.atomic_read_json(state_path, default={})
+                if isinstance(state_obj, dict):
+                    mutated = dict(state_obj)
+                    changed = _strip_legacy_lock_keys_in_memory(mutated)
+                    audit_state = mutated.get("actions_log_audit_state")
+                    if isinstance(audit_state, dict) and "audited_runs" in audit_state:
+                        audit_copy = dict(audit_state)
+                        audit_copy.pop("audited_runs", None)
+                        mutated["actions_log_audit_state"] = audit_copy
+                        changed = True
+                    if changed:
+                        dev_common.atomic_write_json(state_path, mutated, mode=0o600)
 
     clean_slug_for_name = str(resolved_repo_slug or "").strip().strip("/")
     if clean_slug_for_name and clean_slug_for_name.lower() != "default":

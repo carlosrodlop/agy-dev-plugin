@@ -576,10 +576,13 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
             q_items = {it["conversation_id"]: it for it in prs.load_dev_queue(portfolio_dir=pdir)["items"]}
             self.assertEqual(q_items[other_plugin_cid]["repo_slugs"], ["acme-org/acme-plugin"])
 
-            # Verify foreign legacy lock remained untouched in raw state JSON
+            # Verify foreign legacy lock migrated cleanly into dedicated dev_pr_lock.json and was stripped from actions_state.json
+            raw_lock_doc = json.loads((pdir / "dev_pr_lock.json").read_text(encoding="utf-8"))
+            self.assertEqual(raw_lock_doc["dev_pr_locks"]["acme-org/acme-tower"]["conversation_id"], legacy_cid)
+            self.assertTrue(raw_lock_doc["dev_pr_locks"]["acme-org/acme-tower"]["active"])
             raw_state = json.loads((pdir / "actions_state.json").read_text(encoding="utf-8"))
-            self.assertEqual(raw_state["actions_log_audit_state"]["dev_pr_lock"]["conversation_id"], legacy_cid)
-            self.assertTrue(raw_state["actions_log_audit_state"]["dev_pr_lock"]["active"])
+            self.assertNotIn("dev_pr_locks", raw_state.get("actions_log_audit_state", {}))
+            self.assertNotIn("dev_pr_lock", raw_state.get("actions_log_audit_state", {}))
 
             # Releasing only acme-org/acme-plugin keeps cli & legacy tower locks intact
             prs.cleanup_worktree(res_plugin["worktree_path"], repo_dir=repo_plugin)
@@ -3434,9 +3437,9 @@ class TestDevQueueAndMergedConversationCleanup(unittest.TestCase):
                 repo_slug="acme/free-repo",
                 portfolio_dir=pdir,
             )
-            st_path = pdir / "actions_state.json"
+            st_path = pdir / "dev_pr_lock.json"
             st_raw = json.loads(st_path.read_text(encoding="utf-8"))
-            lk_raw = st_raw["actions_log_audit_state"]["dev_pr_locks"]["acme/free-repo"]
+            lk_raw = st_raw["dev_pr_locks"]["acme/free-repo"]
             lk_raw["status"] = "DEVELOPING"
             lk_raw["acquired_at"] = "2020-01-01T00:00:00Z"
             lk_raw["updated_at"] = "2020-01-01T00:00:00Z"

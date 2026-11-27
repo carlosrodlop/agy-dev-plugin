@@ -58,6 +58,7 @@ from lock_store import (  # noqa: E402
     _facade_attr,
     _inspect_local_branch_merged_readonly,
     _is_slot_scoped_rb_key,
+    _read_locks_container_readonly,
     _read_locks_state,
     _resolve_lock_target_repo_dir,
     _secondary_slot_keys,
@@ -1679,13 +1680,13 @@ def collect_protected_conversation_ids(
                 _protect(str(sub), f"dev_queue_subagent:{st}")
 
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
+    all_locks_map, _ = _read_locks_container_readonly(portfolio_dir=p_dir)
     state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
     audit_state = (
         state_obj.get("actions_log_audit_state")
         if isinstance(state_obj.get("actions_log_audit_state"), dict)
         else {}
     )
-    all_locks_map = _read_locks_state(audit_state)
     for active_lock in all_locks_map.values():
         if isinstance(active_lock, dict) and active_lock.get("active"):
             _protect_with_synthetic_prefix(str(active_lock.get("conversation_id") or ""), "active_dev_pr_lock")
@@ -1852,14 +1853,7 @@ def verify_branches_merged_into_base(
 ) -> dict[str, Any]:
     """Verify across all associated repositories that target branches are merged into `main`."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
-    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
-    audit_state = (
-        state_obj.get("actions_log_audit_state")
-        if isinstance(state_obj.get("actions_log_audit_state"), dict)
-        else {}
-    )
-    all_locks_map = _read_locks_state(audit_state)
-    lock_obj = audit_state.get("dev_pr_lock") if isinstance(audit_state.get("dev_pr_lock"), dict) else {}
+    all_locks_map, lock_obj = _read_locks_container_readonly(portfolio_dir=p_dir)
     all_lock_entries: list[dict[str, Any]] = list(all_locks_map.values())
     if lock_obj and lock_obj not in all_lock_entries:
         all_lock_entries.append(lock_obj)
@@ -2672,13 +2666,8 @@ def _collect_repo_dirs_for_cleanup(
                 _add_repo(base_repo)
             _add_repo(base_repo.parent / r_name)
 
-    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
-    audit_state = (
-        state_obj.get("actions_log_audit_state")
-        if isinstance(state_obj.get("actions_log_audit_state"), dict)
-        else {}
-    )
-    for lock_entry in _read_locks_state(audit_state).values():
+    locks_for_cleanup, _ = _read_locks_container_readonly(portfolio_dir=p_dir)
+    for lock_entry in locks_for_cleanup.values():
         if not isinstance(lock_entry, dict):
             continue
         for key in ("target_repo_dir", "repo_slug"):
@@ -2786,13 +2775,8 @@ def _collect_repo_branch_merge_index(
                     unmerged_cid8.add(m_cid.group(1).lower())
 
     # Include inactive released locks whose `last_branch_name` was merged into main
-    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
-    audit_state = (
-        state_obj.get("actions_log_audit_state")
-        if isinstance(state_obj.get("actions_log_audit_state"), dict)
-        else {}
-    )
-    for lock_entry in _read_locks_state(audit_state).values():
+    locks_for_cleanup, _ = _read_locks_container_readonly(portfolio_dir=p_dir)
+    for lock_entry in locks_for_cleanup.values():
         if not isinstance(lock_entry, dict) or lock_entry.get("active"):
             continue
         rel_reason = str(lock_entry.get("last_release_reason") or "").strip()

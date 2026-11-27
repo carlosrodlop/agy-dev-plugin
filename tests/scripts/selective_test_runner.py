@@ -17,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ALL_TEST_MODULES = [
     "tests.test_agy_dev_plugin",
     "tests.test_deterministic_first_audit",
+    "tests.test_dev_pr_lock_isolation",
     "tests.test_dev_queue_cli_ux",
     "tests.test_dev_queue_doctor",
     "tests.test_dev_queue_planning",
@@ -97,6 +98,7 @@ BATS_TRIGGER_PREFIXES = (
 )
 ISOLATED_TEST_FILE_MODULES = {
     "tests/test_deterministic_first_audit.py": "tests.test_deterministic_first_audit",
+    "tests/test_dev_pr_lock_isolation.py": "tests.test_dev_pr_lock_isolation",
     "tests/test_dev_queue_cli_ux.py": "tests.test_dev_queue_cli_ux",
     "tests/test_dev_queue_doctor.py": "tests.test_dev_queue_doctor",
     "tests/test_dev_queue_planning.py": "tests.test_dev_queue_planning",
@@ -602,6 +604,24 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_record_review_flags" not in selected:
                 selected.append("tests.test_record_review_flags")
+
+        if (
+            norm.endswith(
+                (
+                    "lock_store.py",
+                    "review_gate.py",
+                    "merge_watcher.py",
+                    "pr_remediator.py",
+                    "dev_common.py",
+                    "tui_state.py",
+                    "test_dev_pr_lock_isolation.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm.startswith("sidecars/dev-queue-panel/")
+        ):
+            if "tests.test_dev_pr_lock_isolation" not in selected:
+                selected.append("tests.test_dev_pr_lock_isolation")
 
         if norm not in ISOLATED_TEST_FILE_MODULES and "tests.test_agy_dev_plugin" not in selected:
             selected.append("tests.test_agy_dev_plugin")

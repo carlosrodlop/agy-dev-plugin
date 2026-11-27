@@ -31,6 +31,7 @@ import shlex
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 import urllib.parse
@@ -315,7 +316,9 @@ def resolve_state_dir(
 
     dev_default = (base_home / ".local" / "share" / DEFAULT_DEV_STATE_DIRNAME).resolve()
     compat_dir = (base_home / ".local" / "share" / COMPAT_PORTFOLIO_STATE_DIRNAME).resolve()
-    if not dev_default.exists() and (compat_dir / "actions_state.json").is_file():
+    if not dev_default.exists() and (
+        (compat_dir / "dev_pr_lock.json").is_file() or (compat_dir / "actions_state.json").is_file()
+    ):
         return compat_dir
     return dev_default
 
@@ -335,7 +338,7 @@ def atomic_write_json(path: Path | str, data: Any, *, mode: int = 0o600) -> Path
     """Atomically write JSON to `path` via temp file + `os.replace` with strict file permissions."""
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+    tmp_path = target.with_name(f".{target.name}.tmp.{os.getpid()}.{threading.get_ident()}")
     tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     with contextlib.suppress(OSError):
         os.chmod(tmp_path, mode)
@@ -349,6 +352,8 @@ def file_lock(lock_path: Path | str, timeout_seconds: float = 15.0) -> Iterator[
     lpath = Path(lock_path).expanduser()
     lpath.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lpath), os.O_CREAT | os.O_RDWR, 0o600)
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o600)
     deadline = time.monotonic() + max(0.5, float(timeout_seconds))
     try:
         while True:
@@ -675,33 +680,49 @@ def try_sync_actions_ledger_verdicts(
         return dict(verdict_updates or {})
 
 
+def _extract_raw_locks_map_from_container(data: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Extract `{repo_slug: lock_dict}` from a `dev_pr_lock.json` document or `actions_log_audit_state` dict."""
+    locks_out: dict[str, dict[str, Any]] = {}
+    raw_map = data.get("dev_pr_locks") if isinstance(data.get("dev_pr_locks"), Mapping) else data.get("locks")
+    if isinstance(raw_map, Mapping):
+        for slug, info in raw_map.items():
+            if isinstance(info, Mapping):
+                locks_out[str(slug)] = dict(info)
+    single_lock = data.get("dev_pr_lock")
+    if isinstance(single_lock, Mapping):
+        leg_slug = str(single_lock.get("repo_slug") or single_lock.get("repo") or "default")
+        existing = locks_out.get(leg_slug)
+        if not locks_out or (bool(single_lock.get("active")) and (not existing or not bool(existing.get("active")))):
+            locks_out[leg_slug] = dict(single_lock)
+    elif not locks_out and "active" in data:
+        flat_slug = str(data.get("repo_slug") or data.get("repo") or "default")
+        locks_out[flat_slug] = dict(data)
+    return locks_out
+
+
 def get_active_dev_pr_lock_protections(
     *,
     state_dir: Path | str | None = None,
     home_dir: Path | None = None,
 ) -> tuple[set[str], set[str]]:
-    """Return `(active_branches, active_worktree_paths)` held by any active `dev_pr_locks` (including all `slots`) or legacy `dev_pr_lock`."""
+    """Return `(active_branches, active_worktree_paths)` from authoritative `dev_pr_lock.json` (or legacy `actions_state.json` fallback)."""
     p_dir = resolve_state_dir(state_dir, home_dir=home_dir)
     entries: list[dict[str, Any]] = []
+    lock_file_path = p_dir / "dev_pr_lock.json"
 
-    lock_file_obj = atomic_read_json(p_dir / "dev_pr_lock.json", default={})
-    if isinstance(lock_file_obj, dict):
-        raw_nested = lock_file_obj.get("dev_pr_locks") or lock_file_obj.get("locks")
-        if isinstance(raw_nested, dict):
-            entries.extend(v for v in raw_nested.values() if isinstance(v, dict))
-        elif lock_file_obj.get("active"):
-            entries.append(lock_file_obj)
-
-    state_obj = atomic_read_json(p_dir / "actions_state.json", default={})
-    if isinstance(state_obj, dict):
-        audit_state = state_obj.get("actions_log_audit_state")
-        if isinstance(audit_state, dict):
-            raw_locks = audit_state.get("dev_pr_locks")
-            if isinstance(raw_locks, dict):
-                entries.extend(v for v in raw_locks.values() if isinstance(v, dict))
-            legacy = audit_state.get("dev_pr_lock")
-            if isinstance(legacy, dict):
-                entries.append(legacy)
+    if lock_file_path.is_file():
+        lock_file_obj = atomic_read_json(lock_file_path, default={})
+        if isinstance(lock_file_obj, Mapping):
+            entries.extend(_extract_raw_locks_map_from_container(lock_file_obj).values())
+    else:
+        state_obj = atomic_read_json(p_dir / "actions_state.json", default={})
+        if isinstance(state_obj, Mapping):
+            audit_state = (
+                state_obj.get("actions_log_audit_state")
+                if isinstance(state_obj.get("actions_log_audit_state"), Mapping)
+                else state_obj
+            )
+            entries.extend(_extract_raw_locks_map_from_container(audit_state).values())
 
     if not entries:
         return set(), set()
@@ -1076,38 +1097,36 @@ def load_dev_locks_from_dir(
     strict: bool = False,
     normalize_slots: bool = True,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    """Load `(active_locks, all_locks)` across `dev_pr_lock.json` and `actions_state.json`."""
+    """Load `(active_locks, all_locks)` with `dev_pr_lock.json` authoritative when present and `actions_state.json` fallback."""
     st_dir = Path(state_dir).expanduser()
     active: dict[str, dict[str, Any]] = {}
     all_locks: dict[str, dict[str, Any]] = {}
-    for candidate in (st_dir / "dev_pr_lock.json", st_dir / "actions_state.json"):
-        data = load_json_dict(candidate, strict=strict)
-        raw_map: Any = None
-        if candidate.name == "dev_pr_lock.json":
-            raw_map = data.get("dev_pr_locks") or data.get("locks")
+    lock_file = st_dir / "dev_pr_lock.json"
+    if lock_file.is_file():
+        data = load_json_dict(lock_file, strict=strict)
+        raw_map = _extract_raw_locks_map_from_container(data)
+    else:
+        data = load_json_dict(st_dir / "actions_state.json", strict=strict)
+        audit_st = (
+            data.get("actions_log_audit_state")
+            if isinstance(data.get("actions_log_audit_state"), Mapping)
+            else data
+        )
+        raw_map = _extract_raw_locks_map_from_container(audit_st)
+
+    for slug, info in raw_map.items():
+        slug_key = str(slug)
+        if info.get("active"):
+            norm_info = (
+                normalize_repo_lock_slots(slug_key, info)
+                if normalize_slots
+                else dict(info)
+            )
+            all_locks[slug_key] = norm_info
+            active[slug_key] = norm_info
         else:
-            audit_st = data.get("actions_log_audit_state")
-            if isinstance(audit_st, dict):
-                raw_map = audit_st.get("dev_pr_locks")
-                if not raw_map and isinstance(audit_st.get("dev_pr_lock"), dict):
-                    legacy = audit_st["dev_pr_lock"]
-                    slug = str(legacy.get("repo_slug") or legacy.get("repo") or "default")
-                    raw_map = {slug: legacy}
-        if isinstance(raw_map, dict):
-            for slug, info in raw_map.items():
-                if isinstance(info, dict):
-                    slug_key = str(slug)
-                    if info.get("active"):
-                        norm_info = (
-                            normalize_repo_lock_slots(slug_key, info)
-                            if normalize_slots
-                            else dict(info)
-                        )
-                        all_locks[slug_key] = norm_info
-                        active[slug_key] = norm_info
-                    else:
-                        all_locks[slug_key] = dict(info)
-                        active.pop(slug_key, None)
+            all_locks[slug_key] = dict(info)
+            active.pop(slug_key, None)
     return (active, all_locks)
 
 
@@ -2480,7 +2499,7 @@ class DevLifecycleGuardrailEvaluator:
         return clean_def or "default"
 
     def _read_active_locks_map(self) -> dict[str, dict[str, Any]]:
-        """Inspect `dev_pr_locks`, `dev_pr_lock.json`, and `actions_state.json` across state dirs, keyed by `repo_slug`."""
+        """Inspect authoritative `dev_pr_lock.json` (with `actions_state.json` fallback) across state dirs, keyed by `repo_slug`."""
         search_dirs = [self.state_dir]
         compat_dir = self.home_dir / ".local" / "share" / COMPAT_PORTFOLIO_STATE_DIRNAME
         if compat_dir.resolve() != self.state_dir.resolve():
@@ -2488,32 +2507,29 @@ class DevLifecycleGuardrailEvaluator:
 
         active_map: dict[str, dict[str, Any]] = {}
         for candidate_dir in search_dirs:
-            lock_file_data = atomic_read_json(candidate_dir / "dev_pr_lock.json", default={})
-            if isinstance(lock_file_data, dict):
-                raw_nested = lock_file_data.get("dev_pr_locks") or lock_file_data.get("locks")
-                if isinstance(raw_nested, dict):
-                    for k, v in raw_nested.items():
-                        if isinstance(v, dict) and v.get("active"):
-                            slug = self._extract_repo_slug_from_lock(v, k)
-                            active_map.setdefault(slug, v)
-                elif lock_file_data.get("active"):
-                    slug = self._extract_repo_slug_from_lock(lock_file_data)
-                    active_map.setdefault(slug, lock_file_data)
-
-            st_raw = atomic_read_json(candidate_dir / "actions_state.json", default={})
-            if isinstance(st_raw, dict):
-                audit_st = st_raw.get("actions_log_audit_state") or {}
-                if isinstance(audit_st, dict):
-                    raw_locks = audit_st.get("dev_pr_locks")
-                    if isinstance(raw_locks, dict):
-                        for k, v in raw_locks.items():
-                            if isinstance(v, dict) and v.get("active"):
-                                slug = self._extract_repo_slug_from_lock(v, k)
-                                active_map.setdefault(slug, v)
-                    cand_lock = audit_st.get("dev_pr_lock")
-                    if isinstance(cand_lock, dict) and cand_lock.get("active"):
-                        slug = self._extract_repo_slug_from_lock(cand_lock)
-                        active_map.setdefault(slug, cand_lock)
+            lock_path = candidate_dir / "dev_pr_lock.json"
+            if lock_path.is_file():
+                lock_file_data = atomic_read_json(lock_path, default={})
+                raw_locks = (
+                    _extract_raw_locks_map_from_container(lock_file_data)
+                    if isinstance(lock_file_data, Mapping)
+                    else {}
+                )
+            else:
+                st_raw = atomic_read_json(candidate_dir / "actions_state.json", default={})
+                if isinstance(st_raw, Mapping):
+                    audit_st = (
+                        st_raw.get("actions_log_audit_state")
+                        if isinstance(st_raw.get("actions_log_audit_state"), Mapping)
+                        else st_raw
+                    )
+                    raw_locks = _extract_raw_locks_map_from_container(audit_st)
+                else:
+                    raw_locks = {}
+            for k, v in raw_locks.items():
+                if isinstance(v, dict) and v.get("active"):
+                    slug = self._extract_repo_slug_from_lock(v, k)
+                    active_map.setdefault(slug, v)
         return active_map
 
     def _read_active_lock_data(self, repo_slug: str = "") -> dict[str, Any]:

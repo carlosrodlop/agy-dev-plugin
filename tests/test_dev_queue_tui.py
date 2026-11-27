@@ -1013,24 +1013,25 @@ class TestDevQueueTui(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp) / "state"
             state_dir.mkdir(parents=True, exist_ok=True)
-            (state_dir / "dev_pr_lock.json").write_text(
-                json.dumps(
-                    {
-                        "dev_pr_locks": {
-                            "acme/repo-a": {"active": True, "status": "PENDING_HUMAN_PR_VALIDATION"},
-                            "acme/repo-b": {"active": True, "status": "DEVELOPING"},
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
             (state_dir / "actions_state.json").write_text(
                 json.dumps(
                     {
                         "actions_log_audit_state": {
                             "dev_pr_locks": {
-                                "acme/repo-a": {"active": False, "status": "RELEASED"},
+                                "acme/repo-a": {"active": True, "status": "PENDING_HUMAN_PR_VALIDATION"},
+                                "acme/repo-b": {"active": True, "status": "DEVELOPING"},
                             }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (state_dir / "dev_pr_lock.json").write_text(
+                json.dumps(
+                    {
+                        "dev_pr_locks": {
+                            "acme/repo-a": {"active": False, "status": "RELEASED"},
+                            "acme/repo-b": {"active": True, "status": "DEVELOPING"},
                         }
                     }
                 ),

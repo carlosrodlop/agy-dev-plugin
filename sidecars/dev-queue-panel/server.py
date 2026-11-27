@@ -969,6 +969,7 @@ def _compute_opt_hint_cache_signature(
     return (
         str(st_dir),
         _stat_path_signature(st_dir / "dev_queue.json"),
+        _stat_path_signature(st_dir / "dev_pr_lock.json"),
         _stat_path_signature(st_dir / "actions_state.json"),
         tuple(sorted((str(k), str(v)) for k, v in repo_local_dirs.items())),
         tuple(str(b) for b in brain_roots),
@@ -1043,6 +1044,7 @@ def _compute_ghost_purge_cache_signature(ghost_kwargs: Mapping[str, Any]) -> tup
     watched_files: list[Path] = [
         st_dir / _merge_watcher.GHOST_PURGE_ARMED_FILENAME,
         st_dir / _merge_watcher.GHOST_PURGE_RESULT_FILENAME,
+        st_dir / "dev_pr_lock.json",
         st_dir / "actions_state.json",
         st_dir / "dev_queue.json",
     ]
