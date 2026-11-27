@@ -64,7 +64,10 @@ When co-design converges, synthesize a concise **Design Contract** before mutati
 
 1. **Confirmed Decisions**: Numbered summary of the design/UX/architecture choices agreed together.
 2. **Scoped Changes & Verification**: Impacted repositories, anchored target files, and required hermetic tests.
-3. **Explicit Non-Goals & Guardrails**: What is intentionally out of scope (preventing scope creep).
+3. **Review Focus (Top 3–5 Boundary Failure Modes)**: List the top 3–5 concrete edge cases or boundary failure modes (each pinned to a specific hermetic test name/assertion) so planner, builder, and `agy-code-pr-reviewer` verify the highest-risk paths explicitly.
+4. **Optional Builder Check (Critical / Multi-Repo Contracts)**: For critical or multi-repo interface contracts, require a lightweight pre-build sanity check confirming schema, symbol names, and error semantics align before parallel workers fan out.
+5. **Throwaway Spike Rule (Uncertain Feasibility)**: When an external API, parser edge case, or runtime behavior is unverified, run a short time-boxed throwaway **Spike** in an isolated scratch/temp probe to confirm facts, discard the spike artifact completely, and then implement clean production code + hermetic tests (never ship spike code directly).
+6. **Explicit Non-Goals & Guardrails**: What is intentionally out of scope (preventing scope creep).
 
 Then execute the exit handoff calibrated to current per-repository `dev_pr_locks`:
 - **Target Repo(s) Unlocked**: Ask whether to **implement immediately** on a timestamped `fix/*` worktree branch (`agy-code-remediation-pr`) OR **enqueue as `pending`** in `dev_queue.json` (`pr_remediator.py queue-add`).

@@ -37,6 +37,7 @@ ALL_TEST_MODULES = [
     "tests.test_record_review_flags",
     "tests.test_sdlc_determinism_batch",
     "tests.test_sidecar_ghost_purge",
+    "tests.test_superpowers_distilled_standards",
 ]
 
 DOCS_SMOKE_TARGETS = [
@@ -118,6 +119,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_record_review_flags.py": "tests.test_record_review_flags",
     "tests/test_sdlc_determinism_batch.py": "tests.test_sdlc_determinism_batch",
     "tests/test_sidecar_ghost_purge.py": "tests.test_sidecar_ghost_purge",
+    "tests/test_superpowers_distilled_standards.py": "tests.test_superpowers_distilled_standards",
 }
 
 
@@ -622,6 +624,31 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_dev_pr_lock_isolation" not in selected:
                 selected.append("tests.test_dev_pr_lock_isolation")
+
+        if (
+            norm.endswith(
+                (
+                    "project_audit.py",
+                    "qa_static_audit.py",
+                    "test_superpowers_distilled_standards.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm in (
+                "rules/python-and-testing.md",
+                "rules/co-design-and-discovery.md",
+                "agents/agy-code-pr-reviewer.md",
+                "agents/agy-code-developer.md",
+                "agents/agy-dev-executor.md",
+                "agents/agy-dev-orchestrator.md",
+                "agents/agy-dev-planner.md",
+                "skills/agy-code-design-refactor/SKILL.md",
+                "skills/agy-code-remediation-pr/SKILL.md",
+                "skills/agy-project-standards/SKILL.md",
+            )
+        ):
+            if "tests.test_superpowers_distilled_standards" not in selected:
+                selected.append("tests.test_superpowers_distilled_standards")
 
         if norm not in ISOLATED_TEST_FILE_MODULES and "tests.test_agy_dev_plugin" not in selected:
             selected.append("tests.test_agy_dev_plugin")

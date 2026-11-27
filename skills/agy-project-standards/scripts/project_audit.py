@@ -30,6 +30,9 @@ from typing import Any
 
 MAX_MARKDOWN_INSTRUCTION_BYTES = 24000
 MAX_COPILOT_INSTRUCTIONS_BYTES = 4000
+MAX_SKILL_DESCRIPTION_CHARS = 1800
+TEST_ARBITRARY_SLEEP_MIN_SECONDS = 0.25
+ALLOW_SLEEP_COMMENT_RE = re.compile(r"#\s*allow-sleep:")
 MAX_CSS_IMPORTANT_PER_FILE = 10
 SKILL_HEAVY_BYTES_THRESHOLD = 12000
 SKILL_HEAVY_BASH_BLOCKS_THRESHOLD = 4
@@ -723,6 +726,92 @@ def _check_python_undefined_names(
         )
 
 
+def _is_hermetic_test_file(rel: str) -> bool:
+    """Return True when `rel` matches `tests/**/test_*.py`."""
+    norm = rel.replace(os.sep, "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    parts = Path(norm).parts
+    return len(parts) >= 2 and parts[0] == "tests" and parts[-1].startswith("test_") and parts[-1].endswith(".py")
+
+
+def _check_python_test_arbitrary_sleep(
+    tree: ast.AST,
+    src: str,
+    rel: str,
+    warnings: list[AuditFinding],
+) -> None:
+    """Warn on numeric `time.sleep >= 0.25s` in `tests/**/test_*.py` unless suppressed with `# allow-sleep:`."""
+    if not _is_hermetic_test_file(rel):
+        return
+
+    time_module_aliases: set[str] = set()
+    sleep_fn_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "time":
+                    time_module_aliases.add(alias.asname or "time")
+        elif isinstance(node, ast.ImportFrom) and node.module == "time":
+            for alias in node.names:
+                if alias.name == "sleep":
+                    sleep_fn_aliases.add(alias.asname or "sleep")
+
+    if not time_module_aliases and not sleep_fn_aliases:
+        return
+
+    src_lines = src.splitlines()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        is_sleep_call = (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "sleep"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in time_module_aliases
+        ) or (isinstance(node.func, ast.Name) and node.func.id in sleep_fn_aliases)
+        if not is_sleep_call:
+            continue
+
+        arg_node: ast.AST | None = node.args[0] if node.args else None
+        if arg_node is None:
+            for kw in node.keywords:
+                if kw.arg in {"secs", "seconds"}:
+                    arg_node = kw.value
+                    break
+        if (
+            not isinstance(arg_node, ast.Constant)
+            or not isinstance(arg_node.value, (int, float))
+            or isinstance(arg_node.value, bool)
+        ):
+            continue
+
+        sleep_seconds = float(arg_node.value)
+        if sleep_seconds < TEST_ARBITRARY_SLEEP_MIN_SECONDS:
+            continue
+
+        end_lineno = getattr(node, "end_lineno", None) or node.lineno
+        if any(
+            ALLOW_SLEEP_COMMENT_RE.search(src_lines[ln - 1])
+            for ln in range(node.lineno, end_lineno + 1)
+            if 1 <= ln <= len(src_lines)
+        ):
+            continue
+
+        warnings.append(
+            AuditFinding(
+                "warning",
+                "py:test-arbitrary-sleep",
+                rel,
+                node.lineno,
+                (
+                    f"Avoid arbitrary sleep({sleep_seconds:g}) >= {TEST_ARBITRARY_SLEEP_MIN_SECONDS}s in tests; "
+                    "use condition-based polling or add '# allow-sleep: <reason>'."
+                ),
+            )
+        )
+
+
 def _check_python_ast(fpath: Path, rel: str, errors: list[AuditFinding], warnings: list[AuditFinding]) -> None:
     """Validate Python AST syntax, F821 undefined names, bare except, eval/exec, unsafe yaml.load, mutable defaults, and shell=True."""
     try:
@@ -740,6 +829,7 @@ def _check_python_ast(fpath: Path, rel: str, errors: list[AuditFinding], warning
         return
 
     _check_python_undefined_names(tree, rel, errors)
+    _check_python_test_arbitrary_sleep(tree, src, rel, warnings)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.ExceptHandler) and node.type is None:
@@ -1304,6 +1394,39 @@ def _check_sidecar_determinism(
             )
 
 
+def _extract_frontmatter_field(fm_block: str, field_name: str) -> str:
+    """Extract a single-line or YAML block-scalar field value from frontmatter without PyYAML."""
+    lines = fm_block.splitlines()
+    prefix = f"{field_name}:"
+    for idx, line in enumerate(lines):
+        stripped_leading = line.lstrip()
+        if line != stripped_leading or not line.startswith(prefix):
+            continue
+        raw_val = line[len(prefix) :].strip()
+        if raw_val in {">", ">-", "|", "|-", ""}:
+            block_lines: list[str] = []
+            for cont in lines[idx + 1 :]:
+                if cont == "":
+                    block_lines.append("")
+                    continue
+                if cont[0] in {" ", "\t"}:
+                    block_lines.append(cont.strip())
+                    continue
+                break
+            while block_lines and block_lines[-1] == "":
+                block_lines.pop()
+            if raw_val.startswith("|"):
+                return "\n".join(block_lines).strip()
+            return " ".join(part for part in block_lines if part).strip()
+        if (raw_val.startswith('"') and raw_val.endswith('"')) or (
+            raw_val.startswith("'") and raw_val.endswith("'")
+        ):
+            if len(raw_val) >= 2:
+                return raw_val[1:-1].strip()
+        return raw_val
+    return ""
+
+
 def _check_markdown_limits(fpath: Path, rel: str, errors: list[AuditFinding], warnings: list[AuditFinding]) -> None:
     """Verify Antigravity rules/skills/agents (24 KB + YAML frontmatter) and optional Copilot 4 KB hygiene cap."""
     normalized_rel = rel.replace(os.sep, "/")
@@ -1351,8 +1474,23 @@ def _check_markdown_limits(fpath: Path, rel: str, errors: list[AuditFinding], wa
             AuditFinding("warning", "agy:missing-frontmatter", rel, 1, "Missing YAML frontmatter block.")
         )
         return
+    fm_block = text[4 : text.index("\n---\n", 4)]
+    if is_skill:
+        desc_text = _extract_frontmatter_field(fm_block, "description")
+        if len(desc_text) > MAX_SKILL_DESCRIPTION_CHARS:
+            warnings.append(
+                AuditFinding(
+                    "warning",
+                    "agy:skill-description-bloat",
+                    rel,
+                    1,
+                    (
+                        f"SKILL.md description is {len(desc_text)} chars (> {MAX_SKILL_DESCRIPTION_CHARS} char cap); "
+                        "keep frontmatter descriptions trigger-only ('Use when...')."
+                    ),
+                )
+            )
     if is_agent:
-        fm_block = text[4 : text.index("\n---\n", 4)]
         for req_key in ("name:", "description:"):
             if req_key not in fm_block:
                 errors.append(
