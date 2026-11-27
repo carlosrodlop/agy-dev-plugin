@@ -33,6 +33,7 @@ ALL_TEST_MODULES = [
     "tests.test_pr_remediator_preview_staging",
     "tests.test_pr_remediator_queue_and_cleanup",
     "tests.test_queue_compactor",
+    "tests.test_record_review_flags",
     "tests.test_sdlc_determinism_batch",
     "tests.test_sidecar_ghost_purge",
 ]
@@ -112,6 +113,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_pr_remediator_preview_staging.py": "tests.test_pr_remediator_preview_staging",
     "tests/test_pr_remediator_queue_and_cleanup.py": "tests.test_pr_remediator_queue_and_cleanup",
     "tests/test_queue_compactor.py": "tests.test_queue_compactor",
+    "tests/test_record_review_flags.py": "tests.test_record_review_flags",
     "tests/test_sdlc_determinism_batch.py": "tests.test_sdlc_determinism_batch",
     "tests/test_sidecar_ghost_purge.py": "tests.test_sidecar_ghost_purge",
 }
@@ -585,6 +587,21 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         ):
             if "tests.test_sdlc_determinism_batch" not in selected:
                 selected.append("tests.test_sdlc_determinism_batch")
+
+        if (
+            norm.endswith(
+                (
+                    "pr_remediator.py",
+                    "review_gate.py",
+                    "lock_store.py",
+                    "test_record_review_flags.py",
+                    "selective_test_runner.py",
+                )
+            )
+            or norm in ("agents/agy-code-pr-reviewer.md",)
+        ):
+            if "tests.test_record_review_flags" not in selected:
+                selected.append("tests.test_record_review_flags")
 
         if norm not in ISOLATED_TEST_FILE_MODULES and "tests.test_agy_dev_plugin" not in selected:
             selected.append("tests.test_agy_dev_plugin")

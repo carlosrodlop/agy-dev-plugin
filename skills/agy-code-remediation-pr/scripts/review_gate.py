@@ -8,7 +8,7 @@ PR review scoring/circuit-breaker, branch evaluation, and parallel overlap/rebas
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import importlib.util
 import json
 import os
@@ -99,6 +99,15 @@ from worktree_ops import (  # noqa: E402
     _resolve_valid_verification_results,
     _snapshot_worktree_state,
 )
+
+_DEFAULT_GET_DEV_PR_LOCK = get_dev_pr_lock
+
+
+def _resolve_get_dev_pr_lock() -> Callable[..., dict[str, Any]]:
+    """Return active `get_dev_pr_lock` callable respecting mocks on either `review_gate` or `pr_remediator`."""
+    if get_dev_pr_lock is not _DEFAULT_GET_DEV_PR_LOCK:
+        return get_dev_pr_lock
+    return _facade_attr("get_dev_pr_lock", get_dev_pr_lock)
 
 def build_code_developer_subagent_plan(
     conversation_id: str,
@@ -348,7 +357,7 @@ def build_pr_reviewer_subagent_plan(
         f"   - Criterion C (20 pts): Security & Zero-PII Guardrails — Zero hardcoded customer names, emails, `/Users/<user>/` paths, or secrets.\n"
         f"   - Criterion D (15 pts): Code Style, Typing & Documentation — Clean English docstrings, type hints, and plugin / `$HOME` parity.\n"
         f"3. Record your structured verdict via `record-review` (which publishes `origin/<branch>`, starts `watch-pr-merge`, and surfaces `manual_pr_url` ONLY if `PASS` and `score > 90` with zero PR Ready emails; otherwise keeps the branch local and returns `developer_remediation_plan` for auto-iteration up to {MAX_PR_REVIEW_ITERATIONS} rounds, dispatching a `[🟥]` KO escalation alert only at round >= {MAX_PR_REVIEW_ITERATIONS} when `--send-email` is passed):\n"
-        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review --branch <BRANCH_NAME>{wd_flag}{model_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary \"...\" --send-email`\n"
+        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review --branch <BRANCH_NAME>{wd_flag}{model_flag} --reviewer-subagent-id <YOUR_CID> --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary \"...\" --send-email`\n"
         f"4. Return the JSON evaluation summary (`ready_for_human_pr`, `needs_reiteration`, `manual_pr_url` only when `ready_for_human_pr == true`, or `developer_remediation_plan` otherwise)."
     )
 
@@ -365,7 +374,7 @@ def build_pr_reviewer_subagent_plan(
         f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch \"{branch_name}\"{wd_flag}` to inspect the exact local diff and files changed via native `git`.\n"
         f"2. Score the branch changes (0-100) across Resolution Accuracy, Unit Tests, Zero-PII Security, and Code Quality, and give your verdict (`PASS`, `WARN`, or `NEEDS_REVISION`).\n"
         f"3. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review "
-        f"--branch \"{branch_name}\"{wd_flag}{model_flag} --verdict <PASS|WARN|NEEDS_REVISION> --score <SCORE> "
+        f"--branch \"{branch_name}\"{wd_flag}{model_flag} --reviewer-subagent-id <YOUR_CID> --verdict <PASS|WARN|NEEDS_REVISION> --score <SCORE> "
         f"--summary \"<Your detailed technical review comment>\" --send-email`.\n"
         f"4. Return the full JSON evaluation summary (never surface any PR URL unless `ready_for_human_pr == true`)."
     )
@@ -1429,6 +1438,84 @@ def _format_pr_notification_subject_summary(
     return single_line[: max(1, max_len - 3)].rstrip() + "..."
 
 
+def _branch_merge_base_matches_origin_main(
+    repo_dir: Path | None,
+    branch_name: str,
+    head_sha: str = "",
+    *,
+    base_branch: str = "main",
+    remote: str = "origin",
+) -> tuple[bool, str]:
+    """Return `(matches, origin_main_sha)` when `<branch>`'s git merge-base equals `origin/<base_branch>`."""
+    if not isinstance(repo_dir, Path) or not (repo_dir / ".git").exists():
+        return False, ""
+    env = _clean_git_subprocess_env()
+    clean_base = (base_branch or "main").strip()
+    origin_ref = f"{remote}/{clean_base}"
+    p_base = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "--verify", origin_ref],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    origin_sha = (p_base.stdout or "").strip() if p_base.returncode == 0 else ""
+    if not origin_sha:
+        return False, ""
+    candidates: list[str] = []
+    for raw_ref in (head_sha, branch_name, "HEAD"):
+        clean_ref = str(raw_ref or "").strip()
+        if clean_ref and clean_ref not in candidates:
+            candidates.append(clean_ref)
+    for cand in candidates:
+        p_mb = subprocess.run(
+            ["git", "-C", str(repo_dir), "merge-base", origin_sha, cand],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if p_mb.returncode == 0:
+            mb_sha = (p_mb.stdout or "").strip()
+            return bool(mb_sha and mb_sha == origin_sha), origin_sha
+    return False, origin_sha
+
+
+def _extract_latest_review_verdict_and_score(lock_info: Mapping[str, Any]) -> tuple[str, int]:
+    """Return `(verdict_upper, score_int)` from the latest `review_history` entry or top-level lock fields."""
+    history = lock_info.get("review_history")
+    if isinstance(history, list) and history and isinstance(history[-1], Mapping):
+        latest = history[-1]
+        verdict = str(latest.get("verdict") or lock_info.get("reviewer_verdict") or "").strip().upper()
+        raw_score = latest.get("score") if latest.get("score") is not None else lock_info.get("reviewer_score")
+    else:
+        verdict = str(lock_info.get("reviewer_verdict") or "").strip().upper()
+        raw_score = lock_info.get("reviewer_score")
+    try:
+        score_int = int(raw_score or 0)
+    except (TypeError, ValueError):
+        score_int = 0
+    return verdict, score_int
+
+
+def _is_lock_escalated_max_review_iterations(lock_info: Mapping[str, Any]) -> bool:
+    """Return True when lock is circuit-broken at `ESCALATED_MAX_REVIEW_ITERATIONS` (`review_iteration >= MAX` and last verdict != PASS)."""
+    status_u = str(lock_info.get("status") or "").strip().upper()
+    if status_u == "ESCALATED_MAX_REVIEW_ITERATIONS":
+        return True
+    try:
+        rev_iter = int(lock_info.get("review_iteration") or 0)
+    except (TypeError, ValueError):
+        rev_iter = 0
+    if rev_iter >= MAX_PR_REVIEW_ITERATIONS:
+        last_verdict, last_score = _extract_latest_review_verdict_and_score(lock_info)
+        if last_verdict != "PASS" or last_score < PR_REVIEW_PASS_MIN_SCORE:
+            return True
+    return False
+
+
 def record_pr_review_evaluation(
     pr_number: int | None = None,
     verdict: str = "PASS",
@@ -1725,6 +1812,8 @@ def record_pr_review_evaluation(
                     "branch_action": lock_status_next,
                     "branch_pushed": False,
                     "pr_gate_ready": False,
+                    "review_approved": False,
+                    "approved_head_sha": "",
                     "reviewed_head_sha": "",
                     "manual_pr_url": "",
                     "pr_url": "",
@@ -2120,35 +2209,48 @@ def record_pr_review_evaluation(
                 "head_sha": head_sha,
                 "updated_at": now_iso,
             }
+        up_to_date_with_origin_main, origin_main_sha = _branch_merge_base_matches_origin_main(
+            effective_repo_dir if isinstance(effective_repo_dir, Path) else None,
+            resolved_branch,
+            head_sha,
+        )
+        slot1_updates: dict[str, Any] = {
+            "status": "PENDING_HUMAN_PR_VALIDATION",
+            "branch_action": "NEW_BRANCH_CREATED",
+            "branch_pushed": True,
+            "pr_gate_ready": True,
+            "review_approved": True,
+            "approved_head_sha": head_sha,
+            "reviewed_head_sha": head_sha,
+            "notification_source": "Ad-Hoc",
+            "created_by": created_by_label,
+            "branch_name": resolved_branch,
+            "branch_timestamp": resolved_ts,
+            "head_sha": head_sha,
+            "repo_branches": updated_rb,
+            "manual_pr_url": manual_pr_url,
+            "pr_url": manual_pr_url,
+            "proposal_title": proposal_title,
+            "proposal_body": canonical_pr_body,
+            "executive_summary": resolved_exec_summary,
+            "verification_results": valid_vr,
+            "review_iteration": current_iteration,
+            "review_history": updated_history,
+            "reviewer_verdict": norm_verdict,
+            "reviewer_score": score_int,
+            "reviewer_summary": summary.strip(),
+            "reviewer_subagent_id": reviewer_subagent_id.strip(),
+            "last_reviewer_model": effective_reviewer_model,
+            "subagent_conversation_ids": recorded_subagents,
+            "review_markdown": review_markdown,
+        }
+        if up_to_date_with_origin_main:
+            slot1_updates["needs_base_rebase"] = False
+            slot1_updates["base_stale"] = False
+            if origin_main_sha:
+                slot1_updates["base_sha"] = origin_main_sha
         update_dev_pr_lock(
-            {
-                "status": "PENDING_HUMAN_PR_VALIDATION",
-                "branch_action": "NEW_BRANCH_CREATED",
-                "branch_pushed": True,
-                "pr_gate_ready": True,
-                "reviewed_head_sha": head_sha,
-                "notification_source": "Ad-Hoc",
-                "created_by": created_by_label,
-                "branch_name": resolved_branch,
-                "branch_timestamp": resolved_ts,
-                "head_sha": head_sha,
-                "repo_branches": updated_rb,
-                "manual_pr_url": manual_pr_url,
-                "pr_url": manual_pr_url,
-                "proposal_title": proposal_title,
-                "proposal_body": canonical_pr_body,
-                "executive_summary": resolved_exec_summary,
-                "verification_results": valid_vr,
-                "review_iteration": current_iteration,
-                "review_history": updated_history,
-                "reviewer_verdict": norm_verdict,
-                "reviewer_score": score_int,
-                "reviewer_summary": summary.strip(),
-                "reviewer_subagent_id": reviewer_subagent_id.strip(),
-                "last_reviewer_model": effective_reviewer_model,
-                "subagent_conversation_ids": recorded_subagents,
-                "review_markdown": review_markdown,
-            },
+            slot1_updates,
             portfolio_dir=portfolio_dir,
             repo_slug=resolved_repo_slug,
             workdir=effective_repo_dir,
@@ -3122,7 +3224,8 @@ def run_slot_rebase_reverify(
             ),
         }
     vcs = git_client or GitVcsIntegrationClient()
-    lock_info = get_dev_pr_lock(
+    _get_lock_fn = _resolve_get_dev_pr_lock()
+    lock_info = _get_lock_fn(
         portfolio_dir=portfolio_dir,
         repo_slug=repo_slug,
         workdir=workdir,
@@ -3195,6 +3298,26 @@ def run_slot_rebase_reverify(
     if rb_res.status != "ok":
         return rb_res.to_dict()
 
+    # Re-read fresh lock state right before deciding/writing lock status to prevent TOCTOU downgrades
+    # when a concurrent `record-review` completed while `rebase_and_reverify` was running.
+    fresh_lock = _get_lock_fn(
+        portfolio_dir=portfolio_dir,
+        repo_slug=resolved_slug or repo_slug,
+        workdir=workdir or target_dir,
+        branch_name=resolved_branch,
+    )
+    if isinstance(fresh_lock, dict) and fresh_lock.get("active"):
+        lock_info = fresh_lock
+        slot_num = int(lock_info.get("slot_id") or slot_num)
+
+    protected_statuses = (
+        "PENDING_HUMAN_PR_VALIDATION",
+        SLOT_STATUS_READY_AWAITING_BASE_MERGE,
+        "ESCALATED_MAX_REVIEW_ITERATIONS",
+    )
+    fresh_status = str(lock_info.get("status") or "").strip().upper()
+    is_escalated = _is_lock_escalated_max_review_iterations(lock_info)
+
     outcome = rb_res.outcome
     rca_summary = str(lock_info.get("summary") or "")
     proposed_fix = str(lock_info.get("proposed_fix") or "")
@@ -3207,11 +3330,65 @@ def run_slot_rebase_reverify(
     )
 
     if outcome == OUTCOME_AUTO_PROMOTED:
-        was_review_approved = bool(lock_info.get("review_approved")) or (
-            str(lock_info.get("reviewer_verdict") or "").upper() == "PASS"
-            and int(lock_info.get("reviewer_score") or 0) >= PR_REVIEW_PASS_MIN_SCORE
+        last_verdict, last_score = _extract_latest_review_verdict_and_score(lock_info)
+        unreviewed_active_status = fresh_status in {
+            "DEVELOPING",
+            "AWAITING_AGENT_REVIEW",
+            "NEEDS_REVISION_ITERATING",
+            SLOT_STATUS_NEEDS_AGENT_SEMANTIC_FIX,
+            SLOT_STATUS_NEEDS_AGENT_CONFLICT_RESOLUTION,
+        }
+        was_review_approved = (
+            not is_escalated
+            and not unreviewed_active_status
+            and (
+                bool(lock_info.get("review_approved"))
+                or (last_verdict == "PASS" and last_score >= PR_REVIEW_PASS_MIN_SCORE)
+                or fresh_status in ("PENDING_HUMAN_PR_VALIDATION", SLOT_STATUS_READY_AWAITING_BASE_MERGE)
+            )
         )
-        # Promote directly to open human PR when this is Slot #1 and review already passed!
+        # Fast-path TOCTOU guard: if Slot #1 ALREADY transitioned to PENDING_HUMAN_PR_VALIDATION concurrently
+        # and no commits were rewritten by rebase (`not rb_res.rebased`), preserve the published PR state intact.
+        if (
+            slot_num == 1
+            and fresh_status == "PENDING_HUMAN_PR_VALIDATION"
+            and not is_escalated
+            and not rb_res.rebased
+            and bool(lock_info.get("branch_pushed") or lock_info.get("pr_gate_ready"))
+        ):
+            existing_url = str(lock_info.get("manual_pr_url") or lock_info.get("pr_url") or "")
+            existing_head = str(lock_info.get("head_sha") or rb_res.new_head_sha)
+            update_dev_pr_lock(
+                {
+                    "status": "PENDING_HUMAN_PR_VALIDATION",
+                    "base_sha": rb_res.new_base_sha,
+                    "needs_base_rebase": False,
+                    "base_stale": False,
+                    "rebase_outcome": OUTCOME_AUTO_PROMOTED,
+                    "last_rebase_result": rb_res.to_dict(),
+                },
+                portfolio_dir=portfolio_dir,
+                repo_slug=resolved_slug,
+                workdir=target_dir,
+                branch_name=resolved_branch,
+                slot_id=1,
+                preserve_statuses=protected_statuses,
+            )
+            return {
+                **rb_res.to_dict(),
+                "slot_id": 1,
+                "lock_status": "PENDING_HUMAN_PR_VALIDATION",
+                "promoted_to_human_pr": False,
+                "ready_for_human_pr": True,
+                "pr_gate_ready": bool(lock_info.get("pr_gate_ready", True)),
+                "branch_pushed": bool(lock_info.get("branch_pushed", True)),
+                "head_sha": existing_head,
+                "manual_pr_url": existing_url,
+                "pr_url": existing_url,
+                "notification_email_sent": False,
+            }
+
+        # Promote directly to open human PR when this is Slot #1 and review already passed (and NOT escalated)!
         if slot_num == 1 and was_review_approved:
             rev_score = int(lock_info.get("reviewer_score") or 95)
             rev_summary = str(lock_info.get("reviewer_summary") or "Validated prior to 0-LLM base rebase-reverify.")
@@ -3375,37 +3552,53 @@ def run_slot_rebase_reverify(
                 "pr_merge_watcher": watcher_res,
             }
 
-        next_st = (
-            SLOT_STATUS_READY_AWAITING_BASE_MERGE
-            if (slot_num > 1 and was_review_approved)
-            else str(lock_info.get("status") or "DEVELOPING")
-        )
-        if next_st == SLOT_STATUS_NEEDS_REBASE_REVERIFY:
-            next_st = "DEVELOPING"
-        update_dev_pr_lock(
-            {
-                "status": next_st,
-                "base_sha": rb_res.new_base_sha,
-                "head_sha": rb_res.new_head_sha,
-                "needs_base_rebase": False,
-                "verification_results": rb_res.verification_results,
-                "rebase_outcome": OUTCOME_AUTO_PROMOTED,
-                "last_rebase_result": rb_res.to_dict(),
-            },
+        if is_escalated:
+            next_st = "ESCALATED_MAX_REVIEW_ITERATIONS"
+        elif fresh_status == "PENDING_HUMAN_PR_VALIDATION":
+            next_st = "PENDING_HUMAN_PR_VALIDATION"
+        elif fresh_status == SLOT_STATUS_READY_AWAITING_BASE_MERGE or (slot_num > 1 and was_review_approved):
+            next_st = SLOT_STATUS_READY_AWAITING_BASE_MERGE
+        else:
+            next_st = str(lock_info.get("status") or "DEVELOPING")
+            if next_st == SLOT_STATUS_NEEDS_REBASE_REVERIFY:
+                next_st = "DEVELOPING"
+        upd_non_prom: dict[str, Any] = {
+            "status": next_st,
+            "base_sha": rb_res.new_base_sha,
+            "head_sha": rb_res.new_head_sha,
+            "needs_base_rebase": False,
+            "verification_results": rb_res.verification_results,
+            "rebase_outcome": OUTCOME_AUTO_PROMOTED,
+            "last_rebase_result": rb_res.to_dict(),
+        }
+        if is_escalated:
+            upd_non_prom["review_approved"] = False
+            upd_non_prom["pr_gate_ready"] = False
+            upd_non_prom["branch_pushed"] = False
+            upd_non_prom["manual_pr_url"] = ""
+            upd_non_prom["pr_url"] = ""
+        upd_res = update_dev_pr_lock(
+            upd_non_prom,
             portfolio_dir=portfolio_dir,
             repo_slug=resolved_slug,
             workdir=target_dir,
             branch_name=resolved_branch,
             slot_id=slot_num,
+            preserve_statuses=protected_statuses,
         )
+        eff_lock = upd_res.get("lock") if isinstance(upd_res.get("lock"), dict) else lock_info
+        eff_status = str(eff_lock.get("status") or next_st)
+        is_human_ready = eff_status == "PENDING_HUMAN_PR_VALIDATION" and not is_escalated
+        eff_pr_url = str(eff_lock.get("manual_pr_url") or "") if is_human_ready else ""
         return {
             **rb_res.to_dict(),
             "slot_id": slot_num,
+            "lock_status": eff_status,
             "promoted_to_human_pr": False,
-            "ready_for_human_pr": False,
-            "pr_gate_ready": False,
-            "branch_pushed": False,
-            "manual_pr_url": "",
+            "ready_for_human_pr": is_human_ready,
+            "pr_gate_ready": bool(eff_lock.get("pr_gate_ready")) if is_human_ready else False,
+            "branch_pushed": bool(eff_lock.get("branch_pushed")) if is_human_ready else False,
+            "manual_pr_url": eff_pr_url,
         }
 
     # Needs agent intervention (`NEEDS_AGENT_SEMANTIC_FIX` or `NEEDS_AGENT_CONFLICT_RESOLUTION`)
@@ -3539,7 +3732,14 @@ def register_review_cli(sub: Any) -> None:
     p_rev.add_argument("--score", type=int, required=True, help="Quality score (0-100).")
     p_rev.add_argument("--summary", required=True, help="Detailed review evaluation summary.")
     p_rev.add_argument("--executive-summary", default="", help="Optional Executive Summary override.")
-    p_rev.add_argument("--subagent-id", default="", help="Reviewer subagent conversationId.")
+    p_rev.add_argument(
+        "--subagent-id",
+        "--reviewer-subagent-id",
+        "--reviewer-cid",
+        dest="subagent_id",
+        default="",
+        help="Reviewer subagent conversationId (aliases: --reviewer-subagent-id, --reviewer-cid).",
+    )
     p_rev.add_argument("--reviewer-model", dest="reviewer_model", default="", help="Optional actual reviewer model ID (e.g. pro or fallback model ID).")
     p_rev.add_argument("--dev-model", dest="dev_model", default="", help="Optional actual developer model ID override for created_by attribution.")
     p_rev.add_argument(
