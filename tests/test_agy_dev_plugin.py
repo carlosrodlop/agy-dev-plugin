@@ -2403,6 +2403,95 @@ class TestGitClientDevCommonAndRunnerCoverage(unittest.TestCase):
                 )
                 mock_restart.assert_called_once()
 
+    def test_post_merge_hook_uses_ssot_agy_dev_plugin_and_deploy_home_docstrings(self) -> None:
+        """Verify `post-merge` hook uses SSOT `agy-dev-plugin` `pr_remediator.py` and `deploy_repo_to_home` docs describe native root plugin layout."""
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = pathlib.Path(tmp)
+            _, clone = _create_bare_and_clone(troot, name="hook-repo")
+            fake_home = troot / "home"
+            fake_home.mkdir(parents=True)
+            state_dir = troot / "state"
+            state_dir.mkdir(parents=True)
+            vcs = git_client.GitVcsIntegrationClient(
+                env_overrides={"AGY_CONF_REPO_DIR": str(clone), "AGY_DEV_STATE_DIR": str(state_dir)}
+            )
+
+            # 1. Fresh sync installs executable SSOT post-merge hook without legacy wiz-tam-plugin / config/skills fallbacks
+            sync_res = vcs.sync_and_clean_local_repo(
+                repo_dir=clone,
+                home_dir=fake_home,
+                state_dir=state_dir,
+                deploy_to_home=False,
+            )
+            self.assertEqual(sync_res["status"], "ok")
+            self.assertTrue(sync_res["post_merge_hook_installed"])
+            post_merge_path = clone / ".git" / "hooks" / "post-merge"
+            self.assertTrue(post_merge_path.is_file())
+            self.assertEqual(stat.S_IMODE(post_merge_path.stat().st_mode), 0o755)
+            hook_text = post_merge_path.read_text(encoding="utf-8")
+            self.assertIn("# Managed by agy-dev-plugin git_client.py", hook_text)
+            self.assertIn(
+                '"$HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py"',
+                hook_text,
+            )
+            self.assertNotIn("wiz-tam-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py", hook_text)
+            self.assertNotIn("wiz-tam-plugin", hook_text)
+            self.assertNotIn("$HOME/.gemini/config/skills/agy-code-remediation-pr/scripts/pr_remediator.py", hook_text)
+            sh_syntax = subprocess.run(["sh", "-n", str(post_merge_path)], capture_output=True, text=True, check=False)
+            self.assertEqual(sh_syntax.returncode, 0, msg=sh_syntax.stderr)
+
+            # 2. Pre-existing managed hook with legacy wiz-tam-plugin fallback is upgraded in place
+            post_merge_path.write_text(
+                "#!/usr/bin/env sh\n"
+                "# Managed by agy-dev-plugin git_client.py — Pure Git Post-Merge Branch & Lock Cleaner\n"
+                'python3 "$HOME/.gemini/config/plugins/wiz-tam-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py"\n',
+                encoding="utf-8",
+            )
+            vcs.sync_and_clean_local_repo(
+                repo_dir=clone,
+                home_dir=fake_home,
+                state_dir=state_dir,
+                deploy_to_home=False,
+            )
+            upgraded_text = post_merge_path.read_text(encoding="utf-8")
+            self.assertEqual(upgraded_text, hook_text)
+            self.assertNotIn("wiz-tam-plugin", upgraded_text)
+
+            # 3. Unmanaged custom post-merge hook is preserved untouched
+            custom_hook = "#!/usr/bin/env sh\n# Custom user hook\necho custom\n"
+            post_merge_path.write_text(custom_hook, encoding="utf-8")
+            vcs.sync_and_clean_local_repo(
+                repo_dir=clone,
+                home_dir=fake_home,
+                state_dir=state_dir,
+                deploy_to_home=False,
+            )
+            self.assertEqual(post_merge_path.read_text(encoding="utf-8"), custom_hook)
+
+        # 4. Verify deploy_repo_to_home / sync_and_clean_local_repo docstrings & CLI help describe native root plugin layout
+        deploy_doc = git_client.GitVcsIntegrationClient.deploy_repo_to_home.__doc__ or ""
+        sync_doc = git_client.GitVcsIntegrationClient.sync_and_clean_local_repo.__doc__ or ""
+        self.assertIn("~/.gemini/config/plugins/<plugin>/", deploy_doc)
+        self.assertNotIn("src/home", deploy_doc)
+        self.assertIn("~/.gemini/config/plugins/<plugin>/", sync_doc)
+        self.assertNotIn("src/home", sync_doc)
+
+        for help_argv in (["--help"], ["deploy-home", "--help"]):
+            help_buf = io.StringIO()
+            with self.assertRaises(SystemExit) as help_ctx, contextlib.redirect_stdout(help_buf):
+                git_client.parse_args(help_argv)
+            self.assertEqual(help_ctx.exception.code, 0)
+            self.assertIn("~/.gemini/config/plugins/<plugin>/", help_buf.getvalue())
+            self.assertNotIn("src/home", help_buf.getvalue())
+
+        git_client_src = (REPO_ROOT / "clients" / "git_client.py").read_text(encoding="utf-8")
+        self.assertNotIn("wiz-tam-plugin/skills/agy-code-remediation-pr", git_client_src)
+        self.assertNotIn(".gemini/config/skills/agy-code-remediation-pr", git_client_src)
+        self.assertNotIn("wiz-agy-as-code", git_client_src)
+
     def test_dev_common_cli_companion_and_ledger_helpers(self) -> None:
         import contextlib
         import fcntl
