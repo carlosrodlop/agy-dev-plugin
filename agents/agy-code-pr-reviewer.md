@@ -31,7 +31,8 @@ You execute in an isolated conversation context following 0-LLM 3-Tier Risk Effo
 3. **Record Verdict & Enforce Hard PR Readiness Gate**:
    ```bash
    python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review \
-     --branch <BRANCH_NAME> --workdir <WORKTREE_OR_REPO> --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary "..." --send-email
+     --branch <BRANCH_NAME> --workdir <WORKTREE_OR_REPO> --reviewer-subagent-id <YOUR_CID> \
+     --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> --summary "..." --send-email
    ```
    - **On `PASS` with `score > 90` (`>= 91/100`)**: `record-review --send-email` resolves the active worktree, amends the HEAD commit with preserved Executive Summary + deterministic `## 🧪 Automated Verification Checks` + `## 🤖 Independent PR Review`, publishes `origin/<branch>`, sets `pr_gate_ready=True`, transitions `dev_queue.json` to `pr_open`, spawns `watch-pr-merge`, and returns `ready_for_human_pr: true` with clickable `manual_pr_url` and `notification_email_sent: false` (PR readiness is surfaced exclusively via `agy-queue` TUI, `dev_queue_board.md`, `dev_queue.json`, and chat `manual_pr_url` — zero PR-ready emails; `--send-email` is retained strictly for Round-3 `[🟥]` KO circuit-breaker escalations). Reviewers, orchestrators, and executors MUST NEVER invoke `gmail_draft_client.py` or `AGY_DEV_NOTIFY_CMD` for PR readiness emails.
    - **On `NEEDS_REVISION`, `WARN`, or `score <= 90`**: `record-review` keeps the branch local (`branch_pushed: false`, `manual_pr_url: ""`), strips stale compare `pr_urls`, and returns `ready_for_human_pr: false`, `needs_reiteration: true`, and `developer_remediation_plan` (up to 3 rounds; round 3 circuit-breaks to `ESCALATED_MAX_REVIEW_ITERATIONS` + `hitl_blocked` + `[🟥]` KO escalation alert when `--send-email` is passed).

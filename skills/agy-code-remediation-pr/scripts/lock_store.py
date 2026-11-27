@@ -1672,6 +1672,17 @@ def acquire_dev_pr_lock(
     return s1_res
 
 
+def _merge_subagent_cids(existing: Any, incoming: Any) -> list[str]:
+    """Return deduplicated non-empty subagent conversation IDs preserving insertion order."""
+    merged: list[str] = []
+    for raw_list in (existing if isinstance(existing, (list, tuple)) else [], incoming if isinstance(incoming, (list, tuple)) else []):
+        for raw in raw_list:
+            clean = str(raw or "").strip()
+            if clean and clean not in merged:
+                merged.append(clean)
+    return merged
+
+
 def update_dev_pr_lock(
     updates: dict[str, Any],
     portfolio_dir: Path | str | None = None,
@@ -1680,12 +1691,14 @@ def update_dev_pr_lock(
     workdir: Path | str | None = None,
     branch_name: str = "",
     slot_id: int | str | None = None,
+    preserve_statuses: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Update fields on the matching active per-repository lock (Slot #1 or follower Slot #2..#N) inside `actions_state.json`."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
     state_path = p_dir / "actions_state.json"
     lock_file = state_path.with_suffix(".json.lock")
     now_iso = _utc_now_iso()
+    protected_statuses = {str(s).strip().upper() for s in (preserve_statuses or ()) if str(s).strip()}
     sanitize_str_keys = (
         "summary",
         "proposed_fix",
@@ -1732,12 +1745,19 @@ def update_dev_pr_lock(
                     "error": f"No active Slot #{matched_slot} dev_pr_lock to update for `{target_slug or 'default'}`.",
                 }
             slot2_cur = dict(norm_cand["slots"][matched_slot])
+            cur_s2_status = str(slot2_cur.get("status") or "").strip().upper()
+            protect_s2 = bool(protected_statuses and cur_s2_status in protected_statuses)
             for k, v in updates.items():
-                if v is not None and k not in ("slots", "repo_branches"):
-                    if k in sanitize_str_keys and isinstance(v, str):
-                        slot2_cur[k] = _sanitize_home_paths(v)
-                    else:
-                        slot2_cur[k] = v
+                if v is None or k in ("slots", "repo_branches"):
+                    continue
+                if protect_s2 and k == "status" and str(v).strip().upper() not in protected_statuses:
+                    continue
+                if k == "subagent_conversation_ids" and isinstance(v, (list, tuple)):
+                    slot2_cur[k] = _merge_subagent_cids(slot2_cur.get(k), v)
+                elif k in sanitize_str_keys and isinstance(v, str):
+                    slot2_cur[k] = _sanitize_home_paths(v)
+                else:
+                    slot2_cur[k] = v
             slot2_cur["slot_id"] = _slot_sort_key(matched_slot)
             slot2_cur["active"] = True
             slot2_cur["last_activity_at"] = str(updates.get("last_activity_at") or now_iso)
@@ -1781,8 +1801,19 @@ def update_dev_pr_lock(
                     ),
                 }
         current_lock = dict(norm_cand)
+        slot1_mirror = (
+            dict(current_lock["slots"]["1"])
+            if isinstance(current_lock.get("slots"), dict) and isinstance(current_lock["slots"].get("1"), dict)
+            else None
+        )
+        cur_s1_status = str(current_lock.get("status") or "").strip().upper()
+        protect_s1 = bool(protected_statuses and cur_s1_status in protected_statuses)
         for k, v in updates.items():
             if v is None or k == "slots":
+                continue
+            if protect_s1 and k == "status" and str(v).strip().upper() not in protected_statuses:
+                continue
+            if protect_s1 and cur_s1_status == "PENDING_HUMAN_PR_VALIDATION" and bool(current_lock.get("branch_pushed")) and k == "head_sha":
                 continue
             if k == "repo_branches" and isinstance(v, dict):
                 current_lock["repo_branches"] = {
@@ -1790,10 +1821,22 @@ def update_dev_pr_lock(
                     for rb_k, rb_v in v.items()
                     if str(rb_k).strip() and not _is_slot_scoped_rb_key(str(rb_k)) and isinstance(rb_v, dict)
                 }
+            elif k == "subagent_conversation_ids" and isinstance(v, (list, tuple)):
+                merged_cids = _merge_subagent_cids(current_lock.get(k), v)
+                current_lock[k] = merged_cids
+                if slot1_mirror is not None:
+                    slot1_mirror[k] = merged_cids
             elif k in sanitize_str_keys and isinstance(v, str):
-                current_lock[k] = _sanitize_home_paths(v)
+                san_val = _sanitize_home_paths(v)
+                current_lock[k] = san_val
+                if slot1_mirror is not None:
+                    slot1_mirror[k] = san_val
             else:
                 current_lock[k] = v
+                if slot1_mirror is not None:
+                    slot1_mirror[k] = v
+        if slot1_mirror is not None and isinstance(current_lock.get("slots"), dict):
+            current_lock["slots"] = {**current_lock["slots"], "1": slot1_mirror}
         current_lock["repo_slug"] = target_slug
         current_lock["repo"] = target_slug
         current_lock["last_activity_at"] = str(updates.get("last_activity_at") or now_iso)
@@ -1816,14 +1859,19 @@ def record_dev_pr_lock_heartbeat(
     repo_slug: str = "",
     branch_name: str = "",
     worker_cid: str = "",
+    reviewer_subagent_id: str = "",
     stage_label: str = "",
     portfolio_dir: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Stamp `last_activity_at`, optional `worker_cid`, and optional `stage_label` on an active lock."""
+    """Stamp `last_activity_at` and optional `worker_cid`, `reviewer_subagent_id`, and `stage_label` on an active lock."""
     now_iso = _utc_now_iso()
     updates: dict[str, Any] = {"last_activity_at": now_iso}
     if str(worker_cid or "").strip():
         updates["worker_cid"] = str(worker_cid).strip()
+    rev_cid = str(reviewer_subagent_id or "").strip()
+    if rev_cid:
+        updates["reviewer_subagent_id"] = rev_cid
+        updates["subagent_conversation_ids"] = [rev_cid]
     if str(stage_label or "").strip():
         updates["stage_label"] = str(stage_label).strip()[:32]
     res = update_dev_pr_lock(
@@ -3010,11 +3058,21 @@ def register_lock_cli(sub: Any) -> None:
     p_rel.add_argument("--branch", default="", help="Optional branch name to match lock.")
     p_rel.add_argument("--all", dest="release_all", action="store_true", help="Release all active repository locks.")
 
-    p_hb = sub.add_parser("lock-heartbeat", help="Stamp last_activity_at, worker_cid, and optional stage label on an active dev_pr_lock.")
+    p_hb = sub.add_parser(
+        "lock-heartbeat",
+        help="Stamp last_activity_at, worker_cid, reviewer_subagent_id, and optional stage label on an active dev_pr_lock.",
+    )
     p_hb.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
     p_hb.add_argument("--repo", "--repo-slug", dest="repo_slug", default="", help="Optional owner/repo slug.")
     p_hb.add_argument("--branch", default="", help="Optional branch name to match lock.")
     p_hb.add_argument("--worker-cid", dest="worker_cid", default="", help="Active worker subagent conversation ID.")
+    p_hb.add_argument(
+        "--reviewer-subagent-id",
+        "--reviewer-cid",
+        dest="reviewer_subagent_id",
+        default="",
+        help="Active reviewer subagent conversation ID (alias: --reviewer-cid).",
+    )
     p_hb.add_argument("--stage", dest="stage_label", default="", help="Optional compact stage label (e.g., coding, tests).")
 
 
@@ -3082,13 +3140,17 @@ def dispatch_lock_cli(args: Any) -> int | None:
         return 0 if res.get("released") else 1
 
     if args.subcommand == "lock-heartbeat":
-        res = _facade_attr("record_dev_pr_lock_heartbeat", record_dev_pr_lock_heartbeat)(
-            workdir=getattr(args, "workdir", "") or None,
-            repo_slug=getattr(args, "repo_slug", ""),
-            branch_name=getattr(args, "branch", ""),
-            worker_cid=getattr(args, "worker_cid", ""),
-            stage_label=getattr(args, "stage_label", ""),
-        )
+        hb_kwargs: dict[str, Any] = {
+            "workdir": getattr(args, "workdir", "") or None,
+            "repo_slug": getattr(args, "repo_slug", ""),
+            "branch_name": getattr(args, "branch", ""),
+            "worker_cid": getattr(args, "worker_cid", ""),
+            "stage_label": getattr(args, "stage_label", ""),
+        }
+        rev_cid_arg = str(getattr(args, "reviewer_subagent_id", "") or "").strip()
+        if rev_cid_arg:
+            hb_kwargs["reviewer_subagent_id"] = rev_cid_arg
+        res = _facade_attr("record_dev_pr_lock_heartbeat", record_dev_pr_lock_heartbeat)(**hb_kwargs)
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
 
