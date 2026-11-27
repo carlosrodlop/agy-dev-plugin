@@ -60,6 +60,244 @@ KNOWN_MONOLITH_BASENAMES: frozenset[str] = frozenset(
         "git_client.py",
     }
 )
+ADDITIVE_REGISTRY_BASENAMES: frozenset[str] = frozenset(
+    {
+        "pyproject.toml",
+        "README.md",
+        "CHANGELOG.md",
+        "selective_test_runner.py",
+        "index.mjs",
+        "index.js",
+        "__init__.py",
+    }
+)
+BARREL_REEXPORT_BASENAMES: frozenset[str] = frozenset(
+    {
+        "index.mjs",
+        "index.js",
+        "__init__.py",
+        "wiz_common.py",
+    }
+)
+_HTML_ROOT_WRAPPER_NAMES: frozenset[str] = frozenset(
+    {
+        "html",
+        "body",
+        "main",
+        "#app",
+        "#app-shell",
+        "#app-root",
+        "#main",
+        "#main-content",
+        "#root",
+        "#layout",
+    }
+)
+_HTML_GLOBAL_SHELL_CUES: tuple[str, ...] = (
+    "sidebar",
+    "topbar",
+    "nav-account",
+    "brand-subtitle",
+    "global header",
+    "topbar-utility",
+    "oauth login",
+)
+_PROSE_FILE_LINE_RE = re.compile(
+    r"([A-Za-z0-9_./-]+\.(?:py|js|mjs|html|htm|css|toml|md))(?:#L?|:L?)(\d+)(?:\s*-\s*L?(\d+))?",
+    re.IGNORECASE,
+)
+_PROSE_DOM_ID_RE = re.compile(r"(?:^|[^A-Za-z0-9_])(#[A-Za-z][A-Za-z0-9_-]{2,63})\b")
+_PROSE_ATTR_ID_RE = re.compile(r"""\bid\s*=\s*['"]([A-Za-z][A-Za-z0-9_-]{2,63})['"]""")
+_PROSE_IDENT_TOKEN_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{5,80})\b")
+_HTML_VIEW_SLUG_ALIASES: dict[str, tuple[str, ...]] = {
+    "briefing": ("briefing", "airports-briefing", "dispatch"),
+    "radars": ("radars", "release-notes", "threat-intel", "global-attacks", "community-events"),
+    "checklist": ("checklist", "tasks"),
+    "settings": ("settings", "connectors", "tools", "skills", "plugins", "rules", "hooks", "actions", "activities"),
+    "notebook": ("notebook", "flight-plan"),
+    "flight_plan_stats": ("flight-plan-stats", "flight-plan", "notebook"),
+}
+
+
+def is_additive_registry_file(rel_path: str) -> bool:
+    """Return True when `rel_path` is an append-friendly registry, manifest, or barrel index."""
+    clean = str(rel_path or "").strip().replace("\\", "/")
+    if not clean:
+        return False
+    return Path(clean).name in ADDITIVE_REGISTRY_BASENAMES
+
+
+def is_barrel_reexport_file(rel_path: str, structure: FileStructure | None = None) -> bool:
+    """Return True when `rel_path` is a barrel/facade re-export module (`index.mjs`, `__init__.py`, etc.)."""
+    clean = str(rel_path or "").strip().replace("\\", "/")
+    if not clean:
+        return False
+    name = Path(clean).name
+    if name in BARREL_REEXPORT_BASENAMES:
+        return True
+    if structure is not None and structure.language in ("python", "javascript"):
+        if len(structure.resolved_local_imports) >= 3 and structure.total_lines <= 120:
+            non_banner_defs = [s for s in structure.sections if s.kind in ("function", "class", "method")]
+            if not non_banner_defs:
+                return True
+    return False
+
+
+def _touched_lines_mention_any(
+    rel_path: str,
+    line_ranges: Sequence[tuple[int, int]],
+    repo_dir: Path | None,
+    needles: Sequence[str],
+) -> bool:
+    """Return True if any line within `line_ranges` (+/-2 lines) in `rel_path` mentions any token in `needles`."""
+    if not line_ranges or repo_dir is None:
+        return True
+    clean_needles = [str(n).strip() for n in needles if str(n).strip()]
+    if not clean_needles:
+        return False
+    fpath = repo_dir / rel_path
+    if not fpath.is_file():
+        return True
+    try:
+        file_lines = fpath.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return True
+    total = len(file_lines)
+    if total == 0:
+        return False
+    for start_ln, end_ln in line_ranges:
+        lo = max(1, int(start_ln) - 2)
+        hi = min(total, int(end_ln) + 2)
+        snippet = "\n".join(file_lines[lo - 1 : hi])
+        for tok in clean_needles:
+            if tok in snippet:
+                return True
+    return False
+
+
+def _is_html_root_wrapper_span(span: SectionSpan, total_lines: int) -> bool:
+    """Return True when an HTML `SectionSpan` is a document/shell wrapper rather than a leaf page/component section."""
+    name_l = span.name.strip().lower()
+    if name_l in _HTML_ROOT_WRAPPER_NAMES:
+        return True
+    if total_lines >= 80 and span.kind == "html_section":
+        span_len = max(1, span.end_line - span.start_line + 1)
+        if span_len >= int(total_lines * 0.55):
+            return True
+    return False
+
+
+def _extract_prose_mentioned_tokens(prose: str) -> set[str]:
+    """Extract normalized symbol and DOM tokens explicitly mentioned in task prose/anchors."""
+    if not prose:
+        return set()
+    tokens: set[str] = set()
+    for m_bt in _BACKTICK_SYMBOL_RE.finditer(prose):
+        tok = m_bt.group(1).strip().rstrip("()")
+        if tok and "/" not in tok:
+            tokens.add(tok)
+            if "." in tok:
+                tokens.add(tok.rsplit(".", 1)[-1])
+    for m_id in _PROSE_IDENT_TOKEN_RE.finditer(prose):
+        tok = m_id.group(1)
+        if "_" in tok or any(ch.isupper() for ch in tok[1:]):
+            tokens.add(tok)
+    for m_dom in _PROSE_DOM_ID_RE.finditer(prose):
+        tokens.add(m_dom.group(1))
+    for m_aid in _PROSE_ATTR_ID_RE.finditer(prose):
+        tokens.add(f"#{m_aid.group(1)}")
+    return tokens
+
+
+def _infer_monolith_anchors_from_task(
+    rel: str,
+    structure: FileStructure,
+    task: TaskAnchorSpec,
+    task_files: Sequence[str],
+) -> tuple[list[tuple[int, int]], list[str]]:
+    """Deterministically infer `(line_ranges, symbol_or_section_tokens)` for an unanchored monolith touch.
+
+    Zero-LLM fail-closed inference: returns spans/tokens ONLY when concrete line ranges, `#id` anchors,
+    exact AST symbol names, or sibling view slugs match actual non-wrapper `SectionSpan`s in `structure`.
+    """
+    inferred_ranges: list[tuple[int, int]] = []
+    inferred_tokens: list[str] = []
+    prose = task.prose_context or ""
+    rel_norm = rel.strip().replace("\\", "/")
+    rel_name = Path(rel_norm).name
+
+    # 1. Explicit `path#Lstart-Lend` or `path:start-end` mentions inside prose
+    if prose:
+        for m_fl in _PROSE_FILE_LINE_RE.finditer(prose):
+            cand_f = m_fl.group(1).strip().replace("\\", "/").lstrip("./")
+            if cand_f == rel_norm or Path(cand_f).name == rel_name:
+                start_ln = max(1, int(m_fl.group(2)))
+                end_ln = max(start_ln, int(m_fl.group(3) or start_ln))
+                inferred_ranges.append((start_ln, end_ln))
+
+    # 2. HTML leaf-section inference (`#id` mentions + sibling view slug -> `#page-<slug>`)
+    if structure.language == "html":
+        leaf_sections = [
+            sp
+            for sp in structure.sections
+            if sp.kind != "banner" and not _is_html_root_wrapper_span(sp, structure.total_lines)
+        ]
+        leaf_by_lower = {sp.name.lower(): sp.name for sp in leaf_sections}
+
+        if prose:
+            for m_dom in _PROSE_DOM_ID_RE.finditer(prose):
+                cand_id = m_dom.group(1).lower()
+                if cand_id in leaf_by_lower and leaf_by_lower[cand_id] not in inferred_tokens:
+                    inferred_tokens.append(leaf_by_lower[cand_id])
+            for m_aid in _PROSE_ATTR_ID_RE.finditer(prose):
+                cand_id = f"#{m_aid.group(1).lower()}"
+                if cand_id in leaf_by_lower and leaf_by_lower[cand_id] not in inferred_tokens:
+                    inferred_tokens.append(leaf_by_lower[cand_id])
+
+        # Infer page sections from sibling view files (e.g. `web/js/views/features.mjs` -> `#page-features`)
+        view_slugs: list[str] = []
+        for tf in task_files:
+            tf_norm = str(tf or "").strip().replace("\\", "/")
+            if "/views/" in tf_norm or tf_norm.startswith("web/js/views/"):
+                stem = Path(tf_norm).stem.lower()
+                if stem and stem != "index":
+                    for alias in _HTML_VIEW_SLUG_ALIASES.get(stem, (stem, stem.replace("_", "-"))):
+                        if alias not in view_slugs:
+                            view_slugs.append(alias)
+
+        for slug in view_slugs:
+            for prefix in ("#page-", "#view-", "#section-", "#tab-", "#"):
+                cand = f"{prefix}{slug}"
+                if cand in leaf_by_lower and leaf_by_lower[cand] not in inferred_tokens:
+                    inferred_tokens.append(leaf_by_lower[cand])
+
+        # If prose mentions global shell components (sidebar/topbar/header), include those landmark spans too
+        # so global-shell tasks never falsely pretend to be isolated to a single page section.
+        prose_l = prose.lower()
+        if any(cue in prose_l for cue in _HTML_GLOBAL_SHELL_CUES):
+            for shell_name in ("nav", "header", "#sidebar", "#topbar", "#topbar-utility-right", "#nav-sidebar"):
+                if shell_name in leaf_by_lower and leaf_by_lower[shell_name] not in inferred_tokens:
+                    inferred_tokens.append(leaf_by_lower[shell_name])
+
+        return inferred_ranges, inferred_tokens
+
+    # 3. Python / JS monolith exact-symbol matching from unbackticked prose identifiers
+    if structure.language in ("python", "javascript") and prose:
+        known_syms: dict[str, str] = {}
+        for sp in structure.sections:
+            if sp.kind in ("function", "class", "method"):
+                known_syms[sp.name] = sp.name
+                if "." in sp.name:
+                    tail = sp.name.rsplit(".", 1)[-1]
+                    if len(tail) >= 6:
+                        known_syms.setdefault(tail, sp.name)
+        for tok in _extract_prose_mentioned_tokens(prose):
+            if len(tok) >= 6 and tok in known_syms:
+                matched_sym = known_syms[tok]
+                if matched_sym not in inferred_tokens:
+                    inferred_tokens.append(matched_sym)
+
+    return inferred_ranges, inferred_tokens
 
 SKIP_SCAN_DIRS: frozenset[str] = frozenset(
     {
@@ -607,65 +845,106 @@ class BatchOverlapAnalysis:
 # ==============================================================================
 
 
+def _split_multi_anchor_tokens(
+    anchor_raw: str,
+) -> tuple[list[tuple[int, int]], list[str]]:
+    """Parse compound anchor specs (`sym1,sym2`, `sym:L10-L20`, `L10-L20,L30-L40`, `#id`) into `(line_ranges, symbols)`."""
+    ranges: list[tuple[int, int]] = []
+    symbols: list[str] = []
+    clean = str(anchor_raw or "").strip()
+    if not clean:
+        return (ranges, symbols)
+
+    # Handle `sym1,sym2:L10-L20,L30-L40` by splitting trailing `:L...` range suffix from symbol prefix
+    segments = [clean]
+    if ":" in clean and not clean.startswith(":"):
+        left_s, right_s = clean.split(":", 1)
+        right_parts = [p.strip() for p in right_s.split(",") if p.strip()]
+        if right_parts and all(_ANCHOR_LINE_RANGE_RE.match(p) for p in right_parts):
+            segments = [left_s, *right_parts]
+
+    for seg in segments:
+        for raw_part in seg.split(","):
+            part = raw_part.strip()
+            if not part:
+                continue
+            m_lines = _ANCHOR_LINE_RANGE_RE.match(part)
+            if m_lines:
+                start_ln = max(1, int(m_lines.group(1)))
+                end_ln = max(start_ln, int(m_lines.group(2) or start_ln))
+                ranges.append((start_ln, end_ln))
+            else:
+                norm_sym = _normalize_anchor_token(part)
+                if norm_sym and norm_sym not in symbols:
+                    symbols.append(norm_sym)
+    return (ranges, symbols)
+
+
+def parse_target_anchor_entries(
+    raw_spec: str,
+    *,
+    repo_dir: Path | None = None,
+    repo_slug: str = "",
+) -> tuple[str, list[tuple[int, int]], list[str]]:
+    """Parse a target file or compound section anchor string into `(rel_path, line_ranges, symbols)`.
+
+    Supports all single and compound forms observed across `dev_queue.json` & lock anchors:
+      - `web/index.html::id1,id2` and `web/index.html::id1,id2:L101-L276`
+      - `api/routers/features.py:_build_link` and `web/index.html:#page-features`
+      - `g-control-tower:web/index.html:topbar-utility-right`
+      - `web/dashboard.js#L120-L180` / `web/dashboard.js:120-180` / `web/dashboard.js#renderOverview`
+    """
+    text = str(raw_spec or "").strip()
+    if not text:
+        return ("", [], [])
+
+    repo_prefix, stripped_text = split_repo_prefixed_target(text)
+    if repo_prefix:
+        if repo_slug and not _repo_prefix_matches_slug(repo_prefix, repo_slug):
+            return ("", [], [])
+        text = stripped_text
+        if not text:
+            return ("", [], [])
+
+    file_part = text
+    anchor_part = ""
+    if "::" in text:
+        file_part, anchor_part = text.split("::", 1)
+    elif "#" in text and ":" not in text.split("#", 1)[0]:
+        left, right = text.split("#", 1)
+        if left.strip():
+            file_part, anchor_part = left, right
+        else:
+            r_list, s_list = _split_multi_anchor_tokens(right)
+            return ("", r_list, s_list)
+    elif ":" in text:
+        # Support `path/to/file.py:symbol`, `path/to/file.html:#page-x`, `path/to/file.py:L10-L20`
+        left, right = text.split(":", 1)
+        if left.strip() and right.strip():
+            left_l = left.strip().lower()
+            is_file_like = any(
+                left_l.endswith(ext)
+                for ext in (".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".html", ".htm", ".css", ".sh", ".md", ".json", ".toml", ".yaml", ".yml")
+            )
+            if is_file_like or _ANCHOR_LINE_RANGE_RE.match(right.strip()):
+                file_part, anchor_part = left, right
+
+    rel_path = _normalize_rel_path(file_part, repo_dir=repo_dir)
+    if not anchor_part.strip():
+        return (rel_path, [], [])
+    r_list, s_list = _split_multi_anchor_tokens(anchor_part)
+    return (rel_path, r_list, s_list)
+
+
 def parse_target_anchor_string(
     raw_spec: str,
     *,
     repo_dir: Path | None = None,
     repo_slug: str = "",
 ) -> tuple[str, tuple[int, int] | None, str]:
-    """Parse a target file or section anchor string into `(rel_path, optional_line_range, symbol_or_section)`.
-
-    Supported forms (including optional `<repo_name>:` or `<owner>/<repo_name>:` prefixes):
-      - `agy-dev-plugin:tests/test_agy_dev_plugin.py`
-      - `carlosrodlop/agy-dev-plugin:tests/test_agy_dev_plugin.py`
-      - `web/dashboard.js#L120-L180` or `web/dashboard.js:120-180`
-      - `skills/.../pr_remediator.py::record_pr_review_evaluation`
-      - `web/dashboard.js#renderOverview`
-      - `styles.css#root-tokens`
-      - `clients/git_client.py`
-
-    When `repo_slug` is provided and `raw_spec` carries an explicit prefix for a *different*
-    repository, returns `("", None, "")` so cross-repo multi-repo entries never collide falsely.
-    """
-    text = str(raw_spec or "").strip()
-    if not text:
-        return ("", None, "")
-
-    repo_prefix, stripped_text = split_repo_prefixed_target(text)
-    if repo_prefix:
-        if repo_slug and not _repo_prefix_matches_slug(repo_prefix, repo_slug):
-            return ("", None, "")
-        text = stripped_text
-        if not text:
-            return ("", None, "")
-
-    file_part = text
-    anchor_part = ""
-    if "::" in text:
-        file_part, anchor_part = text.split("::", 1)
-    elif "#" in text:
-        left, right = text.split("#", 1)
-        if left.strip():
-            file_part, anchor_part = left, right
-        else:
-            return ("", None, _normalize_anchor_token(right))
-    elif ":" in text:
-        left, right = text.rsplit(":", 1)
-        if _ANCHOR_LINE_RANGE_RE.match(right.strip()) and left.strip():
-            file_part, anchor_part = left, right
-
-    rel_path = _normalize_rel_path(file_part, repo_dir=repo_dir)
-    anchor_clean = anchor_part.strip()
-    if not anchor_clean:
-        return (rel_path, None, "")
-
-    m_lines = _ANCHOR_LINE_RANGE_RE.match(anchor_clean)
-    if m_lines:
-        start_ln = max(1, int(m_lines.group(1)))
-        end_ln = max(start_ln, int(m_lines.group(2) or start_ln))
-        return (rel_path, (start_ln, end_ln), "")
-
-    return (rel_path, None, _normalize_anchor_token(anchor_clean))
+    """Parse a target file or section anchor string into `(rel_path, optional_line_range, symbol_or_section)`."""
+    rel_path, r_list, s_list = parse_target_anchor_entries(raw_spec, repo_dir=repo_dir, repo_slug=repo_slug)
+    return (rel_path, r_list[0] if r_list else None, s_list[0] if s_list else "")
 
 
 # ==============================================================================
@@ -2015,7 +2294,10 @@ def _match_anchor_against_structure(
 
     exact: list[SectionSpan] = []
     fuzzy: list[SectionSpan] = []
+    is_html = structure.language == "html"
     for sec in structure.sections:
+        if is_html and _is_html_root_wrapper_span(sec, structure.total_lines):
+            continue
         sec_norm = _normalize_anchor_token(sec.name)
         sec_lower = sec_norm.lower()
         sec_slug = _slugify_section(sec.name)
@@ -2048,32 +2330,28 @@ def resolve_task_touches(
     explicit_whole_files: set[str] = set()
 
     for raw_tf in task.target_files:
-        rel, lrange, sym = parse_target_anchor_string(raw_tf, repo_dir=repo_dir, repo_slug=eff_repo_slug)
+        rel, lranges, syms = parse_target_anchor_entries(raw_tf, repo_dir=repo_dir, repo_slug=eff_repo_slug)
         if not rel:
-            if sym:
-                global_tokens.append(sym)
+            global_tokens.extend(syms)
             continue
         file_ranges.setdefault(rel, [])
         file_tokens.setdefault(rel, [])
-        if lrange is not None:
-            file_ranges[rel].append(lrange)
-        elif sym:
-            file_tokens[rel].append(sym)
+        if lranges or syms:
+            file_ranges[rel].extend(lranges)
+            file_tokens[rel].extend(syms)
         else:
             explicit_whole_files.add(rel)
 
     for raw_sec in task.section_anchors:
-        rel, lrange, sym = parse_target_anchor_string(raw_sec, repo_dir=repo_dir, repo_slug=eff_repo_slug)
+        rel, lranges, syms = parse_target_anchor_entries(raw_sec, repo_dir=repo_dir, repo_slug=eff_repo_slug)
         if rel:
             file_ranges.setdefault(rel, [])
             file_tokens.setdefault(rel, [])
             explicit_whole_files.discard(rel)
-            if lrange is not None:
-                file_ranges[rel].append(lrange)
-            if sym:
-                file_tokens[rel].append(sym)
-        elif sym:
-            global_tokens.append(sym)
+            file_ranges[rel].extend(lranges)
+            file_tokens[rel].extend(syms)
+        elif syms:
+            global_tokens.extend(syms)
 
     # Fall back to `git diff --name-only <base_sha>...HEAD` (+ staged/unstaged/untracked) when `target_files` is empty
     # or supplement active branch/worktree changes so overlap detection never misses live Slot #1 edits.
@@ -2109,8 +2387,9 @@ def resolve_task_touches(
             if "/" not in cand_tok and len(cand_tok) >= 4:
                 prose_tokens.append(_normalize_anchor_token(cand_tok.rstrip("()")))
 
+    all_task_files = sorted(set(file_ranges.keys()) | set(file_tokens.keys()))
     resolved: dict[str, ResolvedFileTouch] = {}
-    for rel in sorted(set(file_ranges.keys()) | set(file_tokens.keys())):
+    for rel in all_task_files:
         st = (
             structures[rel]
             if (structures is not None and rel in structures)
@@ -2124,9 +2403,6 @@ def resolve_task_touches(
         ref_ids: list[str] = []
 
         tokens_for_file = [*file_tokens.get(rel, ()), *global_tokens]
-        if not ranges and not tokens_for_file and st.is_monolith and prose_tokens:
-            tokens_for_file = prose_tokens
-
         for tok in tokens_for_file:
             spans = _match_anchor_against_structure(tok, st)
             for sp in spans:
@@ -2146,11 +2422,39 @@ def resolve_task_touches(
                     if rid not in ref_ids:
                         ref_ids.append(rid)
 
+        # Fallback: when explicit anchors produced 0 resolved spans on a monolith, run deterministic
+        # prose/view-to-section inference before degrading to `whole_file=True`.
+        if not ranges and st.is_monolith:
+            inf_ranges, inf_tokens = _infer_monolith_anchors_from_task(rel, st, task, all_task_files)
+            if inf_ranges:
+                ranges.extend(inf_ranges)
+            fallback_tokens = list(inf_tokens) if inf_tokens else list(prose_tokens)
+            for tok in fallback_tokens:
+                spans = _match_anchor_against_structure(tok, st)
+                for sp in spans:
+                    ranges.append((sp.start_line, sp.end_line))
+                    if sp.name not in matched_secs:
+                        matched_secs.append(sp.name)
+                    if sp.kind in ("function", "class", "method") and sp.name not in matched_syms:
+                        matched_syms.append(sp.name)
+                        if "." in sp.name:
+                            matched_syms.append(sp.name.rsplit(".", 1)[-1])
+                    if sp.is_interface:
+                        touches_iface = True
+                    for c in sp.calls:
+                        if c not in calls:
+                            calls.append(c)
+                    for rid in sp.referenced_ids:
+                        if rid not in ref_ids:
+                            ref_ids.append(rid)
+
         # Also map explicit/diff line ranges onto enclosing AST/JS/HTML/CSS spans
         if ranges:
             for r_start, r_end in list(ranges):
                 for sp in st.sections:
                     if sp.kind == "banner":
+                        continue
+                    if st.language == "html" and _is_html_root_wrapper_span(sp, st.total_lines):
                         continue
                     if max(r_start, sp.start_line) <= min(r_end, sp.end_line):
                         if sp.name not in matched_secs:
@@ -2449,13 +2753,17 @@ def analyze_pair_overlap(
         if reason and reason not in reasons:
             reasons.append(reason)
 
-    # 2. Evaluate shared files (including monolith section-level disjointness)
+    # 2. Evaluate shared files (including monolith section-level disjointness & additive registries)
     for shared_rel in shared_files:
         ta = touches_a[shared_rel]
         tb = touches_b[shared_rel]
         st = structures.get(shared_rel) or extract_file_structure(shared_rel, repo_dir=r_dir, py_index=py_index)
 
         if ta.whole_file or tb.whole_file:
+            if is_additive_registry_file(shared_rel) and not _ranges_overlap(ta.line_ranges, tb.line_ranges):
+                disjoint_monolith_files.append(shared_rel)
+                _escalate(OVERLAP_TRANSITIVE, f"additive_registry_file:{shared_rel}")
+                continue
             colliding_files.append(shared_rel)
             _escalate(OVERLAP_DEEP_SHARED, f"whole_file_collision:{shared_rel}")
             continue
@@ -2487,11 +2795,21 @@ def analyze_pair_overlap(
     # 3. Evaluate cross-file import graph & HTML/CSS/JS interface contracts
     files_a_set = set(touches_a.keys())
     files_b_set = set(touches_b.keys())
+    mentioned_a = _extract_prose_mentioned_tokens(
+        "\n".join([spec_a.prose_context, *spec_a.section_anchors, *spec_a.symbol_hints])
+    )
+    mentioned_b = _extract_prose_mentioned_tokens(
+        "\n".join([spec_b.prose_context, *spec_b.section_anchors, *spec_b.symbol_hints])
+    )
+    has_context_a = bool(spec_a.prose_context.strip() or spec_a.section_anchors or spec_a.symbol_hints)
+    has_context_b = bool(spec_b.prose_context.strip() or spec_b.section_anchors or spec_b.symbol_hints)
 
     def _check_directional_imports(
         importers: Mapping[str, ResolvedFileTouch],
         upstreams: Mapping[str, ResolvedFileTouch],
         upstream_set: set[str],
+        upstream_mentioned: set[str],
+        upstream_has_context: bool,
     ) -> None:
         for imp_rel, imp_touch in importers.items():
             imp_struct = structures.get(imp_rel) or extract_file_structure(imp_rel, repo_dir=r_dir, py_index=py_index)
@@ -2503,12 +2821,27 @@ def analyze_pair_overlap(
                 if edge_str not in import_edges:
                     import_edges.append(edge_str)
                 up_touch = upstreams[dst_rel]
+                dst_struct = structures.get(dst_rel) or extract_file_structure(dst_rel, repo_dir=r_dir, py_index=py_index)
                 imported_syms = set(imp_struct.imported_symbols.get(dst_rel, ("*",)))
                 up_syms = {s.rsplit(".", 1)[-1] for s in up_touch.matched_symbols} | set(up_touch.matched_symbols)
 
                 if up_touch.whole_file:
-                    interface_collisions.append(f"{edge_str}:whole_module")
-                    _escalate(OVERLAP_INTERFACE_SHARED, f"direct_import_whole_module:{edge_str}")
+                    if is_barrel_reexport_file(dst_rel, dst_struct):
+                        if "*" not in imported_syms and (imported_syms & upstream_mentioned):
+                            for sym_hit in sorted(imported_syms & upstream_mentioned):
+                                interface_collisions.append(f"{edge_str}:{sym_hit}")
+                            _escalate(OVERLAP_INTERFACE_SHARED, f"barrel_imported_symbol_modified:{edge_str}")
+                        else:
+                            _escalate(OVERLAP_TRANSITIVE, f"barrel_reexport_import:{edge_str}")
+                    elif is_barrel_reexport_file(imp_rel, imp_struct) and not imp_touch.whole_file:
+                        # Aggregator barrel (e.g. `api/routers/portfolio/__init__.py`) touched only specific lines
+                        # for another sibling router, not colliding with `dst_rel`!
+                        _escalate(OVERLAP_TRANSITIVE, f"barrel_aggregator_import:{edge_str}")
+                    elif "*" not in imported_syms and upstream_has_context and not (imported_syms & upstream_mentioned):
+                        _escalate(OVERLAP_TRANSITIVE, f"direct_import_unmentioned_symbols:{edge_str}")
+                    else:
+                        interface_collisions.append(f"{edge_str}:whole_module")
+                        _escalate(OVERLAP_INTERFACE_SHARED, f"direct_import_whole_module:{edge_str}")
                 elif "*" in imported_syms and up_touch.touches_interface:
                     # Check if HTML/JS/CSS references specific DOM IDs or CSS tokens
                     up_contracts = set(up_touch.referenced_ids) | set(up_touch.matched_sections)
@@ -2521,13 +2854,29 @@ def analyze_pair_overlap(
                             _escalate(OVERLAP_INTERFACE_SHARED, f"shared_ui_contract:{edge_str}")
                         else:
                             _escalate(OVERLAP_TRANSITIVE, f"disjoint_ui_asset_import:{edge_str}")
+                    elif is_barrel_reexport_file(dst_rel, dst_struct):
+                        _escalate(OVERLAP_TRANSITIVE, f"barrel_reexport_import:{edge_str}")
                     else:
                         interface_collisions.append(f"{edge_str}:wildcard_interface")
                         _escalate(OVERLAP_INTERFACE_SHARED, f"direct_import_interface:{edge_str}")
                 elif imported_syms & up_syms:
-                    for sym_hit in sorted(imported_syms & up_syms):
-                        interface_collisions.append(f"{edge_str}:{sym_hit}")
-                    _escalate(OVERLAP_INTERFACE_SHARED, f"direct_imported_symbol:{edge_str}")
+                    hit_syms = sorted(imported_syms & up_syms)
+                    if (
+                        is_barrel_reexport_file(imp_rel, imp_struct)
+                        and not imp_touch.whole_file
+                        and imp_touch.line_ranges
+                        and not _touched_lines_mention_any(
+                            imp_rel,
+                            imp_touch.line_ranges,
+                            r_dir,
+                            [*hit_syms, Path(dst_rel).stem],
+                        )
+                    ):
+                        _escalate(OVERLAP_TRANSITIVE, f"barrel_aggregator_disjoint_lines:{edge_str}")
+                    else:
+                        for sym_hit in hit_syms:
+                            interface_collisions.append(f"{edge_str}:{sym_hit}")
+                        _escalate(OVERLAP_INTERFACE_SHARED, f"direct_imported_symbol:{edge_str}")
                 else:
                     _escalate(OVERLAP_TRANSITIVE, f"direct_import_disjoint_symbols:{edge_str}")
 
@@ -2539,8 +2888,8 @@ def analyze_pair_overlap(
                     import_edges.append(edge_str)
                 _escalate(OVERLAP_TRANSITIVE, f"transitive_import:{edge_str}")
 
-    _check_directional_imports(touches_a, touches_b, files_b_set)
-    _check_directional_imports(touches_b, touches_a, files_a_set)
+    _check_directional_imports(touches_a, touches_b, files_b_set, mentioned_b, has_context_b)
+    _check_directional_imports(touches_b, touches_a, files_a_set, mentioned_a, has_context_a)
 
     # Cross-file DOM `#id` and CSS `--token` contract collisions across distinct frontend files
     ui_langs = {"html", "javascript", "css"}

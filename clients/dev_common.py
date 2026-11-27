@@ -190,6 +190,17 @@ PARALLEL_KNOWN_MONOLITH_BASENAMES: frozenset[str] = frozenset(
         "git_client.py",
     }
 )
+PARALLEL_ADDITIVE_REGISTRY_BASENAMES: frozenset[str] = frozenset(
+    {
+        "pyproject.toml",
+        "README.md",
+        "CHANGELOG.md",
+        "selective_test_runner.py",
+        "index.mjs",
+        "index.js",
+        "__init__.py",
+    }
+)
 _LEASE_LINE_RANGE_RE = re.compile(r"^L?\d+(?:\s*-\s*L?\d+)?$", re.IGNORECASE)
 _LEASE_REPO_PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]{2,}(?:/[A-Za-z0-9_.-]+)?$")
 _LEASE_SINGLE_COLON_RE = re.compile(r"(?<!:):(?!:)")
@@ -2114,10 +2125,11 @@ class DevLifecycleGuardrailEvaluator:
 
     @staticmethod
     def _is_monolith_target_file(rel_path: str, candidate_roots: Sequence[Path]) -> bool:
-        """Return True (`<0.5ms`) when `rel_path` is a known monolith basename or `>= 250` lines on disk."""
+        """Return True (`<0.5ms`) when `rel_path` is a known monolith, additive registry/barrel, or `>= 250` lines on disk."""
         if not rel_path:
             return False
-        if Path(rel_path).name in PARALLEL_KNOWN_MONOLITH_BASENAMES:
+        fname = Path(rel_path).name
+        if fname in PARALLEL_KNOWN_MONOLITH_BASENAMES or fname in PARALLEL_ADDITIVE_REGISTRY_BASENAMES:
             return True
         for root in candidate_roots:
             fpath = root / rel_path
