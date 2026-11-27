@@ -207,6 +207,7 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
         if (
             norm.endswith(
                 (
+                    "dev_common.py",
                     "orchestration_control.py",
                     "test_orchestration_pause_resume.py",
                     "pr_remediator.py",
