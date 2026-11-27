@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Layer 1 VCS-Interoperable Native Git & SSH Integration Client (`git_vcs.py`).
+"""Layer 1 VCS-Interoperable Native Git & SSH Integration Client (`git_client.py`).
 
 Provides 100% VCS-interoperable (GitHub, GitLab, Bitbucket, Gitea, self-hosted Git) operations
 using exclusively native `/usr/bin/git` and `/usr/bin/ssh` with zero proprietary REST API calls:
@@ -10,7 +10,8 @@ using exclusively native `/usr/bin/git` and `/usr/bin/ssh` with zero proprietary
   - Protected timestamped branch push (`push_branch` — refuses pushing `main`/`master`)
   - Remote branch existence & ancestor-merge inspection (`inspect_remote_branch_state`)
   - Native local & remote branch deletion (`delete_branch_native`)
-  - Post-merge `main` fast-forward synchronization & remote-cleaned local branch/worktree pruning (`sync_and_clean_local_repo`)"""
+  - Post-merge `main` fast-forward synchronization & remote-cleaned local branch/worktree pruning (`sync_and_clean_local_repo`)
+  - Atomic native root plugin deployment to `~/.gemini/config/plugins/<plugin>/` (`deploy_repo_to_home`)"""
 
 from __future__ import annotations
 
@@ -1281,7 +1282,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         home_dir: Path | None = None,
         state_dir: Path | str | None = None,
     ) -> dict[str, Any]:
-        """Synchronize local `base_branch` (`main`) with `<remote>/<base_branch>`, prune local branches/worktrees cleaned on `<remote>`, and atomically deploy `src/home/` (`main`) to `$HOME`."""
+        """Synchronize local `base_branch` (`main`) with `<remote>/<base_branch>`, prune local branches/worktrees cleaned on `<remote>`, and atomically deploy the native root plugin layout (`main`) to `~/.gemini/config/plugins/<plugin>/`."""
         clean_base = (base_branch or "main").strip()
         env_repo_dir = os.environ.get("AGY_CONF_REPO_DIR", "").strip()
         repo_cand = Path(env_repo_dir).expanduser() if env_repo_dir else None
@@ -1345,15 +1346,10 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     'if [ "${AGY_OFFLINE_ONLY:-0}" = "1" ] || [ "${PRE_COMMIT_HOOK:-0}" = "1" ]; then\n'
                     "  exit 0\n"
                     "fi\n"
-                    'for _pr_rem in '
-                    '"$HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py" '
-                    '"$HOME/.gemini/config/plugins/wiz-tam-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py" '
-                    '"$HOME/.gemini/config/skills/agy-code-remediation-pr/scripts/pr_remediator.py"; do\n'
-                    '  if [ -f "$_pr_rem" ]; then\n'
-                    '    python3 "$_pr_rem" lock-status --sync-git >/dev/null 2>&1 &\n'
-                    '    break\n'
-                    '  fi\n'
-                    'done\n'
+                    '_pr_rem="$HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py"\n'
+                    'if [ -f "$_pr_rem" ]; then\n'
+                    '  python3 "$_pr_rem" lock-status --sync-git >/dev/null 2>&1 &\n'
+                    "fi\n"
                     "exit 0\n"
                 )
                 try:
@@ -1364,7 +1360,6 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     )
                     if (
                         not existing_hook
-                        or "Managed by wiz-agy-as-code git_vcs.py" in existing_hook
                         or "Managed by agy-dev-plugin git_client.py" in existing_hook
                     ):
                         if existing_hook != post_merge_script:
@@ -1846,16 +1841,17 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         *,
         _allow_in_tests: bool = False,
     ) -> dict[str, Any]:
-        """Atomically deploy tracked plugin/customization files from the pinned `main` checkout into `$HOME` in `<15 ms` using `git ls-files`.
+        """Atomically deploy the native root plugin layout from the pinned `main` checkout to `~/.gemini/config/plugins/<plugin>/` in `<15 ms` using `git ls-files`.
 
         Guarantees `origin/main` is the single source of truth:
+          - Maps root-level plugin manifests (`plugin.json`, `hooks.json`, `mcp_config.json`, `requirements.json`) and directories (`skills/`, `agents/`, `rules/`, `clients/`, `assets/`, `shell/`, `sidecars/`) into `~/.gemini/config/plugins/<plugin>/`.
           - Refuses to deploy to `$HOME` if `repo_dir` is checked out on an unmerged `fix/*` branch (`require_base_branch="main"`).
           - Refuses unisolated `unittest`/`pytest` runs targeting real `$HOME` unless explicitly opted in.
           - Re-execs a single fresh subprocess pass (`AGY_DEPLOY_REEXEC=1`) when `clients/git_client.py` itself is updated so newly added tracked roots deploy atomically without stale `prune_orphans` deletion.
-          - Expands `$HOME/` in `.gemini/config/mcp_config.json`, `.gemini/config/hooks.json`, plugin manifests (`hooks.json`, `mcp_config.json`, `requirements.json`), and `.gemini/config/sidecars/*.json`.
-          - Stamps the live `HEAD` `<short_sha>-<YYYYMMDD>` into `.gemini/config/plugins/<plugin_name>/plugin.json`.
-          - Applies deterministic permissions (`0755` for scripts/clients/bin, `0600` for `.ssh/*`, `0644` otherwise).
-          - Prunes orphaned files in managed customization subdirectories of `$HOME` so rejected branch edits never linger.
+          - Expands `$HOME/` in plugin manifests (`hooks.json`, `mcp_config.json`, `requirements.json`) and `sidecars/**/*.json` descriptors.
+          - Stamps the live `HEAD` `<short_sha>-<YYYYMMDD>` into `~/.gemini/config/plugins/<plugin>/plugin.json`.
+          - Applies deterministic permissions (`0755` for executable scripts/clients/wrappers/sidecars, `0600` for `.ssh/*`, `0644` otherwise) and syncs `~/.local/bin/{agy-queue,agy-doctor}` symlinks when present.
+          - Prunes orphaned files in managed plugin subdirectories under `$HOME` so rejected branch edits never linger.
         """
         target_dir = repo_dir or self.resolve_repo_dir()
         target_home = (
@@ -2418,7 +2414,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     p_deploy = sub.add_parser(
         "deploy-home",
-        help="Atomically deploy tracked src/home/ files from the pinned main branch into $HOME using git ls-files.",
+        help="Atomically deploy the tracked native root plugin layout from the pinned main branch to ~/.gemini/config/plugins/<plugin>/ using git ls-files.",
+        description="Atomically deploy the tracked native root plugin layout from the pinned main branch to ~/.gemini/config/plugins/<plugin>/ using git ls-files.",
     )
     p_deploy.add_argument("--base", default="main", help="Required base branch name (default: main).")
     p_deploy.add_argument("--repo-dir", default="", help="Optional repository directory override.")
