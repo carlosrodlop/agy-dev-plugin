@@ -31,8 +31,11 @@ from pathlib import Path
 import os
 import re
 import shutil
+import site
 import subprocess
 import sys
+import sysconfig
+import tempfile
 import time
 from typing import Any, Literal
 import urllib.parse
@@ -1281,8 +1284,10 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         deploy_to_home: bool | None = None,
         home_dir: Path | None = None,
         state_dir: Path | str | None = None,
+        *,
+        site_packages_dir: Path | str | None = None,
     ) -> dict[str, Any]:
-        """Synchronize local `base_branch` (`main`) with `<remote>/<base_branch>`, prune local branches/worktrees cleaned on `<remote>`, and atomically deploy the native root plugin layout (`main`) to `~/.gemini/config/plugins/<plugin>/`."""
+        """Synchronize local `base_branch` (`main`) with `<remote>/<base_branch>`, prune local branches/worktrees cleaned on `<remote>`, and atomically deploy the native root plugin layout (`main`) to `~/.gemini/config/plugins/<plugin>/` or `g-control-tower` runtime (`site-packages/api` + `$HOME/.gemini/config/`)."""
         clean_base = (base_branch or "main").strip()
         env_repo_dir = os.environ.get("AGY_CONF_REPO_DIR", "").strip()
         repo_cand = Path(env_repo_dir).expanduser() if env_repo_dir else None
@@ -1732,6 +1737,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                             (target_dir / "plugin.json").is_file()
                             or (target_dir / "home").is_dir()
                             or (target_dir / "src" / "home").is_dir()
+                            or self._is_control_tower_repo(target_dir)
                         )
                     )
                 )
@@ -1745,6 +1751,7 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                 repo_dir=target_dir,
                 home_dir=home_dir,
                 require_base_branch=clean_base,
+                site_packages_dir=site_packages_dir,
             )
 
         return {
@@ -1832,6 +1839,307 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     (bin_dir / f".{link_name}.tmp.{os.getpid()}").unlink()
         return synced
 
+    @staticmethod
+    def _is_control_tower_repo(repo_dir: Path) -> bool:
+        """Return True when `repo_dir` matches the `g-control-tower` layout (`api/` + `pyproject.toml` + `sidecars/` + `scheduler/`)."""
+        return (
+            (repo_dir / "api").is_dir()
+            and (repo_dir / "pyproject.toml").is_file()
+            and (repo_dir / "sidecars").is_dir()
+            and (repo_dir / "scheduler").is_dir()
+        )
+
+    @staticmethod
+    def _map_control_tower_rel_to_home(rel_str: str) -> str:
+        """Map a tracked `g-control-tower` `sidecars/` or `scheduler/` relative path to its `$HOME` target path."""
+        if rel_str.startswith("sidecars/"):
+            return f".gemini/config/{rel_str}"
+        if rel_str.startswith("scheduler/sidecars/"):
+            sub = rel_str[len("scheduler/sidecars/") :]
+            return f".gemini/config/sidecars/{sub}" if sub else ""
+        if rel_str.startswith("scheduler/actions/"):
+            sub = rel_str[len("scheduler/actions/") :]
+            return f".gemini/config/actions/{sub}" if sub else ""
+        if rel_str.startswith("scheduler/scripts/"):
+            sub = rel_str[len("scheduler/scripts/") :]
+            return f".gemini/config/actions/_shared/{sub}" if sub else ""
+        return ""
+
+    @staticmethod
+    def _is_protected_real_site_packages(
+        sp_dir: Path,
+        target_home: Path,
+        real_os_home: Path,
+    ) -> bool:
+        """Return True if `sp_dir` resolves into real OS home, active system Python prefix, or OS system directories."""
+        try:
+            resolved = sp_dir.expanduser().resolve()
+        except OSError:
+            resolved = sp_dir.expanduser()
+
+        if target_home != real_os_home:
+            with contextlib.suppress(ValueError):
+                resolved.relative_to(target_home)
+                return False
+
+        for protected_home_sub in (real_os_home / ".asdf", real_os_home / ".local"):
+            with contextlib.suppress(OSError, ValueError):
+                resolved.relative_to(protected_home_sub.resolve())
+                return True
+
+        for raw_prefix in (sys.prefix, sys.base_prefix):
+            if not raw_prefix:
+                continue
+            with contextlib.suppress(OSError, ValueError):
+                prefix_path = Path(raw_prefix).expanduser().resolve()
+                resolved.relative_to(prefix_path)
+                return True
+
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        in_temp = False
+        with contextlib.suppress(ValueError):
+            resolved.relative_to(temp_root)
+            in_temp = True
+        if not in_temp and any(
+            str(resolved).startswith(sys_root)
+            for sys_root in ("/usr/", "/Library/", "/System/", "/opt/")
+        ):
+            return True
+
+        return False
+
+    @classmethod
+    def _resolve_control_tower_site_packages(
+        cls,
+        repo_dir: Path,
+        target_home: Path,
+        *,
+        site_packages_dir: Path | str | None = None,
+        in_test_runner: bool = False,
+        allow_real_home_in_tests: bool = False,
+    ) -> tuple[Path | None, str]:
+        """Discover writable target `site-packages` for `g-control-tower` `api/` sync without network calls."""
+        real_os_home = _resolve_real_os_home()
+        explicit_raw = (
+            str(site_packages_dir).strip()
+            if site_packages_dir is not None
+            else os.environ.get("AGY_CONTROL_TOWER_SITE_PACKAGES", "").strip()
+        )
+        if explicit_raw:
+            cand = Path(explicit_raw).expanduser().resolve()
+            if (
+                in_test_runner
+                and not allow_real_home_in_tests
+                and cls._is_protected_real_site_packages(
+                    cand, target_home=target_home, real_os_home=real_os_home
+                )
+            ):
+                return None, "blocked_unisolated_test_real_site_packages"
+            return cand, ""
+
+        candidates: list[Path] = []
+        seen: set[Path] = set()
+        repo_resolved = repo_dir.expanduser().resolve()
+
+        def _add_candidate(raw_path: str | Path | None) -> None:
+            if not raw_path:
+                return
+            with contextlib.suppress(OSError):
+                p = Path(raw_path).expanduser().resolve()
+                if p == repo_resolved or p in seen:
+                    return
+                seen.add(p)
+                candidates.append(p)
+
+        def _add_home_candidates(base_home: Path, *, require_existing_local: bool) -> None:
+            for venv_name in (".venv", "venv"):
+                venv_lib = base_home / venv_name / "lib"
+                if venv_lib.is_dir():
+                    for sp in sorted(venv_lib.glob("python*/site-packages"), reverse=True):
+                        _add_candidate(sp)
+            asdf_py = base_home / ".asdf" / "installs" / "python"
+            if asdf_py.is_dir():
+                for sp in sorted(asdf_py.glob("*/lib/python*/site-packages"), reverse=True):
+                    _add_candidate(sp)
+            local_sp = (
+                base_home
+                / ".local"
+                / "lib"
+                / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                / "site-packages"
+            )
+            if not require_existing_local or local_sp.is_dir():
+                _add_candidate(local_sp)
+
+        if target_home != real_os_home:
+            _add_home_candidates(target_home, require_existing_local=True)
+
+        if hasattr(site, "getsitepackages"):
+            with contextlib.suppress(Exception):
+                for sp_str in site.getsitepackages() or ():
+                    _add_candidate(sp_str)
+        for scheme_key in ("purelib", "platlib"):
+            with contextlib.suppress(Exception):
+                _add_candidate(sysconfig.get_path(scheme_key))
+        if hasattr(site, "getusersitepackages"):
+            with contextlib.suppress(Exception):
+                _add_candidate(site.getusersitepackages())
+
+        if target_home == real_os_home:
+            _add_home_candidates(target_home, require_existing_local=False)
+
+        def _is_writable_target(sp_path: Path) -> bool:
+            if sp_path.is_dir():
+                api_sub = sp_path / "api"
+                if api_sub.is_dir():
+                    return os.access(sp_path, os.W_OK) and os.access(api_sub, os.W_OK)
+                return os.access(sp_path, os.W_OK)
+            ancestor = sp_path.parent
+            while ancestor != ancestor.parent and not ancestor.exists():
+                ancestor = ancestor.parent
+            return ancestor.is_dir() and os.access(ancestor, os.W_OK)
+
+        safe_candidates = [
+            sp
+            for sp in candidates
+            if not (
+                in_test_runner
+                and not allow_real_home_in_tests
+                and cls._is_protected_real_site_packages(
+                    sp, target_home=target_home, real_os_home=real_os_home
+                )
+            )
+        ]
+
+        if not safe_candidates:
+            if candidates and in_test_runner and not allow_real_home_in_tests:
+                return None, "blocked_unisolated_test_real_site_packages"
+            return None, "no_writable_site_packages"
+
+        for sp in safe_candidates:
+            if (sp / "api").is_dir() and _is_writable_target(sp):
+                return sp, ""
+        for sp in safe_candidates:
+            if sp.is_dir() and _is_writable_target(sp):
+                return sp, ""
+        for sp in safe_candidates:
+            if _is_writable_target(sp):
+                return sp, ""
+
+        return None, "no_writable_site_packages"
+
+    @staticmethod
+    def _sync_control_tower_api_to_site_packages(
+        repo_dir: Path,
+        target_sp: Path,
+        *,
+        prune_orphans: bool = True,
+    ) -> tuple[list[str], list[str], int]:
+        """Atomically sync tracked `api/` files into `<target_sp>/api` and prune stale `.py`/`.pyc` inside `api/` only."""
+        proc_ls = subprocess.run(
+            ["git", "-C", str(repo_dir), "ls-files", "-z", "--", "api"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        api_rel_to_src: dict[str, Path] = {}
+        if proc_ls.returncode == 0 and proc_ls.stdout:
+            for raw_entry in proc_ls.stdout.split(b"\x00"):
+                if not raw_entry:
+                    continue
+                entry_str = raw_entry.decode("utf-8", errors="ignore").replace("\\", "/").strip("/")
+                if not entry_str.startswith("api/"):
+                    continue
+                parts = Path(entry_str).parts
+                if "__pycache__" in parts or entry_str.endswith((".pyc", ".DS_Store")):
+                    continue
+                api_rel_to_src[entry_str] = repo_dir / entry_str
+
+        api_tracked_set = set(api_rel_to_src.keys())
+        deployed_api_files: list[str] = []
+        pruned_api_files: list[str] = []
+        api_dest_root = target_sp / "api"
+
+        for rel_str, src_file in api_rel_to_src.items():
+            if not src_file.is_file():
+                continue
+            try:
+                desired_bytes = src_file.read_bytes()
+            except OSError:
+                continue
+            dest_file = target_sp / rel_str
+            needs_write = True
+            if dest_file.is_file() and not dest_file.is_symlink():
+                try:
+                    if dest_file.stat().st_size == len(desired_bytes) and dest_file.read_bytes() == desired_bytes:
+                        needs_write = False
+                except OSError:
+                    needs_write = True
+            if needs_write:
+                try:
+                    dest_file.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_dest = dest_file.with_name(f".{dest_file.name}.tmp.{os.getpid()}")
+                    tmp_dest.write_bytes(desired_bytes)
+                    os.chmod(tmp_dest, 0o644)
+                    os.replace(tmp_dest, dest_file)
+                    deployed_api_files.append(f"site-packages/{rel_str}")
+                    if dest_file.suffix == ".py":
+                        pycache_dir = dest_file.parent / "__pycache__"
+                        if pycache_dir.is_dir():
+                            stem_prefix = f"{dest_file.stem}."
+                            for pyc_cand in pycache_dir.iterdir():
+                                if pyc_cand.is_file() and pyc_cand.suffix == ".pyc" and (
+                                    pyc_cand.name.startswith(stem_prefix)
+                                    or pyc_cand.name == f"{dest_file.stem}.pyc"
+                                ):
+                                    with contextlib.suppress(OSError):
+                                        pyc_cand.unlink()
+                except OSError:
+                    pass
+            else:
+                with contextlib.suppress(OSError):
+                    if (dest_file.stat().st_mode & 0o777) != 0o644:
+                        os.chmod(dest_file, 0o644)
+
+        if prune_orphans and api_dest_root.is_dir():
+            for existing_file in sorted(api_dest_root.rglob("*")):
+                if not existing_file.is_file() and not existing_file.is_symlink():
+                    continue
+                fname = existing_file.name
+                if fname == ".DS_Store" or ".tmp." in fname:
+                    continue
+                rel_from_sp = existing_file.relative_to(target_sp).as_posix()
+                if "__pycache__" in existing_file.parts or fname.endswith(".pyc"):
+                    pkg_rel_dir = (
+                        existing_file.parent.parent.relative_to(api_dest_root)
+                        if existing_file.parent.name == "__pycache__"
+                        else existing_file.parent.relative_to(api_dest_root)
+                    )
+                    pyc_stem = fname.split(".", 1)[0]
+                    expected_py_rel = (
+                        f"api/{pkg_rel_dir.as_posix()}/{pyc_stem}.py"
+                        if pkg_rel_dir != Path(".")
+                        else f"api/{pyc_stem}.py"
+                    )
+                    if expected_py_rel not in api_tracked_set:
+                        with contextlib.suppress(OSError):
+                            existing_file.unlink()
+                            pruned_api_files.append(f"site-packages/{rel_from_sp}")
+                elif rel_from_sp not in api_tracked_set:
+                    with contextlib.suppress(OSError):
+                        existing_file.unlink()
+                        pruned_api_files.append(f"site-packages/{rel_from_sp}")
+
+            for dir_path in sorted(
+                (p for p in api_dest_root.rglob("*") if p.is_dir() and not p.is_symlink()),
+                key=lambda p: len(p.parts),
+                reverse=True,
+            ):
+                with contextlib.suppress(OSError):
+                    dir_path.rmdir()
+
+        return deployed_api_files, pruned_api_files, len(api_tracked_set)
+
     def deploy_repo_to_home(
         self,
         repo_dir: Path | None = None,
@@ -1839,19 +2147,21 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
         require_base_branch: str = "main",
         prune_orphans: bool = True,
         *,
+        site_packages_dir: Path | str | None = None,
         _allow_in_tests: bool = False,
     ) -> dict[str, Any]:
-        """Atomically deploy the native root plugin layout from the pinned `main` checkout to `~/.gemini/config/plugins/<plugin>/` in `<15 ms` using `git ls-files`.
+        """Atomically deploy the native root plugin layout from the pinned `main` checkout to `~/.gemini/config/plugins/<plugin>/` (or `g-control-tower` runtime to `site-packages/api` and `~/.gemini/config/{sidecars,actions}/`) in `<15 ms` using `git ls-files`.
 
         Guarantees `origin/main` is the single source of truth:
           - Maps root-level plugin manifests (`plugin.json`, `hooks.json`, `mcp_config.json`, `requirements.json`) and directories (`skills/`, `agents/`, `rules/`, `clients/`, `assets/`, `shell/`, `sidecars/`) into `~/.gemini/config/plugins/<plugin>/`.
-          - Refuses to deploy to `$HOME` if `repo_dir` is checked out on an unmerged `fix/*` branch (`require_base_branch="main"`).
-          - Refuses unisolated `unittest`/`pytest` runs targeting real `$HOME` unless explicitly opted in.
+          - For `g-control-tower` (`api/` + `pyproject.toml` + `sidecars/` + `scheduler/`), atomically syncs tracked `api/` files into the active Python `site-packages/api` (pruning orphan `.py`/`.pyc` inside `api/` only) and deploys `sidecars/` & `scheduler/` manifests into `~/.gemini/config/` before restarting Control Tower.
+          - Refuses to deploy to `$HOME` or `site-packages` if `repo_dir` is checked out on an unmerged `fix/*` branch (`require_base_branch="main"`).
+          - Refuses unisolated `unittest`/`pytest` runs targeting real `$HOME` or real `site-packages` unless explicitly opted in.
           - Re-execs a single fresh subprocess pass (`AGY_DEPLOY_REEXEC=1`) when `clients/git_client.py` itself is updated so newly added tracked roots deploy atomically without stale `prune_orphans` deletion.
           - Expands `$HOME/` in plugin manifests (`hooks.json`, `mcp_config.json`, `requirements.json`) and `sidecars/**/*.json` descriptors.
           - Stamps the live `HEAD` `<short_sha>-<YYYYMMDD>` into `~/.gemini/config/plugins/<plugin>/plugin.json`.
           - Applies deterministic permissions (`0755` for executable scripts/clients/wrappers/sidecars, `0600` for `.ssh/*`, `0644` otherwise) and syncs `~/.local/bin/{agy-queue,agy-doctor}` symlinks when present.
-          - Prunes orphaned files in managed plugin subdirectories under `$HOME` so rejected branch edits never linger.
+          - Prunes orphaned files in managed plugin/control-tower subdirectories under `$HOME` so rejected branch edits never linger.
         """
         target_dir = repo_dir or self.resolve_repo_dir()
         target_home = (
@@ -1884,9 +2194,16 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
             else (target_dir / "src" / "home")
         )
         is_plugin_root_layout = (target_dir / "plugin.json").is_file() and not src_home.is_dir()
+        is_control_tower_layout = (
+            not is_plugin_root_layout
+            and not src_home.is_dir()
+            and self._is_control_tower_repo(target_dir)
+        )
         plugin_name = self._resolve_plugin_name(target_dir) if is_plugin_root_layout else ""
         plugin_prefix = f".gemini/config/plugins/{plugin_name}" if plugin_name else ""
-        if not (target_dir / ".git").exists() or (not is_plugin_root_layout and not src_home.is_dir()):
+        if not (target_dir / ".git").exists() or (
+            not is_plugin_root_layout and not src_home.is_dir() and not is_control_tower_layout
+        ):
             return {
                 "status": "skipped",
                 "deployed": False,
@@ -1913,6 +2230,27 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                 "pruned_files": [],
                 "pruned_orphans": [],
             }
+
+        target_sp: Path | None = None
+        if is_control_tower_layout:
+            target_sp, sp_block_reason = self._resolve_control_tower_site_packages(
+                target_dir,
+                target_home,
+                site_packages_dir=site_packages_dir,
+                in_test_runner=in_test_runner,
+                allow_real_home_in_tests=allow_real_home_in_tests,
+            )
+            if target_sp is None:
+                return {
+                    "status": "skipped",
+                    "deployed": False,
+                    "reason": sp_block_reason or "no_writable_site_packages",
+                    "repo_dir": str(target_dir),
+                    "home_dir": str(target_home),
+                    "deployed_files": [],
+                    "pruned_files": [],
+                    "pruned_orphans": [],
+                }
 
         rel_to_src_file: dict[str, Path] = {}
         if is_plugin_root_layout:
@@ -1949,6 +2287,30 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                         continue
                     entry_str = raw_entry.decode("utf-8", errors="ignore").replace("\\", "/").strip("/")
                     home_rel = self._map_plugin_rel_to_home(entry_str, plugin_name=plugin_name or "wiz-tam-plugin")
+                    if home_rel:
+                        rel_to_src_file[home_rel] = target_dir / entry_str
+        elif is_control_tower_layout:
+            proc_ls = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(target_dir),
+                    "ls-files",
+                    "-z",
+                    "--",
+                    "sidecars",
+                    "scheduler",
+                ],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            if proc_ls.returncode == 0 and proc_ls.stdout:
+                for raw_entry in proc_ls.stdout.split(b"\x00"):
+                    if not raw_entry:
+                        continue
+                    entry_str = raw_entry.decode("utf-8", errors="ignore").replace("\\", "/").strip("/")
+                    home_rel = self._map_control_tower_rel_to_home(entry_str)
                     if home_rel:
                         rel_to_src_file[home_rel] = target_dir / entry_str
         else:
@@ -2039,7 +2401,11 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     and "/scripts/" in rel_str
                     and rel_str.endswith(".py")
                 )
-                or (rel_str.startswith(".gemini/config/actions/") and "/scripts/" in rel_str and rel_str.endswith(".py"))
+                or (
+                    rel_str.startswith(".gemini/config/actions/")
+                    and ("/scripts/" in rel_str or rel_str.startswith(".gemini/config/actions/_shared/"))
+                    and rel_str.endswith(".py")
+                )
                 or (plugin_prefix and rel_str.startswith(f"{plugin_prefix}/shell/") and rel_str.endswith(".sh"))
                 or (
                     (
@@ -2281,7 +2647,9 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                 if not abs_m_dir.is_dir():
                     continue
                 for existing_file in sorted(abs_m_dir.rglob("*")):
-                    if not existing_file.is_file():
+                    if not existing_file.is_file() or (
+                        m_dir == ".gemini/config/actions" and existing_file.is_symlink()
+                    ):
                         continue
                     fname = existing_file.name
                     if (
@@ -2308,19 +2676,30 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
                     if obs_abs.is_dir():
                         shutil.rmtree(obs_abs, ignore_errors=True)
 
+        api_tracked_count = 0
+        if is_control_tower_layout and target_sp is not None:
+            api_deployed, api_pruned, api_tracked_count = self._sync_control_tower_api_to_site_packages(
+                target_dir,
+                target_sp,
+                prune_orphans=prune_orphans,
+            )
+            deployed_files.extend(api_deployed)
+            pruned_files.extend(api_pruned)
+
         synced_symlinks = self._sync_plugin_local_bin_symlinks(target_home, plugin_prefix)
         restarted = _maybe_restart_control_tower_after_deploy(deployed_files, target_home=target_home)
 
-        return {
+        total_tracked_count = len(tracked_set) + api_tracked_count
+        result: dict[str, Any] = {
             "status": "ok",
             "deployed": True,
             "repo_dir": str(target_dir),
             "home_dir": str(target_home),
             "branch": cur_branch,
-            "tracked_count": len(tracked_set),
+            "tracked_count": total_tracked_count,
             "deployed_count": len(deployed_files),
             "updated_count": len(deployed_files),
-            "unchanged_count": max(0, len(tracked_set) - len(deployed_files)),
+            "unchanged_count": max(0, total_tracked_count - len(deployed_files)),
             "deployed_files": deployed_files,
             "synced_symlinks": synced_symlinks,
             "pruned_count": len(pruned_files),
@@ -2328,6 +2707,10 @@ class GitVcsIntegrationClient(BaseIntegrationClient):
             "pruned_orphans": pruned_files,
             "control_tower_restarted": restarted,
         }
+        if is_control_tower_layout and target_sp is not None:
+            result["control_tower_layout"] = True
+            result["site_packages_dir"] = str(target_sp)
+        return result
 
     def delete_branch_native(
         self,
@@ -2420,6 +2803,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p_deploy.add_argument("--base", default="main", help="Required base branch name (default: main).")
     p_deploy.add_argument("--repo-dir", default="", help="Optional repository directory override.")
     p_deploy.add_argument("--home-dir", default="", help="Optional target $HOME directory override.")
+    p_deploy.add_argument("--site-packages-dir", default="", help="Optional target Python site-packages directory override for g-control-tower api/ sync.")
     p_deploy.add_argument("--no-prune", action="store_true", help="Do not prune orphaned files in managed $HOME directories.")
 
     return parser.parse_args(argv)
@@ -2479,11 +2863,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.subcommand == "deploy-home":
         repo_override = Path(args.repo_dir).expanduser().resolve() if getattr(args, "repo_dir", "") else None
         home_override = Path(args.home_dir).expanduser().resolve() if getattr(args, "home_dir", "") else None
+        sp_override = (
+            Path(args.site_packages_dir).expanduser().resolve()
+            if getattr(args, "site_packages_dir", "")
+            else None
+        )
         res = client.deploy_repo_to_home(
             repo_dir=repo_override,
             home_dir=home_override,
             require_base_branch=getattr(args, "base", "main"),
             prune_orphans=not getattr(args, "no_prune", False),
+            site_packages_dir=sp_override,
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") in ("ok", "skipped") else 1
