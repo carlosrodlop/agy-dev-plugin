@@ -27,6 +27,7 @@ ALL_TEST_MODULES = [
     "tests.test_orchestration_pause_resume",
     "tests.test_orchestration_wip_and_wake_fixes",
     "tests.test_parallel_file_leases_and_tui",
+    "tests.test_parallel_slot_unlock",
     "tests.test_parallel_subagent_orchestration",
     "tests.test_pr_remediator_compact_cli",
     "tests.test_pr_remediator_preview_staging",
@@ -105,6 +106,7 @@ ISOLATED_TEST_FILE_MODULES = {
     "tests/test_orchestration_pause_resume.py": "tests.test_orchestration_pause_resume",
     "tests/test_orchestration_wip_and_wake_fixes.py": "tests.test_orchestration_wip_and_wake_fixes",
     "tests/test_parallel_file_leases_and_tui.py": "tests.test_parallel_file_leases_and_tui",
+    "tests/test_parallel_slot_unlock.py": "tests.test_parallel_slot_unlock",
     "tests/test_parallel_subagent_orchestration.py": "tests.test_parallel_subagent_orchestration",
     "tests/test_pr_remediator_compact_cli.py": "tests.test_pr_remediator_compact_cli",
     "tests/test_pr_remediator_preview_staging.py": "tests.test_pr_remediator_preview_staging",
@@ -271,12 +273,16 @@ def select_test_modules(changed_files: list[str], *, run_all: bool = False) -> l
                 "review_gate.py",
                 "merge_watcher.py",
                 "git_client.py",
+                "dev_common.py",
+                "test_parallel_slot_unlock.py",
                 "test_parallel_subagent_orchestration.py",
                 "selective_test_runner.py",
             )
         ):
             if "tests.test_parallel_subagent_orchestration" not in selected:
                 selected.append("tests.test_parallel_subagent_orchestration")
+            if "tests.test_parallel_slot_unlock" not in selected:
+                selected.append("tests.test_parallel_slot_unlock")
         if (
             norm.endswith(
                 (

@@ -1488,10 +1488,55 @@ def get_next_dev_queue_item(
                 return True
         return False
 
+    def _canonical_repo_layer_rank(repo_slug: str) -> int:
+        """Return architectural layer rank so upstream plugin/SDK repos precede downstream UI/app repos.
+
+        Preserves relative order on ties (e.g. generic `acme/repo-a`, `acme/repo-b` both rank 1).
+        Honors optional `AGY_DEV_REPO_LAYER_ORDER` (comma-separated repo suffixes/slugs, lowest rank first).
+        """
+        norm = str(repo_slug or "").strip().lower()
+        name = norm.rsplit("/", 1)[-1]
+        custom_raw = os.environ.get("AGY_DEV_REPO_LAYER_ORDER", "").strip()
+        if custom_raw:
+            custom_entries = [tok.strip().lower() for tok in custom_raw.split(",") if tok.strip()]
+            for idx_c, entry in enumerate(custom_entries):
+                if norm == entry or name == entry:
+                    return idx_c
+        if any(tok in name for tok in ("dev-plugin", "dev-kit", "-sdk", "core-sdk")):
+            return 0
+        if any(tok in name for tok in ("control-tower", "-tower", "-web", "-ui", "-frontend")):
+            return 2
+        if any(tok in name for tok in ("-plugin", "-core", "-lib", "-backend", "-api")):
+            return 1
+        return 1
+
+    def _order_repos_by_contract_layer(repo_list: list[str]) -> list[str]:
+        if len(repo_list) <= 1:
+            return repo_list
+        return sorted(repo_list, key=_canonical_repo_layer_rank)
+
+    def _slot_contract_is_frozen(lock_obj: dict[str, Any], cid_val: str) -> bool:
+        """Return True when `cid_val`'s active slot on `lock_obj` already passed review (`pr_gate_ready` or waiting merge)."""
+        frozen_statuses = {"PENDING_HUMAN_PR_VALIDATION", "READY_AWAITING_BASE_MERGE"}
+        for slot_obj in _active_lock_slot_specs(lock_obj):
+            s_cid = str(slot_obj.get("conversation_id") or "").strip()
+            s_sibs = [str(s).strip() for s in (slot_obj.get("sibling_conversation_ids") or [])]
+            if _matches_cid(s_cid, cid_val) or any(_matches_cid(s, cid_val) for s in s_sibs):
+                st_up = str(slot_obj.get("status") or "").strip().upper()
+                if bool(slot_obj.get("pr_gate_ready")) or st_up in frozen_statuses:
+                    return True
+        if _matches_cid(str(lock_obj.get("conversation_id") or "").strip(), cid_val):
+            st_up = str(lock_obj.get("status") or "").strip().upper()
+            if bool(lock_obj.get("pr_gate_ready")) or st_up in frozen_statuses:
+                return True
+        return False
+
     def _item_repo_schedule(item: dict[str, Any]) -> tuple[list[str], list[str], list[str], list[str]]:
-        """Compute `(remaining_repos, dispatch_repos, foreign_locked, self_locked)` using contract-first ordering and subtracting `merged_repos`."""
-        item_repos = _normalize_str_list(
-            [dev_common.normalize_repo_slug(str(r)) for r in (item.get("repo_slugs") or []) if str(r).strip()]
+        """Compute `(remaining_repos, dispatch_repos, foreign_locked, self_locked)` using canonical contract-first ordering and subtracting `merged_repos`."""
+        item_repos = _order_repos_by_contract_layer(
+            _normalize_str_list(
+                [dev_common.normalize_repo_slug(str(r)) for r in (item.get("repo_slugs") or []) if str(r).strip()]
+            )
         )
         merged_set = {
             dev_common.normalize_repo_slug(str(r))
@@ -1513,24 +1558,38 @@ def get_next_dev_queue_item(
 
         if not remaining_repos:
             return ([], [], [], [])
-        next_contract_repo = remaining_repos[0]
-        if next_contract_repo in foreign_locked or next_contract_repo in self_locked:
+
+        # Skip leading self-locked repos whose contract PR already passed independent review (`pr_gate_ready`),
+        # allowing the downstream repo to start in parallel while the upstream PR awaits human merge!
+        start_idx = 0
+        while start_idx < len(remaining_repos):
+            cand_r = remaining_repos[start_idx]
+            if cand_r in self_locked and _slot_contract_is_frozen(active_locks[cand_r], item_cid):
+                start_idx += 1
+            else:
+                break
+        if start_idx >= len(remaining_repos):
             return (remaining_repos, [], foreign_locked, self_locked)
+
+        effective_remaining = remaining_repos[start_idx:]
+        next_contract_repo = effective_remaining[0]
+        if next_contract_repo in foreign_locked or next_contract_repo in self_locked:
+            return (effective_remaining, [], foreign_locked, self_locked)
         if not foreign_locked:
-            dispatch_repos = [r for r in remaining_repos if r not in self_locked]
+            dispatch_repos = [r for r in effective_remaining if r not in self_locked]
         else:
             # Contract-first partial multi-repo dispatch: advance unlocked prefix repo(s) ahead of downstream locked repo(s)
             dispatch_repos = []
-            for r in remaining_repos:
+            for r in effective_remaining:
                 if r in foreign_locked or r in self_locked:
                     break
                 dispatch_repos.append(r)
-        return (remaining_repos, dispatch_repos, foreign_locked, self_locked)
+        return (effective_remaining, dispatch_repos, foreign_locked, self_locked)
 
     reserved_by_repo: dict[str, list[tuple[int, dict[str, Any]]]] = {}
 
     def _probe_parallel_slot_lookahead(item: dict[str, Any], target_repo: str) -> tuple[bool, dict[str, Any], str]:
-        """Return `(eligible, slot_annotation, blocked_reason)` for a pending item on a locked repo with a free Slot #2..#N.
+        """Return `(eligible, slot_annotation, blocked_reason)` for a pending/contract-ready item on a locked repo with a free Slot #2..#N.
 
         Overlap is validated pairwise against EVERY active slot plus candidates already reserved for this repo
         in the same `queue-next` pass, so two lookahead picks can never collide with each other either.
@@ -1538,6 +1597,9 @@ def get_next_dev_queue_item(
         act = active_locks.get(target_repo)
         if not isinstance(act, dict) or not bool(act.get("active")):
             return (False, {}, "repo_not_locked")
+        item_cid = str(item.get("conversation_id") or "").strip()
+        if item_cid and _lock_owns_cid(act, item_cid):
+            return (False, {}, "self_already_locked_in_repo")
         max_slots = _lock_max_slots(act)
         active_slots = _active_lock_slot_specs(act)
         active_ids = [int(s.get("slot_id") or 1) for s in active_slots]
@@ -1545,7 +1607,8 @@ def get_next_dev_queue_item(
         free_slot_id = _next_free_slot_id(active_ids, max_slots, [r_id for r_id, _ in reserved])
         if max_slots < 2 or not free_slot_id:
             return (False, {"max_slots": max_slots, "active_slot_ids": active_ids}, "max_slots_occupied")
-        if str(item.get("status") or "pending").lower() != "pending":
+        item_st = str(item.get("status") or "pending").lower()
+        if item_st not in ("pending", "in_progress", "pr_open"):
             return (False, {}, "item_not_pending")
         if not (item.get("target_files") or item.get("section_anchors")):
             return (False, {}, "candidate_unanchored")
@@ -1680,6 +1743,7 @@ def get_next_dev_queue_item(
     blocked_deps: list[dict[str, Any]] = []
     blocked_repos: list[dict[str, Any]] = []
     blocked_partial_wip: list[dict[str, Any]] = []
+    capped_fallback_candidates: list[tuple[dict[str, Any], list[str], list[str]]] = []
 
     for it in sorted(items, key=_dispatch_order_key):
         st = str(it.get("status") or "pending").lower()
@@ -1697,7 +1761,7 @@ def get_next_dev_queue_item(
             continue
         remaining_repos, dispatch_repos, foreign_locked, self_locked = _item_repo_schedule(it)
         is_self_waiting = bool(remaining_repos and remaining_repos[0] in self_locked)
-        is_contract_blocked = bool(remaining_repos and not dispatch_repos and foreign_locked)
+        is_contract_blocked = bool(remaining_repos and not dispatch_repos and foreign_locked and not is_self_waiting)
 
         if is_contract_blocked:
             first_repo = remaining_repos[0]
@@ -1734,7 +1798,7 @@ def get_next_dev_queue_item(
             if skip_locked_repos:
                 continue
         elif is_self_waiting:
-            # Already actively developing or awaiting PR merge on its contract-first repo; do not re-dispatch as unlocked
+            # Already actively developing on its contract-first repo (upstream contract not yet frozen/pr_gate_ready)
             if skip_locked_repos:
                 continue
         else:
@@ -1762,6 +1826,7 @@ def get_next_dev_queue_item(
                         "capped_downstream_repos": capped_downstream,
                     }
                 )
+                capped_fallback_candidates.append((it, list(dispatch_repos), list(foreign_locked)))
                 continue
 
             annotated = dict(it)
@@ -1788,6 +1853,40 @@ def get_next_dev_queue_item(
             next_item = it
         if st == "pending" and next_pending_item is None:
             next_pending_item = it
+
+    # Smart idle-repo overflow: if an unlocked repository has ZERO single-repo or existing partial-WIP tasks
+    # runnable, promote the highest-priority capped candidate for that completely idle repo (up to 2x cap) so
+    # unlocked repos never sit 100% starved while downstream repos drain their partial WIP.
+    allow_idle_overflow = os.environ.get("AGY_DEV_IDLE_REPO_WIP_OVERFLOW", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+    if allow_idle_overflow and capped_fallback_candidates:
+        overflow_ceiling = max(max_partial_wip * 2, max_partial_wip + 2)
+        for cand_it, cand_dispatch, cand_foreign in capped_fallback_candidates:
+            idle_repos = [r for r in cand_dispatch if r not in active_locks and r not in runnable_by_repo]
+            if not idle_repos:
+                continue
+            if any(partial_wip_by_repo.get(fr, 0) >= overflow_ceiling for fr in cand_foreign):
+                continue
+            promoted = dict(cand_it)
+            promoted["wip_finish_boost"] = False
+            promoted["wip_cap_idle_repo_fallback"] = True
+            _annotate_dispatch_hints(promoted)
+            promoted["target_slot"] = 1
+            promoted["dispatch_repos"] = list(idle_repos)
+            promoted["partial_multi_repo_dispatch"] = bool(cand_foreign)
+            promoted["waiting_locked_repos"] = list(cand_foreign)
+            for free_r in idle_repos:
+                runnable_by_repo[free_r] = promoted
+            if next_unlocked_item is None:
+                next_unlocked_item = promoted
+            if next_item is None:
+                next_item = promoted
+            if str(cand_it.get("status") or "pending").lower() == "pending" and next_pending_item is None:
+                next_pending_item = promoted
 
     return {
         "status": "ok",
