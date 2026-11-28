@@ -63,7 +63,25 @@ Always follow this strict 4-step sequence so behavior changes are never conflate
 
 ---
 
-## Phase 3: Guardrails Against Over-Engineering
+## Phase 3: Systematic Debugging & Root-Cause Protocol
+
+When diagnosing non-trivial failures, flaky state transitions, or regressions, follow this strict protocol before writing fixes:
+
+1. **4-Phase Root-Cause Analysis (RCA)**:
+   - **Phase A — Reproduce & Gather Evidence**: Capture the exact failing command, inputs, exit code, stack trace, and state files deterministically (zero guessing).
+   - **Phase B — Root-Cause Tracing**: Trace backward from the failure site through call and data-flow boundaries to the exact origin where invalid state or assumptions entered — never patch symptoms downstream.
+   - **Phase C — Minimal Hypothesis & Failing Regression Test (`RED`)**: State one falsifiable hypothesis and encode it as a failing hermetic test (`Name the Break`) before editing production code.
+   - **Phase D — Targeted Fix & Verify (`GREEN`)**: Apply the minimal root fix, confirm `RED -> GREEN`, and run `project_audit.py --strict` + `selective_test_runner.py`.
+2. **3-Failure Architecture Stop**: If **3 consecutive fix attempts** fail or expose new breakages, **STOP patching symptoms**. Halt further edits, document what failed, and escalate (`BLOCKED` / Design Contract review) to re-evaluate the underlying architecture or boundary assumptions.
+3. **4-Layer Defense-in-Depth**: Guard critical invariants at four distinct layers where applicable:
+   - **Layer 1 — Boundary / Input Validation**: Reject malformed arguments, paths (`.resolve()`), or schemas at CLI/API/parser entrypoints.
+   - **Layer 2 — Domain Invariant Guard**: Enforce state-machine preconditions in pure domain functions before side effects.
+   - **Layer 3 — Persistence & Atomic Integrity**: Serialize mutations under `file_lock` with atomic writes (`0600`) and SHA/version checks.
+   - **Layer 4 — Regression & Tier-0 Static Gate**: Lock the invariant with a hermetic unit test and deterministic `project_audit.py` check.
+
+---
+
+## Phase 4: Guardrails Against Over-Engineering
 
 - **Do NOT invent speculative frameworks**: Extract a shared helper only when there is concrete duplication or a real testability boundary — never add single-implementation abstract base classes or empty passthrough layers.
 - **Do NOT duplicate native review tools**: Use `agy-code-pr-reviewer` (`Model="pro"`) for Maker-Checker PR gate validation and `coderabbit` (`code-review` / `autofix`) when reviewing PR threads.

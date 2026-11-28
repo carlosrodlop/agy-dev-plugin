@@ -59,7 +59,12 @@ When the user or `agy-dev-orchestrator` describes a feature, UX change, refactor
    - **On-Demand Backlog Recalibration**: When asked to recalibrate or re-prioritize the backlog, run `pr_remediator.py queue-plan --json`, evaluate `importance_reasons`, `wave`, and `blocks_count`, and persist updates via `pr_remediator.py queue-set-status --id <CID> --status <STATUS> --importance <TIER> --component <SUBCOMPONENT>`.
 
 5. **Deliver Design Contract & Exit Gate into `dev_queue.json` / Execution**:
-   - Present a concise **Design Contract** covering: (a) **Confirmed Decisions**, (b) **Scoped Changes & Anchors** (repos, calibrated priority, collisions/ready-to-run status, file-by-file changes, tests, dependency DAG), and (c) **Explicit Non-Goals**.
+   - Present a concise **Design Contract** covering:
+     - (a) **Confirmed Decisions**
+     - (b) **Scoped Changes & Anchors** (repos, calibrated priority, collisions/ready-to-run status, file-by-file changes, tests, dependency DAG)
+     - (c) **Review Focus (Top 3–5 Boundary Failure Modes)**: Name the 3–5 highest-risk edge cases/failure modes, each pinned to a concrete hermetic test name/assertion.
+     - (d) **Optional Builder Check & Throwaway Spike Rule**: For critical or multi-repo interface contracts, specify a lightweight pre-build `Builder Check` alignment gate; when technical feasibility is uncertain, prescribe a time-boxed throwaway **Spike** in an isolated scratch probe (discarded before clean production implementation + tests).
+     - (e) **Explicit Non-Goals**
    - Execute the exit handoff according to target repository lock state:
      - **Target Repo(s) Unlocked**: Ask whether to proceed directly to `fix/*` execution or enqueue as `pending`.
      - **Target Repo(s) Locked (Mandatory Auto-Enqueue — Zero Confirmation Prompt)**: When one or more target repositories currently hold an active `dev_pr_lock`, **DO NOT ask the user for confirmation or priority** (never prompt *"Do you want me to enqueue this?"* or *"What priority should I assign?"*). Immediately inspect `dev_queue.json`, active `dev_pr_locks`, application architecture, `depends_on`, and user urgency to assign a calibrated numeric priority relative to existing queued tasks, execute `pr_remediator.py queue-add --status pending` immediately (including full `rca_summary`, `proposed_fix`, `target_files`, `depends_on`, and `repo_slugs` via `--repos`), and render a **concise visual confirmation** (compact Markdown table showing queue position, calibrated priority, target repo(s), active blocker lock, and next-up sequence):
