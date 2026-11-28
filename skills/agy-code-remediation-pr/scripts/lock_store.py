@@ -454,30 +454,250 @@ def _inactive_lock_snapshot(lock_obj: dict[str, Any] | None = None, repo_slug: s
     }
 
 
-def _read_locks_state(audit_state: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Load `dev_pr_locks` map from `actions_log_audit_state`, migrating active legacy `dev_pr_lock` cleanly."""
+DEV_PR_LOCK_FILENAME = "dev_pr_lock.json"
+ACTIONS_STATE_FILENAME = "actions_state.json"
+
+
+def resolve_dev_pr_lock_path(portfolio_dir: Path | str | None = None) -> Path:
+    """Resolve the dedicated `dev_pr_lock.json` file path inside the active state directory."""
+    return dev_common.resolve_state_dir(portfolio_dir=portfolio_dir) / DEV_PR_LOCK_FILENAME
+
+
+def _read_locks_state(audit_state: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Load `dev_pr_locks` map from `dev_pr_lock.json` or `actions_log_audit_state`, migrating active legacy `dev_pr_lock` cleanly."""
     locks_map: dict[str, dict[str, Any]] = {}
-    raw_locks = audit_state.get("dev_pr_locks")
-    if isinstance(raw_locks, dict):
+    raw_locks = (
+        audit_state.get("dev_pr_locks")
+        if isinstance(audit_state.get("dev_pr_locks"), Mapping)
+        else audit_state.get("locks")
+    )
+    if isinstance(raw_locks, Mapping):
         for k, v in raw_locks.items():
-            if not isinstance(v, dict):
+            if not isinstance(v, Mapping):
                 continue
-            slug = _extract_repo_slug_from_lock_dict(v, fallback_key=str(k))
-            entry = dict(v)
-            entry.setdefault("repo_slug", slug)
-            entry.setdefault("repo", slug)
-            locks_map[slug] = entry
+            v_dict = dict(v)
+            slug = _extract_repo_slug_from_lock_dict(v_dict, fallback_key=str(k))
+            v_dict.setdefault("repo_slug", slug)
+            v_dict.setdefault("repo", slug)
+            locks_map[slug] = v_dict
 
     legacy = audit_state.get("dev_pr_lock")
-    if isinstance(legacy, dict) and bool(legacy.get("active")):
-        leg_slug = _extract_repo_slug_from_lock_dict(legacy)
+    if isinstance(legacy, Mapping) and bool(legacy.get("active")):
+        leg_dict = dict(legacy)
+        leg_slug = _extract_repo_slug_from_lock_dict(leg_dict)
         existing_entry = locks_map.get(leg_slug)
         if not isinstance(existing_entry, dict) or not bool(existing_entry.get("active")):
-            migrated = dict(legacy)
-            migrated["repo_slug"] = leg_slug
-            migrated["repo"] = leg_slug
-            locks_map[leg_slug] = migrated
+            leg_dict["repo_slug"] = leg_slug
+            leg_dict["repo"] = leg_slug
+            locks_map[leg_slug] = leg_dict
+    elif not locks_map and not isinstance(legacy, Mapping) and "active" in audit_state:
+        flat_dict = dict(audit_state)
+        flat_slug = _extract_repo_slug_from_lock_dict(flat_dict)
+        flat_dict.setdefault("repo_slug", flat_slug)
+        flat_dict.setdefault("repo", flat_slug)
+        locks_map[flat_slug] = flat_dict
     return locks_map
+
+
+def _read_locks_container_readonly(
+    portfolio_dir: Path | str | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Read `(locks_map, single_lock_snapshot)` with `dev_pr_lock.json` authoritative and `actions_state.json` fallback."""
+    p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
+    lock_path = p_dir / DEV_PR_LOCK_FILENAME
+    if lock_path.is_file():
+        doc = dev_common.atomic_read_json(lock_path, default={})
+        if not isinstance(doc, Mapping):
+            return {}, {}
+        locks_map = _read_locks_state(doc)
+        single = dict(doc["dev_pr_lock"]) if isinstance(doc.get("dev_pr_lock"), Mapping) else {}
+        return locks_map, single
+
+    state_obj = dev_common.atomic_read_json(p_dir / ACTIONS_STATE_FILENAME, default={})
+    if not isinstance(state_obj, Mapping):
+        return {}, {}
+    audit_state = (
+        state_obj.get("actions_log_audit_state")
+        if isinstance(state_obj.get("actions_log_audit_state"), Mapping)
+        else state_obj
+    )
+    locks_map = _read_locks_state(audit_state)
+    single = dict(audit_state["dev_pr_lock"]) if isinstance(audit_state.get("dev_pr_lock"), Mapping) else {}
+    return locks_map, single
+
+
+def _has_legacy_lock_keys(state_obj: Mapping[str, Any]) -> bool:
+    """Return True if `actions_state.json` payload contains `dev_pr_locks` or `dev_pr_lock` keys."""
+    if "dev_pr_locks" in state_obj or "dev_pr_lock" in state_obj:
+        return True
+    audit_st = state_obj.get("actions_log_audit_state")
+    return isinstance(audit_st, Mapping) and ("dev_pr_locks" in audit_st or "dev_pr_lock" in audit_st)
+
+
+def _strip_legacy_lock_keys_in_memory(state_obj: dict[str, Any]) -> bool:
+    """Remove `dev_pr_locks` and `dev_pr_lock` from `state_obj` and its `actions_log_audit_state` dict."""
+    changed = False
+    for top_key in ("dev_pr_locks", "dev_pr_lock"):
+        if top_key in state_obj:
+            state_obj.pop(top_key, None)
+            changed = True
+    audit_st = state_obj.get("actions_log_audit_state")
+    if isinstance(audit_st, dict):
+        for sub_key in ("dev_pr_locks", "dev_pr_lock"):
+            if sub_key in audit_st:
+                audit_st.pop(sub_key, None)
+                changed = True
+        state_obj["actions_log_audit_state"] = audit_st
+    return changed
+
+
+def _strip_legacy_locks_from_actions_state(p_dir: Path) -> bool:
+    """Strip legacy `dev_pr_locks` / `dev_pr_lock` keys from `actions_state.json` under `actions_state.json.lock` when present."""
+    actions_path = p_dir / ACTIONS_STATE_FILENAME
+    if not actions_path.is_file():
+        return False
+    preview = dev_common.atomic_read_json(actions_path, default={})
+    if not isinstance(preview, Mapping) or not _has_legacy_lock_keys(preview):
+        return False
+
+    actions_lock = actions_path.with_suffix(".json.lock")
+    with dev_common.file_lock(actions_lock):
+        current = dev_common.atomic_read_json(actions_path, default={})
+        if not isinstance(current, dict) or not _has_legacy_lock_keys(current):
+            return False
+        mutated = dict(current)
+        if isinstance(mutated.get("actions_log_audit_state"), dict):
+            mutated["actions_log_audit_state"] = dict(mutated["actions_log_audit_state"])
+        if not _strip_legacy_lock_keys_in_memory(mutated):
+            return False
+        dev_common.atomic_write_json(actions_path, mutated, mode=0o600)
+        return True
+
+
+def _load_lock_doc_for_write_locked(p_dir: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]], bool]:
+    """Load `dev_pr_lock.json` while holding `dev_pr_lock.json.lock`, seeding 1-time from `actions_state.json` if absent."""
+    lock_path = p_dir / DEV_PR_LOCK_FILENAME
+    if lock_path.is_file():
+        doc_raw = dev_common.atomic_read_json(lock_path, default={})
+        doc = dict(doc_raw) if isinstance(doc_raw, Mapping) else {}
+        doc.setdefault("schema_version", 1)
+        return doc, _read_locks_state(doc), False
+
+    actions_path = p_dir / ACTIONS_STATE_FILENAME
+    if actions_path.is_file():
+        with dev_common.file_lock(actions_path.with_suffix(".json.lock")):
+            st_raw = dev_common.atomic_read_json(actions_path, default={})
+            if isinstance(st_raw, Mapping):
+                audit_st = (
+                    st_raw.get("actions_log_audit_state")
+                    if isinstance(st_raw.get("actions_log_audit_state"), Mapping)
+                    else st_raw
+                )
+                locks_map = _read_locks_state(audit_st)
+                had_legacy = _has_legacy_lock_keys(st_raw)
+                doc_seed: dict[str, Any] = {"schema_version": 1}
+                if had_legacy:
+                    doc_seed["migrated_from"] = ACTIONS_STATE_FILENAME
+                if isinstance(audit_st.get("dev_pr_lock"), Mapping):
+                    doc_seed["dev_pr_lock"] = dict(audit_st["dev_pr_lock"])
+                return doc_seed, locks_map, had_legacy
+    return {"schema_version": 1}, {}, False
+
+
+def _persist_lock_doc_locked(
+    p_dir: Path,
+    lock_doc: dict[str, Any],
+    locks_map: dict[str, dict[str, Any]],
+    *,
+    now_iso: str = "",
+    touched_repo_slug: str = "",
+    released_snapshot: dict[str, Any] | None = None,
+    strip_legacy_actions_state: bool = False,
+) -> None:
+    """Persist `dev_pr_lock.json` (`0600`) under `dev_pr_lock.json.lock` and strip legacy `actions_state.json` on 1-time migration."""
+    lock_doc["schema_version"] = int(lock_doc.get("schema_version") or 1)
+    lock_doc["updated_at"] = now_iso or _utc_now_iso()
+    _write_locks_state(
+        lock_doc,
+        locks_map,
+        touched_repo_slug=touched_repo_slug,
+        released_snapshot=released_snapshot,
+    )
+    dev_common.atomic_write_json(p_dir / DEV_PR_LOCK_FILENAME, lock_doc, mode=0o600)
+    if strip_legacy_actions_state:
+        _strip_legacy_locks_from_actions_state(p_dir)
+
+
+def migrate_legacy_dev_pr_locks(portfolio_dir: Path | str | None = None) -> dict[str, Any]:
+    """Idempotently migrate `dev_pr_locks` / `dev_pr_lock` from `actions_state.json` into `0600` `dev_pr_lock.json`."""
+    p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
+    lock_path = p_dir / DEV_PR_LOCK_FILENAME
+    actions_path = p_dir / ACTIONS_STATE_FILENAME
+    if not lock_path.is_file() and not actions_path.is_file():
+        return {
+            "status": "ok",
+            "migrated": False,
+            "stripped_legacy": False,
+            "lock_path": str(lock_path),
+            "active_locks_count": 0,
+        }
+
+    with dev_common.file_lock(lock_path.with_suffix(".json.lock")):
+        if lock_path.is_file():
+            stripped = _strip_legacy_locks_from_actions_state(p_dir)
+            existing_doc = dev_common.atomic_read_json(lock_path, default={})
+            existing_map = _read_locks_state(existing_doc if isinstance(existing_doc, Mapping) else {})
+            active_cnt = sum(1 for v in existing_map.values() if isinstance(v, dict) and bool(v.get("active")))
+            return {
+                "status": "ok",
+                "migrated": False,
+                "already_isolated": True,
+                "stripped_legacy": stripped,
+                "lock_path": str(lock_path),
+                "active_locks_count": active_cnt,
+            }
+
+        with dev_common.file_lock(actions_path.with_suffix(".json.lock")):
+            st_raw = dev_common.atomic_read_json(actions_path, default={})
+            if not isinstance(st_raw, dict) or not _has_legacy_lock_keys(st_raw):
+                return {
+                    "status": "ok",
+                    "migrated": False,
+                    "stripped_legacy": False,
+                    "lock_path": str(lock_path),
+                    "active_locks_count": 0,
+                }
+            audit_st = (
+                st_raw.get("actions_log_audit_state")
+                if isinstance(st_raw.get("actions_log_audit_state"), Mapping)
+                else st_raw
+            )
+            locks_map = _read_locks_state(audit_st)
+            now_iso = _utc_now_iso()
+            lock_doc: dict[str, Any] = {
+                "schema_version": 1,
+                "migrated_from": ACTIONS_STATE_FILENAME,
+                "updated_at": now_iso,
+            }
+            if isinstance(audit_st.get("dev_pr_lock"), Mapping):
+                lock_doc["dev_pr_lock"] = dict(audit_st["dev_pr_lock"])
+            _write_locks_state(lock_doc, locks_map)
+            dev_common.atomic_write_json(lock_path, lock_doc, mode=0o600)
+
+            cleaned_state = dict(st_raw)
+            if isinstance(cleaned_state.get("actions_log_audit_state"), dict):
+                cleaned_state["actions_log_audit_state"] = dict(cleaned_state["actions_log_audit_state"])
+            _strip_legacy_lock_keys_in_memory(cleaned_state)
+            dev_common.atomic_write_json(actions_path, cleaned_state, mode=0o600)
+
+        active_cnt = sum(1 for v in locks_map.values() if isinstance(v, dict) and bool(v.get("active")))
+        return {
+            "status": "ok",
+            "migrated": True,
+            "stripped_legacy": True,
+            "lock_path": str(lock_path),
+            "active_locks_count": active_cnt,
+        }
 
 
 def _write_locks_state(
@@ -1096,15 +1316,8 @@ def get_all_dev_pr_locks(
     *,
     include_inactive: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Return per-repository locks keyed by `repo_slug` from `actions_state.json`."""
-    p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
-    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
-    audit_state = (
-        state_obj.get("actions_log_audit_state")
-        if isinstance(state_obj.get("actions_log_audit_state"), dict)
-        else {}
-    )
-    locks_map = _read_locks_state(audit_state)
+    """Return per-repository locks keyed by `repo_slug` from authoritative `dev_pr_lock.json` (or legacy fallback)."""
+    locks_map, _ = _read_locks_container_readonly(portfolio_dir=portfolio_dir)
     if include_inactive:
         return {
             k: (_sync_lock_slots_structure(v, repo_slug=k) if bool(v.get("active")) else dict(v))
@@ -1123,14 +1336,7 @@ def get_dev_pr_lock(
     slot_id: int | str | None = None,
 ) -> dict[str, Any]:
     """Read the per-repository remediation branch lock matching `repo_slug`/`workdir`/`branch_name` (or active fallback)."""
-    p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
-    state_obj = dev_common.atomic_read_json(p_dir / "actions_state.json", default={})
-    audit_state = (
-        state_obj.get("actions_log_audit_state")
-        if isinstance(state_obj.get("actions_log_audit_state"), dict)
-        else {}
-    )
-    locks_map = _read_locks_state(audit_state)
+    locks_map, legacy = _read_locks_container_readonly(portfolio_dir=portfolio_dir)
     matched_slug, lock_obj = _match_lock_entry(
         locks_map,
         repo_slug=repo_slug,
@@ -1150,7 +1356,6 @@ def get_dev_pr_lock(
         )
         return _project_slot_view(norm_lock, slot_key)
     has_selector = bool(repo_slug.strip() or workdir or branch_name.strip())
-    legacy = audit_state.get("dev_pr_lock") if isinstance(audit_state.get("dev_pr_lock"), dict) else {}
     snap_source = lock_obj if lock_obj else ({} if has_selector else legacy)
     return _inactive_lock_snapshot(snap_source, repo_slug=matched_slug)
 
@@ -1207,8 +1412,8 @@ def acquire_dev_pr_lock(
     """
     _ = scheduled
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
-    state_path = p_dir / "actions_state.json"
-    lock_file = state_path.with_suffix(".json.lock")
+    lock_path = p_dir / DEV_PR_LOCK_FILENAME
+    lock_file = lock_path.with_suffix(".json.lock")
     cid_clean = str(conversation_id or "").strip()
     if not cid_clean:
         return {"status": "error", "acquired": False, "error": "conversation_id is required to acquire lock"}
@@ -1256,13 +1461,7 @@ def acquire_dev_pr_lock(
             hydrated_fields.append("section_anchors")
 
     with dev_common.file_lock(lock_file):
-        state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
-        if not isinstance(state_obj, dict):
-            state_obj = {}
-        audit_state = state_obj.get("actions_log_audit_state")
-        if not isinstance(audit_state, dict):
-            audit_state = {}
-        locks_map = _read_locks_state(audit_state)
+        lock_doc, locks_map, strip_legacy = _load_lock_doc_for_write_locked(p_dir)
         existing_lock = locks_map.get(resolved_slug)
         repo_branches: dict[str, dict[str, Any]] = {}
 
@@ -1446,13 +1645,14 @@ def acquire_dev_pr_lock(
                     norm_existing["max_slots"] = eff_max_slots
                     updated_repo_lock = _sync_lock_slots_structure(norm_existing, repo_slug=resolved_slug)
                     locks_map[resolved_slug] = updated_repo_lock
-                    _write_locks_state(audit_state, locks_map, touched_repo_slug=resolved_slug)
-                    state_obj["actions_log_audit_state"] = audit_state
-                    tmp_path = state_path.with_suffix(".tmp")
-                    tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                    with contextlib.suppress(OSError):
-                        os.chmod(tmp_path, 0o600)
-                    os.replace(tmp_path, state_path)
+                    _persist_lock_doc_locked(
+                        p_dir,
+                        lock_doc,
+                        locks_map,
+                        now_iso=now_iso,
+                        touched_repo_slug=resolved_slug,
+                        strip_legacy_actions_state=strip_legacy,
+                    )
 
                     active_count = sum(1 for v in locks_map.values() if isinstance(v, dict) and bool(v.get("active")))
                     slot_res: dict[str, Any] = {
@@ -1648,13 +1848,14 @@ def acquire_dev_pr_lock(
             new_lock_raw["slots"] = preserved_followers
         new_lock = _sync_lock_slots_structure(new_lock_raw, repo_slug=resolved_slug)
         locks_map[resolved_slug] = new_lock
-        _write_locks_state(audit_state, locks_map, touched_repo_slug=resolved_slug)
-        state_obj["actions_log_audit_state"] = audit_state
-        tmp_path = state_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        with contextlib.suppress(OSError):
-            os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, state_path)
+        _persist_lock_doc_locked(
+            p_dir,
+            lock_doc,
+            locks_map,
+            now_iso=now_iso,
+            touched_repo_slug=resolved_slug,
+            strip_legacy_actions_state=strip_legacy,
+        )
 
     active_count = sum(1 for v in locks_map.values() if isinstance(v, dict) and bool(v.get("active")))
     s1_res: dict[str, Any] = {
@@ -1693,10 +1894,10 @@ def update_dev_pr_lock(
     slot_id: int | str | None = None,
     preserve_statuses: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    """Update fields on the matching active per-repository lock (Slot #1 or follower Slot #2..#N) inside `actions_state.json`."""
+    """Update fields on the matching active per-repository lock (Slot #1 or follower Slot #2..#N) inside `dev_pr_lock.json`."""
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
-    state_path = p_dir / "actions_state.json"
-    lock_file = state_path.with_suffix(".json.lock")
+    lock_path = p_dir / DEV_PR_LOCK_FILENAME
+    lock_file = lock_path.with_suffix(".json.lock")
     now_iso = _utc_now_iso()
     protected_statuses = {str(s).strip().upper() for s in (preserve_statuses or ()) if str(s).strip()}
     sanitize_str_keys = (
@@ -1710,13 +1911,7 @@ def update_dev_pr_lock(
     )
 
     with dev_common.file_lock(lock_file):
-        state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
-        if not isinstance(state_obj, dict):
-            state_obj = {}
-        audit_state = state_obj.get("actions_log_audit_state")
-        if not isinstance(audit_state, dict):
-            audit_state = {}
-        locks_map = _read_locks_state(audit_state)
+        lock_doc, locks_map, strip_legacy = _load_lock_doc_for_write_locked(p_dir)
         req_branch = (branch_name or str(updates.get("branch_name") or "")).strip()
         target_slug, cand_lock = _match_lock_entry(
             locks_map,
@@ -1765,13 +1960,14 @@ def update_dev_pr_lock(
             norm_cand["slots"][matched_slot] = slot2_cur
             current_lock = _sync_lock_slots_structure(norm_cand, repo_slug=target_slug)
             locks_map[target_slug] = current_lock
-            _write_locks_state(audit_state, locks_map, touched_repo_slug=target_slug)
-            state_obj["actions_log_audit_state"] = audit_state
-            tmp_path = state_path.with_suffix(".tmp")
-            tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-            with contextlib.suppress(OSError):
-                os.chmod(tmp_path, 0o600)
-            os.replace(tmp_path, state_path)
+            _persist_lock_doc_locked(
+                p_dir,
+                lock_doc,
+                locks_map,
+                now_iso=now_iso,
+                touched_repo_slug=target_slug,
+                strip_legacy_actions_state=strip_legacy,
+            )
             return {
                 "status": "ok",
                 "repo_slug": target_slug,
@@ -1843,13 +2039,14 @@ def update_dev_pr_lock(
         current_lock["updated_at"] = now_iso
         current_lock = _sync_lock_slots_structure(current_lock, repo_slug=target_slug)
         locks_map[target_slug] = current_lock
-        _write_locks_state(audit_state, locks_map, touched_repo_slug=target_slug)
-        state_obj["actions_log_audit_state"] = audit_state
-        tmp_path = state_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        with contextlib.suppress(OSError):
-            os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, state_path)
+        _persist_lock_doc_locked(
+            p_dir,
+            lock_doc,
+            locks_map,
+            now_iso=now_iso,
+            touched_repo_slug=target_slug,
+            strip_legacy_actions_state=strip_legacy,
+        )
     return {"status": "ok", "repo_slug": target_slug, "slot_id": 1, "lock": current_lock}
 
 
@@ -1922,31 +2119,64 @@ def cleanup_worktree(worktree_path: str | Path, repo_dir: Path | None = None) ->
         shutil.rmtree(wt, ignore_errors=True)
 
 
-def _finalize_single_released_lock(
+def _build_released_lock_snapshot(
     *,
     released_lock: dict[str, Any],
     released_slug: str,
-    audit_state: dict[str, Any],
+    reason: str,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Build inactive released lock snapshot for `dev_pr_lock.json`."""
+    cid_clean = str(released_lock.get("conversation_id") or "").strip()
+    return {
+        "active": False,
+        "repo_slug": released_slug,
+        "repo": released_slug,
+        "last_released_at": now_iso,
+        "last_release_reason": reason,
+        "last_conversation_id": cid_clean,
+        "last_branch_name": released_lock.get("branch_name", ""),
+        "last_branch_timestamp": released_lock.get("branch_timestamp", ""),
+        "last_repo_branches": released_lock.get("repo_branches") or {},
+        "last_subagent_conversation_ids": list(released_lock.get("subagent_conversation_ids") or []),
+        "last_pr_number": released_lock.get("pr_number"),
+        "last_issue_number": released_lock.get("issue_number"),
+    }
+
+
+def _sync_released_entries_verdicts(
+    *,
     state_dir: Path,
+    released_entries: Sequence[tuple[str, dict[str, Any]]],
     reason: str,
     resolution: str,
     summary: str,
     now_iso: str,
-) -> dict[str, Any]:
-    """Build released lock snapshot and sync ledger verdicts for one unlocked repository."""
-    cid_clean = str(released_lock.get("conversation_id") or "").strip()
-    siblings = list(released_lock.get("sibling_conversation_ids") or [])
-    legacy_audited = audit_state.get("audited_runs") if isinstance(audit_state.get("audited_runs"), dict) else {}
+) -> None:
+    """Sync released lock verdicts into `actions_ledger.db` and prune legacy `actions_state.json` proposal keys if present."""
+    if not released_entries:
+        return
+    actions_path = state_dir / ACTIONS_STATE_FILENAME
+    has_actions_file = actions_path.is_file()
+    legacy_audited: dict[str, Any] = {}
+    if has_actions_file:
+        st_preview = dev_common.atomic_read_json(actions_path, default={})
+        if isinstance(st_preview, Mapping) and isinstance(st_preview.get("actions_log_audit_state"), Mapping):
+            aud_prev = st_preview["actions_log_audit_state"]
+            if isinstance(aud_prev.get("audited_runs"), dict):
+                legacy_audited = dict(aud_prev["audited_runs"])
+
     audited_runs = dev_common.try_sync_actions_ledger_verdicts(
         state_dir=state_dir,
         legacy_audited=legacy_audited,
     )
-    pending_tier2 = (
-        audit_state.get("pending_tier2_proposals")
-        if isinstance(audit_state.get("pending_tier2_proposals"), dict)
-        else {}
-    )
-    if cid_clean:
+    verdict_updates: dict[str, dict[str, Any]] = {}
+    cids_to_pop: set[str] = set()
+    for released_slug, released_lock in released_entries:
+        cid_clean = str(released_lock.get("conversation_id") or "").strip()
+        if not cid_clean:
+            continue
+        siblings = [str(s).strip() for s in (released_lock.get("sibling_conversation_ids") or []) if str(s).strip()]
         rec = dict(audited_runs.get(cid_clean) or {})
         rec.update(
             {
@@ -1963,32 +2193,72 @@ def _finalize_single_released_lock(
                 "updated_at": now_iso,
             }
         )
-        verdict_updates: dict[str, dict[str, Any]] = {cid_clean: rec}
-        pending_tier2.pop(cid_clean, None)
+        verdict_updates[cid_clean] = rec
+        cids_to_pop.add(cid_clean)
         for sib in siblings:
             sib_rec = dict(rec)
             sib_rec["conversation_id"] = sib
             sib_rec["grouped_with"] = cid_clean
             verdict_updates[sib] = sib_rec
-            pending_tier2.pop(sib, None)
+            cids_to_pop.add(sib)
+
+    if verdict_updates:
         dev_common.try_sync_actions_ledger_verdicts(verdict_updates, state_dir=state_dir)
 
-    audit_state.pop("audited_runs", None)
-    audit_state["pending_tier2_proposals"] = pending_tier2
-    return {
-        "active": False,
-        "repo_slug": released_slug,
-        "repo": released_slug,
-        "last_released_at": now_iso,
-        "last_release_reason": reason,
-        "last_conversation_id": cid_clean,
-        "last_branch_name": released_lock.get("branch_name", ""),
-        "last_branch_timestamp": released_lock.get("branch_timestamp", ""),
-        "last_repo_branches": released_lock.get("repo_branches") or {},
-        "last_subagent_conversation_ids": list(released_lock.get("subagent_conversation_ids") or []),
-        "last_pr_number": released_lock.get("pr_number"),
-        "last_issue_number": released_lock.get("issue_number"),
-    }
+    if not has_actions_file:
+        return
+    with dev_common.file_lock(actions_path.with_suffix(".json.lock")):
+        st_cur = dev_common.atomic_read_json(actions_path, default={})
+        if not isinstance(st_cur, dict):
+            return
+        mutated = dict(st_cur)
+        changed = _strip_legacy_lock_keys_in_memory(mutated)
+        audit_cur = mutated.get("actions_log_audit_state")
+        if isinstance(audit_cur, dict):
+            audit_copy = dict(audit_cur)
+            if "audited_runs" in audit_copy:
+                audit_copy.pop("audited_runs", None)
+                changed = True
+            pending_t2 = audit_copy.get("pending_tier2_proposals")
+            if isinstance(pending_t2, dict) and any(c in pending_t2 for c in cids_to_pop):
+                p2_copy = dict(pending_t2)
+                for c in cids_to_pop:
+                    p2_copy.pop(c, None)
+                audit_copy["pending_tier2_proposals"] = p2_copy
+                changed = True
+            if changed:
+                mutated["actions_log_audit_state"] = audit_copy
+        if changed:
+            dev_common.atomic_write_json(actions_path, mutated, mode=0o600)
+
+
+def _finalize_single_released_lock(
+    *,
+    released_lock: dict[str, Any],
+    released_slug: str,
+    audit_state: dict[str, Any] | None = None,
+    state_dir: Path,
+    reason: str,
+    resolution: str,
+    summary: str,
+    now_iso: str,
+) -> dict[str, Any]:
+    """Build released lock snapshot and sync ledger verdicts for one unlocked repository."""
+    _ = audit_state
+    _sync_released_entries_verdicts(
+        state_dir=state_dir,
+        released_entries=[(released_slug, released_lock)],
+        reason=reason,
+        resolution=resolution,
+        summary=summary,
+        now_iso=now_iso,
+    )
+    return _build_released_lock_snapshot(
+        released_lock=released_lock,
+        released_slug=released_slug,
+        reason=reason,
+        now_iso=now_iso,
+    )
 
 
 def release_dev_pr_lock(
@@ -2011,21 +2281,15 @@ def release_dev_pr_lock(
       - Releasing a follower Slot #K finalizes only that slot while keeping Slot #1 and other followers untouched.
     """
     p_dir = dev_common.resolve_state_dir(portfolio_dir=portfolio_dir)
-    state_path = p_dir / "actions_state.json"
-    lock_file = state_path.with_suffix(".json.lock")
+    lock_path = p_dir / DEV_PR_LOCK_FILENAME
+    lock_file = lock_path.with_suffix(".json.lock")
     now_iso = _utc_now_iso()
 
     released_entries: list[tuple[str, dict[str, Any]]] = []
     promoted_slots: dict[str, dict[str, Any]] = {}
     remaining_active_slugs: list[str] = []
     with dev_common.file_lock(lock_file):
-        state_obj = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
-        if not isinstance(state_obj, dict):
-            state_obj = {}
-        audit_state = state_obj.get("actions_log_audit_state")
-        if not isinstance(audit_state, dict):
-            audit_state = {}
-        locks_map = _read_locks_state(audit_state)
+        lock_doc, locks_map, strip_legacy = _load_lock_doc_for_write_locked(p_dir)
         active_slugs = [k for k, v in locks_map.items() if isinstance(v, dict) and bool(v.get("active"))]
 
         target_slugs: list[str] = []
@@ -2077,16 +2341,6 @@ def release_dev_pr_lock(
                         slot2_rel = dict(slots_cur[rel_slot_key])
                         slot2_rel["repo_branches"] = {}
                         released_entries.append((slug, slot2_rel))
-                        _finalize_single_released_lock(
-                            released_lock=slot2_rel,
-                            released_slug=slug,
-                            audit_state=audit_state,
-                            state_dir=state_path.parent,
-                            reason=reason,
-                            resolution=resolution,
-                            summary=summary,
-                            now_iso=now_iso,
-                        )
                         slots_cur.pop(rel_slot_key, None)
                         norm_cur["slots"] = slots_cur
                         locks_map[slug] = _sync_lock_slots_structure(norm_cur, repo_slug=slug)
@@ -2108,14 +2362,10 @@ def release_dev_pr_lock(
                     slot1_rel["repo_branches"] = slot1_rb
                     slot1_rel.pop("slots", None)
                     released_entries.append((slug, slot1_rel))
-                    snap1 = _finalize_single_released_lock(
+                    snap1 = _build_released_lock_snapshot(
                         released_lock=slot1_rel,
                         released_slug=slug,
-                        audit_state=audit_state,
-                        state_dir=state_path.parent,
                         reason=reason,
-                        resolution=resolution,
-                        summary=summary,
                         now_iso=now_iso,
                     )
                     promote_key = _select_promotion_slot_key(norm_cur, follower_keys)
@@ -2180,14 +2430,10 @@ def release_dev_pr_lock(
                     s2_extra["repo_branches"] = {}
                     released_entries.append((slug, s2_extra))
             released_entries.append((slug, rel_lock))
-            snap = _finalize_single_released_lock(
+            snap = _build_released_lock_snapshot(
                 released_lock=rel_lock,
                 released_slug=slug,
-                audit_state=audit_state,
-                state_dir=state_path.parent,
                 reason=reason,
-                resolution=resolution,
-                summary=summary,
                 now_iso=now_iso,
             )
             locks_map[slug] = snap
@@ -2196,24 +2442,30 @@ def release_dev_pr_lock(
 
         if not released_entries:
             last_snap = _inactive_lock_snapshot(
-                audit_state.get("dev_pr_lock") if isinstance(audit_state.get("dev_pr_lock"), dict) else None
+                lock_doc.get("dev_pr_lock") if isinstance(lock_doc.get("dev_pr_lock"), dict) else None
             )
             last_snap["last_released_at"] = now_iso
             last_snap["last_release_reason"] = reason
 
-        _write_locks_state(
-            audit_state,
+        remaining_active_slugs = [k for k, v in locks_map.items() if isinstance(v, dict) and bool(v.get("active"))]
+        _persist_lock_doc_locked(
+            p_dir,
+            lock_doc,
             locks_map,
+            now_iso=now_iso,
             touched_repo_slug=last_slug,
             released_snapshot=last_snap,
+            strip_legacy_actions_state=strip_legacy,
         )
-        remaining_active_slugs = [k for k, v in locks_map.items() if isinstance(v, dict) and bool(v.get("active"))]
-        state_obj["actions_log_audit_state"] = audit_state
-        tmp_path = state_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(state_obj, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        with contextlib.suppress(OSError):
-            os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, state_path)
+
+    _sync_released_entries_verdicts(
+        state_dir=p_dir,
+        released_entries=released_entries,
+        reason=reason,
+        resolution=resolution,
+        summary=summary,
+        now_iso=now_iso,
+    )
 
     if reason in ("BRANCH_MERGED_INTO_MAIN", "HUMAN_VALIDATED_MANUAL_PR"):
         for released_slug, released_lock in released_entries:

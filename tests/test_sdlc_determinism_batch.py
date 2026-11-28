@@ -105,8 +105,8 @@ def _write_state_files(
         mode=0o600,
     )
     dev_common.atomic_write_json(
-        state_dir / "actions_state.json",
-        {"actions_log_audit_state": {"dev_pr_locks": dict(locks or {})}},
+        state_dir / "dev_pr_lock.json",
+        {"schema_version": 1, "dev_pr_locks": dict(locks or {})},
         mode=0o600,
     )
 
