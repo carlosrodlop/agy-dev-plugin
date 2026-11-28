@@ -5,12 +5,12 @@ description: Enforces semantic Git commit messages, zero-secret verification, ma
 
 # Git Commit & Configuration Synchronization Skill
 
-Enforces clean, VCS-agnostic Native Git hygiene, Zero-PII/secret safety, mandatory `pre-commit` verification, and deterministic `$HOME` plugin mirror parity across repositories managed with [`agy-dev-plugin`]($HOME/.gemini/config/plugins/agy-dev-plugin/plugin.json).
+Enforces clean, GitHub-First Native Git hygiene (Santa Lockdown compliant — zero `gh` binary), Zero-PII/secret safety, mandatory `pre-commit` verification, and deterministic `$HOME` plugin mirror parity across repositories managed with [`agy-dev-plugin`]($HOME/.gemini/config/plugins/agy-dev-plugin/plugin.json).
 
 ## 1. Mandatory Pre-Commit & Protected-Branch Protocol
 1. **Never Push Directly to `main` or `master`**:
    - Tracked changes MUST be committed on a timestamped branch `fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>` created through [`pr_remediator.py`]($HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py) (holding `dev_pr_lock`).
-   - Only pure native `/usr/bin/git` and `/usr/bin/ssh` via [`git_client.py`]($HOME/.gemini/config/plugins/agy-dev-plugin/clients/git_client.py) are allowed (`gh` / `glab` are blocked).
+   - Only pure native `/usr/bin/git` and `/usr/bin/ssh` via [`git_client.py`]($HOME/.gemini/config/plugins/agy-dev-plugin/clients/git_client.py) are allowed (the `gh` / `glab` compiled CLI binaries are blocked under Santa Lockdown; use Python stdlib `urllib.request` only if GitHub REST API access is ever needed).
 2. **Pre-Commit Hook Gate (`--all-files`)**:
    - Before every push, execute `pre-commit run --all-files` (inside the active worktree or repository) and include the visible `pre-commit` summary output directly in your response.
    - Verify `.gitignore` covers `.env`, `.venv/`, `__pycache__/`, `*.pyc`, `*.db`, and local secret caches before staging.
@@ -30,4 +30,4 @@ Follow Conventional Commits (`<type>(<scope>): <imperative summary>`):
 - `refactor(...)`: structural/modular code improvement without behavior change
 - `test(...)`: hermetic unit tests or static QA audit enhancements
 - `docs(...)` / `chore(...)`: documentation, CI workflow, or tooling maintenance
-- Embed `Tests: ...` and key rationale bullets in commit bodies so VCS Compare/PR pages auto-populate cleanly.
+- Embed `Tests: ...` and key rationale bullets in commit bodies so GitHub Compare/PR pages auto-populate cleanly.

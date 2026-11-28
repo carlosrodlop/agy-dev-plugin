@@ -89,10 +89,10 @@ DETERMINISTIC_DEV_PRETOOL_CHECKS: tuple[dict[str, str], ...] = (
     {
         "check_id": "pretool:proprietary-vcs-cli",
         "event": "PreToolUse",
-        "title": "Pure Native Git Mandate (gh/glab Blocker)",
+        "title": "GitHub-First Native Git Mandate (gh/glab Binary Blocker)",
         "target": "run_command (PROPRIETARY_VCS_CLI_RE)",
         "decision": "deny",
-        "description": "Blocks 'gh' and 'glab' CLI invocations; enforces 100% VCS-agnostic native /usr/bin/git and /usr/bin/ssh.",
+        "description": "Blocks unapproved compiled 'gh' and 'glab' CLI binaries (Santa Lockdown); enforces GitHub-First native /usr/bin/git and /usr/bin/ssh transport.",
     },
     {
         "check_id": "pretool:santa-lockdown-binary",
@@ -1272,8 +1272,9 @@ class DevLifecycleGuardrailEvaluator:
                 return {
                     "decision": "deny",
                     "reason": (
-                        "Guardrail violation (Pure Native Git): proprietary CLI wrappers ('gh' / 'glab') "
-                        "are forbidden. Use 'git_client.py' or 'pr_remediator.py' with native /usr/bin/git and /usr/bin/ssh."
+                        "Guardrail violation (GitHub-First Native Git - Santa Lockdown): unapproved compiled CLI binaries "
+                        "('gh' / 'glab') are forbidden. Use 'git_client.py' or 'pr_remediator.py' with native /usr/bin/git "
+                        "and /usr/bin/ssh; if GitHub REST API access is ever needed, use Python stdlib urllib.request."
                     ),
                 }
 

@@ -1,11 +1,11 @@
 ---
 name: agy-code-remediation-pr
-description: VCS-Interoperable Native Git Timestamped Branch Remediation Pipeline with Per-Repository Development Locks (dev_pr_locks) and Multi-Agent Orchestration (agy-dev-executor / agy-code-developer -> agy-code-pr-reviewer, Model='pro') for interactive user-prompted code/configuration changes or escalated incident audits. Uses pure native git (git_client.py; GitHub, GitLab, Bitbucket, Gitea interoperable): creates repo-isolated worktrees on fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>, pushes exclusively to remote feature branches, scopes locks per repository so unrelated repos progress in parallel, and produces clickable Compare/Manual PR URLs.
+description: GitHub-First Native Git Timestamped Branch Remediation Pipeline (Santa-safe, zero gh binary) with Per-Repository Development Locks (dev_pr_locks) and Multi-Agent Orchestration (agy-dev-executor / agy-code-developer -> agy-code-pr-reviewer, Model='pro') for interactive user-prompted code/configuration changes or escalated incident audits. Uses pure native git + ssh (git_client.py): creates repo-isolated worktrees on fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>, pushes exclusively to remote feature branches, scopes locks per repository so unrelated repos progress in parallel, and produces clickable GitHub Compare/Manual PR URLs.
 ---
 
-# Native Git Timestamped Branch Remediation Pipeline (`agy-code-remediation-pr`)
+# GitHub-First Native Git Timestamped Branch Remediation Pipeline (`agy-code-remediation-pr`)
 
-All code, script, skill, rule, agent, hook, and configuration changes MUST flow through [`pr_remediator.py`]($HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py) using pure native `git` (never `gh` / `glab` REST CLIs, never direct pushes to `main`).
+All code, script, skill, rule, agent, hook, and configuration changes MUST flow through [`pr_remediator.py`]($HOME/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py) using pure native `/usr/bin/git` + `/usr/bin/ssh` against GitHub (never the `gh` / `glab` compiled CLI binaries — unapproved under Santa Lockdown; Python stdlib `urllib.request` only if GitHub REST API access is ever needed; never direct pushes to `main`).
 
 ## End-to-End Execution Protocol
 1. **Check Per-Repository Lock Status & Sync Local `main`**:
