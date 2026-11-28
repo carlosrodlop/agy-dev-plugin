@@ -41,7 +41,8 @@ import parallel_scope as _parallel_scope  # noqa: E402
 
 DEFAULT_STALL_THRESHOLD_SECONDS = 900
 DEFAULT_MAX_PARTIAL_WIP = 3
-DEFAULT_MAX_ORCHESTRATOR_STEPS = 150
+DEFAULT_MAX_ORCHESTRATOR_STEPS = 100
+DEFAULT_HARD_ORCHESTRATOR_STEPS = 110
 # Multi-slot per-repository engine bounds (mirrors `dev_common.resolve_max_repo_slots`, clamped `[1..4]`).
 DEFAULT_MAX_REPO_SLOTS = 3
 MAX_REPO_SLOTS_CAP = 4
@@ -128,7 +129,7 @@ def resolve_stall_threshold_seconds(threshold_seconds: int | float | None = None
 
 
 def resolve_max_orchestrator_steps(max_steps: int | float | None = None) -> int:
-    """Resolve orchestrator context rotation threshold in steps (default `150`, env `AGY_DEV_MAX_ORCHESTRATOR_STEPS`, clamped `>= 30`)."""
+    """Resolve proactive orchestrator auto-handoff rotation threshold in steps (default `100`, env `AGY_DEV_MAX_ORCHESTRATOR_STEPS`, clamped `>= 30`)."""
     if max_steps is not None:
         with contextlib.suppress(TypeError, ValueError):
             val = int(round(float(max_steps)))
@@ -141,6 +142,11 @@ def resolve_max_orchestrator_steps(max_steps: int | float | None = None) -> int:
             if val > 0:
                 return max(30, val)
     return DEFAULT_MAX_ORCHESTRATOR_STEPS
+
+
+def resolve_hard_orchestrator_steps(max_steps: int | float | None = None) -> int:
+    """Resolve urgent upper-bound orchestrator rotation threshold (`soft_threshold + 10`, default `110`)."""
+    return resolve_max_orchestrator_steps(max_steps) + 10
 
 
 def resolve_max_repo_slots(explicit_max_slots: Any = None) -> int:
@@ -1861,25 +1867,34 @@ def _detect_telemetry_efficiency_anomalies(
         dev_models.extend(metrics["dev_invocations"])
 
     max_orch_steps = resolve_max_orchestrator_steps()
+    hard_orch_steps = max_orch_steps + 10
     if orch_clean and orch_steps >= max_orch_steps:
+        is_urgent = orch_steps >= hard_orch_steps
         findings.append(
             _make_finding(
                 code="bloated_orchestrator_session",
-                severity="medium",
+                severity="high" if is_urgent else "medium",
                 category="telemetry",
-                title=f"Orchestrator session {orch_clean[:8]} has {orch_steps} steps (>={max_orch_steps})",
+                title=(
+                    f"Orchestrator session {orch_clean[:8]} has {orch_steps} steps "
+                    f"(>={hard_orch_steps if is_urgent else max_orch_steps}; auto-handoff window {max_orch_steps}-{hard_orch_steps})"
+                ),
                 evidence={
                     "orchestrator_cid": orch_clean,
                     "step_count": orch_steps,
                     "threshold": max_orch_steps,
+                    "hard_threshold": hard_orch_steps,
+                    "auto_handoff_recommended": True,
+                    "rotation_urgency": "urgent" if is_urgent else "proactive",
                 },
                 recommendation=(
-                    f"Rotate to a fresh `agy-dev-orchestrator` conversation (every ~{max_orch_steps} steps or 5-8 PRs; "
-                    "configurable via `AGY_DEV_MAX_ORCHESTRATOR_STEPS`) and register it via "
-                    "`pr_remediator.py queue-next --unlocked --orchestrator-id <NEW_CID>` to cut per-turn context tokens."
+                    f"Proactively auto-handoff and rotate to a fresh `agy-dev-orchestrator` conversation "
+                    f"(every {max_orch_steps}-{hard_orch_steps} steps or 4-6 PRs; configurable via "
+                    "`AGY_DEV_MAX_ORCHESTRATOR_STEPS`) and register it via "
+                    "`pr_remediator.py queue-next --unlocked --orchestrator-id <NEW_CID>` to prevent context bloat."
                 ),
-                auto_action_hint="Start a fresh agy-dev-orchestrator conversation and transfer orchestrator ID.",
-                estimated_savings_min=15,
+                auto_action_hint="Auto-handoff to a fresh agy-dev-orchestrator conversation and transfer orchestrator ID.",
+                estimated_savings_min=20 if is_urgent else 15,
             )
         )
 

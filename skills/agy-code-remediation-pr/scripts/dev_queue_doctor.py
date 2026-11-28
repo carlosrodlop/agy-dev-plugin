@@ -58,6 +58,8 @@ from dev_flow_optimizer import (  # noqa: E402
     detect_stalled_lock,
     format_idle_duration,
     parse_iso_timestamp,
+    resolve_hard_orchestrator_steps,
+    resolve_max_orchestrator_steps,
     resolve_stall_threshold_seconds,
 )
 
@@ -430,6 +432,16 @@ def inspect_live_processes(
     }
 
 
+def _count_transcript_steps(path: Path) -> int:
+    """Count non-empty JSONL steps in `path` without loading full file into memory."""
+    count = 0
+    with contextlib.suppress(OSError), path.open("rb") as fh:
+        for raw in fh:
+            if raw.strip():
+                count += 1
+    return count
+
+
 def _read_tail_lines(path: Path, max_bytes: int = TRANSCRIPT_TAIL_MAX_BYTES) -> list[str]:
     """Read tail lines from `path` bounded by `max_bytes` for sub-millisecond inspection."""
     with path.open("rb") as fh:
@@ -604,6 +616,7 @@ def inspect_transcript_tail(
         "quota_resets_at": str(quota_info.get("resets_at") or ""),
         "quota_resets_in_seconds": int(quota_info.get("resets_in_seconds") or 0),
         "quota_snippet": _sanitize_path(str(quota_info.get("snippet") or "")),
+        "step_count": _count_transcript_steps(tpath),
         "tail_lines_scanned": len(lines),
     }
 
@@ -1457,6 +1470,12 @@ def diagnose_orchestrator(
             }
         )
 
+    rot_soft = resolve_max_orchestrator_steps()
+    rot_hard = resolve_hard_orchestrator_steps()
+    orch_steps = int(orch_transcript.get("step_count") or 0)
+    rot_recommended = bool(eff_orch_cid and orch_steps >= rot_soft)
+    rot_urgency = "urgent" if (eff_orch_cid and orch_steps >= rot_hard) else ("proactive" if rot_recommended else "none")
+
     return {
         "status": "ok",
         "generated_at": _utc_now_iso(cur_ts),
@@ -1471,6 +1490,11 @@ def diagnose_orchestrator(
         "orchestrator": {
             "conversation_id": eff_orch_cid,
             "transcript": orch_transcript,
+            "step_count": orch_steps,
+            "rotation_threshold": rot_soft,
+            "hard_rotation_threshold": rot_hard,
+            "rotation_recommended": rot_recommended,
+            "rotation_urgency": rot_urgency,
         },
         "processes": proc_info,
         "queue_summary": {
@@ -2453,6 +2477,34 @@ def run_orchestrator_tick(
         "blocked_by_wip_cap_repos": list(q_next.get("blocked_by_wip_cap_repos") or []),
     }
 
+    rot_soft = resolve_max_orchestrator_steps()
+    rot_hard = resolve_hard_orchestrator_steps()
+    tick_orch_steps = 0
+    tick_rot_recommended = False
+    tick_rot_urgency = "none"
+    if orchestrator_id and brain_dir is not None:
+        # Always report the real step count, including below the rotation threshold where no finding exists.
+        tr_tick = inspect_transcript_tail(orchestrator_id, brain_dir, now_ts=now_ts, home_dir=home_dir)
+        tick_orch_steps = int(tr_tick.get("step_count") or 0)
+        tick_rot_recommended = tick_orch_steps >= rot_soft
+        tick_rot_urgency = "urgent" if tick_orch_steps >= rot_hard else ("proactive" if tick_rot_recommended else "none")
+    if include_optimize:
+        for f_raw in (opt_res.get("findings") or []):
+            if isinstance(f_raw, dict) and str(f_raw.get("code") or "") == "bloated_orchestrator_session":
+                ev_b = f_raw.get("evidence") if isinstance(f_raw.get("evidence"), dict) else {}
+                tick_orch_steps = int(ev_b.get("step_count") or 0) or tick_orch_steps
+                tick_rot_recommended = True
+                tick_rot_urgency = str(ev_b.get("rotation_urgency") or ("urgent" if tick_orch_steps >= rot_hard else "proactive"))
+                break
+
+    orchestrator_rotation = {
+        "recommended": tick_rot_recommended,
+        "step_count": tick_orch_steps,
+        "threshold": rot_soft,
+        "hard_threshold": rot_hard,
+        "urgency": tick_rot_urgency,
+    }
+
     needs_llm_action = bool(
         not is_paused
         and (
@@ -2470,6 +2522,7 @@ def run_orchestrator_tick(
         "dry_run": bool(dry_run),
         "paused": bool(is_paused),
         "orchestration_control": _orch_ctrl.summarize_orchestration_phase(orch_ctrl, active_locks),
+        "orchestrator_rotation": orchestrator_rotation,
         "lock_sync": lock_sync_summary,
         "auto_heals": auto_heals_summary,
         "compaction": compaction_summary,
@@ -2482,6 +2535,8 @@ def run_orchestrator_tick(
             "auto_healed_count": int(auto_heals_summary["applied_count"]),
             "compacted_count": int(compaction_summary["applied_count"]),
             "findings_count": int(optimization_summary["findings_count"]),
+            "rotation_recommended": tick_rot_recommended,
+            "orchestrator_step_count": tick_orch_steps,
             "needs_llm_action": needs_llm_action,
         },
     }

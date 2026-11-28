@@ -16,7 +16,8 @@ Pure Python 3 standard-library module using native `/usr/bin/git` (`shell=False`
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+import argparse
+from collections.abc import Callable, Mapping, Sequence
 import contextlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 DEFAULT_REBASE_VERIFY_TIMEOUT_SECONDS: float = 480.0
@@ -43,6 +45,20 @@ REBASE_OUTCOMES: tuple[str, ...] = (
     OUTCOME_NEEDS_SEMANTIC_FIX,
     OUTCOME_NEEDS_CONFLICT_RESOLUTION,
 )
+
+OUTCOME_SPECULATIVE_READY = "SPECULATIVE_PRE_REBASE_READY"
+OUTCOME_SPECULATIVE_CONFLICT = "SPECULATIVE_CONFLICT_DETECTED"
+OUTCOME_SPECULATIVE_SEMANTIC_FAILURE = "SPECULATIVE_SEMANTIC_FAILURE"
+OUTCOME_SPECULATIVE_SKIPPED = "SPECULATIVE_SKIPPED"
+SPECULATIVE_REF_PREFIX = "refs/agy-speculative/"
+
+OUTCOME_TRAIN_BUNDLED = "RELEASE_TRAIN_BUNDLED"
+OUTCOME_TRAIN_DRY_RUN_READY = "RELEASE_TRAIN_DRY_RUN_READY"
+OUTCOME_TRAIN_ROLLED_BACK_CONFLICT = "RELEASE_TRAIN_ROLLED_BACK_CONFLICT"
+OUTCOME_TRAIN_ROLLED_BACK_VERIFICATION = "RELEASE_TRAIN_ROLLED_BACK_VERIFICATION"
+OUTCOME_TRAIN_NOT_ELIGIBLE = "RELEASE_TRAIN_NOT_ELIGIBLE"
+DEFAULT_TRAIN_MIN_SLOTS = 2
+DEFAULT_TRAIN_MAX_SLOTS = 3
 
 MAX_CAPTURED_DIFF_CHARS = 24000
 _GIT_HOOK_ENV_VARS: frozenset[str] = frozenset(
@@ -215,6 +231,7 @@ class RebaseReverifyResult:
     verification_results: dict[str, Any] = field(default_factory=dict)
     failure_details: str = ""
     merge_tree_probe: dict[str, Any] = field(default_factory=dict)
+    speculative_cache_hit: bool = False
     error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -225,6 +242,76 @@ class RebaseReverifyResult:
         data["union_files"] = list(self.union_files)
         data["conflicted_files"] = list(self.conflicted_files)
         data["merged_a_commits"] = list(self.merged_a_commits)
+        return data
+
+
+@dataclass(frozen=True)
+class SpeculativePreRebaseResult:
+    """Structured 0-LLM speculative pre-rebase result over frozen Slot #1 HEAD."""
+
+    status: str
+    outcome: str
+    rebased: bool
+    clean: bool
+    aborted_cleanly: bool
+    worktree_pristine: bool
+    follower_branch: str
+    slot1_ref: str
+    slot1_head_sha: str
+    slot1_tree_sha: str
+    follower_head_sha: str
+    speculative_head_sha: str = ""
+    speculative_tree_sha: str = ""
+    speculative_ref: str = ""
+    union_files: tuple[str, ...] = ()
+    conflicted_files: tuple[str, ...] = ()
+    verification_passed: bool = False
+    verification_results: dict[str, Any] = field(default_factory=dict)
+    failure_details: str = ""
+    merge_tree_probe: dict[str, Any] = field(default_factory=dict)
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize speculative pre-rebase result to JSON-friendly dict."""
+        data = asdict(self)
+        data["union_files"] = list(self.union_files)
+        data["conflicted_files"] = list(self.conflicted_files)
+        return data
+
+
+@dataclass(frozen=True)
+class ReleaseTrainBundleResult:
+    """Structured 0-LLM Release Train (`bundle-ready-slots`) integration result with atomic rollback telemetry."""
+
+    status: str
+    outcome: str
+    bundled: bool
+    rolled_back: bool
+    worktree_pristine: bool
+    train_branch: str
+    train_worktree: str
+    base_ref: str
+    base_sha: str
+    train_head_sha: str = ""
+    included_branches: tuple[str, ...] = ()
+    included_slot_ids: tuple[int, ...] = ()
+    included_conversation_ids: tuple[str, ...] = ()
+    union_files: tuple[str, ...] = ()
+    conflicted_branch: str = ""
+    conflicted_files: tuple[str, ...] = ()
+    verification_passed: bool = False
+    verification_results: dict[str, Any] = field(default_factory=dict)
+    failure_details: str = ""
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize Release Train bundle result to JSON-friendly dict."""
+        data = asdict(self)
+        data["included_branches"] = list(self.included_branches)
+        data["included_slot_ids"] = list(self.included_slot_ids)
+        data["included_conversation_ids"] = list(self.included_conversation_ids)
+        data["union_files"] = list(self.union_files)
+        data["conflicted_files"] = list(self.conflicted_files)
         return data
 
 
@@ -1036,6 +1123,7 @@ def rebase_and_reverify(
     timeout: float | None = None,
     verify_fn: Callable[[Path, list[str]], dict[str, Any]] | None = None,
     restamp_fn: Callable[[Path, list[str]], None] | None = None,
+    speculative_cache: Mapping[str, Any] | None = None,
 ) -> RebaseReverifyResult:
     """Rebase `branch_name` onto updated `<remote>/<base_branch>` and re-verify over `files(B) ∪ files(merged_A)`.
 
@@ -1138,84 +1226,113 @@ def rebase_and_reverify(
                 error=(co_proc.stderr or co_proc.stdout or f"Failed to checkout {resolved_br}").strip(),
             )
 
+    cache_ok = (
+        isinstance(speculative_cache, Mapping)
+        and bool(speculative_cache.get("verification_passed"))
+        and str(speculative_cache.get("follower_head_sha") or "").strip() == pre_head_sha
+    )
+    cache_slot1_sha = str((speculative_cache or {}).get("slot1_head_sha") or "").strip() if cache_ok else ""
+    cache_spec_sha = str((speculative_cache or {}).get("speculative_head_sha") or "").strip() if cache_ok else ""
+    cache_spec_tree = str((speculative_cache or {}).get("speculative_tree_sha") or "").strip() if cache_ok else ""
+    cache_vr = (
+        dict((speculative_cache or {}).get("verification_results") or {})
+        if cache_ok and isinstance((speculative_cache or {}).get("verification_results"), Mapping)
+        else {}
+    )
+
     probe_dict: dict[str, Any] = {}
     rebased = False
+    speculative_cache_hit = False
+    fast_path_tree_sha = ""
+
     if drift.behind_count > 0:
-        probe = probe_merge_tree_conflicts(
-            effective_dir,
-            target_base_sha,
-            pre_head_sha,
-            merge_base_sha=drift.merge_base_sha,
-        )
-        probe_dict = probe.to_dict()
-        if not probe.clean and probe.supported_write_tree:
-            # In-memory `merge-tree --write-tree` deterministically proved a conflict without touching the worktree!
-            conf_list = list(probe.conflicted_files) or sorted(set(drift.branch_b_files) & set(drift.merged_a_files))
-            return RebaseReverifyResult(
-                status="ok",
-                outcome=OUTCOME_NEEDS_CONFLICT_RESOLUTION,
-                rebased=False,
-                drifted=True,
-                aborted_cleanly=True,
-                worktree_pristine=_is_worktree_clean(effective_dir),
-                branch_name=resolved_br,
-                workdir=_sanitize_path(str(effective_dir)),
-                previous_head_sha=pre_head_sha,
-                new_head_sha=pre_head_sha,
-                previous_base_sha=old_base_sha,
-                new_base_sha=target_base_sha,
-                branch_b_files=drift.branch_b_files,
-                merged_a_files=drift.merged_a_files,
-                union_files=drift.union_files,
-                conflicted_files=tuple(conf_list),
-                merged_a_commits=tuple(merged_a_commits),
-                merged_a_diff=merged_a_diff,
-                verification_passed=False,
-                merge_tree_probe=probe_dict,
+        # Speculative fast-path 1: Slot #1 fast-forwarded directly onto main -> reset branch directly to pre-verified commit.
+        if cache_ok and cache_slot1_sha == target_base_sha and cache_spec_sha:
+            chk_spec = _run_git(effective_dir, ["rev-parse", "--verify", f"{cache_spec_sha}^{{tree}}"], timeout=5.0)
+            spec_tree_live = (chk_spec.stdout or "").strip() if chk_spec.returncode == 0 else ""
+            if spec_tree_live and (not cache_spec_tree or spec_tree_live == cache_spec_tree):
+                rst_proc = _run_git(effective_dir, ["reset", "--hard", cache_spec_sha], timeout=15.0)
+                if rst_proc.returncode == 0:
+                    rebased = True
+                    speculative_cache_hit = True
+                    fast_path_tree_sha = spec_tree_live
+
+        if not speculative_cache_hit:
+            probe = probe_merge_tree_conflicts(
+                effective_dir,
+                target_base_sha,
+                pre_head_sha,
+                merge_base_sha=drift.merge_base_sha,
             )
+            probe_dict = probe.to_dict()
+            if not probe.clean and probe.supported_write_tree:
+                # In-memory `merge-tree --write-tree` deterministically proved a conflict without touching the worktree!
+                conf_list = list(probe.conflicted_files) or sorted(set(drift.branch_b_files) & set(drift.merged_a_files))
+                return RebaseReverifyResult(
+                    status="ok",
+                    outcome=OUTCOME_NEEDS_CONFLICT_RESOLUTION,
+                    rebased=False,
+                    drifted=True,
+                    aborted_cleanly=True,
+                    worktree_pristine=_is_worktree_clean(effective_dir),
+                    branch_name=resolved_br,
+                    workdir=_sanitize_path(str(effective_dir)),
+                    previous_head_sha=pre_head_sha,
+                    new_head_sha=pre_head_sha,
+                    previous_base_sha=old_base_sha,
+                    new_base_sha=target_base_sha,
+                    branch_b_files=drift.branch_b_files,
+                    merged_a_files=drift.merged_a_files,
+                    union_files=drift.union_files,
+                    conflicted_files=tuple(conf_list),
+                    merged_a_commits=tuple(merged_a_commits),
+                    merged_a_diff=merged_a_diff,
+                    verification_passed=False,
+                    merge_tree_probe=probe_dict,
+                )
 
-        rb_proc = _run_git(effective_dir, ["rebase", target_base_sha], timeout=45.0)
-        if rb_proc.returncode != 0:
-            unmerged_proc = _run_git(effective_dir, ["diff", "--name-only", "--diff-filter=U"], timeout=5.0)
-            unmerged_files = [
-                ln.strip() for ln in (unmerged_proc.stdout or "").splitlines() if ln.strip()
-            ]
-            parsed_rb_conf = _parse_write_tree_conflicts(f"{rb_proc.stdout or ''}\n{rb_proc.stderr or ''}")
-            conflicted = sorted(set(unmerged_files) | set(parsed_rb_conf) | set(probe.conflicted_files))
-            if not conflicted:
-                conflicted = sorted(set(drift.branch_b_files) & set(drift.merged_a_files))
+            rb_proc = _run_git(effective_dir, ["rebase", target_base_sha], timeout=45.0)
+            if rb_proc.returncode != 0:
+                unmerged_proc = _run_git(effective_dir, ["diff", "--name-only", "--diff-filter=U"], timeout=5.0)
+                unmerged_files = [
+                    ln.strip() for ln in (unmerged_proc.stdout or "").splitlines() if ln.strip()
+                ]
+                parsed_rb_conf = _parse_write_tree_conflicts(f"{rb_proc.stdout or ''}\n{rb_proc.stderr or ''}")
+                conflicted = sorted(set(unmerged_files) | set(parsed_rb_conf) | set(probe.conflicted_files))
+                if not conflicted:
+                    conflicted = sorted(set(drift.branch_b_files) & set(drift.merged_a_files))
 
-            abort_proc = _run_git(effective_dir, ["rebase", "--abort"], timeout=15.0)
-            if abort_proc.returncode != 0 and _is_rebase_in_progress(effective_dir):
-                _run_git(effective_dir, ["reset", "--hard", pre_head_sha], timeout=10.0)
-            pristine = _is_worktree_clean(effective_dir)
-            _, restored_sha = _resolve_branch_head_sha(effective_dir, branch_name=resolved_br)
-            aborted_ok = pristine and (restored_sha == pre_head_sha)
+                abort_proc = _run_git(effective_dir, ["rebase", "--abort"], timeout=15.0)
+                if abort_proc.returncode != 0 and _is_rebase_in_progress(effective_dir):
+                    _run_git(effective_dir, ["reset", "--hard", pre_head_sha], timeout=10.0)
+                pristine = _is_worktree_clean(effective_dir)
+                _, restored_sha = _resolve_branch_head_sha(effective_dir, branch_name=resolved_br)
+                aborted_ok = pristine and (restored_sha == pre_head_sha)
 
-            return RebaseReverifyResult(
-                status="ok",
-                outcome=OUTCOME_NEEDS_CONFLICT_RESOLUTION,
-                rebased=False,
-                drifted=True,
-                aborted_cleanly=aborted_ok,
-                worktree_pristine=pristine,
-                branch_name=resolved_br,
-                workdir=_sanitize_path(str(effective_dir)),
-                previous_head_sha=pre_head_sha,
-                new_head_sha=restored_sha or pre_head_sha,
-                previous_base_sha=old_base_sha,
-                new_base_sha=target_base_sha,
-                branch_b_files=drift.branch_b_files,
-                merged_a_files=drift.merged_a_files,
-                union_files=drift.union_files,
-                conflicted_files=tuple(conflicted),
-                merged_a_commits=tuple(merged_a_commits),
-                merged_a_diff=merged_a_diff,
-                verification_passed=False,
-                merge_tree_probe=probe_dict,
-                failure_details=f"{rb_proc.stdout or ''}\n{rb_proc.stderr or ''}".strip()[:3000],
-            )
-        rebased = True
+                return RebaseReverifyResult(
+                    status="ok",
+                    outcome=OUTCOME_NEEDS_CONFLICT_RESOLUTION,
+                    rebased=False,
+                    drifted=True,
+                    aborted_cleanly=aborted_ok,
+                    worktree_pristine=pristine,
+                    branch_name=resolved_br,
+                    workdir=_sanitize_path(str(effective_dir)),
+                    previous_head_sha=pre_head_sha,
+                    new_head_sha=restored_sha or pre_head_sha,
+                    previous_base_sha=old_base_sha,
+                    new_base_sha=target_base_sha,
+                    branch_b_files=drift.branch_b_files,
+                    merged_a_files=drift.merged_a_files,
+                    union_files=drift.union_files,
+                    conflicted_files=tuple(conflicted),
+                    merged_a_commits=tuple(merged_a_commits),
+                    merged_a_diff=merged_a_diff,
+                    verification_passed=False,
+                    merge_tree_probe=probe_dict,
+                    failure_details=f"{rb_proc.stdout or ''}\n{rb_proc.stderr or ''}".strip()[:3000],
+                )
+            rebased = True
 
     if restamp_fn is not None and rebased:
         with contextlib.suppress(Exception):
@@ -1225,7 +1342,30 @@ def rebase_and_reverify(
     post_b_files = _git_diff_names(effective_dir, f"{target_base_sha}..{post_head_sha}") if post_head_sha else list(drift.branch_b_files)
     union_files = compute_cross_impact_files(post_b_files or drift.branch_b_files, drift.merged_a_files)
 
-    if verify_fn is not None:
+    # Speculative fast-path 2: squash/merge commit produced byte-for-byte identical tree SHA -> reuse pre-verified results!
+    post_snap = _snapshot_clean_fingerprint(effective_dir, post_head_sha or pre_head_sha)
+    post_tree_sha = str(post_snap.get("tree_sha") or "")
+    if speculative_cache_hit and post_tree_sha != fast_path_tree_sha:
+        # `restamp_fn` amended the pre-verified commit: the cached verification no longer covers this tree.
+        speculative_cache_hit = False
+    if not speculative_cache_hit and cache_ok and cache_spec_tree and post_tree_sha == cache_spec_tree:
+        speculative_cache_hit = True
+
+    if speculative_cache_hit and cache_vr:
+        ver_out: dict[str, Any] = {
+            "passed": True,
+            "verification_results": {
+                **cache_vr,
+                "head_sha": post_head_sha or pre_head_sha,
+                "tree_sha": str(post_snap.get("tree_sha") or cache_spec_tree),
+                "dirty": False,
+                "content_fingerprint": str(post_snap.get("content_fingerprint") or cache_vr.get("content_fingerprint") or ""),
+                "speculative_cache_hit": True,
+                "cross_impact_union_files": list(union_files),
+            },
+            "failure_details": "",
+        }
+    elif verify_fn is not None:
         ver_out = verify_fn(effective_dir, union_files)
     else:
         effective_timeout = _resolve_rebase_verify_timeout(timeout)
@@ -1234,6 +1374,13 @@ def rebase_and_reverify(
     ver_passed = bool(ver_out.get("passed"))
     ver_results = dict(ver_out.get("verification_results") or {})
     failure_details = str(ver_out.get("failure_details") or ver_out.get("test_output") or ver_out.get("qa_output") or "").strip()
+
+    # Best-effort cleanup: a promoted follower has consumed its pinned speculative commit.
+    consumed_ref = (
+        str(speculative_cache.get("speculative_ref") or "").strip() if isinstance(speculative_cache, Mapping) else ""
+    )
+    if ver_passed and rebased and consumed_ref.startswith(SPECULATIVE_REF_PREFIX):
+        _run_git(effective_dir, ["update-ref", "-d", consumed_ref], timeout=5.0)
 
     outcome = OUTCOME_AUTO_PROMOTED if ver_passed else OUTCOME_NEEDS_SEMANTIC_FIX
     return RebaseReverifyResult(
@@ -1259,4 +1406,830 @@ def rebase_and_reverify(
         verification_results=ver_results,
         failure_details=failure_details,
         merge_tree_probe=probe_dict,
+        speculative_cache_hit=speculative_cache_hit,
     )
+
+
+# ==============================================================================
+# Phase 2: Speculative Pre-Rebase over Frozen Slot #1 HEAD & Release Train Bundling
+# ==============================================================================
+
+
+def _resolve_main_repo_root(repo_or_wt: Path) -> Path:
+    """Resolve the primary repository checkout root from any linked worktree or repo path."""
+    proc = _run_git(repo_or_wt, ["rev-parse", "--git-common-dir"], timeout=5.0)
+    if proc.returncode == 0 and (proc.stdout or "").strip():
+        common_raw = Path((proc.stdout or "").strip())
+        common_abs = common_raw if common_raw.is_absolute() else (repo_or_wt / common_raw)
+        common_res = common_abs.resolve()
+        if common_res.name == ".git" and common_res.parent.is_dir():
+            return common_res.parent
+    return repo_or_wt.resolve()
+
+
+def _slugify_ref_token(raw: str, max_len: int = 64) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(raw or "").strip()).strip("-.")
+    return cleaned[:max_len].strip("-.") or "slot"
+
+
+def _remove_worktree_cleanly(main_repo: Path, wt_path: Path) -> None:
+    """Force-remove a temporary or train worktree and prune stale git worktree records."""
+    if wt_path.exists():
+        _run_git(main_repo, ["worktree", "remove", "--force", str(wt_path)], timeout=20.0)
+        if wt_path.exists():
+            shutil.rmtree(wt_path, ignore_errors=True)
+    _run_git(main_repo, ["worktree", "prune"], timeout=10.0)
+
+
+def discard_release_train(
+    repo_dir: Path | str,
+    *,
+    train_branch: str,
+    train_worktree: Path | str | None = None,
+) -> None:
+    """Best-effort removal of a local Release Train worktree and branch (rollback or failed publish)."""
+    main_repo = _resolve_main_repo_root(Path(str(repo_dir).replace("$HOME", str(Path.home()))).expanduser().resolve())
+    wt_raw = str(train_worktree or "").strip()
+    if wt_raw:
+        wt_path = Path(wt_raw.replace("$HOME", str(Path.home()))).expanduser().resolve()
+        if wt_path.exists():
+            _run_git(wt_path, ["cherry-pick", "--abort"], timeout=10.0)
+        _remove_worktree_cleanly(main_repo, wt_path)
+    clean_branch = str(train_branch or "").strip().removeprefix("refs/heads/")
+    if clean_branch:
+        _run_git(main_repo, ["branch", "-D", clean_branch], timeout=10.0)
+
+
+def speculative_pre_rebase_slot(
+    repo_dir: Path | str,
+    *,
+    follower_branch: str,
+    slot1_ref: str = "",
+    slot1_head_sha: str = "",
+    verify: bool = True,
+    timeout: float | None = None,
+    verify_fn: Callable[[Path, list[str]], dict[str, Any]] | None = None,
+) -> SpeculativePreRebaseResult:
+    """Speculatively pre-rebase `follower_branch` over frozen Slot #1 `HEAD` inside an isolated temp worktree.
+
+    Never mutates `follower_branch` or its live worktree: pins a verified commit under
+    `refs/agy-speculative/<slug>` so post-merge promotion via `rebase_and_reverify` reuses the
+    verified tree/commit directly with near-zero latency. `verification_passed` is True only when
+    verification actually ran and passed (never for `verify=False` or `SPECULATIVE_SKIPPED`), so an
+    unverified result can never satisfy the promotion cache.
+    """
+    r_dir = Path(str(repo_dir).replace("$HOME", str(Path.home()))).expanduser().resolve()
+    clean_follower = str(follower_branch or "").strip().removeprefix("refs/heads/")
+    target_ref = str(slot1_head_sha or slot1_ref or "").strip()
+    if not (r_dir / ".git").exists():
+        return SpeculativePreRebaseResult(
+            status="error",
+            outcome="",
+            rebased=False,
+            clean=False,
+            aborted_cleanly=False,
+            worktree_pristine=False,
+            follower_branch=clean_follower,
+            slot1_ref=target_ref,
+            slot1_head_sha="",
+            slot1_tree_sha="",
+            follower_head_sha="",
+            error=f"Git repository not found at {_sanitize_path(str(r_dir))}",
+        )
+    if not clean_follower or not target_ref:
+        return SpeculativePreRebaseResult(
+            status="error",
+            outcome="",
+            rebased=False,
+            clean=False,
+            aborted_cleanly=False,
+            worktree_pristine=_is_worktree_clean(r_dir),
+            follower_branch=clean_follower,
+            slot1_ref=target_ref,
+            slot1_head_sha="",
+            slot1_tree_sha="",
+            follower_head_sha="",
+            error="Both `follower_branch` and `slot1_ref`/`slot1_head_sha` are required.",
+        )
+
+    main_repo = _resolve_main_repo_root(r_dir)
+    _, resolved_follower_sha = _resolve_branch_head_sha(main_repo, branch_name=clean_follower)
+    s1_proc = _run_git(main_repo, ["rev-parse", "--verify", target_ref], timeout=5.0)
+    resolved_s1_sha = (s1_proc.stdout or "").strip() if s1_proc.returncode == 0 else ""
+    if not resolved_follower_sha or not resolved_s1_sha:
+        return SpeculativePreRebaseResult(
+            status="error",
+            outcome="",
+            rebased=False,
+            clean=False,
+            aborted_cleanly=False,
+            worktree_pristine=_is_worktree_clean(main_repo),
+            follower_branch=clean_follower,
+            slot1_ref=target_ref,
+            slot1_head_sha=resolved_s1_sha,
+            slot1_tree_sha="",
+            follower_head_sha=resolved_follower_sha,
+            error="Could not resolve follower branch or frozen Slot #1 HEAD SHA.",
+        )
+
+    s1_tree_proc = _run_git(main_repo, ["rev-parse", "--verify", f"{resolved_s1_sha}^{{tree}}"], timeout=5.0)
+    s1_tree_sha = (s1_tree_proc.stdout or "").strip() if s1_tree_proc.returncode == 0 else ""
+
+    # Skip if follower already contains frozen Slot #1 HEAD
+    anc_proc = _run_git(main_repo, ["merge-base", "--is-ancestor", resolved_s1_sha, resolved_follower_sha], timeout=5.0)
+    if anc_proc.returncode == 0:
+        f_snap = _snapshot_clean_fingerprint(main_repo, resolved_follower_sha)
+        return SpeculativePreRebaseResult(
+            status="ok",
+            outcome=OUTCOME_SPECULATIVE_SKIPPED,
+            rebased=False,
+            clean=True,
+            aborted_cleanly=False,
+            worktree_pristine=_is_worktree_clean(main_repo),
+            follower_branch=clean_follower,
+            slot1_ref=target_ref,
+            slot1_head_sha=resolved_s1_sha,
+            slot1_tree_sha=s1_tree_sha,
+            follower_head_sha=resolved_follower_sha,
+            speculative_head_sha=resolved_follower_sha,
+            speculative_tree_sha=str(f_snap.get("tree_sha") or ""),
+            verification_passed=False,
+        )
+
+    mb_proc = _run_git(main_repo, ["merge-base", resolved_s1_sha, resolved_follower_sha], timeout=5.0)
+    mb_sha = (mb_proc.stdout or "").strip() if mb_proc.returncode == 0 else ""
+    if not mb_sha:
+        return SpeculativePreRebaseResult(
+            status="error",
+            outcome="",
+            rebased=False,
+            clean=False,
+            aborted_cleanly=False,
+            worktree_pristine=_is_worktree_clean(main_repo),
+            follower_branch=clean_follower,
+            slot1_ref=target_ref,
+            slot1_head_sha=resolved_s1_sha,
+            slot1_tree_sha=s1_tree_sha,
+            follower_head_sha=resolved_follower_sha,
+            error="Could not compute merge-base between frozen Slot #1 HEAD and follower branch.",
+        )
+
+    slot1_files = _git_diff_names(main_repo, f"{mb_sha}..{resolved_s1_sha}")
+    follower_files = _git_diff_names(main_repo, f"{mb_sha}..{resolved_follower_sha}")
+    union_files = compute_cross_impact_files(follower_files, slot1_files)
+
+    probe = probe_merge_tree_conflicts(
+        main_repo,
+        resolved_s1_sha,
+        resolved_follower_sha,
+        merge_base_sha=mb_sha,
+    )
+    probe_dict = probe.to_dict()
+    if not probe.clean and probe.supported_write_tree:
+        conf_list = list(probe.conflicted_files) or sorted(set(follower_files) & set(slot1_files))
+        return SpeculativePreRebaseResult(
+            status="ok",
+            outcome=OUTCOME_SPECULATIVE_CONFLICT,
+            rebased=False,
+            clean=False,
+            aborted_cleanly=True,
+            worktree_pristine=_is_worktree_clean(main_repo),
+            follower_branch=clean_follower,
+            slot1_ref=target_ref,
+            slot1_head_sha=resolved_s1_sha,
+            slot1_tree_sha=s1_tree_sha,
+            follower_head_sha=resolved_follower_sha,
+            union_files=tuple(union_files),
+            conflicted_files=tuple(conf_list),
+            verification_passed=False,
+            merge_tree_probe=probe_dict,
+        )
+
+    spec_ref = f"{SPECULATIVE_REF_PREFIX}{_slugify_ref_token(clean_follower)}"
+    with tempfile.TemporaryDirectory(prefix="agy-spec-rebase-") as tmp_root:
+        tmp_wt = (Path(tmp_root) / "wt").resolve()
+        add_proc = _run_git(main_repo, ["worktree", "add", "--detach", str(tmp_wt), resolved_follower_sha], timeout=30.0)
+        if add_proc.returncode != 0:
+            return SpeculativePreRebaseResult(
+                status="error",
+                outcome="",
+                rebased=False,
+                clean=False,
+                aborted_cleanly=False,
+                worktree_pristine=_is_worktree_clean(main_repo),
+                follower_branch=clean_follower,
+                slot1_ref=target_ref,
+                slot1_head_sha=resolved_s1_sha,
+                slot1_tree_sha=s1_tree_sha,
+                follower_head_sha=resolved_follower_sha,
+                union_files=tuple(union_files),
+                merge_tree_probe=probe_dict,
+                error=(add_proc.stderr or add_proc.stdout or "Failed to create speculative temp worktree.").strip(),
+            )
+        try:
+            rb_proc = _run_git(tmp_wt, ["rebase", "--onto", resolved_s1_sha, mb_sha, "HEAD"], timeout=45.0)
+            if rb_proc.returncode != 0:
+                unmerged_proc = _run_git(tmp_wt, ["diff", "--name-only", "--diff-filter=U"], timeout=5.0)
+                unmerged_files = [ln.strip() for ln in (unmerged_proc.stdout or "").splitlines() if ln.strip()]
+                parsed_conf = _parse_write_tree_conflicts(f"{rb_proc.stdout or ''}\n{rb_proc.stderr or ''}")
+                conflicted = sorted(set(unmerged_files) | set(parsed_conf) | set(probe.conflicted_files))
+                if not conflicted:
+                    conflicted = sorted(set(follower_files) & set(slot1_files))
+                _run_git(tmp_wt, ["rebase", "--abort"], timeout=15.0)
+                _run_git(main_repo, ["update-ref", "-d", spec_ref], timeout=5.0)
+                return SpeculativePreRebaseResult(
+                    status="ok",
+                    outcome=OUTCOME_SPECULATIVE_CONFLICT,
+                    rebased=False,
+                    clean=False,
+                    aborted_cleanly=True,
+                    worktree_pristine=True,
+                    follower_branch=clean_follower,
+                    slot1_ref=target_ref,
+                    slot1_head_sha=resolved_s1_sha,
+                    slot1_tree_sha=s1_tree_sha,
+                    follower_head_sha=resolved_follower_sha,
+                    union_files=tuple(union_files),
+                    conflicted_files=tuple(conflicted),
+                    verification_passed=False,
+                    failure_details=f"{rb_proc.stdout or ''}\n{rb_proc.stderr or ''}".strip()[:3000],
+                    merge_tree_probe=probe_dict,
+                )
+
+            spec_head_proc = _run_git(tmp_wt, ["rev-parse", "HEAD"], timeout=5.0)
+            spec_head_sha = (spec_head_proc.stdout or "").strip() if spec_head_proc.returncode == 0 else ""
+            spec_snap = _snapshot_clean_fingerprint(tmp_wt, spec_head_sha)
+            spec_tree_sha = str(spec_snap.get("tree_sha") or "")
+
+            ver_passed = True
+            verified = False
+            ver_results: dict[str, Any] = {}
+            failure_details = ""
+            if verify:
+                verified = True
+                if verify_fn is not None:
+                    ver_out = verify_fn(tmp_wt, union_files)
+                else:
+                    ver_out = _run_default_union_verification(
+                        tmp_wt,
+                        union_files,
+                        timeout=_resolve_rebase_verify_timeout(timeout),
+                    )
+                ver_passed = bool(ver_out.get("passed"))
+                ver_results = dict(ver_out.get("verification_results") or {})
+                ver_results["head_sha"] = spec_head_sha
+                ver_results["tree_sha"] = spec_tree_sha
+                ver_results["dirty"] = False
+                ver_results["content_fingerprint"] = str(spec_snap.get("content_fingerprint") or "")
+                failure_details = str(
+                    ver_out.get("failure_details") or ver_out.get("test_output") or ver_out.get("qa_output") or ""
+                ).strip()
+
+            if ver_passed and spec_head_sha:
+                _run_git(main_repo, ["update-ref", spec_ref, spec_head_sha], timeout=5.0)
+                return SpeculativePreRebaseResult(
+                    status="ok",
+                    outcome=OUTCOME_SPECULATIVE_READY,
+                    rebased=True,
+                    clean=True,
+                    aborted_cleanly=False,
+                    worktree_pristine=True,
+                    follower_branch=clean_follower,
+                    slot1_ref=target_ref,
+                    slot1_head_sha=resolved_s1_sha,
+                    slot1_tree_sha=s1_tree_sha,
+                    follower_head_sha=resolved_follower_sha,
+                    speculative_head_sha=spec_head_sha,
+                    speculative_tree_sha=spec_tree_sha,
+                    speculative_ref=spec_ref,
+                    union_files=tuple(union_files),
+                    conflicted_files=(),
+                    verification_passed=verified,
+                    verification_results=ver_results,
+                    merge_tree_probe=probe_dict,
+                )
+
+            _run_git(main_repo, ["update-ref", "-d", spec_ref], timeout=5.0)
+            return SpeculativePreRebaseResult(
+                status="ok",
+                outcome=OUTCOME_SPECULATIVE_SEMANTIC_FAILURE,
+                rebased=True,
+                clean=False,
+                aborted_cleanly=True,
+                worktree_pristine=True,
+                follower_branch=clean_follower,
+                slot1_ref=target_ref,
+                slot1_head_sha=resolved_s1_sha,
+                slot1_tree_sha=s1_tree_sha,
+                follower_head_sha=resolved_follower_sha,
+                speculative_head_sha=spec_head_sha,
+                speculative_tree_sha=spec_tree_sha,
+                speculative_ref="",
+                union_files=tuple(union_files),
+                conflicted_files=(),
+                verification_passed=False,
+                verification_results=ver_results,
+                failure_details=failure_details,
+                merge_tree_probe=probe_dict,
+            )
+        finally:
+            _remove_worktree_cleanly(main_repo, tmp_wt)
+
+
+def _run_train_ci_parity_verification(
+    train_wt: Path,
+    *,
+    run_pre_commit: bool = False,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Run full `test-local --mode ci-parity` validation inside the Release Train integration worktree.
+
+    Fails closed: a crash inside the gate is reported as a failed verification instead of silently
+    downgrading to the weaker union verification (no coverage gate, no pre-commit).
+    """
+    eff_timeout = _resolve_rebase_verify_timeout(timeout)
+    script_dir = str(Path(__file__).resolve().parent)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    try:
+        import worktree_ops as _wt_ops
+
+        res = _wt_ops.run_local_validation_suite(
+            workdir=train_wt,
+            timeout=eff_timeout,
+            run_pre_commit=run_pre_commit,
+            ci_parity=True,
+        )
+        vr = dict(res.get("verification_results") or {})
+        passed = bool(res.get("passed")) and bool(vr.get("overall_passed", True))
+        failure_parts: list[str] = []
+        if not passed:
+            for key in ("pre_commit_output", "qa_output", "test_output", "coverage_output", "bats_output", "error"):
+                val = str(res.get(key) or "").strip()
+                if val:
+                    failure_parts.append(f"[{key}]\n{val[-2000:]}")
+        return {
+            "passed": passed,
+            "verification_results": vr,
+            "failure_details": "\n\n".join(failure_parts),
+        }
+    except Exception as exc:
+        return {
+            "passed": False,
+            "verification_results": {"overall_passed": False, "ci_parity": True},
+            "failure_details": (
+                f"Release Train ci-parity verification crashed ({exc.__class__.__name__}: {exc}); "
+                "refusing to downgrade to union verification."
+            ),
+        }
+
+
+def bundle_ready_slots_git(
+    repo_dir: Path | str,
+    slot_entries: Sequence[Mapping[str, Any]],
+    *,
+    base_branch: str = "main",
+    remote: str = "origin",
+    base_sha_override: str = "",
+    fetch: bool = False,
+    train_branch: str = "",
+    train_worktree_dir: Path | str | None = None,
+    worktree_base_dir: Path | str | None = None,
+    min_slots: int = DEFAULT_TRAIN_MIN_SLOTS,
+    max_slots: int = DEFAULT_TRAIN_MAX_SLOTS,
+    dry_run: bool = False,
+    run_pre_commit: bool = False,
+    timeout: float | None = None,
+    ci_parity_verify_fn: Callable[[Path], dict[str, Any]] | None = None,
+) -> ReleaseTrainBundleResult:
+    """Combine 2-3 verified disjoint ready slots onto one Release Train branch with `ci-parity` gate + atomic rollback."""
+    r_dir = Path(str(repo_dir).replace("$HOME", str(Path.home()))).expanduser().resolve()
+    eff_min = max(2, int(min_slots))
+    eff_max = max(eff_min, min(4, int(max_slots)))
+    if not (r_dir / ".git").exists():
+        return ReleaseTrainBundleResult(
+            status="error",
+            outcome=OUTCOME_TRAIN_NOT_ELIGIBLE,
+            bundled=False,
+            rolled_back=False,
+            worktree_pristine=False,
+            train_branch=train_branch,
+            train_worktree="",
+            base_ref="",
+            base_sha="",
+            error=f"Git repository not found at {_sanitize_path(str(r_dir))}",
+        )
+
+    main_repo = _resolve_main_repo_root(r_dir)
+    is_offline = os.environ.get("AGY_OFFLINE_ONLY") == "1" or os.environ.get("PRE_COMMIT_HOOK") == "1"
+    if fetch and (not is_offline or _is_local_git_remote(main_repo, remote)):
+        _run_git(main_repo, ["fetch", remote, "--prune", "--quiet"], timeout=25.0)
+
+    if base_sha_override.strip():
+        ov_proc = _run_git(main_repo, ["rev-parse", "--verify", base_sha_override.strip()], timeout=5.0)
+        base_ref = base_sha_override.strip()
+        base_sha = (ov_proc.stdout or "").strip() if ov_proc.returncode == 0 else ""
+    else:
+        base_ref, base_sha = _resolve_base_ref_and_sha(main_repo, base_branch=base_branch, remote=remote)
+
+    if not base_sha:
+        return ReleaseTrainBundleResult(
+            status="error",
+            outcome=OUTCOME_TRAIN_NOT_ELIGIBLE,
+            bundled=False,
+            rolled_back=False,
+            worktree_pristine=_is_worktree_clean(main_repo),
+            train_branch=train_branch,
+            train_worktree="",
+            base_ref=base_ref,
+            base_sha="",
+            error="Could not resolve base SHA for release train bundling.",
+        )
+
+    selected_entries = [dict(e) for e in slot_entries[:eff_max]]
+    if len(selected_entries) < eff_min:
+        return ReleaseTrainBundleResult(
+            status="ok",
+            outcome=OUTCOME_TRAIN_NOT_ELIGIBLE,
+            bundled=False,
+            rolled_back=False,
+            worktree_pristine=_is_worktree_clean(main_repo),
+            train_branch=train_branch,
+            train_worktree="",
+            base_ref=base_ref,
+            base_sha=base_sha,
+            error=f"Need at least {eff_min} eligible ready slots to form a release train (found {len(selected_entries)}).",
+        )
+
+    resolved_slots: list[dict[str, Any]] = []
+    all_union_files: list[str] = []
+    for entry in selected_entries:
+        br = str(entry.get("branch_name") or "").strip().removeprefix("refs/heads/")
+        if not br:
+            return ReleaseTrainBundleResult(
+                status="error",
+                outcome=OUTCOME_TRAIN_NOT_ELIGIBLE,
+                bundled=False,
+                rolled_back=False,
+                worktree_pristine=_is_worktree_clean(main_repo),
+                train_branch=train_branch,
+                train_worktree="",
+                base_ref=base_ref,
+                base_sha=base_sha,
+                error="Slot entry is missing `branch_name`.",
+            )
+        _, head_sha = _resolve_branch_head_sha(main_repo, branch_name=br)
+        if not head_sha:
+            return ReleaseTrainBundleResult(
+                status="error",
+                outcome=OUTCOME_TRAIN_NOT_ELIGIBLE,
+                bundled=False,
+                rolled_back=False,
+                worktree_pristine=_is_worktree_clean(main_repo),
+                train_branch=train_branch,
+                train_worktree="",
+                base_ref=base_ref,
+                base_sha=base_sha,
+                error=f"Could not resolve branch `{br}` in repository.",
+            )
+        pinned_head = str(entry.get("expected_head_sha") or "").strip()
+        if pinned_head and pinned_head != head_sha:
+            return ReleaseTrainBundleResult(
+                status="ok",
+                outcome=OUTCOME_TRAIN_NOT_ELIGIBLE,
+                bundled=False,
+                rolled_back=False,
+                worktree_pristine=_is_worktree_clean(main_repo),
+                train_branch=train_branch,
+                train_worktree="",
+                base_ref=base_ref,
+                base_sha=base_sha,
+                error=f"Branch `{br}` HEAD {head_sha[:12]} moved since review (expected {pinned_head[:12]}).",
+            )
+        # Prefer the live merge-base with the train base: a recorded `base_sha` goes stale once the slot is rebased,
+        # and cherry-picking from it would replay commits the base already contains. Honor the recorded base only
+        # for stacked branches, where it sits strictly ahead of the live merge-base.
+        rec_base = str(entry.get("base_sha") or "").strip()
+        mb_p = _run_git(main_repo, ["merge-base", base_sha, head_sha], timeout=5.0)
+        slot_mb = (mb_p.stdout or "").strip() if mb_p.returncode == 0 else ""
+        if rec_base and rec_base != slot_mb:
+            rec_in_head = _run_git(main_repo, ["merge-base", "--is-ancestor", rec_base, head_sha], timeout=5.0)
+            rec_behind_live_mb = bool(slot_mb) and (
+                _run_git(main_repo, ["merge-base", "--is-ancestor", rec_base, slot_mb], timeout=5.0).returncode == 0
+            )
+            if rec_in_head.returncode == 0 and not rec_behind_live_mb:
+                slot_mb = rec_base
+        if not slot_mb:
+            return ReleaseTrainBundleResult(
+                status="error",
+                outcome=OUTCOME_TRAIN_NOT_ELIGIBLE,
+                bundled=False,
+                rolled_back=False,
+                worktree_pristine=_is_worktree_clean(main_repo),
+                train_branch=train_branch,
+                train_worktree="",
+                base_ref=base_ref,
+                base_sha=base_sha,
+                error=f"Could not resolve merge-base for branch `{br}`.",
+            )
+        cnt_p = _run_git(main_repo, ["rev-list", "--count", f"{slot_mb}..{head_sha}"], timeout=5.0)
+        commit_cnt = int((cnt_p.stdout or "0").strip() or 0) if cnt_p.returncode == 0 else 0
+        if commit_cnt <= 0:
+            return ReleaseTrainBundleResult(
+                status="ok",
+                outcome=OUTCOME_TRAIN_NOT_ELIGIBLE,
+                bundled=False,
+                rolled_back=False,
+                worktree_pristine=_is_worktree_clean(main_repo),
+                train_branch=train_branch,
+                train_worktree="",
+                base_ref=base_ref,
+                base_sha=base_sha,
+                error=f"Branch `{br}` has 0 commits ahead of base `{slot_mb[:8]}`.",
+            )
+        br_files = _git_diff_names(main_repo, f"{slot_mb}..{head_sha}")
+        all_union_files = compute_cross_impact_files(all_union_files, br_files)
+        resolved_slots.append(
+            {
+                "branch_name": br,
+                "slot_id": int(entry.get("slot_id") or 0),
+                "conversation_id": str(entry.get("conversation_id") or "").strip(),
+                "head_sha": head_sha,
+                "merge_base_sha": slot_mb,
+                "files": br_files,
+            }
+        )
+
+    included_branches = tuple(s["branch_name"] for s in resolved_slots)
+    included_slot_ids = tuple(s["slot_id"] for s in resolved_slots if s["slot_id"] > 0)
+    included_cids = tuple(s["conversation_id"] for s in resolved_slots if s["conversation_id"])
+
+    # In-memory preflight probes against base and between adjacent slot heads
+    for idx_s, s_obj in enumerate(resolved_slots):
+        probe_base = probe_merge_tree_conflicts(
+            main_repo,
+            base_sha,
+            s_obj["head_sha"],
+            merge_base_sha=s_obj["merge_base_sha"],
+        )
+        if not probe_base.clean and probe_base.supported_write_tree:
+            return ReleaseTrainBundleResult(
+                status="ok",
+                outcome=OUTCOME_TRAIN_ROLLED_BACK_CONFLICT,
+                bundled=False,
+                rolled_back=True,
+                worktree_pristine=_is_worktree_clean(main_repo),
+                train_branch=train_branch,
+                train_worktree="",
+                base_ref=base_ref,
+                base_sha=base_sha,
+                included_branches=included_branches,
+                included_slot_ids=included_slot_ids,
+                included_conversation_ids=included_cids,
+                union_files=tuple(all_union_files),
+                conflicted_branch=s_obj["branch_name"],
+                conflicted_files=probe_base.conflicted_files,
+                verification_passed=False,
+                failure_details=probe_base.raw_output,
+            )
+        for other_s in resolved_slots[idx_s + 1 :]:
+            probe_pair = probe_merge_tree_conflicts(main_repo, s_obj["head_sha"], other_s["head_sha"])
+            if not probe_pair.clean and probe_pair.supported_write_tree:
+                return ReleaseTrainBundleResult(
+                    status="ok",
+                    outcome=OUTCOME_TRAIN_ROLLED_BACK_CONFLICT,
+                    bundled=False,
+                    rolled_back=True,
+                    worktree_pristine=_is_worktree_clean(main_repo),
+                    train_branch=train_branch,
+                    train_worktree="",
+                    base_ref=base_ref,
+                    base_sha=base_sha,
+                    included_branches=included_branches,
+                    included_slot_ids=included_slot_ids,
+                    included_conversation_ids=included_cids,
+                    union_files=tuple(all_union_files),
+                    conflicted_branch=other_s["branch_name"],
+                    conflicted_files=probe_pair.conflicted_files,
+                    verification_passed=False,
+                    failure_details=probe_pair.raw_output,
+                )
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    digest8 = hashlib.sha256("|".join(included_branches).encode("utf-8")).hexdigest()[:8]
+    eff_train_branch = (
+        str(train_branch or "").strip().removeprefix("refs/heads/")
+        or f"fix/{stamp}-release-train-{len(resolved_slots)}slots-{digest8}"
+    )
+
+    if dry_run:
+        return ReleaseTrainBundleResult(
+            status="ok",
+            outcome=OUTCOME_TRAIN_DRY_RUN_READY,
+            bundled=False,
+            rolled_back=False,
+            worktree_pristine=_is_worktree_clean(main_repo),
+            train_branch=eff_train_branch,
+            train_worktree="",
+            base_ref=base_ref,
+            base_sha=base_sha,
+            included_branches=included_branches,
+            included_slot_ids=included_slot_ids,
+            included_conversation_ids=included_cids,
+            union_files=tuple(all_union_files),
+            verification_passed=False,
+        )
+
+    if train_worktree_dir is not None and str(train_worktree_dir).strip():
+        train_wt = Path(str(train_worktree_dir).replace("$HOME", str(Path.home()))).expanduser().resolve()
+    else:
+        base_parent = (
+            Path(str(worktree_base_dir).replace("$HOME", str(Path.home()))).expanduser().resolve()
+            if (worktree_base_dir is not None and str(worktree_base_dir).strip())
+            else main_repo.parent
+        )
+        base_parent.mkdir(parents=True, exist_ok=True)
+        wt_slug = _slugify_ref_token(eff_train_branch.replace("/", "-"), max_len=72)
+        train_wt = (base_parent / f"pr-worktree-{main_repo.name}-{wt_slug}").resolve()
+
+    def _rollback_train() -> None:
+        discard_release_train(main_repo, train_branch=eff_train_branch, train_worktree=train_wt)
+
+    add_proc = _run_git(
+        main_repo,
+        ["worktree", "add", "-b", eff_train_branch, str(train_wt), base_sha],
+        timeout=30.0,
+    )
+    if add_proc.returncode != 0:
+        _rollback_train()
+        return ReleaseTrainBundleResult(
+            status="error",
+            outcome=OUTCOME_TRAIN_ROLLED_BACK_CONFLICT,
+            bundled=False,
+            rolled_back=True,
+            worktree_pristine=_is_worktree_clean(main_repo),
+            train_branch=eff_train_branch,
+            train_worktree=_sanitize_path(str(train_wt)),
+            base_ref=base_ref,
+            base_sha=base_sha,
+            included_branches=included_branches,
+            included_slot_ids=included_slot_ids,
+            included_conversation_ids=included_cids,
+            union_files=tuple(all_union_files),
+            error=(add_proc.stderr or add_proc.stdout or "Failed to create release train worktree.").strip(),
+        )
+
+    for s_obj in resolved_slots:
+        cp_proc = _run_git(
+            train_wt,
+            ["cherry-pick", f"{s_obj['merge_base_sha']}..{s_obj['head_sha']}"],
+            timeout=45.0,
+        )
+        if cp_proc.returncode != 0:
+            unmerged_p = _run_git(train_wt, ["diff", "--name-only", "--diff-filter=U"], timeout=5.0)
+            unmerged = [ln.strip() for ln in (unmerged_p.stdout or "").splitlines() if ln.strip()]
+            parsed_c = _parse_write_tree_conflicts(f"{cp_proc.stdout or ''}\n{cp_proc.stderr or ''}")
+            conf_files = sorted(set(unmerged) | set(parsed_c))
+            _rollback_train()
+            return ReleaseTrainBundleResult(
+                status="ok",
+                outcome=OUTCOME_TRAIN_ROLLED_BACK_CONFLICT,
+                bundled=False,
+                rolled_back=True,
+                worktree_pristine=_is_worktree_clean(main_repo),
+                train_branch=eff_train_branch,
+                train_worktree="",
+                base_ref=base_ref,
+                base_sha=base_sha,
+                included_branches=included_branches,
+                included_slot_ids=included_slot_ids,
+                included_conversation_ids=included_cids,
+                union_files=tuple(all_union_files),
+                conflicted_branch=s_obj["branch_name"],
+                conflicted_files=tuple(conf_files),
+                verification_passed=False,
+                failure_details=f"{cp_proc.stdout or ''}\n{cp_proc.stderr or ''}".strip()[:3000],
+            )
+
+    head_proc = _run_git(train_wt, ["rev-parse", "HEAD"], timeout=5.0)
+    train_head_sha = (head_proc.stdout or "").strip() if head_proc.returncode == 0 else ""
+    final_union_files = _git_diff_names(train_wt, f"{base_sha}..{train_head_sha}") or all_union_files
+
+    if ci_parity_verify_fn is not None:
+        ver_out = ci_parity_verify_fn(train_wt)
+    else:
+        ver_out = _run_train_ci_parity_verification(
+            train_wt,
+            run_pre_commit=run_pre_commit,
+            timeout=timeout,
+        )
+
+    ver_results = dict(ver_out.get("verification_results") or {})
+    ver_passed = bool(ver_out.get("passed")) and bool(ver_results.get("overall_passed", True))
+    failure_details = str(
+        ver_out.get("failure_details") or ver_out.get("test_output") or ver_out.get("qa_output") or ""
+    ).strip()
+
+    if not ver_passed:
+        _rollback_train()
+        return ReleaseTrainBundleResult(
+            status="ok",
+            outcome=OUTCOME_TRAIN_ROLLED_BACK_VERIFICATION,
+            bundled=False,
+            rolled_back=True,
+            worktree_pristine=_is_worktree_clean(main_repo),
+            train_branch=eff_train_branch,
+            train_worktree="",
+            base_ref=base_ref,
+            base_sha=base_sha,
+            train_head_sha="",
+            included_branches=included_branches,
+            included_slot_ids=included_slot_ids,
+            included_conversation_ids=included_cids,
+            union_files=tuple(final_union_files),
+            verification_passed=False,
+            verification_results=ver_results,
+            failure_details=failure_details,
+        )
+
+    snap = _snapshot_clean_fingerprint(train_wt, train_head_sha)
+    ver_results["head_sha"] = train_head_sha
+    ver_results["tree_sha"] = str(snap.get("tree_sha") or "")
+    ver_results["dirty"] = False
+    ver_results["content_fingerprint"] = str(snap.get("content_fingerprint") or "")
+    ver_results["overall_passed"] = True
+    return ReleaseTrainBundleResult(
+        status="ok",
+        outcome=OUTCOME_TRAIN_BUNDLED,
+        bundled=True,
+        rolled_back=False,
+        worktree_pristine=_is_worktree_clean(train_wt),
+        train_branch=eff_train_branch,
+        train_worktree=_sanitize_path(str(train_wt)),
+        base_ref=base_ref,
+        base_sha=base_sha,
+        train_head_sha=train_head_sha,
+        included_branches=included_branches,
+        included_slot_ids=included_slot_ids,
+        included_conversation_ids=included_cids,
+        union_files=tuple(final_union_files),
+        verification_passed=True,
+        verification_results=ver_results,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Standalone CLI entrypoint for `rebase_gate.py` (`bundle-ready-slots`, `speculative-rebase`)."""
+    parser = argparse.ArgumentParser(description="0-LLM Native Git Rebase, Speculative Pre-Rebase & Release Train Bundler.")
+    sub = parser.add_subparsers(dest="subcommand")
+
+    p_bun = sub.add_parser("bundle-ready-slots", help="Bundle 2-3 disjoint ready slot branches into one verified Release Train branch.")
+    p_bun.add_argument("--workdir", required=True, help="Target git repository or worktree directory.")
+    p_bun.add_argument("--branches", nargs="+", required=True, help="Ordered 2-3 ready branch names to combine.")
+    p_bun.add_argument("--base", default="main", help="Base branch name (default: main).")
+    p_bun.add_argument("--base-sha", dest="base_sha", default="", help="Optional explicit base SHA override (e.g. frozen Slot #1 HEAD).")
+    p_bun.add_argument("--train-branch", dest="train_branch", default="", help="Optional explicit integration branch name.")
+    p_bun.add_argument("--train-worktree", dest="train_worktree", default="", help="Optional explicit train worktree directory.")
+    p_bun.add_argument("--fetch", action="store_true", help="Fetch origin before bundling.")
+    p_bun.add_argument("--dry-run", dest="dry_run", action="store_true", help="Check conflict cleanliness without mutating git.")
+    p_bun.add_argument("--with-pre-commit", dest="run_pre_commit", action="store_true", help="Include single-pass pre-commit in ci-parity gate.")
+
+    p_spec = sub.add_parser("speculative-rebase", help="Speculatively pre-rebase a follower branch over frozen Slot #1 HEAD.")
+    p_spec.add_argument("--workdir", required=True, help="Target git repository or worktree directory.")
+    p_spec.add_argument("--branch", required=True, help="Follower branch name.")
+    p_spec.add_argument("--slot1-ref", dest="slot1_ref", required=True, help="Frozen Slot #1 HEAD SHA or branch ref.")
+    p_spec.add_argument("--no-verify", dest="no_verify", action="store_true", help="Skip cross-impact verification during speculative rebase.")
+
+    args = parser.parse_args(argv)
+    if args.subcommand == "bundle-ready-slots":
+        entries = [{"branch_name": br, "slot_id": idx + 2} for idx, br in enumerate(args.branches)]
+        res = bundle_ready_slots_git(
+            args.workdir,
+            entries,
+            base_branch=args.base,
+            base_sha_override=args.base_sha,
+            fetch=bool(args.fetch),
+            train_branch=args.train_branch,
+            train_worktree_dir=args.train_worktree or None,
+            dry_run=bool(args.dry_run),
+            run_pre_commit=bool(args.run_pre_commit),
+        )
+        print(json.dumps(res.to_dict(), indent=2, ensure_ascii=False))
+        return 0 if res.status == "ok" else 1
+
+    if args.subcommand == "speculative-rebase":
+        res_s = speculative_pre_rebase_slot(
+            args.workdir,
+            follower_branch=args.branch,
+            slot1_ref=args.slot1_ref,
+            verify=not bool(args.no_verify),
+        )
+        print(json.dumps(res_s.to_dict(), indent=2, ensure_ascii=False))
+        return 0 if res_s.status == "ok" else 1
+
+    parser.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

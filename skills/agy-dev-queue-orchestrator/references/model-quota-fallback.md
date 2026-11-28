@@ -39,7 +39,7 @@ Configure optional overrides in `0600` `~/.env` (mirrored as safe defaults in `.
 | `AGY_DEV_MODEL_FALLBACK_ORDER` | `gemini-flash-next,auto,hydrogen-l-tf-medium,fable-5.2-medium,opus-5.5-medium,gemini-3.5-flash-lite` | Ordered fallback chain for orchestrators and detached `agy-doctor` wakes. |
 | `AGY_DEV_DEV_ECO_FALLBACK_ORDER` | `gemini-flash-next,gemini-3.5-flash-lite,auto,fable-5.2-low,hydrogen-l-tf-medium` | Ordered Eco chain for Round 1 development when primary pools are low/exhausted. |
 | `AGY_DEV_REVIEWER_MODEL_FALLBACK_ORDER` | `pro,auto,opus-5.5-high,fable-5.2-high,hydrogen-l-tf-high,gemini-flash-next` | Ordered high-reasoning review chain (`pro` -> cross-pool high-tier models). |
-| `AGY_DEV_MAX_ORCHESTRATOR_STEPS` | `150` | Early orchestrator session rotation threshold (`bloated_orchestrator_session`) to cut per-turn context tokens. |
+| `AGY_DEV_MAX_ORCHESTRATOR_STEPS` | `100` | Proactive orchestrator auto-handoff rotation threshold (`100-110` step window; `bloated_orchestrator_session`) to cut per-turn context tokens. |
 
 ---
 
@@ -70,5 +70,5 @@ Only official Antigravity runtime APIs and local `0600` state are used:
 
 - **Compact CLI Output by Default (`--verbose` opt-in)**: `start-remediation`, `prepare-review` / `push-branch`, and `plan-developer` emit compact token-saving JSON (~1–2 KB) on CLI stdout by default (stripping redundant `SystemPrompt`, `proposal_markdown`, and nested lock blobs); pass `--verbose` only when full raw markdown/prompts are needed.
 - **Planner Fast-Path (`skip_planner_subagent`)**: `queue-next --unlocked` annotates `skip_planner_subagent: true` (and `risk_classification`) whenever a runnable queue item already provides `target_files` + (`proposed_fix` or `section_anchors`). Skip invoking `agy-dev-planner` and dispatch the developer directly!
-- **Early Session Rotation (`~150` steps)**: Rotate long-running `agy-dev-orchestrator` sessions via `AGY_DEV_MAX_ORCHESTRATOR_STEPS` (`queue-optimize` -> `bloated_orchestrator_session`) using `pr_remediator.py queue-next --unlocked --orchestrator-id <NEW_CID>`.
+- **Proactive Auto-Handoff Rotation (`100-110` steps)**: Rotate long-running `agy-dev-orchestrator` sessions via `AGY_DEV_MAX_ORCHESTRATOR_STEPS` (default `100`, hard `110`; `queue-optimize` -> `bloated_orchestrator_session` & `orchestrator-tick` `orchestrator_rotation`) using `pr_remediator.py queue-next --unlocked --orchestrator-id <NEW_CID>`.
 - In interactive engineering chats, use Antigravity's native `/compact` command when conversations grow long, and always pass `--stall-seconds 900` on `wait-for-unlock` (values `> 3600s` are automatically clamped unless `--allow-excessive-stall-seconds` is explicitly supplied).
