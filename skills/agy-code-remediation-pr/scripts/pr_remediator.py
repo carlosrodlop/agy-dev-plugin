@@ -85,12 +85,16 @@ from dev_queue_planner import (  # noqa: F401, E402
     normalize_importance_tier,
 )
 from dev_flow_optimizer import (  # noqa: F401, E402
+    DEFAULT_HARD_ORCHESTRATOR_STEPS,
+    DEFAULT_MAX_ORCHESTRATOR_STEPS,
     DEFAULT_STALL_THRESHOLD_SECONDS,
     analyze_dev_flow_optimizations,
     build_branch_diff_verification_gate,
     detect_stalled_lock,
     format_compact_opt_hint,
     normalize_pre_commit_status,
+    resolve_hard_orchestrator_steps,
+    resolve_max_orchestrator_steps,
 )
 import dev_queue_doctor as _queue_doctor  # noqa: F401, E402
 from dev_queue_doctor import (  # noqa: F401, E402
@@ -120,13 +124,28 @@ from parallel_scope import (  # noqa: F401, E402
 )
 import rebase_gate as _rebase_gate  # noqa: F401, E402
 from rebase_gate import (  # noqa: F401, E402
+    DEFAULT_TRAIN_MAX_SLOTS,
+    DEFAULT_TRAIN_MIN_SLOTS,
     OUTCOME_AUTO_PROMOTED,
     OUTCOME_NEEDS_CONFLICT_RESOLUTION,
     OUTCOME_NEEDS_SEMANTIC_FIX,
+    OUTCOME_SPECULATIVE_CONFLICT,
+    OUTCOME_SPECULATIVE_READY,
+    OUTCOME_SPECULATIVE_SEMANTIC_FAILURE,
+    OUTCOME_SPECULATIVE_SKIPPED,
+    OUTCOME_TRAIN_BUNDLED,
+    OUTCOME_TRAIN_DRY_RUN_READY,
+    OUTCOME_TRAIN_NOT_ELIGIBLE,
+    OUTCOME_TRAIN_ROLLED_BACK_CONFLICT,
+    OUTCOME_TRAIN_ROLLED_BACK_VERIFICATION,
+    ReleaseTrainBundleResult,
+    SpeculativePreRebaseResult,
+    bundle_ready_slots_git,
     compute_cross_impact_files,
     detect_base_sha_drift,
     probe_merge_tree_conflicts,
     rebase_and_reverify,
+    speculative_pre_rebase_slot,
 )
 from lock_store import (  # noqa: F401, E402
     CLIENTS_DIR,
@@ -385,6 +404,7 @@ from review_gate import (  # noqa: F401, E402
     _sync_branch_head_commit_message_detailed,
     _sync_preview_subtree,
     analyze_queue_or_tasks_overlap,
+    audit_isolated_feature_test_policy,
     build_canonical_pr_description,
     build_code_developer_subagent_plan,
     build_pr_reviewer_subagent_plan,
@@ -395,7 +415,9 @@ from review_gate import (  # noqa: F401, E402
     push_remediation_branch_and_build_reviewer_plan,
     record_pr_review_evaluation,
     register_review_cli,
+    run_bundle_ready_slots,
     run_slot_rebase_reverify,
+    run_speculative_pre_rebase,
 )
 
 if __name__ != "__main__":

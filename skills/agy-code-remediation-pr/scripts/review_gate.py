@@ -90,9 +90,24 @@ from queue_store import (  # noqa: E402
     update_dev_queue_item_status,
 )
 from rebase_gate import (  # noqa: E402
+    DEFAULT_TRAIN_MAX_SLOTS,
+    DEFAULT_TRAIN_MIN_SLOTS,
     OUTCOME_AUTO_PROMOTED,
     OUTCOME_NEEDS_SEMANTIC_FIX,
+    OUTCOME_SPECULATIVE_CONFLICT,
+    OUTCOME_SPECULATIVE_READY,
+    OUTCOME_SPECULATIVE_SEMANTIC_FAILURE,
+    OUTCOME_SPECULATIVE_SKIPPED,
+    OUTCOME_TRAIN_BUNDLED,
+    OUTCOME_TRAIN_DRY_RUN_READY,
+    OUTCOME_TRAIN_NOT_ELIGIBLE,
+    OUTCOME_TRAIN_ROLLED_BACK_CONFLICT,
+    OUTCOME_TRAIN_ROLLED_BACK_VERIFICATION,
+    _resolve_branch_head_sha,
+    bundle_ready_slots_git,
+    discard_release_train,
     rebase_and_reverify,
+    speculative_pre_rebase_slot,
 )
 from worktree_ops import (  # noqa: E402
     _clean_git_subprocess_env,
@@ -348,9 +363,9 @@ def build_pr_reviewer_subagent_plan(
         f"(Maker-Checker pattern) for `agy-dev-plugin` and companion repositories (`agy-tam-plugin`, `g-control-tower`, etc.).\n"
         f"You run in a completely isolated conversation context right after a timestamped branch is staged locally (`AWAITING_AGENT_REVIEW`).\n"
         f"Hard PR Readiness Gate: ONLY `verdict == \"PASS\"` with `score > 90` (`>= {PR_REVIEW_PASS_MIN_SCORE}/100`) publishes `origin/<branch>` and exposes `manual_pr_url`.\n"
-        f"Your mandatory responsibilities (Lean Reviewer Protocol — Target 3-5 turns):\n"
-        f"1. Inspect the local staged branch diff, changed files, and embedded `verification_gate` against `origin/main` using pure native `git` via:\n"
-        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch <BRANCH_NAME>{wd_flag}`\n"
+        f"Your mandatory responsibilities (Lean Reviewer Protocol — Target 2-4 turns):\n"
+        f"1. Inspect the local staged branch diff, embedded `verification_gate`, and `static_audit_summary` in ONE single call using pure native `git` via:\n"
+        f"   `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch <BRANCH_NAME>{wd_flag} --review-bundle`\n"
         f"   - When `verification_gate.skip_redundant_test_rerun == true` (`matches_head == true` AND `passed == true`), DO NOT re-run `pre-commit` or the full `unittest` suite; focus directly on diff logic, security/Zero-PII, and test coverage quality.\n"
         f"2. Independently evaluate the proposed branch changes across 4 criteria (0-100 score) and determine your verdict (`PASS`, `WARN`, or `NEEDS_REVISION`):\n"
         f"   - Criterion A (40 pts): Root Cause / Requirement Resolution — Does the diff accurately implement the change without regressions?\n"
@@ -372,7 +387,7 @@ def build_pr_reviewer_subagent_plan(
         f"- **Root Cause / Rationale**: {rca_summary}\n"
         f"- **Proposed Solution**: {proposed_fix}\n\n"
         f"Execute the following steps:\n"
-        f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch \"{branch_name}\"{wd_flag}` to inspect the exact local diff and files changed via native `git`.\n"
+        f"1. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py branch-diff --branch \"{branch_name}\"{wd_flag} --review-bundle` to inspect the exact local diff, `verification_gate`, and `static_audit_summary` in 1 single call.\n"
         f"2. Score the branch changes (0-100) across Resolution Accuracy, Unit Tests, Zero-PII Security, and Code Quality, and give your verdict (`PASS`, `WARN`, or `NEEDS_REVISION`).\n"
         f"3. Run `~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py record-review "
         f"--branch \"{branch_name}\"{wd_flag}{model_flag} --reviewer-subagent-id <YOUR_CID> --verdict <PASS|WARN|NEEDS_REVISION> --score <SCORE> "
@@ -2753,6 +2768,115 @@ def _extract_audit_findings_dicts(findings: Sequence[Any]) -> list[dict[str, Any
     return out
 
 
+_MONOLITH_TEST_LINE_THRESHOLD = 1500
+_DEFAULT_REVIEW_BUNDLE_MAX_DIFF_CHARS = 48000
+_MARKDOWN_CEILING_BYTES = 24000
+
+
+def audit_isolated_feature_test_policy(
+    changed_files: Sequence[Any],
+    *,
+    repo_dir: Path | str | None = None,
+    slot_id: int = 1,
+    conversation_id: str = "",
+    action_id: str = "",
+    monolith_test_line_threshold: int = _MONOLITH_TEST_LINE_THRESHOLD,
+) -> dict[str, Any]:
+    """Deterministically evaluate Isolated Feature Test Policy for new features and parallel Slots #2..#N.
+
+    Flags advisory warnings when code changes modify a shared monolithic test file (`> monolith_test_line_threshold`
+    lines) without introducing/updating a dedicated isolated feature test module (`tests/test_<component>_<cid8>.py`
+    or `tests/test_<feature>.py`).
+    """
+    resolved_repo = Path(repo_dir).expanduser().resolve() if repo_dir is not None and str(repo_dir).strip() else None
+    norm_changed = [_norm_diff_rel_path(p) for p in changed_files if _norm_diff_rel_path(p)]
+    test_files = [p for p in norm_changed if _is_test_diff_path(p)]
+    code_files = [p for p in norm_changed if not _is_doc_only_diff_path(p) and not _is_test_diff_path(p)]
+
+    monolith_test_files: list[dict[str, Any]] = []
+    isolated_test_files: list[str] = []
+    for tf in test_files:
+        if tf.endswith(".bats"):
+            isolated_test_files.append(tf)
+            continue
+        line_cnt = 0
+        if resolved_repo is not None:
+            fpath = resolved_repo / tf
+            if fpath.is_file():
+                with contextlib.suppress(OSError):
+                    line_cnt = len(fpath.read_text(encoding="utf-8", errors="ignore").splitlines())
+        if line_cnt >= max(1, int(monolith_test_line_threshold)):
+            monolith_test_files.append({"file": tf, "lines": line_cnt})
+        else:
+            isolated_test_files.append(tf)
+
+    cid8 = re.sub(r"[^a-zA-Z0-9]+", "", str(conversation_id or "").strip().lower())[:8]
+    comp_raw = str(action_id or "").strip() or (Path(code_files[0]).stem if code_files else "feature")
+    comp_slug = re.sub(r"[^a-zA-Z0-9]+", "_", comp_raw.lower()).strip("_")[:28] or "feature"
+    suggested_test_file = f"tests/test_{comp_slug}_{cid8}.py" if cid8 else f"tests/test_{comp_slug}.py"
+
+    is_follower_slot = int(slot_id or 1) >= 2
+    monolith_only_tests = bool(code_files and monolith_test_files and not isolated_test_files)
+    advisory_triggered = bool(monolith_only_tests)
+    warnings: list[str] = []
+    if advisory_triggered:
+        mono_list = ", ".join(f"{m['file']} ({m['lines']}L)" for m in monolith_test_files[:3])
+        slot_note = f" on parallel Slot #{slot_id}" if is_follower_slot else ""
+        warnings.append(
+            f"Isolated Feature Test Policy{slot_note}: code changes only touch monolithic test file(s) "
+            f"[{mono_list}]; prefer a dedicated isolated test file such as `{suggested_test_file}` "
+            "to prevent cross-slot DEEP_SHARED test collisions."
+        )
+
+    return {
+        "compliant": not advisory_triggered,
+        "advisory_triggered": advisory_triggered,
+        "slot_id": int(slot_id or 1),
+        "monolith_test_line_threshold": int(monolith_test_line_threshold),
+        "isolated_test_files": isolated_test_files,
+        "monolith_test_files": monolith_test_files,
+        "suggested_test_file": suggested_test_file,
+        "warnings": warnings,
+    }
+
+
+def _audit_markdown_byte_ceilings(
+    repo_dir: Path | None,
+    changed_files: Sequence[str],
+    *,
+    ceiling_bytes: int = _MARKDOWN_CEILING_BYTES,
+) -> dict[str, Any]:
+    """Check `< 24,000` byte ceiling across modified agent/rule/skill markdown files."""
+    if repo_dir is None or not repo_dir.is_dir():
+        return {"passed": True, "ceiling_bytes": ceiling_bytes, "checked": [], "violations": []}
+    checked: list[dict[str, Any]] = []
+    violations: list[dict[str, Any]] = []
+    for rel in changed_files:
+        norm = _norm_diff_rel_path(rel)
+        if not norm.endswith(".md"):
+            continue
+        if not (
+            norm.startswith(("agents/", "rules/"))
+            or (norm.startswith("skills/") and norm.endswith("/SKILL.md"))
+        ):
+            continue
+        fpath = repo_dir / norm
+        if not fpath.is_file():
+            continue
+        with contextlib.suppress(OSError):
+            size_b = int(fpath.stat().st_size)
+            entry = {"file": norm, "bytes": size_b, "ceiling_bytes": ceiling_bytes, "ok": size_b < ceiling_bytes}
+            checked.append(entry)
+            if size_b >= ceiling_bytes:
+                violations.append(entry)
+    return {
+        "passed": not violations,
+        "ceiling_bytes": ceiling_bytes,
+        "checked": checked,
+        "violations": violations,
+    }
+
+
 def evaluate_pre_review_fail_fast_gate(
     repo_dir: Path | str | None,
     *,
@@ -2998,6 +3122,21 @@ def evaluate_pre_review_fail_fast_gate(
         "test_files_count": len(test_files),
         "verified_test_gate": vr_tests_passed,
     }
+    lk_dict = lock_info if isinstance(lock_info, dict) else {}
+    isolated_test_policy = audit_isolated_feature_test_policy(
+        norm_changed,
+        repo_dir=resolved_repo,
+        slot_id=int(lk_dict.get("slot_id") or 1),
+        conversation_id=str(lk_dict.get("conversation_id") or ""),
+        action_id=str(lk_dict.get("action_id") or ""),
+    )
+    for iso_warn in isolated_test_policy.get("warnings") or []:
+        gate_warnings.append(
+            {
+                "code": "isolated_feature_test_policy",
+                "message": iso_warn,
+            }
+        )
     max_warnings = 50
     capped_warnings = gate_warnings[:max_warnings]
     passed = not gate_errors
@@ -3008,6 +3147,7 @@ def evaluate_pre_review_fail_fast_gate(
         "project_audit": audit_summary,
         "sha_parity": sha_parity,
         "diff_test_coverage": diff_test_coverage,
+        "isolated_test_policy": isolated_test_policy,
         "errors": gate_errors,
         "warnings": capped_warnings,
         "warnings_count": len(gate_warnings),
@@ -3024,9 +3164,16 @@ def get_branch_diff_with_verification_gate(
     repo_slug: str = "",
     portfolio_dir: Path | str | None = None,
     git_client: GitVcsIntegrationClient | None = None,
+    review_bundle: bool = False,
+    max_diff_chars: int = _DEFAULT_REVIEW_BUNDLE_MAX_DIFF_CHARS,
 ) -> dict[str, Any]:
-    """Compute native git `branch-diff` and embed SHA-bound `verification_gate` + `pre_review_gate`."""
-    lock_info = get_dev_pr_lock(
+    """Compute native git `branch-diff` and embed SHA-bound `verification_gate` + `pre_review_gate`.
+
+    When `review_bundle=True`, returns a lean single-call reviewer bundle containing bounded unified diff,
+    compact file summary, SHA-bound `verification_gate`, distilled `static_audit_summary` (with `<24KB`
+    markdown ceiling & isolated-test checks), task context, and ready-to-run `recommended_next_command`.
+    """
+    lock_info = _resolve_get_dev_pr_lock()(
         portfolio_dir=portfolio_dir,
         repo_slug=repo_slug,
         workdir=workdir,
@@ -3046,7 +3193,7 @@ def get_branch_diff_with_verification_gate(
     res = vcs.get_branch_diff(head_branch=resolved_branch, base_branch=base_branch, repo_dir=repo_dir)
     vg = build_branch_diff_verification_gate(lock_info, repo_dir, resolved_branch)
     res["verification_gate"] = vg
-    res["pre_review_gate"] = evaluate_pre_review_fail_fast_gate(
+    pre_gate = evaluate_pre_review_fail_fast_gate(
         repo_dir,
         changed_files=res.get("files", []) or [],
         lock_info=lock_info,
@@ -3054,7 +3201,95 @@ def get_branch_diff_with_verification_gate(
         head_branch=resolved_branch,
         head_sha=str(res.get("head_sha") or vg.get("head_sha") or ""),
     )
-    return res
+    res["pre_review_gate"] = pre_gate
+
+    if not review_bundle:
+        return res
+
+    if res.get("status") != "ok":
+        return {
+            "status": str(res.get("status") or "error"),
+            "review_bundle": True,
+            "branch_name": resolved_branch,
+            "base_branch": base_branch,
+            "error": str(res.get("error") or "branch-diff failed"),
+            "verification_gate": vg,
+        }
+
+    raw_diff = str(res.get("diff") or "")
+    eff_limit = max(2000, int(max_diff_chars or _DEFAULT_REVIEW_BUNDLE_MAX_DIFF_CHARS))
+    diff_truncated = len(raw_diff) > eff_limit
+    bounded_diff = (
+        raw_diff[:eff_limit] + f"\n...(diff truncated at {eff_limit} of {len(raw_diff)} chars)"
+        if diff_truncated
+        else raw_diff
+    )
+
+    files_raw = list(res.get("files") or [])
+    norm_file_paths = [_norm_diff_rel_path(f) for f in files_raw if _norm_diff_rel_path(f)]
+    md_audit = _audit_markdown_byte_ceilings(repo_dir, norm_file_paths)
+    pa = dict(pre_gate.get("project_audit") or {})
+    static_audit_summary = {
+        "passed": bool(pre_gate.get("passed")) and bool(md_audit.get("passed", True)),
+        "status": "ok" if (bool(pre_gate.get("passed")) and bool(md_audit.get("passed", True))) else "failed",
+        "project_audit_passed": bool(pa.get("passed", True)),
+        "repo_passed": bool(pa.get("repo_passed", True)),
+        "errors_count": int(pa.get("errors_count") or 0),
+        "diff_errors_count": int(pa.get("diff_errors_count") or 0),
+        "warnings_count": int(pre_gate.get("warnings_count") or 0),
+        "errors": list(pre_gate.get("errors") or [])[:15],
+        "warnings": list(pre_gate.get("warnings") or [])[:15],
+        "sha_parity": dict(pre_gate.get("sha_parity") or {}),
+        "diff_test_coverage": dict(pre_gate.get("diff_test_coverage") or {}),
+        "isolated_test_policy": dict(pre_gate.get("isolated_test_policy") or {}),
+        "markdown_byte_audit": md_audit,
+    }
+
+    eff_slug = str(repo_slug or lock_info.get("repo_slug") or res.get("repo") or res.get("repo_slug") or "").strip()
+    eff_wd_display = _sanitize_home_paths(str(repo_dir)) if repo_dir is not None else _sanitize_home_paths(cand_str)
+    wd_arg = f' --workdir "{eff_wd_display}"' if eff_wd_display else ""
+    fast_path_ready = bool(vg.get("skip_redundant_test_rerun")) and bool(static_audit_summary["passed"])
+    recommended_cmd = (
+        "python3 ~/.gemini/config/plugins/agy-dev-plugin/skills/agy-code-remediation-pr/scripts/pr_remediator.py "
+        f'record-review --branch "{resolved_branch}"{wd_arg} '
+        '--reviewer-subagent-id <YOUR_CID> --verdict <PASS|WARN|NEEDS_REVISION> --score <0-100> '
+        '--summary "..." --send-email'
+    )
+
+    return {
+        "status": "ok",
+        "review_bundle": True,
+        "branch_name": resolved_branch,
+        "base_branch": base_branch,
+        "head_sha": str(res.get("head_sha") or vg.get("head_sha") or ""),
+        "repo_slug": eff_slug,
+        "slot_id": int(lock_info.get("slot_id") or 1),
+        "review_iteration": int(lock_info.get("review_iteration") or 0),
+        "fast_path_ready": fast_path_ready,
+        "pre_review_gate_passed": bool(static_audit_summary["passed"]),
+        "task_context": {
+            "conversation_id": str(lock_info.get("conversation_id") or ""),
+            "action_id": str(lock_info.get("action_id") or ""),
+            "proposal_title": str(lock_info.get("proposal_title") or ""),
+            "rca_summary": _sanitize_home_paths(str(lock_info.get("summary") or ""))[:1200],
+            "proposed_fix": _sanitize_home_paths(str(lock_info.get("proposed_fix") or ""))[:1600],
+            "target_files": list(lock_info.get("target_files") or [])[:40],
+            "dev_model": str(lock_info.get("dev_model") or ""),
+        },
+        "diff_summary": {
+            "files_count": len(files_raw),
+            "total_additions": int(res.get("additions") or res.get("total_additions") or 0),
+            "total_deletions": int(res.get("deletions") or res.get("total_deletions") or 0),
+            "commits": list(res.get("commits") or [])[:30],
+            "files": files_raw,
+        },
+        "diff": bounded_diff,
+        "diff_truncated": diff_truncated,
+        "diff_total_chars": len(raw_diff),
+        "verification_gate": vg,
+        "static_audit_summary": static_audit_summary,
+        "recommended_next_command": recommended_cmd,
+    }
 
 
 # ==============================================================================
@@ -3294,6 +3529,11 @@ def run_slot_rebase_reverify(
                 check=False,
             )
 
+    spec_cache = (
+        dict(lock_info.get("speculative_pre_rebase") or {})
+        if isinstance(lock_info.get("speculative_pre_rebase"), Mapping)
+        else None
+    )
     rb_res = rebase_and_reverify(
         target_dir,
         branch_name=resolved_branch,
@@ -3302,6 +3542,7 @@ def run_slot_rebase_reverify(
         fetch=fetch,
         verify_fn=verify_fn,
         restamp_fn=_restamp_if_manifest_touched,
+        speculative_cache=spec_cache,
     )
     if rb_res.status != "ok":
         return rb_res.to_dict()
@@ -3685,6 +3926,636 @@ def run_slot_rebase_reverify(
     }
 
 
+def _slot_passed_independent_review(slot_info: Mapping[str, Any]) -> bool:
+    """Return True when a slot passed Maker-Checker review (`PASS` & `score > 90`) and is not escalated."""
+    if _is_lock_escalated_max_review_iterations(slot_info):
+        return False
+    verdict, score = _extract_latest_review_verdict_and_score(slot_info)
+    if verdict:
+        # The latest recorded verdict is authoritative: a later NEEDS_REVISION/WARN must never fall through
+        # to a stale `review_approved=True` left over from an earlier iteration.
+        return verdict == "PASS" and score >= PR_REVIEW_PASS_MIN_SCORE
+    rev_score = int(slot_info.get("reviewer_score") or 0)
+    return bool(slot_info.get("review_approved")) and rev_score >= PR_REVIEW_PASS_MIN_SCORE
+
+
+def _resolve_slot_reviewed_head_parity(repo_dir: Path, slot_info: Mapping[str, Any]) -> tuple[str, str]:
+    """Return `(live_head_sha, error)`; `error` is non-empty unless the live branch HEAD is the reviewed commit."""
+    branch = str(slot_info.get("branch_name") or "").strip()
+    if not branch:
+        return "", "slot has no branch_name"
+    expected = str(
+        slot_info.get("reviewed_head_sha") or slot_info.get("approved_head_sha") or slot_info.get("head_sha") or ""
+    ).strip()
+    if not expected:
+        return "", "no reviewed/approved HEAD SHA recorded on the slot lock"
+    _, live = _resolve_branch_head_sha(repo_dir, branch_name=branch)
+    if not live:
+        return "", f"branch `{branch}` not found in repository"
+    if live != expected and not (7 <= len(expected) < len(live) and live.startswith(expected)):
+        return live, f"live HEAD {live[:12]} != reviewed HEAD {expected[:12]} (commits added after review)"
+    return live, ""
+
+
+def _slot_holds_open_pushed_pr(slot_info: Mapping[str, Any]) -> bool:
+    """Return True when a slot already owns the repository's single open pushed PR."""
+    status_u = str(slot_info.get("status") or "").strip().upper()
+    return (
+        bool(slot_info.get("branch_pushed"))
+        or bool(str(slot_info.get("manual_pr_url") or "").strip())
+        or status_u == "PENDING_HUMAN_PR_VALIDATION"
+    )
+
+
+def run_speculative_pre_rebase(
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    branch_name: str = "",
+    slot1_ref: str = "",
+    verify: bool = True,
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+    verify_fn: Any | None = None,
+) -> dict[str, Any]:
+    """Speculatively pre-rebase ready follower slot(s) over frozen Slot #1 HEAD and persist verified cache on lock."""
+    if _orch_ctrl.is_hard_stop_active(portfolio_dir=portfolio_dir):
+        return {
+            "status": "hard_stopped",
+            "paused": True,
+            "hard_stopped": True,
+            "error": "orchestration_hard_stopped",
+        }
+    _get_lock_fn = _resolve_get_dev_pr_lock()
+    lock_info = _get_lock_fn(
+        portfolio_dir=portfolio_dir,
+        repo_slug=repo_slug,
+        workdir=workdir,
+        branch_name=branch_name,
+    )
+    if not lock_info.get("active"):
+        return {
+            "status": "error",
+            "error": "No active dev_pr_lock found for speculative-rebase.",
+        }
+
+    resolved_slug = dev_common.normalize_repo_slug(
+        repo_slug or str(lock_info.get("repo_slug") or lock_info.get("repo") or "")
+    )
+    slots_map = lock_info.get("slots") if isinstance(lock_info.get("slots"), dict) else {}
+    slot1 = slots_map.get("1") if isinstance(slots_map.get("1"), dict) else lock_info
+    s1_status = str(slot1.get("status") or "").strip().upper()
+    s1_head = str(slot1_ref or slot1.get("head_sha") or slot1.get("branch_name") or "").strip()
+    if not slot1_ref and s1_status != "PENDING_HUMAN_PR_VALIDATION":
+        return {
+            "status": "ok",
+            "outcome": OUTCOME_SPECULATIVE_SKIPPED,
+            "repo_slug": resolved_slug,
+            "reason": f"Slot #1 is `{s1_status or 'unknown'}` (not frozen PENDING_HUMAN_PR_VALIDATION); pass --slot1-ref to override.",
+            "results": [],
+        }
+
+    wt_raw = str(workdir or lock_info.get("target_repo_dir") or lock_info.get("worktree_path") or "").strip()
+    wt_cand = Path(wt_raw.replace("$HOME", str(Path.home()))).expanduser() if wt_raw else None
+    lock_main_dir = _resolve_lock_target_repo_dir(lock_info)
+    target_dir: Path | None = None
+    if lock_main_dir is not None and (lock_main_dir / ".git").exists():
+        target_dir = lock_main_dir
+    elif wt_cand is not None and wt_cand.exists():
+        target_dir = _find_git_root_from_path(wt_cand) or wt_cand.resolve()
+    elif resolved_slug and resolved_slug != "default":
+        target_dir = _resolve_repo_dir_for_slug(resolved_slug, portfolio_dir=portfolio_dir, git_client=git_client)
+
+    if target_dir is None or not (target_dir / ".git").exists():
+        return {"status": "error", "error": f"Git repository not found for `{resolved_slug}`."}
+
+    follower_keys = _secondary_slot_keys(slots_map)
+    clean_br = branch_name.strip()
+    targets: list[tuple[int, dict[str, Any]]] = []
+    for f_key in follower_keys:
+        f_slot = slots_map[f_key]
+        f_br = str(f_slot.get("branch_name") or "").strip()
+        if clean_br and f_br != clean_br:
+            continue
+        f_st = str(f_slot.get("status") or "").strip().upper()
+        if not clean_br and f_st != SLOT_STATUS_READY_AWAITING_BASE_MERGE:
+            continue
+        targets.append((int(f_slot.get("slot_id") or int(f_key)), dict(f_slot)))
+
+    if not targets:
+        return {
+            "status": "ok",
+            "outcome": OUTCOME_SPECULATIVE_SKIPPED,
+            "repo_slug": resolved_slug,
+            "slot1_ref": s1_head,
+            "reason": "No eligible READY_AWAITING_BASE_MERGE follower slots found.",
+            "results": [],
+        }
+
+    results: list[dict[str, Any]] = []
+    for f_slot_id, f_slot in targets:
+        f_br = str(f_slot.get("branch_name") or "").strip()
+        spec_res = speculative_pre_rebase_slot(
+            target_dir,
+            follower_branch=f_br,
+            slot1_ref=s1_head,
+            verify=verify,
+            verify_fn=verify_fn,
+        )
+        res_dict = {**spec_res.to_dict(), "slot_id": f_slot_id}
+        results.append(res_dict)
+        if spec_res.status == "ok":
+            cache_payload = {
+                "outcome": spec_res.outcome,
+                "slot1_head_sha": spec_res.slot1_head_sha,
+                "slot1_tree_sha": spec_res.slot1_tree_sha,
+                "follower_head_sha": spec_res.follower_head_sha,
+                "speculative_head_sha": spec_res.speculative_head_sha,
+                "speculative_tree_sha": spec_res.speculative_tree_sha,
+                "speculative_ref": spec_res.speculative_ref,
+                "verification_passed": bool(spec_res.verification_passed),
+                "verification_results": dict(spec_res.verification_results or {}),
+                "conflicted_files": list(spec_res.conflicted_files),
+                "updated_at": _utc_now_iso(),
+            }
+            update_dev_pr_lock(
+                {"speculative_pre_rebase": cache_payload},
+                portfolio_dir=portfolio_dir,
+                repo_slug=resolved_slug,
+                workdir=target_dir,
+                branch_name=f_br,
+                slot_id=f_slot_id,
+            )
+
+    all_ready = all(r.get("outcome") in (OUTCOME_SPECULATIVE_READY, OUTCOME_SPECULATIVE_SKIPPED) for r in results)
+    top_outcome = results[0].get("outcome") if len(results) == 1 else (
+        OUTCOME_SPECULATIVE_READY if all_ready else OUTCOME_SPECULATIVE_CONFLICT
+    )
+    return {
+        "status": "ok",
+        "outcome": str(top_outcome or OUTCOME_SPECULATIVE_READY),
+        "repo_slug": resolved_slug,
+        "slot1_ref": s1_head,
+        "processed_count": len(results),
+        "all_ready": all_ready,
+        "results": results,
+    }
+
+
+def run_bundle_ready_slots(
+    *,
+    repo_slug: str = "",
+    workdir: Path | str | None = None,
+    base_branch: str = "main",
+    slot_ids: Sequence[int] | None = None,
+    min_slots: int = DEFAULT_TRAIN_MIN_SLOTS,
+    max_slots: int = DEFAULT_TRAIN_MAX_SLOTS,
+    fetch: bool = False,
+    dry_run: bool = False,
+    speculative: bool = False,
+    publish: bool = False,
+    run_pre_commit: bool = False,
+    train_branch: str = "",
+    train_worktree_dir: Path | str | None = None,
+    worktree_base_dir: Path | str | None = None,
+    portfolio_dir: Path | str | None = None,
+    git_client: GitVcsIntegrationClient | None = None,
+    ci_parity_verify_fn: Callable[[Path], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """0-LLM Release Train bundler combining 2-3 PASS>90 disjoint READY_AWAITING_BASE_MERGE slots into one verified PR."""
+    if _orch_ctrl.is_hard_stop_active(portfolio_dir=portfolio_dir):
+        return {
+            "status": "hard_stopped",
+            "paused": True,
+            "hard_stopped": True,
+            "error": "orchestration_hard_stopped",
+            "message": "Orchestration is HARD STOPPED (Hard Freeze): refusing `bundle-ready-slots` mutation.",
+        }
+
+    vcs = git_client or GitVcsIntegrationClient()
+    _get_lock_fn = _resolve_get_dev_pr_lock()
+    lock_info = _get_lock_fn(
+        portfolio_dir=portfolio_dir,
+        repo_slug=repo_slug,
+        workdir=workdir,
+    )
+    if not lock_info.get("active"):
+        return {
+            "status": "error",
+            "outcome": OUTCOME_TRAIN_NOT_ELIGIBLE,
+            "bundled": False,
+            "error": "No active dev_pr_lock found for bundle-ready-slots.",
+        }
+
+    resolved_slug = dev_common.normalize_repo_slug(
+        repo_slug or str(lock_info.get("repo_slug") or lock_info.get("repo") or "")
+    )
+    lock_main_dir = _resolve_lock_target_repo_dir(lock_info)
+    wd_raw = str(workdir or lock_info.get("target_repo_dir") or lock_info.get("worktree_path") or "").strip()
+    wd_cand = Path(wd_raw.replace("$HOME", str(Path.home()))).expanduser() if wd_raw else None
+    target_dir: Path | None = None
+    if lock_main_dir is not None and (lock_main_dir / ".git").exists():
+        target_dir = lock_main_dir
+    elif wd_cand is not None and wd_cand.exists():
+        target_dir = _resolve_main_git_repo_root(_find_git_root_from_path(wd_cand) or wd_cand.resolve())
+    elif resolved_slug and resolved_slug != "default":
+        target_dir = _resolve_repo_dir_for_slug(resolved_slug, portfolio_dir=portfolio_dir, git_client=git_client)
+
+    if target_dir is None or not (target_dir / ".git").exists():
+        return {
+            "status": "error",
+            "outcome": OUTCOME_TRAIN_NOT_ELIGIBLE,
+            "bundled": False,
+            "error": f"Git repository not found for `{resolved_slug}`.",
+        }
+
+    slots_map = lock_info.get("slots") if isinstance(lock_info.get("slots"), dict) else {}
+    slot1 = slots_map.get("1") if isinstance(slots_map.get("1"), dict) else lock_info
+    slot1_status = str(slot1.get("status") or "").strip().upper()
+    slot1_open_pr = bool(slot1_status == "PENDING_HUMAN_PR_VALIDATION" and slot1.get("branch_pushed"))
+    requested_ids = {int(s) for s in (slot_ids or []) if int(s) > 0}
+
+    eligible_slots: list[dict[str, Any]] = []
+    ineligible_reasons: list[dict[str, Any]] = []
+    all_slot_keys = sorted(
+        (str(k) for k in slots_map if isinstance(slots_map[k], dict)),
+        key=lambda k: int(k) if k.isdigit() else 99,
+    )
+    for sk in all_slot_keys:
+        s_obj = dict(slots_map[sk])
+        sid = int(s_obj.get("slot_id") or (int(sk) if sk.isdigit() else 0))
+        if requested_ids and sid not in requested_ids:
+            continue
+        s_status = str(s_obj.get("status") or "").strip().upper()
+        if s_status != SLOT_STATUS_READY_AWAITING_BASE_MERGE:
+            ineligible_reasons.append(
+                {
+                    "slot_id": sid,
+                    "branch_name": str(s_obj.get("branch_name") or ""),
+                    "reason": f"status={s_status or 'unknown'} (requires {SLOT_STATUS_READY_AWAITING_BASE_MERGE})",
+                }
+            )
+            continue
+        if not _slot_passed_independent_review(s_obj):
+            verdict, score = _extract_latest_review_verdict_and_score(s_obj)
+            ineligible_reasons.append(
+                {
+                    "slot_id": sid,
+                    "branch_name": str(s_obj.get("branch_name") or ""),
+                    "reason": f"review gate not satisfied (verdict={verdict or 'NONE'}, score={score}, requires PASS >= {PR_REVIEW_PASS_MIN_SCORE})",
+                }
+            )
+            continue
+        live_head_sha, head_parity_error = _resolve_slot_reviewed_head_parity(target_dir, s_obj)
+        if head_parity_error:
+            ineligible_reasons.append(
+                {
+                    "slot_id": sid,
+                    "branch_name": str(s_obj.get("branch_name") or ""),
+                    "reason": f"reviewed HEAD parity failed: {head_parity_error}",
+                }
+            )
+            continue
+        s_obj["expected_head_sha"] = live_head_sha
+        eligible_slots.append(s_obj)
+
+    eff_min = max(2, int(min_slots))
+    eff_max = max(eff_min, min(4, int(max_slots)))
+    if len(eligible_slots) < eff_min:
+        return {
+            "status": "ok",
+            "outcome": OUTCOME_TRAIN_NOT_ELIGIBLE,
+            "repo_slug": resolved_slug,
+            "bundled": False,
+            "rolled_back": False,
+            "eligible_count": len(eligible_slots),
+            "min_slots": eff_min,
+            "max_slots": eff_max,
+            "ineligible_reasons": ineligible_reasons,
+            "error": f"Need at least {eff_min} PASS>{PR_REVIEW_PASS_MIN_SCORE - 1} {SLOT_STATUS_READY_AWAITING_BASE_MERGE} slots (found {len(eligible_slots)}).",
+        }
+
+    # Sort deterministically by landing_order, then slot_id
+    landing_order = [str(c).strip() for c in (lock_info.get("landing_order") or []) if str(c).strip()]
+
+    def _slot_order_key(s_item: dict[str, Any]) -> tuple[int, int]:
+        cid_s = str(s_item.get("conversation_id") or "").strip()
+        for idx_o, ref_o in enumerate(landing_order):
+            if _matches_cid(cid_s, ref_o):
+                return (idx_o, int(s_item.get("slot_id") or 99))
+        return (len(landing_order) + 1, int(s_item.get("slot_id") or 99))
+
+    eligible_slots.sort(key=_slot_order_key)
+    selected_slots = eligible_slots[:eff_max]
+
+    # Pairwise 0-LLM disjointness check via parallel_scope
+    overlap_conflicts: list[dict[str, Any]] = []
+    for idx_a, s_a in enumerate(selected_slots):
+        spec_a = TaskAnchorSpec.from_mapping(s_a)
+        for s_b in selected_slots[idx_a + 1 :]:
+            spec_b = TaskAnchorSpec.from_mapping(s_b)
+            ov = analyze_pair_overlap(spec_a, spec_b, repo_dir=target_dir, repo_slug=resolved_slug)
+            if not ov.parallel_safe:
+                overlap_conflicts.append(
+                    {
+                        "slot_a": int(s_a.get("slot_id") or 0),
+                        "slot_b": int(s_b.get("slot_id") or 0),
+                        "overlap_tier": ov.overlap_tier,
+                        "colliding_files": list(ov.colliding_files),
+                    }
+                )
+    if overlap_conflicts:
+        return {
+            "status": "ok",
+            "outcome": OUTCOME_TRAIN_NOT_ELIGIBLE,
+            "repo_slug": resolved_slug,
+            "bundled": False,
+            "rolled_back": False,
+            "eligible_count": len(selected_slots),
+            "overlap_conflicts": overlap_conflicts,
+            "error": "Candidate ready slots are not pairwise disjoint (INTERFACE_SHARED/DEEP_SHARED overlap detected).",
+        }
+
+    base_sha_override = ""
+    if speculative and slot1_open_pr:
+        base_sha_override = str(slot1.get("head_sha") or slot1.get("branch_name") or "").strip()
+
+    # Strict max-1-open-GitHub-PR-per-repo: only a train led by Slot #1 may be published, and only while no slot
+    # outside the train already holds a pushed PR. Anything else is verified and staged locally instead.
+    selected_slot_ids = {int(s.get("slot_id") or 0) for s in selected_slots}
+    primary_slot = next((s for s in selected_slots if int(s.get("slot_id") or 0) == 1), None)
+    open_pr_slot_ids = sorted(
+        sid_o
+        for sid_o, s_o in (
+            (int(v.get("slot_id") or (int(k) if str(k).isdigit() else 0)), v)
+            for k, v in slots_map.items()
+            if isinstance(v, dict)
+        )
+        if sid_o not in selected_slot_ids and _slot_holds_open_pushed_pr(s_o)
+    )
+    publish_blocked_reason = ""
+    if base_sha_override:
+        publish_blocked_reason = "speculative train is stacked over the frozen Slot #1 HEAD"
+    elif slot1_open_pr or open_pr_slot_ids:
+        blocking_ids = sorted({*open_pr_slot_ids, *([1] if slot1_open_pr else [])})
+        publish_blocked_reason = f"slot(s) {blocking_ids} already hold an open pushed PR (max 1 open PR per repo)"
+    elif primary_slot is None:
+        publish_blocked_reason = (
+            f"Slot #1 (status={slot1_status or 'unknown'}) is not part of this train; "
+            "only a train led by Slot #1 may be published"
+        )
+
+    bundle_res = bundle_ready_slots_git(
+        target_dir,
+        selected_slots,
+        base_branch=base_branch,
+        base_sha_override=base_sha_override,
+        fetch=fetch,
+        train_branch=train_branch,
+        train_worktree_dir=train_worktree_dir,
+        worktree_base_dir=worktree_base_dir,
+        min_slots=eff_min,
+        max_slots=eff_max,
+        dry_run=dry_run,
+        run_pre_commit=run_pre_commit,
+        ci_parity_verify_fn=ci_parity_verify_fn,
+    )
+    res_payload: dict[str, Any] = {
+        **bundle_res.to_dict(),
+        "repo_slug": resolved_slug,
+        "speculative_over_slot1": bool(base_sha_override),
+        "slot1_open_pr_blocking_publish": bool(slot1_open_pr),
+        "publish_requested": bool(publish),
+        "publish_blocked": bool(publish and publish_blocked_reason),
+        "publish_blocked_reason": publish_blocked_reason if publish else "",
+        "branch_pushed": False,
+        "ready_for_human_pr": False,
+        "manual_pr_url": "",
+        "ineligible_reasons": ineligible_reasons,
+    }
+    if dry_run or not bundle_res.bundled:
+        return res_payload
+
+    # Build canonical Release Train PR description & amend train HEAD commit
+    cid8_list = [str(s.get("conversation_id") or "")[:8] or f"s{s.get('slot_id')}" for s in selected_slots]
+    train_title = format_remediation_commit_title(
+        f"feat(release-train): bundle {len(selected_slots)} verified slots ({', '.join(cid8_list)})",
+        action_id="release-train",
+        conversation_id=cid8_list[0],
+        branch_timestamp=generate_branch_timestamp(),
+    )
+    slot_bullets = "\n".join(
+        f"- Slot #{int(s.get('slot_id') or 0)} `{s.get('branch_name', '')}` "
+        f"(`{str(s.get('conversation_id') or '')[:8]}` · PASS {int(s.get('reviewer_score') or PR_REVIEW_PASS_MIN_SCORE)}/100): "
+        f"{str(s.get('proposal_title') or s.get('proposed_fix') or s.get('summary') or '')[:140]}"
+        for s in selected_slots
+    )
+    min_score = min(int(s.get("reviewer_score") or PR_REVIEW_PASS_MIN_SCORE) for s in selected_slots)
+    train_exec_summary = (
+        f"0-LLM Release Train bundling {len(selected_slots)} independently approved (PASS>{PR_REVIEW_PASS_MIN_SCORE - 1}) "
+        f"disjoint slots verified via `test-local --mode ci-parity`:\n{slot_bullets}"
+    )
+    train_wt_path = Path(bundle_res.train_worktree.replace("$HOME", str(Path.home()))).expanduser().resolve()
+    canonical_body = build_canonical_pr_description(
+        commit_title=train_title,
+        executive_summary=train_exec_summary,
+        branch_name=bundle_res.train_branch,
+        branch_timestamp=generate_branch_timestamp(),
+        conversation_id=str(selected_slots[0].get("conversation_id") or ""),
+        files_changed=list(bundle_res.union_files),
+        verification_results=bundle_res.verification_results,
+        reviewer_verdict="PASS",
+        reviewer_score=min_score,
+        reviewer_summary=(
+            f"All {len(selected_slots)} bundled slots independently passed Maker-Checker review "
+            f"(min score {min_score}/100) and unified ci-parity gate."
+        ),
+        review_iteration=1,
+    )
+    amend_res = _sync_branch_head_commit_message_detailed(
+        target_repo_dir=train_wt_path,
+        branch_name=bundle_res.train_branch,
+        base_branch=base_branch,
+        commit_title=train_title,
+        commit_body=canonical_body,
+    )
+    final_head_sha = str(amend_res.get("head_sha") or bundle_res.train_head_sha)
+    res_payload["train_head_sha"] = final_head_sha
+    # Amending the commit message keeps the verified tree but changes the commit SHA: keep the gate bound to it.
+    res_payload["verification_results"] = {**bundle_res.verification_results, "head_sha": final_head_sha, "dirty": False}
+    res_payload["proposal_title"] = train_title
+    res_payload["proposal_body"] = canonical_body
+
+    # Respect strict max-1-open-GitHub-PR-per-repo invariant: publish ONLY if requested AND Slot #1 is not already an open pushed PR
+    if publish and primary_slot is not None and not publish_blocked_reason:
+        try:
+            push_res = vcs.push_branch(
+                branch_name=bundle_res.train_branch,
+                remote="origin",
+                base_branch=base_branch,
+                set_upstream=True,
+                force_with_lease=True,
+                title=train_title,
+                body=canonical_body,
+                repo_dir=train_wt_path,
+            )
+        except TypeError:
+            push_res = vcs.push_branch(
+                branch_name=bundle_res.train_branch,
+                remote="origin",
+                base_branch=base_branch,
+                set_upstream=True,
+                repo_dir=train_wt_path,
+            )
+        if not isinstance(push_res, dict) or push_res.get("status") != "ok":
+            # Never leave an unpublished train worktree/branch behind; slot branches stay untouched for a retry.
+            discard_release_train(target_dir, train_branch=bundle_res.train_branch, train_worktree=train_wt_path)
+            return {
+                **res_payload,
+                "status": "error",
+                "step": "push_release_train",
+                "bundled": False,
+                "rolled_back": True,
+                "train_worktree": "",
+                "error": str((push_res or {}).get("error") or f"Failed to push release train branch '{bundle_res.train_branch}'."),
+            }
+        final_head_sha = str(push_res.get("head_sha") or final_head_sha)
+        try:
+            manual_pr_url = vcs.build_manual_pr_url(
+                head_branch=bundle_res.train_branch,
+                base_branch=base_branch,
+                title=train_title,
+                body=canonical_body,
+                repo_dir=train_wt_path,
+            )
+        except TypeError:
+            manual_pr_url = vcs.build_manual_pr_url(head_branch=bundle_res.train_branch, base_branch=base_branch)
+
+        absorbed_slots = [s for s in selected_slots if s is not primary_slot]
+        primary_cid = str(primary_slot.get("conversation_id") or "").strip()
+        # Union (never overwrite) siblings already tracked by the primary and absorbed slots.
+        sibling_cids: list[str] = []
+        for sib_raw in (
+            *(primary_slot.get("sibling_conversation_ids") or []),
+            *(
+                c_raw
+                for s in absorbed_slots
+                for c_raw in (s.get("conversation_id"), *(s.get("sibling_conversation_ids") or []))
+            ),
+        ):
+            sib_clean = str(sib_raw or "").strip()
+            if sib_clean and sib_clean != primary_cid and sib_clean not in sibling_cids:
+                sibling_cids.append(sib_clean)
+        updated_vr = {**bundle_res.verification_results, "head_sha": final_head_sha, "dirty": False}
+        res_payload["verification_results"] = updated_vr
+        now_iso = _utc_now_iso()
+        persistent_root = _resolve_main_git_repo_root(train_wt_path)
+        upd_train_rb = {
+            resolved_slug: {
+                "repo_slug": resolved_slug,
+                "branch_name": bundle_res.train_branch,
+                "branch_timestamp": generate_branch_timestamp(),
+                "target_repo_dir": _sanitize_home_paths(str(persistent_root)),
+                "worktree_path": _sanitize_home_paths(str(train_wt_path)),
+                "manual_pr_url": manual_pr_url,
+                "branch_pushed": True,
+                "head_sha": final_head_sha,
+                "updated_at": now_iso,
+            }
+        }
+        update_dev_pr_lock(
+            {
+                "conversation_id": primary_cid,
+                "status": "PENDING_HUMAN_PR_VALIDATION",
+                "branch_name": bundle_res.train_branch,
+                "worktree_path": _sanitize_home_paths(str(train_wt_path)),
+                "head_sha": final_head_sha,
+                "reviewed_head_sha": final_head_sha,
+                "approved_head_sha": final_head_sha,
+                "base_sha": bundle_res.base_sha,
+                "proposal_title": train_title,
+                "proposal_body": canonical_body,
+                "executive_summary": train_exec_summary,
+                "verification_results": updated_vr,
+                "branch_pushed": True,
+                "pr_gate_ready": True,
+                "manual_pr_url": manual_pr_url,
+                "pr_url": manual_pr_url,
+                "repo_branches": upd_train_rb,
+                "release_train": True,
+                "bundled_slot_branches": list(bundle_res.included_branches),
+                "sibling_conversation_ids": sibling_cids,
+            },
+            portfolio_dir=portfolio_dir,
+            repo_slug=resolved_slug,
+            workdir=train_wt_path,
+            branch_name=str(primary_slot.get("branch_name") or ""),
+            slot_id=int(primary_slot.get("slot_id") or 1),
+        )
+        for absorbed in absorbed_slots:
+            release_dev_pr_lock(
+                reason="RELEASE_TRAIN_BUNDLED",
+                resolution="BUNDLED_INTO_RELEASE_TRAIN",
+                summary=f"Bundled into release train `{bundle_res.train_branch}`.",
+                portfolio_dir=portfolio_dir,
+                repo_slug=resolved_slug,
+                slot_id=int(absorbed.get("slot_id") or 2),
+            )
+        for s_item in selected_slots:
+            s_cid = str(s_item.get("conversation_id") or "").strip()
+            if s_cid:
+                with contextlib.suppress(Exception):
+                    update_dev_queue_item_status(
+                        conversation_id=s_cid,
+                        status="pr_open",
+                        branch_names=[bundle_res.train_branch],
+                        pr_urls=[manual_pr_url],
+                        notes=f"Bundled into 0-LLM Release Train `{bundle_res.train_branch}`.",
+                        portfolio_dir=portfolio_dir,
+                    )
+        watcher_res = _facade_attr("spawn_pr_merge_watcher_daemon", spawn_pr_merge_watcher_daemon)(
+            portfolio_dir=portfolio_dir
+        )
+        res_payload.update(
+            {
+                "train_head_sha": final_head_sha,
+                "branch_pushed": True,
+                "ready_for_human_pr": True,
+                "pr_gate_ready": True,
+                "manual_pr_url": manual_pr_url,
+                "pr_url": manual_pr_url,
+                "notification_email_sent": False,
+                "pr_merge_watcher": watcher_res,
+            }
+        )
+        return res_payload
+
+    # Record staged local train metadata on the first selected slot without pushing (preserves max-1-open-PR-per-repo)
+    first_sid = int(selected_slots[0].get("slot_id") or 2)
+    update_dev_pr_lock(
+        {
+            "release_train_bundle": {
+                "train_branch": bundle_res.train_branch,
+                "train_worktree": bundle_res.train_worktree,
+                "train_head_sha": final_head_sha,
+                "base_sha": bundle_res.base_sha,
+                "included_branches": list(bundle_res.included_branches),
+                "included_slot_ids": list(bundle_res.included_slot_ids),
+                "included_conversation_ids": list(bundle_res.included_conversation_ids),
+                "speculative_over_slot1": bool(base_sha_override),
+                "publish_blocked_reason": publish_blocked_reason if publish else "",
+                "verified_at": _utc_now_iso(),
+            }
+        },
+        portfolio_dir=portfolio_dir,
+        repo_slug=resolved_slug,
+        workdir=target_dir,
+        branch_name=str(selected_slots[0].get("branch_name") or ""),
+        slot_id=first_sid,
+    )
+    return res_payload
+
+
 def register_review_cli(sub: Any) -> None:
     """Register developer-plan, review-staging, diff, evaluation, overlap & rebase subcommands."""
     p_plan_dev = sub.add_parser(
@@ -3727,6 +4598,19 @@ def register_review_cli(sub: Any) -> None:
     p_diff.add_argument("--base", default="main", help="Base branch name (default: main).")
     p_diff.add_argument("--workdir", default="", help="Optional target repository directory.")
     p_diff.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
+    p_diff.add_argument(
+        "--review-bundle",
+        dest="review_bundle",
+        action="store_true",
+        help="Return lean single-call reviewer bundle (bounded diff + verification_gate + static_audit_summary + task_context).",
+    )
+    p_diff.add_argument(
+        "--max-diff-chars",
+        dest="max_diff_chars",
+        type=int,
+        default=_DEFAULT_REVIEW_BUNDLE_MAX_DIFF_CHARS,
+        help="Maximum diff characters included in --review-bundle output (default: 48000).",
+    )
 
     p_rev = sub.add_parser(
         "record-review",
@@ -3797,10 +4681,49 @@ def register_review_cli(sub: Any) -> None:
     p_rbr.add_argument("--base", default="main", help="Base branch name (default: main).")
     p_rbr.add_argument("--fetch", action="store_true", help="Fetch origin before rebasing.")
     p_rbr.add_argument(
+        "--speculative",
+        action="store_true",
+        help="Run speculative pre-rebase over frozen Slot #1 HEAD instead of rebasing onto origin/main.",
+    )
+    p_rbr.add_argument(
+        "--slot1-ref",
+        dest="slot1_ref",
+        default="",
+        help="Optional explicit frozen Slot #1 HEAD SHA/branch ref when using --speculative.",
+    )
+    p_rbr.add_argument(
         "--send-email",
         action="store_true",
         help="Retained for backward CLI compatibility (deprecated no-op; PR Ready emails are disabled).",
     )
+
+    p_spec = sub.add_parser(
+        "speculative-rebase",
+        help="0-LLM speculative pre-rebase of READY_AWAITING_BASE_MERGE follower slot(s) over frozen Slot #1 HEAD.",
+    )
+    p_spec.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
+    p_spec.add_argument("--workdir", default="", help="Optional worktree or repository directory.")
+    p_spec.add_argument("--branch", default="", help="Optional specific follower branch name (defaults to all ready followers).")
+    p_spec.add_argument("--slot1-ref", dest="slot1_ref", default="", help="Optional frozen Slot #1 HEAD SHA/ref override.")
+    p_spec.add_argument("--no-verify", dest="no_verify", action="store_true", help="Skip cross-impact verification during speculative pre-rebase.")
+
+    p_train = sub.add_parser(
+        "bundle-ready-slots",
+        help="0-LLM Release Train bundler combining 2-3 PASS>90 disjoint READY_AWAITING_BASE_MERGE slots into one verified integration PR.",
+    )
+    p_train.add_argument("--repo", dest="repo_slug", default="", help="Optional owner/repo slug.")
+    p_train.add_argument("--workdir", default="", help="Optional repository or worktree directory.")
+    p_train.add_argument("--base", default="main", help="Base branch name (default: main).")
+    p_train.add_argument("--slots", dest="slot_ids", nargs="*", type=int, default=[], help="Optional explicit slot IDs to bundle (2-3 slots).")
+    p_train.add_argument("--min-slots", dest="min_slots", type=int, default=DEFAULT_TRAIN_MIN_SLOTS, help="Minimum ready slots required (default: 2).")
+    p_train.add_argument("--max-slots", dest="max_slots", type=int, default=DEFAULT_TRAIN_MAX_SLOTS, help="Maximum ready slots per train (default: 3).")
+    p_train.add_argument("--train-branch", dest="train_branch", default="", help="Optional explicit integration branch name.")
+    p_train.add_argument("--train-worktree", dest="train_worktree", default="", help="Optional explicit train worktree directory.")
+    p_train.add_argument("--fetch", action="store_true", help="Fetch origin before bundling.")
+    p_train.add_argument("--dry-run", dest="dry_run", action="store_true", help="Validate eligibility and conflict cleanliness without creating a branch.")
+    p_train.add_argument("--speculative", action="store_true", help="Bundle speculatively on top of frozen Slot #1 HEAD.")
+    p_train.add_argument("--publish", action="store_true", help="Push the verified Release Train branch and surface manual_pr_url only when Slot #1 leads the train and no other slot holds an open PR (otherwise stage locally).")
+    p_train.add_argument("--with-pre-commit", dest="run_pre_commit", action="store_true", help="Include single-pass pre-commit in ci-parity verification gate.")
 
     p_quota = sub.add_parser(
         "quota-status",
@@ -3915,6 +4838,8 @@ def dispatch_review_cli(args: Any) -> int | None:
             base_branch=args.base,
             workdir=getattr(args, "workdir", "") or None,
             repo_slug=getattr(args, "repo_slug", ""),
+            review_bundle=bool(getattr(args, "review_bundle", False)),
+            max_diff_chars=int(getattr(args, "max_diff_chars", _DEFAULT_REVIEW_BUNDLE_MAX_DIFF_CHARS) or _DEFAULT_REVIEW_BUNDLE_MAX_DIFF_CHARS),
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("status") == "ok" else 1
@@ -3978,6 +4903,15 @@ def dispatch_review_cli(args: Any) -> int | None:
         return 0 if ov_res.get("status") == "ok" else 1
 
     if args.subcommand == "rebase-reverify":
+        if getattr(args, "speculative", False):
+            spec_res = _facade_attr("run_speculative_pre_rebase", run_speculative_pre_rebase)(
+                repo_slug=getattr(args, "repo_slug", ""),
+                workdir=getattr(args, "workdir", "") or None,
+                branch_name=str(getattr(args, "branch", "") or ""),
+                slot1_ref=str(getattr(args, "slot1_ref", "") or ""),
+            )
+            print(json.dumps(spec_res, indent=2, ensure_ascii=False))
+            return 0 if spec_res.get("status") == "ok" else 1
         rbr_res = _facade_attr("run_slot_rebase_reverify", run_slot_rebase_reverify)(
             repo_slug=getattr(args, "repo_slug", ""),
             workdir=getattr(args, "workdir", "") or None,
@@ -3988,6 +4922,36 @@ def dispatch_review_cli(args: Any) -> int | None:
         )
         print(json.dumps(rbr_res, indent=2, ensure_ascii=False))
         return 0 if rbr_res.get("status") == "ok" else 1
+
+    if args.subcommand == "speculative-rebase":
+        spec_res = _facade_attr("run_speculative_pre_rebase", run_speculative_pre_rebase)(
+            repo_slug=getattr(args, "repo_slug", ""),
+            workdir=getattr(args, "workdir", "") or None,
+            branch_name=str(getattr(args, "branch", "") or ""),
+            slot1_ref=str(getattr(args, "slot1_ref", "") or ""),
+            verify=not bool(getattr(args, "no_verify", False)),
+        )
+        print(json.dumps(spec_res, indent=2, ensure_ascii=False))
+        return 0 if spec_res.get("status") == "ok" else 1
+
+    if args.subcommand == "bundle-ready-slots":
+        train_res = _facade_attr("run_bundle_ready_slots", run_bundle_ready_slots)(
+            repo_slug=getattr(args, "repo_slug", ""),
+            workdir=getattr(args, "workdir", "") or None,
+            base_branch=str(getattr(args, "base", "main") or "main"),
+            slot_ids=list(getattr(args, "slot_ids", []) or []) or None,
+            min_slots=int(getattr(args, "min_slots", DEFAULT_TRAIN_MIN_SLOTS) or DEFAULT_TRAIN_MIN_SLOTS),
+            max_slots=int(getattr(args, "max_slots", DEFAULT_TRAIN_MAX_SLOTS) or DEFAULT_TRAIN_MAX_SLOTS),
+            fetch=bool(getattr(args, "fetch", False)),
+            dry_run=bool(getattr(args, "dry_run", False)),
+            speculative=bool(getattr(args, "speculative", False)),
+            publish=bool(getattr(args, "publish", False)),
+            run_pre_commit=bool(getattr(args, "run_pre_commit", False)),
+            train_branch=str(getattr(args, "train_branch", "") or ""),
+            train_worktree_dir=str(getattr(args, "train_worktree", "") or "") or None,
+        )
+        print(json.dumps(train_res, indent=2, ensure_ascii=False))
+        return 0 if train_res.get("status") == "ok" else 1
 
     if args.subcommand == "quota-status":
         snapshot_res: dict[str, Any] | None = None

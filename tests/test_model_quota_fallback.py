@@ -285,9 +285,9 @@ class TestReviewGateFlashFirstAndEscalation(unittest.TestCase):
 
 
 class TestDoctorBlindSpotsWatcherAndRotation(unittest.TestCase):
-    """Verify all 4 agy-doctor/merge_watcher blind spots, quota wakes, watchdog suppression & 150-step rotation."""
+    """Verify all 4 agy-doctor/merge_watcher blind spots, quota wakes, watchdog suppression & 100-110 step rotation."""
 
-    def test_early_orchestrator_rotation_threshold_150_steps(self) -> None:
+    def test_early_orchestrator_rotation_threshold_100_to_110_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             pdir = root / "state"
@@ -297,7 +297,7 @@ class TestDoctorBlindSpotsWatcherAndRotation(unittest.TestCase):
             _write_transcript(
                 brain_dir,
                 orch_cid,
-                [{"type": "PLANNER_RESPONSE", "status": "DONE"} for _ in range(155)],
+                [{"type": "PLANNER_RESPONSE", "status": "DONE"} for _ in range(105)],
             )
             rep_default = dfo.analyze_dev_flow_optimizations(
                 portfolio_dir=pdir,
@@ -306,7 +306,8 @@ class TestDoctorBlindSpotsWatcherAndRotation(unittest.TestCase):
             )
             by_code = {f["code"]: f for f in rep_default["findings"]}
             self.assertIn("bloated_orchestrator_session", by_code)
-            self.assertEqual(by_code["bloated_orchestrator_session"]["evidence"]["threshold"], 150)
+            self.assertEqual(by_code["bloated_orchestrator_session"]["evidence"]["threshold"], 100)
+            self.assertEqual(by_code["bloated_orchestrator_session"]["evidence"]["hard_threshold"], 110)
 
             with mock.patch.dict(os.environ, {"AGY_DEV_MAX_ORCHESTRATOR_STEPS": "200"}):
                 rep_override = dfo.analyze_dev_flow_optimizations(

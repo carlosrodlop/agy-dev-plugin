@@ -1816,6 +1816,13 @@ def register_worktree_cli(sub: Any) -> None:
         help="Run full GitHub Actions CI parity locally: full `qa_static_audit.py` (no `--incremental`), full `unittest` + BATS, and local `coverage` gate against workflow `--fail-under` threshold (auto-enabled when workflows gate on `ENABLE_GHA_HOSTED_RUNNERS` or `--all`).",
     )
     p_test.add_argument(
+        "--mode",
+        dest="test_mode",
+        choices=("", "selective", "ci-parity", "all"),
+        default="",
+        help="Optional validation mode selector (`selective`, `ci-parity`, or `all`; `--mode ci-parity` is equivalent to `--ci-parity`).",
+    )
+    p_test.add_argument(
         "--with-pre-commit",
         "--run-pre-commit",
         "--pre-commit",
@@ -1901,13 +1908,16 @@ def dispatch_worktree_cli(args: Any) -> int | None:
         return 0 if res.get("status") == "ok" else 1
 
     if args.subcommand == "test-local":
+        test_mode = str(getattr(args, "test_mode", "") or "").strip().lower()
+        eff_ci_parity = bool(getattr(args, "ci_parity", False)) or test_mode == "ci-parity"
+        eff_run_all = bool(getattr(args, "run_all", False)) or test_mode == "all"
         res = _facade_attr("run_local_validation_suite", run_local_validation_suite)(
             workdir=args.workdir or None,
             test_targets=args.targets or None,
             run_pre_commit=bool(getattr(args, "run_pre_commit", False)),
             pre_commit_status=str(getattr(args, "pre_commit_status", "") or ""),
-            run_all=bool(getattr(args, "run_all", False)),
-            ci_parity=bool(getattr(args, "ci_parity", False)),
+            run_all=eff_run_all,
+            ci_parity=eff_ci_parity,
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0 if res.get("passed") else 1
