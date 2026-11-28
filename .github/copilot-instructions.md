@@ -6,8 +6,8 @@ Review pull requests against these mandatory engineering guardrails. Flag violat
 - **Zero-PII & Zero-Secrets**: Reject customer names, personal emails, tokens, credentials, private keys, or hardcoded local `/Users/<user>/` paths in tracked files. Use synthetic mocks only (`AcmeCorp`, `acme/repo-a`); keep live secrets in `0600` `~/.env` (mirrored in `.env.example`).
 - **Protected `main`**: Never suggest direct pushes or merges to `main`/`master`; route changes through timestamped `fix/<YYYYMMDD-HHMMSS>-<scope>-<cid8>` branches under per-repo `dev_pr_locks`.
 
-## 2. VCS-Agnostic Native Git / SSH Only
-- **No Proprietary VCS CLIs or Forge Tokens**: NEVER suggest or introduce `gh`, `glab`, `hub`, or GitHub/GitLab REST API tokens (`PROPRIETARY_VCS_CLI_RE` in `clients/dev_common.py`). Use native `/usr/bin/git` and `/usr/bin/ssh` (`clients/git_client.py`) exclusively.
+## 2. GitHub-First Native Git / SSH (Zero `gh` Binary)
+- **Santa-Safe GitHub Transport**: NEVER suggest `gh`, `glab`, or `hub` binaries (`PROPRIETARY_VCS_CLI_RE` in `clients/dev_common.py`). Use native `/usr/bin/git` + `/usr/bin/ssh` (`clients/git_client.py`); any GitHub REST need uses Python stdlib `urllib.request` only.
 
 ## 3. Santa Lockdown & Declarative Tooling
 - **Primary Languages**: Python 3, POSIX/Bash Shell, and Vanilla-First Zero-Build Web (`ES2022+` JS/HTML5/CSS3; frameworks only if explicitly declared).

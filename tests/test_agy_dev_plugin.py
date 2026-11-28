@@ -143,11 +143,39 @@ class TestDevCommonAndGuardrails(unittest.TestCase):
             )
             self.assertEqual(res_feat["decision"], "allow")
 
-            # Block gh / glab
+            # Block gh / glab compiled CLI binaries (GitHub-First native git under Santa Lockdown)
             res_gh = evaluator.evaluate_pre_tool_use(
                 {"toolName": "run_command", "arguments": {"CommandLine": "gh pr create --title test"}}
             )
             self.assertEqual(res_gh["decision"], "deny")
+            res_glab = evaluator.evaluate_pre_tool_use(
+                {"toolName": "run_command", "arguments": {"CommandLine": "cd /tmp && glab mr create --fill"}}
+            )
+            self.assertEqual(res_glab["decision"], "deny", msg="glab is an unapproved compiled binary and must stay blocked")
+            for res_cli in (res_gh, res_glab):
+                for reason_term in ("GitHub-First", "Santa Lockdown", "/usr/bin/git", "/usr/bin/ssh", "urllib.request"):
+                    self.assertIn(reason_term, res_cli["reason"], msg=f"gh/glab deny reason lost GitHub-First guidance: {reason_term}")
+                self.assertNotRegex(res_cli["reason"], r"(?i)VCS-agnostic|GitLab|Bitbucket|Gitea")
+
+            vcs_cli_check = next(c for c in pre_checks if c["check_id"] == "pretool:proprietary-vcs-cli")
+            self.assertEqual(vcs_cli_check["decision"], "deny")
+            self.assertEqual(vcs_cli_check["target"], "run_command (PROPRIETARY_VCS_CLI_RE)")
+            self.assertIn("GitHub-First", vcs_cli_check["title"])
+            for catalog_term in ("GitHub-First", "Santa Lockdown", "'gh'", "'glab'", "/usr/bin/git", "/usr/bin/ssh"):
+                self.assertIn(catalog_term, vcs_cli_check["description"], msg=f"Catalog description lost term: {catalog_term}")
+            self.assertNotRegex(vcs_cli_check["title"] + vcs_cli_check["description"], r"(?i)VCS-agnostic|interoperable")
+
+            # GitHub-First never weakens native git: plain git/ssh GitHub transport and stdlib REST scripts stay allowed
+            for allowed_native_cmd in (
+                "git fetch origin main",
+                "/usr/bin/git -C /tmp/acme-repo log --oneline -5",
+                "ssh -T git@github.com",
+                "python3 scripts/github_rest_probe.py --repo acme/repo-a",
+            ):
+                res_native = evaluator.evaluate_pre_tool_use(
+                    {"toolName": "run_command", "arguments": {"CommandLine": allowed_native_cmd}}
+                )
+                self.assertEqual(res_native["decision"], "allow", msg=f"Native GitHub transport must stay allowed: {allowed_native_cmd}")
 
             # Block Santa Lockdown binary pipes, chained binary downloads, and unapproved managers
             for blocked_santa_cmd in (
@@ -1992,6 +2020,90 @@ class TestProjectAuditAndPluginContracts(unittest.TestCase):
             "4,000",
         ):
             self.assertIn(ruleset_term, readme_text, msg=f"Missing Copilot Ruleset guidance in README.md: {ruleset_term}")
+
+    def test_github_first_santa_safe_native_git_docs_contract(self) -> None:
+        """Principles, rules, skills, and agent docs stay GitHub-First with zero `gh` binary and no multi-forge framing."""
+        github_first_docs: dict[str, tuple[str, ...]] = {
+            "rules/git-and-pr-workflow.md": (
+                "GitHub-First",
+                "Santa Lockdown",
+                "/usr/bin/git",
+                "/usr/bin/ssh",
+                "`gh`",
+                "pretool:proprietary-vcs-cli",
+                "urllib.request",
+                "GitHub Actions CI",
+                "GitHub Rulesets",
+                "GitHub Compare",
+                "GitHub Copilot Code Review",
+            ),
+            "rules/engineering-pillars.md": (
+                "GitHub-First",
+                "/usr/bin/git",
+                "/usr/bin/ssh",
+                "`gh`",
+                "urllib.request",
+                "GitHub Actions CI",
+                "GitHub Rulesets",
+                "GitHub Compare",
+            ),
+            ".github/copilot-instructions.md": ("GitHub-First", "`gh`", "/usr/bin/git", "/usr/bin/ssh", "urllib.request"),
+            "README.md": (
+                "GitHub-First",
+                "Santa Lockdown",
+                "`gh`",
+                "/usr/bin/git",
+                "/usr/bin/ssh",
+                "urllib.request",
+                "GitHub Actions CI",
+                "GitHub Ruleset",
+                "GitHub Compare",
+                "GitHub Copilot Code Review",
+            ),
+            "agents/agy-code-developer.md": (
+                "GitHub-First",
+                "Santa Lockdown",
+                "/usr/bin/git",
+                "/usr/bin/ssh",
+                "`gh`",
+                "urllib.request",
+                "GitHub Compare",
+            ),
+            "skills/agy-code-remediation-pr/SKILL.md": (
+                "GitHub-First",
+                "Santa Lockdown",
+                "/usr/bin/git",
+                "/usr/bin/ssh",
+                "`gh`",
+                "urllib.request",
+                "GitHub Compare",
+            ),
+            "skills/git-commit-configuration/SKILL.md": (
+                "GitHub-First",
+                "Santa Lockdown",
+                "/usr/bin/git",
+                "/usr/bin/ssh",
+                "`gh`",
+                "urllib.request",
+                "GitHub Compare",
+            ),
+        }
+        stale_multi_forge_re = re.compile(r"(?i)VCS[- ]agnostic|VCS[- ]interoperable|\bGitLab\b|\bBitbucket\b|\bGitea\b|\bforge\b")
+        for rel_path, required_terms in github_first_docs.items():
+            doc_path = REPO_ROOT / rel_path
+            self.assertTrue(doc_path.is_file(), msg=f"Missing GitHub-First doc: {rel_path}")
+            self.assertLess(doc_path.stat().st_size, 24000, msg=f"{rel_path} exceeds 24,000-byte ceiling")
+            doc_text = doc_path.read_text(encoding="utf-8")
+            for term in required_terms:
+                self.assertIn(term, doc_text, msg=f"{rel_path} missing GitHub-First contract term: {term}")
+            stale_hits = sorted({m.group(0) for m in stale_multi_forge_re.finditer(doc_text)})
+            self.assertEqual(stale_hits, [], msg=f"{rel_path} still carries VCS-agnostic / multi-forge wording: {stale_hits}")
+            # `gh` may only be named as a blocked binary: never as a fenced or inline runnable command
+            self.assertNotRegex(
+                doc_text,
+                r"(?m)^\s*(?:\$\s*)?gh\s+(?:pr|issue|repo|release|api|auth)\b|`gh\s+(?:pr|issue|repo|release|api|auth)\b",
+                msg=f"{rel_path} must never document runnable `gh` CLI commands",
+            )
 
     def test_project_audit_five_languages_security_hygiene_and_santa(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,8 +1,8 @@
 # `agy-dev-plugin` — Antigravity Software Engineering, Native Git & Project Standards Plugin
 
-`agy-dev-plugin` is a standalone, modular Antigravity plugin dedicated to **software engineering best practices, VCS-agnostic Native Git branching workflows, deterministic lifecycle guardrails, and Zero-PII/Santa Lockdown project auditing**.
+`agy-dev-plugin` is a standalone, modular Antigravity plugin dedicated to **software engineering best practices, GitHub-First Native Git branching workflows (Santa Lockdown compliant — zero `gh` binary), deterministic lifecycle guardrails, and Zero-PII/Santa Lockdown project auditing**.
 
-By decoupling generic SDLC automation from domain-specific plugins (such as [`agy-tam-plugin`](https://github.com/carlosrodlop/agy-tam-plugin) for Wiz TAM workflows), `agy-dev-plugin` governs any Python / Unix repository consistently without polluting domain contexts.
+By decoupling generic SDLC automation from domain-specific plugins (such as [`agy-tam-plugin`](https://github.com/carlosrodlop/agy-tam-plugin) for Wiz TAM workflows), `agy-dev-plugin` governs any Python / Unix GitHub repository consistently (GitHub Actions CI, GitHub Rulesets, GitHub Compare PR URLs, optional GitHub Copilot Code Review) without polluting domain contexts.
 
 ---
 
@@ -11,7 +11,7 @@ By decoupling generic SDLC automation from domain-specific plugins (such as [`ag
 ### 1. Deterministic Guardrails (`clients/dev_common.py` + `hooks.json`)
 - **`PreToolUse` Safety Gate (`agy-dev-sdlc-guardrail`)**:
   - `pretool:direct-main-push`: Blocks direct `git push` commands targeting `main` or `master`.
-  - `pretool:proprietary-vcs-cli`: Blocks proprietary forge wrappers (`gh`, `glab`), enforcing native `/usr/bin/git` and `/usr/bin/ssh`.
+  - `pretool:proprietary-vcs-cli`: Blocks unapproved compiled CLI binaries (`gh`, `glab`) under Santa Lockdown, enforcing GitHub-First native `/usr/bin/git` and `/usr/bin/ssh` transport (Python stdlib `urllib.request` only if GitHub REST API access is ever needed).
   - `pretool:santa-lockdown-binary`: Blocks unapproved remote script pipes (`curl | sh`, `wget | sh`, `curl | python*`), chained binary downloads (`releases/download` + `chmod +x`), and unapproved binary managers (`mise`, `uv tool/python install`, `cargo binstall`).
   - `pretool:dotenv-write-protection`: Blocks direct agent edits to live `~/.env` credentials.
   - `pretool:unvalidated-branch-push`: Blocks raw `git push` to locked branches before `agy-code-pr-reviewer` passes (`PASS > 90/100`).
@@ -42,7 +42,7 @@ By decoupling generic SDLC automation from domain-specific plugins (such as [`ag
 - `python-and-testing.md` (`glob`: `*.py`, `pyproject.toml`, `.pre-commit-config.yaml`, CI workflows) — Python 3 typing, AST safety, Santa pure-Python constraints, and hermetic offline testing
 - `shell-standards.md` (`glob`: `*.sh`, `*.bash`, `*.zsh`, `*.bats`, `Makefile`) — POSIX/Bash/Zsh portability, sourced-safe strict mode, quoting, Santa binary safety, and BATS
 - `web-frontend-standards.md` (`glob`: `*.js`, `*.mjs`, `*.html`, `*.css`) — Vanilla-First Zero-Build JS/HTML5/CSS3, XSS/CSP defense, WCAG accessibility, design tokens, and Santa Lockdown toolchain rules
-- `git-and-pr-workflow.md` (`glob`) — Native Git timestamped branches, per-repo `dev_pr_locks`, and hard `PASS > 90/100` PR readiness gate
+- `git-and-pr-workflow.md` (`glob`) — GitHub-First Native Git timestamped branches (zero `gh` binary), per-repo `dev_pr_locks`, and hard `PASS > 90/100` PR readiness gate
 
 ---
 
